@@ -936,7 +936,11 @@ final class DefaultLitePullConsumer
     public string $consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
     /** Start point of CONSUME_FROM_TIMESTAMP (format yyyyMMddHHmmss), 30 minutes ago by default. */
     public string $consumeTimestamp;
-    public int $pullBatchSize = 32;
+    /**
+     * Messages requested per pull round. The aggregate gate below budgets every pending round at a
+     * whole batch of this size, so this is also that budget's multiplier, not only a pull size.
+     */
+    public int $pullBatchSize = 10;
     public int $pollTimeoutMillis = 5000;
     public int $pollNameServerInterval = 30000;
     public bool $autoCommit = true;
@@ -945,10 +949,13 @@ final class DefaultLitePullConsumer
     public int $brokerSuspendMaxTimeMillis = 20000;
     public int $pullIntervalMillis = 50;  // Backoff on empty polls at queue tail, avoiding busy loops hammering the broker
     /**
-     * Message-count budget for the **whole** local buffer, summed over every queue: the aggregate
-     * cache gate. When the buffer holds strictly more than this many messages the application is
-     * not draining at all, so no queue is worth pulling. A plain budget, never clamped: 0 means
-     * "trip on the first cached message".
+     * Message-count budget for the **whole** local buffer: the aggregate cache gate. It budgets the
+     * pull rounds whose messages the application has not taken yet -- one whole batch per round,
+     * whether or not that round came back full -- so it asks "how much may still be on the way"
+     * rather than "how much is cached now". A queue whose rounds are half empty therefore still
+     * reserves its batch. When that projection is strictly greater than this number the application
+     * is not draining at all, so no queue is worth pulling. A plain budget, never clamped: 0 means
+     * "trip on the first pending round".
      */
     public int $pullThresholdForAll = 10000;
     /**
@@ -987,15 +994,16 @@ final class DefaultLitePullConsumer
     private array $paused = [];
     /**
      * Per-queue cache accumulators (key = mqKey), the cache gates' O(1) view of the local buffer:
-     * how many messages of this queue the buffer holds, how many **stored** bytes, and the lowest
+     * how many messages of this queue the buffer holds, how many **body** bytes, and the lowest
      * and highest cached queue offset -- with the offset -> refcount map behind the boundaries, so
      * a removal whose boundary offset lost its last message can re-pick the boundary without
-     * walking the buffer. Only the buffer's own primitives (``bufferAppend`` / ``bufferTake`` /
+     * walking the buffer, and the list of still-undrained pull rounds of this queue, which is what
+     * the aggregate gate counts. Only the buffer's own primitives (``bufferAppend`` / ``bufferTake`` /
      * ``bufferRetain``) write these, in the same step as they move the buffer itself, so an
      * accumulator can never describe a buffer the buffer does not have; a queue that leaves the
      * assignment loses its record together with its cached messages.
      *
-     * @var array<string,array{count:int,bytes:int,min:int,max:int,offsets:array<int,int>}>
+     * @var array<string,array{count:int,bytes:int,min:int,max:int,offsets:array<int,int>,rounds:list<int>}>
      */
     private array $queueCache = [];
     /** @var array<string,float> Due time of one queue's own-cache pause (seconds, microtime basis; the PHP form of a pull task re-scheduled 50 ms later) */
@@ -1144,7 +1152,7 @@ final class DefaultLitePullConsumer
         return $this->queueCache[self::mqKey($mq)]['count'] ?? 0;
     }
 
-    /** Stored bytes of this queue's cached messages (the size gate's numerator, before the MiB division). */
+    /** Body bytes of this queue's cached messages (the size gate's numerator, before the MiB division). */
     public function cachedByteSizeOf(MessageQueue $mq): int
     {
         return $this->queueCache[self::mqKey($mq)]['bytes'] ?? 0;
@@ -1157,10 +1165,24 @@ final class DefaultLitePullConsumer
         return $stat === null ? 0 : $stat['max'] - $stat['min'];
     }
 
-    /** Messages cached across every queue: the aggregate gate's measurement. */
+    /** Messages cached across every queue right now -- what the application can still be handed. */
     public function cachedMessageCount(): int
     {
         return count($this->localBuffer);
+    }
+
+    /**
+     * Pull rounds whose messages are still in the buffer, across every queue: the aggregate gate's
+     * measurement. A round counts as long as any of its messages remain, whether it came back full
+     * or with one message.
+     */
+    public function pendingPullRounds(): int
+    {
+        $rounds = 0;
+        foreach ($this->queueCache as $stat) {
+            $rounds += count($stat['rounds']);
+        }
+        return $rounds;
     }
 
     /** Trips of the aggregate gate; the push path's ``flowControlTriggeredCount()`` counterpart for this path. */
@@ -1664,7 +1686,8 @@ final class DefaultLitePullConsumer
 
     /**
      * The buffer and its per-queue accumulators, moved in one step: every message that lands in
-     * the buffer also lands in its queue's count / stored bytes / offset boundaries. This is the
+     * the buffer also lands in its queue's count / body bytes / offset boundaries, and one pull
+     * round that left messages here is booked as one pending round of that queue. This is the
      * only writer of ``$localBuffer``'s tail, so a gate verdict always describes what is really
      * cached -- the messages already handed to the application included, since they stay here
      * until ``poll()`` takes them away.
@@ -1673,12 +1696,23 @@ final class DefaultLitePullConsumer
      */
     private function bufferAppend(array $msgs): void
     {
+        $perQueue = [];
+        foreach ($msgs as $m) {
+            $k = self::messageCacheKey($m);
+            $perQueue[$k] = ($perQueue[$k] ?? 0) + 1;
+        }
+        $roundBooked = [];
         foreach ($msgs as $m) {
             $this->localBuffer[] = $m;
             $key = self::messageCacheKey($m);
-            $stat = $this->queueCache[$key] ?? ['count' => 0, 'bytes' => 0, 'min' => 0, 'max' => 0, 'offsets' => []];
+            $stat = $this->queueCache[$key]
+                ?? ['count' => 0, 'bytes' => 0, 'min' => 0, 'max' => 0, 'offsets' => [], 'rounds' => []];
             $stat['count']++;
-            $stat['bytes'] += $m->storeSize;
+            $stat['bytes'] += strlen((string) $m->body);
+            if (!isset($roundBooked[$key]) && $perQueue[$key] > 0) {
+                $roundBooked[$key] = true;
+                $stat['rounds'][] = $perQueue[$key];
+            }
             $stat['offsets'][$m->queueOffset] = ($stat['offsets'][$m->queueOffset] ?? 0) + 1;
             if ($stat['count'] === 1) {
                 $stat['min'] = $m->queueOffset;
@@ -1735,6 +1769,11 @@ final class DefaultLitePullConsumer
      * and not once per message but once per removal batch -- so a round of the gates stays O(1) and
      * never scans the buffer.
      *
+     * A queue's messages always leave in round order -- ``poll()`` drains the shared buffer from its
+     * head and ``seek()`` prunes a prefix of this queue's cached offsets -- so taking one message
+     * away eats the front pending round and a round that runs out is dropped. A half-drained round
+     * still counts as pending, exactly as the aggregate gate budgets it.
+     *
      * @param list<MessageExt> $msgs
      */
     private function bufferForget(array $msgs): void
@@ -1748,7 +1787,17 @@ final class DefaultLitePullConsumer
                 continue;
             }
             $stat['count']--;
-            $stat['bytes'] = max(0, $stat['bytes'] - $m->storeSize);
+            $stat['bytes'] = max(0, $stat['bytes'] - strlen((string) $m->body));
+            $rounds = $stat['rounds'] ?? [];
+            if ($rounds !== []) {
+                $front = $rounds[0] - 1;
+                if ($front > 0) {
+                    $rounds[0] = $front;
+                } else {
+                    array_shift($rounds);
+                }
+                $stat['rounds'] = $rounds;
+            }
             $left = ($stat['offsets'][$m->queueOffset] ?? 0) - 1;
             if ($left > 0) {
                 $stat['offsets'][$m->queueOffset] = $left;
@@ -1804,9 +1853,10 @@ final class DefaultLitePullConsumer
      * The four cache gates, judged for **this one queue** before its round resolves a pull offset
      * and therefore before any request leaves. The order is fixed:
      *
-     * 1. aggregate: everything cached across every queue against ``pullThresholdForAll``;
+     * 1. aggregate: the pull rounds still waiting to be polled across every queue, each budgets a
+     *    whole ``pullBatchSize``, against ``pullThresholdForAll``;
      * 2. count: this queue's cached message count against ``pullThresholdForQueue``;
-     * 3. size: this queue's cached **stored** bytes, as whole MiB, against ``pullThresholdSizeForQueue``;
+     * 3. size: this queue's cached **body** bytes, as whole MiB, against ``pullThresholdSizeForQueue``;
      * 4. span: this queue's cached offset span against ``consumeMaxSpan``.
      *
      * All four compare **strictly greater than**, so a queue that sits exactly on its threshold
@@ -1817,18 +1867,22 @@ final class DefaultLitePullConsumer
      */
     private function cacheFlowControlHit(MessageQueue $mq, string $key): bool
     {
-        $cached = count($this->localBuffer);
-        if ($cached > $this->pullThresholdForAll) {
+        $pendingRounds = $this->pendingPullRounds();
+        $reserved = $pendingRounds * $this->pullBatchSize;
+        if ($reserved > $this->pullThresholdForAll) {
             $times = ++$this->flowControlForAllTimes;
+            // The budget is stated in messages while this gate counts rounds, so the warn translates
+            // it back into the number of rounds that fit: ceil(threshold / batch).
+            $fits = intdiv($this->pullThresholdForAll + $this->pullBatchSize - 1, max(1, $this->pullBatchSize));
             $this->armCacheFlowControlPause(
                 $mq,
                 $key,
                 $times,
                 sprintf(
                     'the consume request count exceeds threshold %d, so do flow control,'
-                        . ' cached=%d, flowControlTimes=%d',
-                    $this->pullThresholdForAll,
-                    $cached,
+                        . ' consume request count=%d, flowControlTimes=%d',
+                    $fits,
+                    $pendingRounds,
                     $times,
                 ),
             );
@@ -1992,6 +2046,7 @@ final class DefaultLitePullConsumer
     private function rebalance(): void
     {
         $client = $this->requireClient();
+        $wasByTopic = consumer_queues_by_topic($this->assigned);
         $newSet = [];
         foreach (array_keys($this->subscription) as $topic) {
             try {
@@ -2028,9 +2083,9 @@ final class DefaultLitePullConsumer
                 $newSet[self::mqKey($mq)] = $mq;
             }
         }
-        if (array_keys($newSet) !== array_keys($this->assigned) || $newSet != $this->assigned) {
-            $old = $this->assigned;
-            $oldKeys = array_fill_keys(array_keys($old), true);
+        $moved = consumer_changed_topics($wasByTopic, consumer_queues_by_topic($newSet));
+        if ($moved !== []) {
+            $oldKeys = array_fill_keys(array_keys($this->assigned), true);
             $this->assigned = $newSet;
             foreach (array_keys($newSet) as $key) {
                 if (isset($oldKeys[$key])) {
@@ -2059,21 +2114,24 @@ final class DefaultLitePullConsumer
                 $this->dropQueueCache($key);
             }
             if ($this->messageQueueListener !== null) {
-                try {
-                    // The MessageQueueListener interface signature is (topic, mqAll, mqDivided);
-                    // lite's rebalance computes all subscriptions together, so notify per topic here.
-                    foreach (array_keys($this->subscription) as $topic) {
+                // The MessageQueueListener interface signature is (topic, mqAll, mqDivided): the
+                // topic's FULL queue set from the route and this instance's share of it. Only the
+                // topics whose share moved are told -- an unchanged topic has nothing to report, and
+                // re-reporting every subscription each round would have the application rebuild
+                // state for queues that never changed hands.
+                foreach ($moved as $topic) {
+                    try {
                         $this->messageQueueListener->messageQueueChanged(
                             $topic,
-                            array_values($old),
+                            $client->getTopicSubscribeInfo($topic),
                             array_values(array_filter(
                                 $newSet,
                                 static fn(MessageQueue $mq): bool => $mq->topic === $topic,
                             )),
                         );
+                    } catch (\Throwable $e) {
+                        Logger::debug("queue listener failed for $topic: " . $e->getMessage());
                     }
-                } catch (\Throwable) {
-                    // ignore
                 }
             }
         }

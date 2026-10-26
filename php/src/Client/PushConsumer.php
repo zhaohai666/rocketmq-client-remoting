@@ -169,6 +169,11 @@ final class DefaultMQPushConsumer
     /** @var array<string, SubscriptionData> topic => SubscriptionData */
     public array $subscriptionData = [];
     public mixed $messageListener = null;
+    /**
+     * The application's window onto the assignment: called for every topic whose set of queues
+     * moved, with that topic's full queue set and this instance's share of it.
+     */
+    public mixed $messageQueueListener = null;
 
     public ?MQClientInstance $mqClient = null;
     private bool $started = false;
@@ -458,6 +463,16 @@ final class DefaultMQPushConsumer
     public function setMessageListener(mixed $listener): void
     {
         $this->messageListener = $listener;
+    }
+
+    /**
+     * Install the assignment-change callback (see MessageQueueListener): it hears about a topic when
+     * the set of its queues this instance owns moves, with that topic's full queue set and this
+     * instance's share.
+     */
+    public function setMessageQueueListener(mixed $listener): void
+    {
+        $this->messageQueueListener = $listener;
     }
 
     /** Ceiling in milliseconds that shutdown() spends draining queued consumption; <= 0 = no extra ceiling. */
@@ -1202,6 +1217,7 @@ final class DefaultMQPushConsumer
         foreach ($this->assigned as $key => $mq) {
             $was[$key] = true;
         }
+        $wasByTopic = consumer_queues_by_topic($this->assigned);
         $assigned = [];
         $topics = array_keys($this->subscriptionData);
         if ($this->messageModel === MessageModel::BROADCASTING) {
@@ -1251,20 +1267,17 @@ final class DefaultMQPushConsumer
             $newAssigned[self::mqKey($mq)] = $mq;
         }
         $this->assigned = $newAssigned;
-        $now = [];
-        foreach ($newAssigned as $key => $mq) {
-            $now[$key] = true;
-        }
-        // A SET comparison, not a size one: losing a queue while gaining another keeps the count
-        // but changes who owns what, and every topic budget has to be re-split over the new set.
-        // The same verdict decides the log line and the division at the end of this method.
-        $changed = ($now != $was);
-        if ($changed) {
+        // A comparison of each topic's queue SET, not of one global count: losing a queue while
+        // gaining another keeps the totals but changes who owns what, and the topics that changed
+        // are also exactly the ones the application has to be told about.
+        $moved = consumer_changed_topics($wasByTopic, consumer_queues_by_topic($newAssigned));
+        if ($moved !== []) {
             Logger::info(sprintf(
-                'rebalance result changed, group=%s clientId=%s assigned=%d',
+                'rebalance result changed, group=%s clientId=%s assigned=%d topics=%s',
                 $this->consumerGroup,
                 $this->clientId,
                 count($assigned),
+                implode(',', $moved),
             ));
         }
         foreach ($newAssigned as $key => $mq) {
@@ -1289,12 +1302,84 @@ final class DefaultMQPushConsumer
             }
         }
         $this->rebalancePullState();
-        // The topic budgets become per-queue knobs here -- AFTER the pull state for this round was
-        // rebuilt, so the division runs over the count THIS round produced (a shrink from 4 queues
-        // to 2 divides by 2, not by 4) -- and only when the assignment CHANGED: an identical round
-        // owns the same queues, so re-dividing would only overwrite a knob the user set by hand.
-        if ($changed) {
-            $this->divideTopicThresholds();
+        $this->afterAssignmentChange($moved);
+    }
+
+    /**
+     * Everything a rebalance round whose queue set moved pays, in one order that cannot be shuffled:
+     * the moved topics' subscription version is re-stamped, the topic budgets are re-split over this
+     * round's queue count, one heartbeat goes out to every broker immediately, and the application's
+     * queue listener hears about exactly the topics that moved. A round that changed nothing pays
+     * nothing.
+     *
+     * @param list<string> $moved
+     */
+    private function afterAssignmentChange(array $moved): void
+    {
+        if ($moved === []) {
+            return;
+        }
+        $this->restampSubscriptionVersions($moved);
+        $this->divideTopicThresholds();
+        try {
+            $this->sendHeartbeatToAllBroker();
+        } catch (\Throwable $e) {
+            Logger::debug('heartbeat after rebalance change failed: ' . $e->getMessage());
+        }
+        $this->notifyQueueChanged($moved);
+    }
+
+    /**
+     * Re-share the subscription version of the topics whose assignment moved.
+     *
+     * The version is what makes a broker re-read a subscription instead of reusing the filtered
+     * result it cached for the old generation, so a topic whose queues moved has to look new to the
+     * broker even when the filter expression did not change. Topics that did not move keep their
+     * version: restamping everything on every change would throw away the caching the broker does
+     * for the untouched subscriptions.
+     *
+     * @param list<string> $moved
+     */
+    private function restampSubscriptionVersions(array $moved): void
+    {
+        $newVersion = UtilAll::currentTimeMillis();
+        foreach ($moved as $topic) {
+            $sub = $this->subscriptionData[$topic] ?? null;
+            if ($sub === null) {
+                continue;
+            }
+            Logger::info(sprintf('%s rebalance changed, also update version: %d, %d',
+                $topic, $sub->subVersion, $newVersion));
+            $sub->setSubVersion($newVersion);
+        }
+    }
+
+    /**
+     * Fire the application's queue listener for the moved topics only, each with that topic's full
+     * queue set and this instance's share of it.
+     *
+     * @param list<string> $moved
+     */
+    private function notifyQueueChanged(array $moved): void
+    {
+        $listener = $this->messageQueueListener;
+        if ($listener === null) {
+            return;
+        }
+        $byTopic = [];
+        foreach ($this->assigned as $mq) {
+            $byTopic[$mq->topic][] = $mq;
+        }
+        foreach ($moved as $topic) {
+            try {
+                $listener->messageQueueChanged(
+                    $topic,
+                    $this->allQueuesOfTopic($topic),
+                    $byTopic[$topic] ?? [],
+                );
+            } catch (\Throwable $e) {
+                Logger::debug("message queue listener failed for $topic: " . $e->getMessage());
+            }
         }
     }
 
@@ -1408,10 +1493,7 @@ final class DefaultMQPushConsumer
 
     public function applyPopAssignment(string $topic, array $assignments): void
     {
-        $was = [];
-        foreach ($this->assigned as $key => $mq) {
-            $was[$key] = true;
-        }
+        $wasByTopic = consumer_queues_by_topic($this->assigned);
         $newAssigned = [];
         foreach ($this->assigned as $key => $mq) {
             if ($mq->topic !== $topic) {
@@ -1443,14 +1525,11 @@ final class DefaultMQPushConsumer
             ));
         }
         $this->assigned = $newAssigned;
-        $now = [];
-        foreach ($newAssigned as $key => $mq) {
-            $now[$key] = true;
-        }
         // Same set comparison as the local rebalance: this is the round that can change which
-        // queues this client owns, so it is also the round the topic budgets are re-split in.
-        $changed = ($now != $was);
-        if ($changed) {
+        // queues this client owns, so it is also the round the topic budgets are re-split in, the
+        // subscription version is re-stamped for, and the brokers are beaten about immediately.
+        $moved = consumer_changed_topics($wasByTopic, consumer_queues_by_topic($newAssigned));
+        if ($moved !== []) {
             Logger::info(sprintf(
                 'broker rebalanced result changed. allocateMessageQueueStrategyName=%s, group=%s, topic=%s, clientId=%s, assignmentSet=%d',
                 $this->allocateStrategy->getName(),
@@ -1461,12 +1540,10 @@ final class DefaultMQPushConsumer
             ));
         }
         $this->rebalancePullState();
-        // Under POP the pull state rebuilt above is the ``popQueues`` table, so the division that
-        // follows reads that table as its divisor -- and, like the local path, it runs on the count
-        // this round produced rather than the previous round's.
-        if ($changed) {
-            $this->divideTopicThresholds();
-        }
+        // Under POP the pull state rebuilt above is the ``popQueues`` table, so the division inside
+        // the package reads that table as its divisor -- and, like the local path, it runs on the
+        // count this round produced rather than the previous round's.
+        $this->afterAssignmentChange($moved);
     }
 
     public function rebalanceImmediately(): void
@@ -1722,35 +1799,55 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * Whether the cache gates pause **this one queue's** pull. Every gate compares its threshold
-     * **strictly greater than**, so a buffer that has reached the threshold exactly is still allowed
-     * to pull and a threshold reads as "how many may be cached".
+     * Whether the cache gates pause **this one queue's** pull.
      *
-     * There are exactly three gates, all per-queue: the message count, the buffered MB and the
-     * offset span. A topic-level budget is NOT judged here -- nothing is summed across the topic's
-     * queues at pull time -- because {@see divideTopicThresholds()} already turned that budget into
-     * this queue's share of the per-queue knob during rebalance. Sibling queues therefore never
-     * make each other pause: one queue going past its share pauses that queue alone.
+     * Every gate compares its threshold **strictly greater than**, the threshold taken exactly as it
+     * stands: no floor of 1 and no "this gate is switched off at 0" escape. A queue that has reached a
+     * threshold exactly is therefore still allowed to pull, so the knobs read as "how many may be
+     * cached", not "how many stop the pull", and a threshold of 0 reads as "cache nothing" -- the first
+     * message held trips it. Keeping each knob inside its legal range is
+     * {@see checkConfigRanges()}'s job at start-up, not this gate's.
+     *
+     * There are exactly three gates, all per-queue, judged in one fixed order: the message COUNT, then
+     * the SIZE, then the offset SPAN. A topic-level budget is NOT judged here -- nothing is summed
+     * across the topic's queues at pull time -- because {@see divideTopicThresholds()} already turned
+     * that budget into this queue's share of the per-queue knob during rebalance. Sibling queues
+     * therefore never make each other pause: one queue going past its share pauses that queue alone.
+     *
+     * What all three measure is everything this queue still HOLDS: the pulled-but-undispatched buffer
+     * UNION the batches already handed to the listener and not settled yet
+     * ({@see processQueueEntries()}). A dispatched batch has only moved, it has not left the queue --
+     * it leaves when it settles through an ack/complete or is requeued -- and a gate that read the
+     * buffer alone would let a queue whose listener is wedged keep pulling without bound.
+     *
+     * The size is whole MiB of message **body** bytes by integer division, so a partially filled MiB
+     * costs nothing and a 1 MiB budget therefore tolerates 1.9 MiB. The stored-record size on the wire
+     * is not what this client holds in memory and never enters this number.
+     *
+     * The one per-term difference is that the SPAN gate does not run at all under ordered consumption:
+     * an ordered queue has no run-ahead to guard against, because its pull cursor only moves once the
+     * batch in the listener's hands has settled. Count and size still bind an ordered queue, over the
+     * same held set.
      */
     private function flowControlHit(MessageQueue $mq, string $key): bool
     {
-        $dq = $this->pending[$key] ?? [];
-        $sizeMb = 0.0;
-        $span = 0;
-        foreach ($dq as $m) {
-            $sizeMb += $m->storeSize;
+        $held = $this->processQueueEntries($key);
+        $bodyBytes = 0;
+        foreach ($held as $m) {
+            $bodyBytes += strlen((string) $m->body);
         }
-        $sizeMb /= (1024.0 * 1024.0);
-        if ($dq !== []) {
-            $offsets = array_map(static fn(MessageExt $m) => $m->queueOffset, $dq);
+        $sizeMb = intdiv($bodyBytes, 1024 * 1024);
+        $span = 0;
+        if ($held !== []) {
+            $offsets = array_map(static fn(MessageExt $m) => $m->queueOffset, $held);
             $span = max($offsets) - min($offsets);
         }
         $reason = '';
-        if (count($dq) > max(1, $this->pullThresholdForQueue)) {
-            $reason = 'count=' . count($dq);
-        } elseif ($this->pullThresholdSizeForQueue > 0 && $sizeMb > $this->pullThresholdSizeForQueue) {
-            $reason = sprintf('size=%.1fMB', $sizeMb);
-        } elseif ($this->consumeConcurrentlyMaxSpan > 0 && $span > $this->consumeConcurrentlyMaxSpan) {
+        if (count($held) > $this->pullThresholdForQueue) {
+            $reason = 'count=' . count($held);
+        } elseif ($sizeMb > $this->pullThresholdSizeForQueue) {
+            $reason = 'size=' . $sizeMb . 'MB';
+        } elseif (!$this->isOrderly() && $span > $this->consumeConcurrentlyMaxSpan) {
             $reason = "span=$span";
         }
         if ($reason === '') {
@@ -2154,7 +2251,31 @@ final class DefaultMQPushConsumer
         return $this->messageListener instanceof MessageListenerOrderly;
     }
 
+    /**
+     * Hand one batch to the listener while keeping it inside the queue's held set.
+     *
+     * Splicing the batch out of the buffer only moves it -- it has not left the queue until the
+     * listener settles it -- so it is registered as in-flight for BOTH consume modes and dropped
+     * from that table once the call returns, however it returns. Without this, an orderly listener
+     * that never returns would hold nothing in either table and every cache gate would keep
+     * reporting an empty queue.
+     */
     private function consumeBatch(string $key, MessageQueue $mq, array $batch, ?int $epoch = null): bool
+    {
+        if (!isset($this->inflightMsgs[$key])) {
+            $this->inflightMsgs[$key] = [];
+        }
+        foreach ($batch as $m) {
+            $this->inflightMsgs[$key][] = $m;
+        }
+        try {
+            return $this->consumeBatchHeld($key, $mq, $batch, $epoch);
+        } finally {
+            $this->deregisterInflight($key, $batch);
+        }
+    }
+
+    private function consumeBatchHeld(string $key, MessageQueue $mq, array $batch, ?int $epoch = null): bool
     {
         if ($epoch !== null && $epoch !== ($this->queueEpoch[$key] ?? 0)) {
             $dropped = $this->queueEpoch[$key] ?? 0;
@@ -2253,17 +2374,7 @@ final class DefaultMQPushConsumer
             $this->suspendedUntil[$key] = microtime(true) + $this->orderlySuspendMillis($ocontext) / 1000.0;
             return false;
         }
-        if (!isset($this->inflightMsgs[$key])) {
-            $this->inflightMsgs[$key] = [];
-        }
-        foreach ($batch as $m) {
-            $this->inflightMsgs[$key][] = $m;
-        }
-        try {
-            return $this->consumeConcurrentBatch($key, $mq, $batch, $epoch, $broadcast);
-        } finally {
-            $this->deregisterInflight($key, $batch);
-        }
+        return $this->consumeConcurrentBatch($key, $mq, $batch, $epoch, $broadcast);
     }
 
     private function consumeConcurrentBatch(

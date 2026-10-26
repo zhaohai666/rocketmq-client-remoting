@@ -59,9 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains **26** suites — the list is derived
+the other dies — this guard cannot be skipped), then chains **28** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,554 assertions across the 26 suites pass**; any failure exits with a
+**guard CLEAN, all 4,638 assertions across the 28 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -417,12 +417,26 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   auto-accumulation and two-level fair backpressure) / oneway / async / transactional
   (two-phase + broker check-back) / timed messages and recall / Request-Reply
 - ✅ Consuming: Push (concurrent / orderly / broadcasting / offset persistence / start-up
-  numeric validation / three pre-pull cache gates per queue, topic budgets divided over the owned queues at rebalance; the POP outstanding-ACK gate stops a round only when this queue's debt is strictly above `popThresholdForQueue` (default 96) and a trip lands on the pull path's one client-wide flow-control counter and warn cadence), Pull (whole-topic view and
-  this-instance share view), LitePull (incl. topic queue-set change listener, and four cache
-  gates judged before the pull offset is resolved — whole-buffer count `pullThresholdForAll`
-  10000 / this queue's count `pullThresholdForQueue` 1000 / this queue's stored bytes
+  numeric validation / three pre-pull cache gates per queue, measuring everything the queue
+  still holds — the undispatched buffer plus the batches handed to the listener that have not
+  settled yet; count, body bytes divided into whole MiB and offset span each refuse only when
+  strictly above their threshold, which gets neither a clamp to 1 nor a "0 disables it" escape,
+  and an orderly consumer never judges the span at all; a topic budget is divided over the
+  queues owned in the round that assignment changed. A rebalance round whose per-topic queue
+  set moved pays, in order: re-stamp the subscription version of the moved topics only →
+  re-divide the budgets → one immediate heartbeat to every broker → call the queue listener
+  for the moved topics only; a round where nothing moved, and a stall self-heal round, do
+  none of it. The POP outstanding-ACK gate stops a round only when this queue's debt is
+  strictly above `popThresholdForQueue` (default 96) and a trip lands on the pull path's one
+  client-wide flow-control counter and warn cadence), Pull (whole-topic view and
+  this-instance share view), LitePull (incl. topic queue-set change listener, reporting only
+  the topics whose set moved; four cache gates judged before the pull offset is resolved — the
+  queued pull rounds times `pullBatchSize` (default 10) against `pullThresholdForAll`
+  10000 / this queue's count `pullThresholdForQueue` 1000 / this queue's body bytes
   `pullThresholdSizeForQueue` 100 MiB with integer division / this queue's offset span
-  `consumeMaxSpan` 2000, each refusing only when strictly above its threshold; a refusal
+  `consumeMaxSpan` 2000, each refusing only when strictly above its threshold, with neither a
+  clamp nor a "0 disables it" escape; count and size share one trip counter while the
+  aggregate and the span keep their own; a refusal
   re-schedules just this queue 50ms later while the broker's `FLOW_CONTROL`(215) waits 20ms),
   POP (200050 pop / 200051 ack / 200053 change-invisible-time + checkpoints),
   `ConsumeMessageDirectly`
@@ -447,7 +461,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 26 suites with 4,554 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 28 suites with 4,638 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

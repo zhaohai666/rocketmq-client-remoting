@@ -53,8 +53,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 **26** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
-悄悄漏出自检。当前实测：**守卫 CLEAN，26 个套件 4,554 项断言全部通过**，任一失败即以非零码退出。
+守卫不能省），然后串起 **28** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
+悄悄漏出自检。当前实测：**守卫 CLEAN，28 个套件 4,638 项断言全部通过**，任一失败即以非零码退出。
 
 ## 快速上手
 
@@ -386,11 +386,19 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   6 段批量消息编解码、sync / async / oneway、opaque 匹配、半包重组、GO_AWAY 换连接重发、TLS
 - ✅ 发送：普通 / 定点 / 队列选择器 / 批量（含 `ProduceAccumulator` 自动攒批与两级公平
   背压）/ 单向 / 异步 / 事务（两阶段 + broker 回查）/ 定时消息与撤回 / Request-Reply
-- ✅ 消费：Push（并发 / 顺序 / 广播 / 位点持久化 / 启动期数值校验 / 每队列三条拉取前流控闸门，topic 预算在重平衡时摊到每队列；POP 的待 ack 欠账闸门严格大于 `popThresholdForQueue`（默认 96）才停，命中记进拉取路径同一个流控计数与告警节奏）、
-  Pull（全量队列与本实例份额两种视图）、LitePull（含 topic 队列集合变更监听；拉取前先过四道
-  缓存闸门——整个缓冲条数 `pullThresholdForAll` 10000 / 本队列条数 `pullThresholdForQueue`
-  1000 / 本队列存储字节 `pullThresholdSizeForQueue` 100 MiB 整除 / 本队列位点跨度
-  `consumeMaxSpan` 2000，都严格大于才停；命中只重排这一个队列 50ms，broker 的
+- ✅ 消费：Push（并发 / 顺序 / 广播 / 位点持久化 / 启动期数值校验 / 每队列三条拉取前缓存闸门，
+  度量该队列持有的全部消息——未派发缓冲加上已交给监听器但尚未结算的批次；条数、消息体字节
+  整除 MiB、位点跨度三条都严格大于才停，阈值既不做下限钳制也没有 0 关闭，顺序消费完全不判
+  跨度；topic 预算在重平衡时按本轮持有的队列数摊到每队列。分配集合变化的那一轮按序补齐：
+  只给变动的 topic 重打订阅版本 → 摊预算 → 立刻向所有 broker 心跳 → 只向变动的 topic 回调
+  队列监听；集合未变的轮次与停摆自愈轮都不做任何事。POP 的待 ack 欠账闸门严格大于
+  `popThresholdForQueue`（默认 96）才停，命中记进拉取路径同一个流控计数与告警节奏）、
+  Pull（全量队列与本实例份额两种视图）、LitePull（含 topic 队列集合变更监听，只回调集合
+  变动的 topic；拉取前先过四道缓存闸门——排队中的拉取轮次 × `pullBatchSize`（默认 10）
+  对 `pullThresholdForAll` 10000 / 本队列条数 `pullThresholdForQueue` 1000 / 本队列消息体
+  整除 MiB `pullThresholdSizeForQueue` 100 / 本队列位点跨度 `consumeMaxSpan` 2000，
+  都严格大于才停、阈值不做下限钳制也不支持 0 关闭；条数与体积共用一个流控计数，聚合与跨度
+  各计各的；命中只重排这一个队列 50ms，broker 的
   `FLOW_CONTROL`(215) 只等 20ms）、
   POP（200050 弹出 / 200051 ACK / 200053 延长不可见时间 + 检查点）、`ConsumeMessageDirectly`
 - ✅ 队列分配：本地策略 `AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` /
@@ -407,7 +415,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：26 套件 4,554 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：28 套件 4,638 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 14 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP（含 BATCH_ACK 批量确认）/ POP 消费者 / TLS / Request-Reply / 压缩冒烟 / 静态 topic /
   SQL92 过滤 / 单向推送 / 生产端重注册 / 鉴权集群上的全部消息类型收发

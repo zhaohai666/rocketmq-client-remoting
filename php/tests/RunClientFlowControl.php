@@ -71,6 +71,18 @@ use RocketMQ\Remoting\Protocol\ResponseCode;
 use function RocketMQ\Remoting\Protocol\message_queue_key;
 
 /**
+ * An orderly listener, used only to put a consumer in ordered-consumption mode: the cache gate's
+ * span leg is what is under test here, never what the listener does with a batch.
+ */
+final class FcOrderlyListener implements RocketMQ\Client\MessageListenerOrderly
+{
+    public function consumeMessage(array $msgs, RocketMQ\Client\ConsumeOrderlyContext $context): RocketMQ\Client\ConsumeOrderlyStatus
+    {
+        return RocketMQ\Client\ConsumeOrderlyStatus::SUCCESS;
+    }
+}
+
+/**
  * Instance double for the pull round: it records every pull this client asks for and answers each
  * one with a live two-message batch, so "the gate stopped the request" and "the request went out"
  * are both read from recorded state.
@@ -116,14 +128,16 @@ final class FcInstance extends MQClientInstance
         }
         $made = [];
         foreach ([0, 1] as $offset) {
-            $m = new MessageExt(topic: $mq->topic, body: 'fc-' . $offset);
+            // A 1 KiB body on a 1-byte store record: the accumulators the lite gates read are the
+            // body sums, so a gate that still measured the store record would see nothing here.
+            $m = new MessageExt(topic: $mq->topic, body: 'fc-' . str_repeat('x', 1021));
             // Re-stamped with the queue the response belongs to, exactly as the real pull decoder
             // does: the lite path keys its cache accumulators off the message's own queue, so an
             // unstamped double would describe a queue that does not exist.
             $m->brokerName = $mq->brokerName;
             $m->queueId = $mq->queueId;
             $m->setQueueOffset($offset);
-            $m->setStoreSize(1024);
+            $m->setStoreSize(1);
             $made[] = $m;
         }
         return new PullResult(
@@ -232,17 +246,42 @@ final class RunClientFlowControl
 
     // ---------------- message helpers ----------------
 
-    /** @param list<int> $offsets */
-    private function msgs(array $offsets, int $storeSize = 1024): array
+    /**
+     * Cached messages for the push gates. The body carries the bytes the size gate reads, while
+     * ``storeSize`` is deliberately a different number: a gate that still measured the store record
+     * would read 1 byte per message here and never trip, which is what reddens it.
+     *
+     * @param list<int> $offsets
+     */
+    private function msgs(array $offsets, int $bodyBytes = 1024, int $storeSize = 1): array
     {
         $out = [];
         foreach ($offsets as $offset) {
-            $m = new MessageExt(topic: 'GateTopic', body: 'x');
+            $m = new MessageExt(topic: 'GateTopic', body: str_repeat('x', max(1, $bodyBytes)));
             $m->queueOffset = (int) $offset;
             $m->storeSize = $storeSize;
             $out[] = $m;
         }
         return $out;
+    }
+
+    /**
+     * Stage a queue's held set -- the pulled-but-not-yet-dispatched buffer plus the batches already
+     * handed to the listener and not settled yet -- and ask the gate whether it would pause.
+     *
+     * @param list<MessageExt> $buffered
+     * @param list<MessageExt> $withListener
+     */
+    private function hitHeld(
+        DefaultMQPushConsumer $c,
+        MessageQueue $mq,
+        array $buffered,
+        array $withListener,
+    ): bool {
+        $key = message_queue_key($mq);
+        $this->setProp($c, 'pending', [$key => $buffered]);
+        $this->setProp($c, 'inflightMsgs', $withListener === [] ? [] : [$key => $withListener]);
+        return (bool) $this->call($c, 'flowControlHit', [$mq, $key]);
     }
 
     /** Seed one queue's cached messages and ask the gate whether it would pause the pull. */
@@ -349,33 +388,94 @@ final class RunClientFlowControl
         $this->checkSame(true, $this->hit($c, $mq, $this->msgs([0, 1, 2])),
             'one message past threshold 2 trips the count gate');
 
-        // The clamp keeps a zero threshold meaningful: it behaves like 1, so it trips on the
-        // second message rather than on the first.
-        $c->pullThresholdForQueue = 0;
-        $this->checkSame(false, $this->hit($c, $mq, $this->msgs([0])),
-            'a zero threshold clamps to one, so a single message still pulls');
-        $this->checkSame(true, $this->hit($c, $mq, $this->msgs([0, 1])),
-            'a zero threshold trips on the second message, not the first');
+        // A zero threshold is not a disable switch: the comparison is the plain one, so the very
+        // first cached message already exceeds it. Which values a user may set at all is the
+        // start-up config check's business, not the gate's.
+        $zero = $this->gateConsumer('GID-FC-COUNT-ZERO');
+        $zero->pullThresholdForQueue = 0;
+        $this->checkSame(true, $this->hit($zero, $mq, $this->msgs([0])),
+            'a zero threshold switches nothing off: the first cached message already exceeds it');
+        $this->checkSame(1, $zero->flowControlTriggeredCount(),
+            'the zero-threshold refusal is counted like any other trip');
     }
 
-    // ================================================================ 3. the size gate is in MiB and strictly greater
+    // ================================================================ 2b. the held set is the cache plus what the listener still owes
 
-    private function testSizeGateIsStrictlyGreater(): void
+    /**
+     * The gate judges everything this queue still owes, not just the buffer: messages pulled and not
+     * yet dispatched plus the batches already handed to the listener that have not settled. A budget
+     * of 2 with 2 in the buffer and 1 with the listener is 3 held, so the round pauses; the same
+     * buffer with the listener's batch settled is 2 held, so it pulls.
+     */
+    private function testHeldSetIncludesWhatTheListenerStillOwes(): void
     {
-        $c = $this->gateConsumer('GID-FC-SIZE');
+        $this->captureLogs(Logger::DEBUG);
+        try {
+            $mq = new MessageQueue('GateTopic', 'b-fc', 0);
+
+            $c = $this->gateConsumer('GID-FC-HELD');
+            $c->pullThresholdForQueue = 2;
+            $this->checkSame(true, $this->hitHeld($c, $mq, $this->msgs([0, 1]), $this->msgs([2])),
+                'two buffered plus one still with the listener is three held, so the round pauses');
+            $this->check($this->lastDebugContains('count=3'),
+                'the refusal names the whole held set, not just the buffer');
+
+            // Paired control: the identical buffer with nothing outstanding at the listener.
+            $settled = $this->gateConsumer('GID-FC-HELD-SETTLED');
+            $settled->pullThresholdForQueue = 2;
+            $this->checkSame(false, $this->hitHeld($settled, $mq, $this->msgs([0, 1]), []),
+                'the same buffer with the listener batch settled is inside the budget and pulls');
+
+            // A message present in both accounts is one message, not two.
+            $shared = $this->gateConsumer('GID-FC-HELD-DEDUP');
+            $shared->pullThresholdForQueue = 2;
+            $batch = $this->msgs([7]);
+            $this->checkSame(false, $this->hitHeld($shared, $mq, $batch, $batch),
+                'the same message counted in the buffer and at the listener is still one held');
+        } finally {
+            $this->releaseLogs();
+        }
+    }
+
+    // ================================================================ 3. the size gate counts whole MiB of message body
+
+    /**
+     * The size gate measures the **message body**, never the store record, and compares whole MiB
+     * after an integer division: a backlog of 1.9 MiB is still one whole MiB and stays inside a 1 MiB
+     * budget, while two whole MiB do not. The mirror control puts a big store record on small bodies,
+     * which is exactly the pair that reddens a gate still reading ``storeSize``.
+     */
+    private function testSizeGateCountsWholeMiBOfBody(): void
+    {
+        $mib = 1024 * 1024;
         $mq = new MessageQueue('GateTopic', 'b-fc', 0);
+
+        $c = $this->gateConsumer('GID-FC-SIZE');
         $c->pullThresholdForQueue = 1000;
         $c->pullThresholdSizeForQueue = 1;
-        $mib = 1024 * 1024;
-
         $this->checkSame(false, $this->hit($c, $mq, $this->msgs([0], $mib)),
-            'exactly 1 MiB is still allowed under a 1 MiB threshold (strictly greater)');
-        $this->checkSame(true, $this->hit($c, $mq, $this->msgs([0, 1], intdiv($mib, 2) + 1)),
-            'one byte past 1 MiB trips the size gate');
-        // Control: the same backlog under a disabled gate never trips.
-        $c->pullThresholdSizeForQueue = 0;
-        $this->checkSame(false, $this->hit($c, $mq, $this->msgs([0, 1, 2], 50 * $mib)),
-            'a zero size threshold disables the gate');
+            'exactly 1 MiB of body is still allowed under a 1 MiB budget (strictly greater)');
+        $this->checkSame(false, $this->hit($c, $mq, $this->msgs([0], $mib + 1)),
+            'one byte past 1 MiB is still 1 whole MiB, so the budget tolerates it (integer division)');
+        $this->checkSame(true, $this->hit($c, $mq, $this->msgs([0, 1], $mib)),
+            'two whole MiB of body trip a 1 MiB budget');
+
+        // Paired control: the same queue on a wide store record and a small body. A gate reading the
+        // store record would refuse this round; the body says one byte.
+        $body = $this->gateConsumer('GID-FC-SIZE-BODY');
+        $body->pullThresholdForQueue = 1000;
+        $body->pullThresholdSizeForQueue = 1;
+        $this->checkSame(false, $this->hit($body, $mq, $this->msgs([0, 1], 1, 50 * $mib)),
+            'the gate sizes the message body, never the store record');
+
+        // A zero size budget is not a switch either: one whole MiB of body exceeds it.
+        $zero = $this->gateConsumer('GID-FC-SIZE-ZERO');
+        $zero->pullThresholdForQueue = 1000;
+        $zero->pullThresholdSizeForQueue = 0;
+        $this->checkSame(true, $this->hit($zero, $mq, $this->msgs([0], $mib)),
+            'a zero size budget switches nothing off: a whole MiB of body exceeds it');
+        $this->checkSame(false, $this->hit($zero, $mq, $this->msgs([0], 1024)),
+            'the same zero budget still tolerates a fraction of a MiB (control)');
     }
 
     // ================================================================ 4. the span gate is strictly greater
@@ -392,10 +492,44 @@ final class RunClientFlowControl
             'a span past maxSpan 10 trips the span gate');
         $this->checkSame(true, $this->hit($c, $mq, $this->msgs([11, 0, 4])),
             'the span is max minus min, whatever order the buffer holds');
-        // Control: a huge span with the gate switched off.
-        $c->consumeConcurrentlyMaxSpan = 0;
-        $this->checkSame(false, $this->hit($c, $mq, $this->msgs([0, 1_000_000_000])),
-            'a zero maxSpan disables the span gate');
+        // A zero maxSpan is not a switch either: any cache that spans more than nothing exceeds it.
+        $zero = $this->gateConsumer('GID-FC-SPAN-ZERO');
+        $zero->consumeConcurrentlyMaxSpan = 0;
+        $this->checkSame(true, $this->hit($zero, $mq, $this->msgs([0, 1_000_000_000])),
+            'a zero maxSpan switches nothing off: a two-offset cache already exceeds it');
+        $this->checkSame(false, $this->hit($zero, $mq, $this->msgs([5])),
+            'the same zero budget tolerates a single cached offset, which spans nothing (control)');
+    }
+
+    // ================================================================ 4b. ordered consumption never runs the span leg
+
+    /**
+     * The span gate is a concurrent-consumption device: with the same cache and the same budget, a
+     * concurrent consumer refuses the round and an orderly one pulls. Judging one cache twice is
+     * what makes the exception observable -- either leg alone would also pass if the leg simply
+     * stopped being skipped.
+     */
+    private function testSpanGateIsSkippedWhenConsumingOrderly(): void
+    {
+        $mq = new MessageQueue('GateTopic', 'b-fc', 0);
+
+        $concurrent = $this->gateConsumer('GID-FC-ORDERLY-NO');
+        $concurrent->pullThresholdForQueue = 1000;
+        $concurrent->pullThresholdSizeForQueue = 100;
+        $concurrent->consumeConcurrentlyMaxSpan = 10;
+        $this->checkSame(true, $this->hit($concurrent, $mq, $this->msgs([0, 50])),
+            'a concurrent consumer with a too-long span pauses');
+
+        // The identical cache, budget and queue, on an orderly listener.
+        $orderly = $this->gateConsumer('GID-FC-ORDERLY-YES');
+        $orderly->pullThresholdForQueue = 1000;
+        $orderly->pullThresholdSizeForQueue = 100;
+        $orderly->consumeConcurrentlyMaxSpan = 10;
+        $orderly->messageListener = new FcOrderlyListener();
+        $this->checkSame(false, $this->hit($orderly, $mq, $this->msgs([0, 50])),
+            'the same span never gates a queue consumed orderly');
+        $this->checkSame(0, $orderly->flowControlTriggeredCount(),
+            'the skipped leg arms no pause and moves no counter');
     }
 
     // ================================================================ 5. which gate answers first
@@ -425,7 +559,7 @@ final class RunClientFlowControl
             $c2->pullThresholdSizeForQueue = 1;
             $c2->consumeConcurrentlyMaxSpan = 1;
             $this->hit($c2, $mq, $this->msgs([0], 2 * $mib));
-            $this->check($this->lastDebugContains('size=2.0MB'),
+            $this->check($this->lastDebugContains('size=2MB'),
                 'with only the size gate exceeded the size reason is credited');
 
             $c3 = $this->gateConsumer('GID-FC-ORDER3');
@@ -1111,8 +1245,9 @@ final class RunClientFlowControl
         $c->pullThresholdSizeForTopic = 100;
         $c->pullThresholdForQueue = $countGate;
         $c->pullThresholdSizeForQueue = $sizeGate;
-        // The span gate is switched off so that only the message count can ever be the reason here.
-        $c->consumeConcurrentlyMaxSpan = 0;
+        // The span budget is set wide rather than to zero: a zero maxSpan is a real budget, not a
+        // switch, and these buffers span 249 offsets. Only the message count can be the reason here.
+        $c->consumeConcurrentlyMaxSpan = 1000;
         $this->setProp($c, 'mqMap', $mqMap);
         $this->setProp($c, 'pending', $pending);
         return $c;
@@ -1178,28 +1313,33 @@ final class RunClientFlowControl
         return [$c, $assigned, $keys];
     }
 
-    /** One cached message of one queue, stamped with that queue's identity and its stored size. */
-    private function liteMsg(MessageQueue $mq, int $offset, int $storeSize, string $body = 'x'): MessageExt
+    /**
+     * One cached message of one queue, stamped with that queue's identity. The size accumulator the
+     * gates read is built from the body, so ``$bodyBytes`` is the number under test and the store
+     * record is set to 1 -- a gate that measured the store record would see 1 byte per message here.
+     */
+    private function liteMsg(MessageQueue $mq, int $offset, int $bodyBytes, string $body = ''): MessageExt
     {
-        $m = new MessageExt(topic: $mq->topic, body: $body);
+        $m = new MessageExt(topic: $mq->topic, body: $body === '' ? str_repeat('x', max(1, $bodyBytes)) : $body);
         $m->brokerName = $mq->brokerName;
         $m->queueId = $mq->queueId;
         $m->setQueueOffset($offset);
-        $m->setStoreSize($storeSize);
+        $m->setStoreSize(1);
         return $m;
     }
 
     /**
      * Put messages into the consumer's cache through the buffer's own append step -- the same one a
      * live pull result goes through -- so the accumulators the gates read are filled by the buffer.
+     * Each call is one pull round, which is what the aggregate gate counts.
      *
      * @param list<int> $offsets
      */
-    private function liteSeed(DefaultLitePullConsumer $c, MessageQueue $mq, array $offsets, int $storeSize = 1024): void
+    private function liteSeed(DefaultLitePullConsumer $c, MessageQueue $mq, array $offsets, int $bodyBytes = 1024): void
     {
         $made = [];
         foreach ($offsets as $offset) {
-            $made[] = $this->liteMsg($mq, (int) $offset, $storeSize);
+            $made[] = $this->liteMsg($mq, (int) $offset, $bodyBytes);
         }
         $this->callLite($c, 'bufferAppend', [$made]);
     }
@@ -1250,6 +1390,11 @@ final class RunClientFlowControl
         $this->checkSame(0, $c->flowControlForAllTimes(), 'a fresh lite consumer tripped no aggregate gate');
         $this->checkSame(0, $c->flowControlForQueueTimes(), 'a fresh lite consumer tripped no count or size gate');
         $this->checkSame(0, $c->flowControlForSpanTimes(), 'a fresh lite consumer tripped no span gate');
+        // The batch size is the aggregate gate's multiplier, so its default is the budget of one
+        // round; the push path asks for a whole 32 and stays there.
+        $this->checkSame(10, $c->pullBatchSize, 'the lite pull batch defaults to 10 messages');
+        $this->checkSame(32, (new DefaultMQPushConsumer('GID-LITE-CFG-PUSH'))->pullBatchSize,
+            'the push path keeps its own 32-message pull batch');
 
         $c->setPullThresholdForAll(7);
         $c->setPullThresholdForQueue(0);
@@ -1328,42 +1473,41 @@ final class RunClientFlowControl
     }
 
     /**
-     * The size gate measures the **stored** size, never the body length, and compares whole MiB
-     * after an integer division: a small body inside a large store record refuses the round, while
-     * a large body inside a store record at the budget does not.
+     * The size gate measures the message **body**, never the store record, and compares whole MiB
+     * after an integer division: a large store record around a small body leaves the round pulling,
+     * while a body backlog of threshold+1 whole MiB refuses it. The two mirror legs are the pair --
+     * a gate reading ``storeSize`` reddens on the first and passes the second the wrong way round.
      */
-    private function testLiteSizeGateUsesStoredSize(): void
+    private function testLiteSizeGateUsesBodyBytes(): void
     {
         $mib = 1024 * 1024;
 
-        // A 1 MiB body inside a 5 MiB store record: only the store size can be what refuses.
+        // One small body inside a huge store record: only a body measurement lets this round out.
         $inst = new FcInstance('lite-size-' . uniqid(), []);
         [$c, $mqMap, $keys] = $this->liteConsumer($inst, 'GID-LITE-SIZE', 'LiteSize', 0);
         $mq = $mqMap[$keys[0]];
         $c->setPullThresholdForQueue(1000);
         $c->setPullThresholdSizeForQueue(1);
-        $this->liteSeed($c, $mq, [0], 5 * $mib);
-        $this->checkSame(5 * $mib, $c->cachedByteSizeOf($mq), 'the accumulator sums the stored size of the cache');
-        $this->checkSame(false, $this->litePullOnce($c, $mq),
-            'a backlog measured on storeSize refuses the round even though the body is small');
-        $this->checkSame(0, $inst->pullCount(), 'the store-size refusal sent no request');
-        $this->checkSame(1, $c->flowControlForQueueTimes(),
-            'the size gate feeds the same counter as the count gate, not one of its own');
+        $this->liteSeed($c, $mq, [0], 1);
+        $this->checkSame(1, $c->cachedByteSizeOf($mq), 'the accumulator sums the body bytes of the cache');
+        $this->checkSame(true, $this->litePullOnce($c, $mq),
+            'a one-byte body does not refuse the round, whatever its store record says');
+        $this->checkSame(1, $inst->pullCount(), 'the body-size refusal-free round sent its request');
 
-        // Mirror control: a 5 MiB body inside a store record of exactly the 1 MiB budget. Integer
-        // division puts it back on the threshold, so this queue still pulls.
-        $body = str_repeat('y', 5 * $mib);
-        $inst2 = new FcInstance('lite-size-ok-' . uniqid(), []);
-        [$c2, $map2, $keys2] = $this->liteConsumer($inst2, 'GID-LITE-SIZE-OK', 'LiteSizeOk', 0);
+        // Mirror: the same 1 MiB budget against a body that overflows it.
+        $inst2 = new FcInstance('lite-size-trip-' . uniqid(), []);
+        [$c2, $map2, $keys2] = $this->liteConsumer($inst2, 'GID-LITE-SIZE-TRIP', 'LiteSizeTrip', 0);
         $mq2 = $map2[$keys2[0]];
         $c2->setPullThresholdForQueue(1000);
         $c2->setPullThresholdSizeForQueue(1);
-        $this->callLite($c2, 'bufferAppend', [[$this->liteMsg($mq2, 0, $mib, $body)]]);
-        $this->checkSame(true, $this->litePullOnce($c2, $mq2),
-            'a big body in a store record of exactly the MiB budget still pulls (>, and on storeSize)');
-        $this->checkSame(1, $inst2->pullCount(), 'the body-size control sent its request');
+        $this->liteSeed($c2, $mq2, [0, 1], $mib);
+        $this->checkSame(2 * $mib, $c2->cachedByteSizeOf($mq2),
+            'the accumulator is the sum of the cached bodies');
+        $this->checkSame(false, $this->litePullOnce($c2, $mq2),
+            'a backlog of threshold+1 whole MiB refuses the round');
+        $this->checkSame(0, $inst2->pullCount(), 'the whole-MiB refusal sent no request');
 
-        // Integer division leg: one byte past a whole MiB is still that MiB, one MiB more is not.
+        // Integer division leg: one byte past a whole MiB is still that MiB.
         $inst3 = new FcInstance('lite-size-int-' . uniqid(), []);
         [$c3, $map3, $keys3] = $this->liteConsumer($inst3, 'GID-LITE-SIZE-INT', 'LiteSizeInt', 0);
         $mq3 = $map3[$keys3[0]];
@@ -1373,15 +1517,6 @@ final class RunClientFlowControl
         $this->checkSame(true, $this->litePullOnce($c3, $mq3),
             'one byte past 1 MiB is still 1 whole MiB, so a 1 MiB budget still pulls (integer division)');
         $this->checkSame(1, $inst3->pullCount(), 'the below-a-whole-MiB round sent its request');
-
-        $inst4 = new FcInstance('lite-size-int2-' . uniqid(), []);
-        [$c4, $map4, $keys4] = $this->liteConsumer($inst4, 'GID-LITE-SIZE-INT2', 'LiteSizeInt2', 0);
-        $c4->setPullThresholdForQueue(1000);
-        $c4->setPullThresholdSizeForQueue(1);
-        $this->liteSeed($c4, $map4[$keys4[0]], [0, 1], $mib);
-        $this->checkSame(false, $this->litePullOnce($c4, $map4[$keys4[0]]),
-            'a backlog of threshold+1 whole MiB refuses the round');
-        $this->checkSame(0, $inst4->pullCount(), 'the whole-MiB refusal sent no request');
     }
 
     /**
@@ -1448,53 +1583,89 @@ final class RunClientFlowControl
     }
 
     /**
-     * The aggregate gate is a **separate** budget over the whole buffer: total cached above
-     * pullThresholdForAll refuses every queue while none of the per-queue budgets is anywhere near
-     * its own limit, and the same backlog under a wide-open aggregate pulls everywhere.
+     * The aggregate gate is a capacity projection, not a sum of what happens to be cached: every
+     * pull round still waiting to be handed to the application budgets a whole ``pullBatchSize``,
+     * and it is that projection that is compared with ``pullThresholdForAll``. Three rounds against a
+     * 20-message budget at a batch of 10 therefore refuse every queue while the buffers hold only six
+     * messages -- no per-queue budget is anywhere near its limit -- and the very same three rounds
+     * against a 30-message budget pull everywhere.
      */
-    private function testLiteAggregateGateIsASeparateBudget(): void
+    private function testLiteAggregateGateProjectsRoundsTimesBatch(): void
     {
         $inst = new FcInstance('lite-all-' . uniqid(), []);
         [$c, $mqMap, $keys] = $this->liteConsumer($inst, 'GID-LITE-ALL', 'LiteAll', 0, 1, 2);
         $c->setPullThresholdForQueue(1000);
         $c->setPullThresholdSizeForQueue(100);
         $c->setConsumeMaxSpan(2000);
-        $c->setPullThresholdForAll(5);
+        $c->setPullBatchSize(10);
+        $c->setPullThresholdForAll(20);
         foreach ($keys as $i => $key) {
             $this->liteSeed($c, $mqMap[$key], [$i * 10, $i * 10 + 1]);
         }
-        $this->checkSame(6, $c->cachedMessageCount(), 'six messages are cached across the three queues');
-        $this->checkSame(2, $c->cachedMessageCountOf($mqMap[$keys[0]]),
-            'each queue alone holds two: no per-queue budget is anywhere near its limit');
+        $this->checkSame(3, $c->pendingPullRounds(), 'three append rounds are pending across the three queues');
+        $this->checkSame(6, $c->cachedMessageCount(),
+            'only six messages are actually cached, so a sum of the buffer would never refuse');
 
         foreach ($keys as $i => $key) {
             $this->checkSame(false, $this->litePullOnce($c, $mqMap[$key]),
-                "queue $i is refused by the aggregate budget over the whole buffer");
+                "queue $i is refused by the projection of the pending rounds");
         }
         $this->checkSame(0, $inst->pullCount(), 'an aggregate refusal sends no request for any queue');
         $this->checkSame(3, $c->flowControlForAllTimes(),
             'the aggregate gate counts one trip per refused queue on its own counter');
         $this->checkSame(0, $c->flowControlForQueueTimes(),
-            'the per-queue count/size counter stayed untouched, so nothing was summed into it');
+            'the per-queue count/size counter stayed untouched, so no buffer total was read');
         $this->checkSame(0, $c->flowControlForSpanTimes(),
             'the span counter stayed untouched on an aggregate refusal');
         $this->checkSame(3, count($this->litePauseMap($c)), 'each refused queue parked on its own deadline');
 
-        // Paired control: the very same 6-message backlog under the default aggregate budget.
+        // The multiplier is the pull batch size: the same three rounds under a batch of 6 are a
+        // projection of 18, inside the same 20-message budget, and every queue pulls.
+        $c->setPullBatchSize(6);
+        $this->liteSetPause($c, $this->liteKey($mqMap[$keys[0]]), null);
+        $this->checkSame(true, $this->litePullOnce($c, $mqMap[$keys[0]]),
+            'three rounds at a batch of 6 project 18, inside the same budget the batch of 10 breached');
+
+        // Paired control: the same three rounds and the same batch of 10 against a 30-message budget,
+        // judged without sending a request -- a round that succeeds projects a fourth round of its own.
         $inst2 = new FcInstance('lite-all-ok-' . uniqid(), []);
         [$c2, $map2, $keys2] = $this->liteConsumer($inst2, 'GID-LITE-ALL-OK', 'LiteAllOk', 0, 1, 2);
         $c2->setPullThresholdForQueue(1000);
         $c2->setPullThresholdSizeForQueue(100);
         $c2->setConsumeMaxSpan(2000);
+        $c2->setPullBatchSize(10);
+        $c2->setPullThresholdForAll(30);
         foreach ($keys2 as $i => $key) {
             $this->liteSeed($c2, $map2[$key], [$i * 10, $i * 10 + 1]);
         }
+        $this->checkSame(30, $c2->pendingPullRounds() * $c2->pullBatchSize,
+            'the projection is exactly the threshold here: strictly greater, so it still pulls');
         foreach ($keys2 as $i => $key) {
-            $this->checkSame(true, $this->litePullOnce($c2, $map2[$key]),
-                "queue $i pulls with the aggregate budget left alone ($i)");
+            $this->checkSame(false, $this->liteGate($c2, $map2[$key]),
+                "queue $i passes the aggregate gate with its rounds projected at the budget ($i)");
         }
-        $this->checkSame(3, $inst2->pullCount(), 'the control sent one request per queue');
-        $this->checkSame(0, $c2->flowControlForAllTimes(), 'a backlog inside the aggregate budgets trips nothing');
+        $this->checkSame(0, $c2->flowControlForAllTimes(), 'a projection at the budget trips nothing');
+
+        // The projection is the buffer's own bookkeeping: the rounds retire as the batches they
+        // carried are handed over, and a round still partly in the buffer keeps counting a batch.
+        $drainInst = new FcInstance('lite-drain-' . uniqid(), []);
+        [$dc, $dmap, $dkeys] = $this->liteConsumer($drainInst, 'GID-LITE-DRAIN', 'LiteDrain', 0);
+        $dmq = $dmap[$dkeys[0]];
+        $this->liteSeed($dc, $dmq, [0, 1, 2]);
+        $this->checkSame(1, $dc->pendingPullRounds(), 'one append round is pending');
+        $this->checkSame(3, $dc->cachedMessageCount(), 'and it carried three messages into the buffer');
+        $this->callLite($dc, 'bufferTake', [1]);
+        $this->checkSame(1, $dc->pendingPullRounds(),
+            'a round with messages still in the buffer keeps its projected batch');
+        $this->callLite($dc, 'bufferTake', [2]);
+        $this->checkSame(0, $dc->pendingPullRounds(), 'the round retires once its last message left');
+        $this->checkSame(0, $dc->cachedMessageCount(), 'and the buffer emptied with it');
+    }
+
+    /** Judge one queue's cache gates without running its round. */
+    private function liteGate(DefaultLitePullConsumer $c, MessageQueue $mq): bool
+    {
+        return (bool) $this->callLite($c, 'cacheFlowControlHit', [$mq, $this->liteKey($mq)]);
     }
 
     /**
@@ -1688,10 +1859,10 @@ final class RunClientFlowControl
             $this->liteSeed($c4, $map4[$keys4[1]], [0, 1, 2, 3]);
             $this->litePullOnce($c4, $map4[$keys4[0]]);
             $expected4 = 'flow control: queue ' . $map4[$keys4[0]]
-                . ' the consume request count exceeds threshold 3, so do flow control, cached=6,'
-                . ' flowControlTimes=1, pause pull for 50 ms';
+                . ' the consume request count exceeds threshold 1, so do flow control,'
+                . ' consume request count=2, flowControlTimes=1, pause pull for 50 ms';
             $this->checkSame($expected4, $this->messageOf((string) ($this->linesOf('DEBUG')[0] ?? '')),
-                'the aggregate warn names the request-count threshold in messages, as the contract words it');
+                'the aggregate line states the threshold in rounds the batch budget fits, and the rounds pending');
             $this->checkSame($expected4, $this->messageOf((string) ($this->linesOf('WARNING')[0] ?? '')),
                 'the aggregate gate warns on its first trip too');
 
@@ -1699,7 +1870,7 @@ final class RunClientFlowControl
             // Each case breaches exactly one budget, so the counter whose trip lands on 1001 is
             // unambiguous: aggregate total, this queue's count, this queue's span.
             $cadenceCases = [
-                ['flowControlForAllTimes', 'cached=4', static function (DefaultLitePullConsumer $x): void {
+                ['flowControlForAllTimes', 'consume request count=1', static function (DefaultLitePullConsumer $x): void {
                     $x->setPullThresholdForAll(3);
                     $x->setPullThresholdForQueue(1000);
                     $x->setPullThresholdSizeForQueue(100);
@@ -1839,14 +2010,14 @@ final class RunClientFlowControl
         $mq = $map[$keys[0]];
         $this->checkSame(true, $this->litePullOnce($c, $mq), 'the round pulled two messages into the cache');
         $this->checkSame(2, $c->cachedMessageCountOf($mq), 'the append updated this queue\'s count');
-        $this->checkSame(2048, $c->cachedByteSizeOf($mq), 'the append updated this queue\'s stored bytes');
+        $this->checkSame(2048, $c->cachedByteSizeOf($mq), 'the append updated this queue\'s body bytes');
         $this->checkSame(2, $c->cachedMessageCount(), 'the aggregate reads the same buffer');
 
         // poll() taking them away is the exact inverse.
         $handed = $c->poll(0);
         $this->checkSame(2, count($handed), 'poll handed the cached messages to the application');
         $this->checkSame(0, $c->cachedMessageCountOf($mq), 'the removal subtracted the count');
-        $this->checkSame(0, $c->cachedByteSizeOf($mq), 'the removal subtracted the stored bytes');
+        $this->checkSame(0, $c->cachedByteSizeOf($mq), 'the removal subtracted the body bytes');
         $this->checkSame(0, $c->cachedMessageCount(), 'no accumulator outlives the buffer');
 
         // seek() pruning subtracts exactly the pruned messages, boundaries included.
@@ -2043,8 +2214,10 @@ final class RunClientFlowControl
     {
         $this->testConfigurationSurface();
         $this->testCountGateIsStrictlyGreater();
-        $this->testSizeGateIsStrictlyGreater();
+        $this->testHeldSetIncludesWhatTheListenerStillOwes();
+        $this->testSizeGateCountsWholeMiBOfBody();
         $this->testSpanGateIsStrictlyGreater();
+        $this->testSpanGateIsSkippedWhenConsumingOrderly();
         $this->testGatePrecedence();
         $this->testTripArmsThePause();
         $this->testWarnCadence();
@@ -2061,9 +2234,9 @@ final class RunClientFlowControl
         $this->testGateNeverSumsTheQueuesOfATopic();
         $this->testLiteConfigurationSurface();
         $this->testLiteCountGateIsStrictlyGreater();
-        $this->testLiteSizeGateUsesStoredSize();
+        $this->testLiteSizeGateUsesBodyBytes();
         $this->testLiteSpanGateIsStrictlyGreater();
-        $this->testLiteAggregateGateIsASeparateBudget();
+        $this->testLiteAggregateGateProjectsRoundsTimesBatch();
         $this->testLiteGatesJudgeOneQueueOnly();
         $this->testLiteGateOrder();
         $this->testLiteTripWordingAndWarnCadence();

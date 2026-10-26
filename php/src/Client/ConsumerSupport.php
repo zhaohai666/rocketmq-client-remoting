@@ -71,6 +71,50 @@ function consumer_mq_sort_key(MessageQueue $mq): array
     return [$mq->topic, $mq->brokerName, $mq->queueId];
 }
 
+/**
+ * Group a queue assignment by topic into the identity each queue brings: brokerName + queueId.
+ *
+ * The topic is the unit an assignment change is reported in, and a queue's identity inside it is
+ * the broker it now sits on plus its number -- the object itself says nothing, since a rebuilt
+ * route hands out equal-but-fresh instances.
+ *
+ * @param iterable<MessageQueue> $queues
+ * @return array<string, array<string, true>>
+ */
+function consumer_queues_by_topic(iterable $queues): array
+{
+    $grouped = [];
+    foreach ($queues as $mq) {
+        $grouped[$mq->topic][$mq->brokerName . '-' . $mq->queueId] = true;
+    }
+    return $grouped;
+}
+
+/**
+ * The topics whose queue set moved between two assignments, sorted.
+ *
+ * A comparison of SETS, not of counts: losing one queue while gaining another leaves the total
+ * untouched but changes who owns what, and a same-count swap onto a different broker is exactly
+ * such a move. A topic that appeared or vanished entirely counts too.
+ *
+ * @param array<string, array<string, true>> $before
+ * @param array<string, array<string, true>> $after
+ * @return list<string>
+ */
+function consumer_changed_topics(array $before, array $after): array
+{
+    $moved = [];
+    foreach (array_keys($before + $after) as $topic) {
+        $was = $before[$topic] ?? [];
+        $now = $after[$topic] ?? [];
+        if ($was !== $now) {
+            $moved[] = $topic;
+        }
+    }
+    sort($moved);
+    return $moved;
+}
+
 function safe_hook_name(object $hook): string
 {
     try {
