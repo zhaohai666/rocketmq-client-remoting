@@ -11,7 +11,7 @@ NameServer（取路由、动态取址）与 Broker（收发消息、心跳、位
   zlib 走内置 `ZLibStream`，LZ4 / ZSTD 通过 P/Invoke 调系统库。
 - 一个库覆盖生产者、Push / Pull / LitePull 三种消费者、管理端、消息轨迹、ACL、TLS。
 - 能力在真实 RocketMQ 5.5.1 集群（namesrv 9876 + broker 10911）上逐条联调，
-  离线行为由 1062 项单元测试锁死。
+  离线行为由 1078 项单元测试锁死。
 
 ## 先决条件
 
@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1062，已跳过:     0，总计:  1062，持续时间: 4 m 41 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1078，已跳过:     0，总计:  1078，持续时间: 4 m 40 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -274,7 +274,10 @@ consumer.PopThresholdForQueue = 96;      // 本队列待 ack 上限，严格大�
 常用调优：`ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset`（另有
 `ConsumeFromLastOffset` / `ConsumeFromTimestamp`）、`SetConsumeThreadNums(n)`、
 `PullBatchSize`、`PullThresholdForQueue` / `PullThresholdSizeForQueue` / `PullThresholdForTopic`
-（拉取前流控：每队列三条闸门，topic 预算在重平衡改变分配时摊到每队列）、`MaxReconsumeTimes`、`SuspendCurrentQueueTimeMillis`、
+（拉取前流控：每队列只判它「持有」的一切——未派发缓冲 + 已交给监听器但尚未结算的批次，按 `queueOffset`
+去重；三条闸门都严格大于才停，阈值按字面取值，不 clamp 到 1、0 也不是「关闭」，合法区间由启动配置检查把守；
+字节闸门按消息体长度整 MiB 向下取整，不看 `storeSize`；跨度闸门不作用于顺序消费；topic 预算不在拉取时
+累计兄弟队列，而是在重平衡改变分配时除以本轮自有队列数、把商写回对应的每队列闸门）、`MaxReconsumeTimes`、`SuspendCurrentQueueTimeMillis`、
 `SetAllocateMessageQueueStrategy(new AllocateMessageQueueConsistentHash())`、
 `Suspend()` / `Resume()`（暂停拉取但不掉线）、`SetEnableMsgTrace(true)`、
 `consumer.SubscribedTopics()` / `ConsumedCount` / `ClientId`。
@@ -492,13 +495,19 @@ producer.TlsOptions = new TlsOptions
   同步 / 异步 / oneway；半包重组；超时与重连；连接断开时在途请求立即判死
 - ✅ 发送：同步 / 定点 / 队列选择器 / 批量（320）/ 自动攒批 / 单向 / 异步（发送池 + 公平背压信号量）/
   事务（两阶段 + broker 回查）/ 定时与延迟 / 撤回（recallMessage）/ Request-Reply
-- ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前流控 +
+- ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前每队列三条缓存闸门
+  （只判该队列「持有」的一切：未派发缓冲 + 已交给监听器但尚未结算的批次，按位点去重；条数 /
+  消息体字节整 MiB 向下取整 / 位点跨度都严格大于才停，阈值不做下限钳制、0 也不是「关闭」，
+  顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、命中后本地重排 50ms、告警第 1 次及其后每
+  1000 次一次、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳
+  → 只向变动的 topic 回调队列监听；集合未变的轮次与停摆自愈轮都不做任何事）、
   POP 的待 ack 欠账闸门（默认 96，严格大于才停，命中记进拉取路径同一个流控计数）+
-  挂起 listener 的清扫逃生口）、Pull（带消费者心跳）、LitePull（拉取 / 已消费 / 待提交三张位点表 +
-  队列集合变更监听 + 解析拉取位点前先过四道缓存闸门：整个缓冲条数 `PullThresholdForAll` 10000 /
-  本队列条数 `PullThresholdForQueue` 1000 / 本队列存储字节 `PullThresholdSizeForQueue` 100 MiB
-  整除 / 本队列位点跨度 `ConsumeMaxSpan` 2000，都严格大于才停；命中只重排这一个队列 50ms，
-  broker 的 `FLOW_CONTROL`(215) 只等 20ms）
+  挂起 listener 的清扫逃生口）、Pull（带消费者心跳，队列集合变动时只回调监听这一半）、LitePull（拉取 / 已消费 / 待提交三张位点表 +
+  队列集合变更监听 + 解析拉取位点前先过四道缓存闸门：在途拉取轮次 × `PullBatchSize`（默认 10）超过
+  `PullThresholdForAll` 10000 / 本队列条数 `PullThresholdForQueue` 1000 / 本队列消息体字节
+  `PullThresholdSizeForQueue` 100 MiB 整除 / 本队列位点跨度 `ConsumeMaxSpan` 2000，都严格大于才停；
+  条数与字节共用一个 trip 计数、跨度与聚合各用自己的；命中只重排这一个队列 50ms，
+  broker 的 `FLOW_CONTROL`(215) 只等 20ms；被撤销的队列连缓冲、累计值和在途轮次一起消失）
 - ✅ 队列分配：六种可插拔策略
 - ✅ 命名空间：本地前缀与服务端 `nsd`/`ns` 两套
 - ✅ 管理端：topic / 订阅组 / 集群与路由 / 各类统计 / 消息查询 / 位点重置 / `searchOffset` 边界语义 /
@@ -507,7 +516,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1062 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1078 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -588,7 +597,7 @@ dotnet run --no-build --project examples/RocketMQ.Examples -- lite-queue-change 
 | `trace` | 消息轨迹全链路（需 broker `traceTopicEnable=true`） |
 | `hook` | CheckForbidden / FilterMessage 钩子 |
 | `backpressure` | 异步发送背压公平信号量：条数与字节闸、拒绝对账、运行时扩容 |
-| `flow-control` | 拉取前每队列三条缓存闸门（topic 预算在重平衡时摊到每队列）+ 启动期数值闸门 |
+| `flow-control` | 拉取前每队列三条缓存闸门（只判本队列持有的一切：未派发缓冲 + 监听器手上未结算的批次；topic 预算在重平衡时摊到每队列）+ 启动期数值闸门 |
 | `async-send` | 异步发送内核：不阻塞调用方、线程口径、并发不串台、`Shutdown` 排空 |
 | `validators-live` | 名字校验：本地快拒 + 合法名字收发 + 寻址故障定性 |
 | `recall` | 定时消息撤回（自动打开并在退出时还原 `recallMessageEnable`） |
@@ -660,7 +669,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs  Schedules（定时任务锚定）
 │       ├── TopAddressing.cs        # 动态 NameServer 取址
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit，1062 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
+├── tests/RocketMQ.Client.Tests/    # xunit，1078 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
 └── examples/RocketMQ.Examples/     # rmq 真机联调工具（见上）
 ```
 

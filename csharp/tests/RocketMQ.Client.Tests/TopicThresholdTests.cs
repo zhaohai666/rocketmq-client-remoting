@@ -201,15 +201,22 @@ public class TopicThresholdTests
         Assert.Equal(1, c.PullThresholdForQueue);
         Assert.Equal(1, c.PullThresholdSizeForQueue);
 
-        // Control: the floored knob really is a gate of one message, not a dead consumer.
+        // Control: the floored knob really is a gate of one message, not a dead consumer. The two
+        // other gates are widened rather than zeroed -- a gate has no off switch, so a 0 would trip
+        // on the first row and say nothing about the count budget -- and the rows carry distinct
+        // offsets, because the held set is deduplicated by offset.
         MessageQueue mq = QueueOf(Topic, 0);
-        c.PullThresholdSizeForQueue = 0;
-        c.ConsumeConcurrentlyMaxSpan = 0;
-        c.SetPendingForTest(KeyOf(mq), new List<MessageExt> { new() { Topic = Topic, StoreSize = 1 } });
+        c.PullThresholdSizeForQueue = int.MaxValue;
+        c.ConsumeConcurrentlyMaxSpan = long.MaxValue;
+        c.SetPendingForTest(KeyOf(mq), new List<MessageExt>
+        {
+            new() { Topic = Topic, QueueOffset = 0, Body = new byte[8] },
+        });
         Assert.False(c.FlowControlHitForTest(mq, KeyOf(mq)), "one message fits a gate of 1");
         c.SetPendingForTest(KeyOf(mq), new List<MessageExt>
         {
-            new() { Topic = Topic, StoreSize = 1 }, new() { Topic = Topic, StoreSize = 1 },
+            new() { Topic = Topic, QueueOffset = 0, Body = new byte[8] },
+            new() { Topic = Topic, QueueOffset = 1, Body = new byte[8] },
         });
         Assert.True(c.FlowControlHitForTest(mq, KeyOf(mq)), "two messages must pause on a gate of 1");
     }

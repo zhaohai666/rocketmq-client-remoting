@@ -62,7 +62,10 @@ public sealed class DefaultLitePullConsumer
     private int _brokerSuspendMaxTimeMillis = 20000;
     private int _consumerTimeoutMillisWhenSuspend = 30000;
     private int _pollTimeoutMillis = 5000;
-    private int _pullBatchSize = 32;
+    // The lite pull path asks for 10 per round (the push path's pullBatchSize stays 32):
+    // since the aggregate gate budgets a whole batch per pending round, this number is a
+    // multiplier of that budget and not just a request size.
+    private int _pullBatchSize = 10;
     private bool _autoCommit = true;
     private int _autoCommitIntervalMillis = 5000;
     private int _pullIntervalMillis = 50;
@@ -78,7 +81,7 @@ public sealed class DefaultLitePullConsumer
 
     private readonly object _bufferLock = new();
     private readonly Queue<MessageExt> _localBuffer = new();
-    // One queue's slice of _localBuffer (cached count, cached stored bytes, lowest and
+    // One queue's slice of _localBuffer (cached count, cached body bytes, lowest and
     // highest cached queue offset). Only ever mutated together with the buffer, under
     // _bufferLock, so this view cannot drift from the messages it describes.
     private readonly Dictionary<MessageQueue, QueueCache> _queueCaches = new();
@@ -285,6 +288,8 @@ public sealed class DefaultLitePullConsumer
 
     public void SetPullBatchSize(int n) => _pullBatchSize = Math.Max(1, n);
 
+    public int PullBatchSize => _pullBatchSize;
+
     public void SetPollTimeoutMillis(int ms) => _pollTimeoutMillis = Math.Max(0, ms);
 
     public void SetAutoCommit(bool b) => _autoCommit = b;
@@ -297,11 +302,13 @@ public sealed class DefaultLitePullConsumer
 
     public void SetPullIntervalMillis(int ms) => _pullIntervalMillis = Math.Max(0, ms);
 
-    /// <summary><c>pullThresholdForAll</c> (default 10000): the message-count budget for
-    /// the <b>whole</b> local buffer, summed over every queue this instance holds. The
-    /// gate fires only when the cached total is STRICTLY greater, so the threshold reads
-    /// as "how many may sit in the buffer". A plain budget: 0 trips on the first cached
-    /// message.</summary>
+    /// <summary><c>pullThresholdForAll</c> (default 10000): the budget for the messages the
+    /// <b>pending pull rounds</b> could still deliver -- a capacity projection, not the count
+    /// sitting in the buffer. Measured as <c>rounds x pullBatchSize</c>, where a round counts
+    /// while at least one of its messages is still cached, whether it came back full or with
+    /// a single row. The gate fires only when that projection is STRICTLY greater, so the
+    /// threshold reads as "how many may be in flight". A plain budget: 0 trips on the first
+    /// pending round.</summary>
     public int PullThresholdForAll
     {
         get => _pullThresholdForAll;
@@ -319,11 +326,11 @@ public sealed class DefaultLitePullConsumer
     }
 
     /// <summary><c>pullThresholdSizeForQueue</c> (default 100): the cached bytes allowed
-    /// for <b>one</b> queue, measured in <b>MiB</b>. The measure is this queue's sum of
-    /// the stored message size the decoder records (<c>storeSize</c>), never the body
-    /// length -- this budget is about the physical backlog the client holds. Divided by
-    /// 1 MiB with <b>integer</b> division, so a threshold of 1 allows anything below
-    /// 2 MiB. 0 trips as soon as a full MiB is cached.</summary>
+    /// for <b>one</b> queue, measured in <b>MiB</b>. The measure is this queue's sum of each
+    /// cached message's <b>body</b> length, never the stored-record size a broker charges
+    /// (<c>storeSize</c> is a telemetry field and must not reach a flow-control input).
+    /// Divided by 1 MiB with <b>integer</b> division, so a threshold of 1 allows anything
+    /// below 2 MiB. 0 trips as soon as a full MiB is cached.</summary>
     public int PullThresholdSizeForQueue
     {
         get => _pullThresholdSizeForQueue;
@@ -354,9 +361,9 @@ public sealed class DefaultLitePullConsumer
     /// <see cref="ConsumeMaxSpan"/>).</summary>
     public long FlowControlForSpanTriggered => Interlocked.Read(ref _flowControlForSpanTriggered);
 
-    /// <summary>Messages currently sitting in the local buffer, over every queue: the
-    /// value the aggregate gate measures, including the ones already handed to the
-    /// application but not yet polled away.</summary>
+    /// <summary>Messages currently sitting in the local buffer, over every queue: the rows
+    /// the per-queue count gate measures. The aggregate gate does NOT read this -- it
+    /// budgets the pending pull rounds, one whole <c>pullBatchSize</c> each.</summary>
     public int CachedMessageCount
     {
         get
@@ -365,6 +372,32 @@ public sealed class DefaultLitePullConsumer
             {
                 return _localBuffer.Count;
             }
+        }
+    }
+
+    /// <summary>This instance's pending pull rounds summed over every queue's accumulator:
+    /// what the aggregate gate multiplies by <c>pullBatchSize</c>. A round counts while at
+    /// least one of its messages is still cached.</summary>
+    public long PendingPullRounds
+    {
+        get
+        {
+            lock (_bufferLock)
+            {
+                long rounds = 0;
+                foreach (QueueCache cache in _queueCaches.Values) rounds += cache.PendingRounds;
+                return rounds;
+            }
+        }
+    }
+
+    /// <summary>This queue's pending pull rounds (0 when the buffer holds nothing of
+    /// it, and 0 once the queue was revoked, since its accumulator went with it).</summary>
+    public int PendingPullRoundsOf(MessageQueue mq)
+    {
+        lock (_bufferLock)
+        {
+            return _queueCaches.TryGetValue(mq, out QueueCache? cache) ? cache.PendingRounds : 0;
         }
     }
 
@@ -378,8 +411,8 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>This queue's cached bytes, measured as the sum of the stored message
-    /// sizes (0 when the buffer holds nothing of it).</summary>
+    /// <summary>This queue's cached bytes, measured as the sum of its messages' <b>body</b>
+    /// lengths (0 when the buffer holds nothing of it).</summary>
     public long CachedBytesOf(MessageQueue mq)
     {
         lock (_bufferLock)
@@ -546,6 +579,7 @@ public sealed class DefaultLitePullConsumer
     {
         _assignMode = true;
         var set = new HashSet<MessageQueue>(messageQueues);
+        var dropped = new List<MessageQueue>();
         lock (_lock)
         {
             foreach (MessageQueue mq in _assigned)
@@ -557,6 +591,7 @@ public sealed class DefaultLitePullConsumer
                 // to the pull round of that assignment, and a stale one must neither delay
                 // a re-assigned queue nor be reported for a queue nobody owns.
                 _pullPause.Remove(mq);
+                dropped.Add(mq);
             }
 
             _assigned.Clear();
@@ -576,6 +611,10 @@ public sealed class DefaultLitePullConsumer
                 }
             }
         }
+
+        // Outside _lock: the buffer has its own lock, and the state lock is never held while
+        // it is taken.
+        ForgetQueues(dropped);
     }
 
     // ---------------- lifecycle ----------------
@@ -833,18 +872,24 @@ public sealed class DefaultLitePullConsumer
     /// <b>strictly greater than</b> so a queue sitting exactly on a threshold still
     /// pulls:</summary>
     /// <list type="number">
-    /// <item>the whole buffer's cached count over <see cref="PullThresholdForAll"/></item>
+    /// <item>this instance's pending pull rounds, each reserved with a whole
+    /// <c>pullBatchSize</c>, over <see cref="PullThresholdForAll"/></item>
     /// <item>this queue's cached count over <see cref="PullThresholdForQueue"/></item>
-    /// <item>this queue's cached MiB (stored size, integer division) over
+    /// <item>this queue's cached <b>body</b> MiB (integer division) over
     /// <see cref="PullThresholdSizeForQueue"/></item>
     /// <item>this queue's cached offset span over <see cref="ConsumeMaxSpan"/></item>
     /// </list>
+    /// Gate 1 is a capacity projection rather than a sum of the buffer: a round that came
+    /// back with two messages still reserves a whole batch, because the application has not
+    /// drained it yet. Its warn states the threshold in the unit it is written in, so it
+    /// prints how many rounds fit (ceiling division) and the round count.
     /// Gates 2 to 4 read <b>this queue's own accumulator only</b>, so a sibling over
     /// budget never stops this queue, and no gate ever scans the buffer. A queue this
     /// instance no longer owns cannot refuse a pull even if its parked accumulator still
     /// describes messages the application has not polled away. One refusal increments its
     /// counter by exactly one and parks this queue for
-    /// <see cref="CacheFlowControlBackoffMillis"/>.</summary>
+    /// <see cref="CacheFlowControlBackoffMillis"/>; count and size share one counter, the
+    /// aggregate and the span each have their own.</summary>
     private bool CacheFlowControlHit(MessageQueue mq)
     {
         // Ownership first: a revoked queue's accumulator must never refuse a pull.
@@ -853,14 +898,20 @@ public sealed class DefaultLitePullConsumer
             if (!_assigned.Contains(mq)) return false;
         }
 
-        int cachedAll;
+        long rounds;
         int count;
         long sizeBytes;
         long minOffset;
         long maxOffset;
+        long batch = Math.Max(1, _pullBatchSize);
         lock (_bufferLock)
         {
-            cachedAll = _localBuffer.Count;
+            rounds = 0;
+            foreach (QueueCache any in _queueCaches.Values)
+            {
+                rounds += any.PendingRounds;
+            }
+
             if (_queueCaches.TryGetValue(mq, out QueueCache? cache))
             {
                 count = cache.Count;
@@ -881,15 +932,19 @@ public sealed class DefaultLitePullConsumer
         // backlog is 0 MiB and stays inside a threshold of 1.
         long sizeMiB = sizeBytes / MiB;
         long span = maxOffset - minOffset;
+        long reserved = rounds * batch;
 
-        if (cachedAll > _pullThresholdForAll)
+        if (reserved > _pullThresholdForAll)
         {
+            // Ceiling division: the threshold is stated in messages, the gate counts rounds.
+            long fits = (_pullThresholdForAll + batch - 1) / batch;
             long times = Interlocked.Increment(ref _flowControlForAllTriggered);
             Refuse(mq, times,
-                "the consume request count exceeds threshold " + Num(_pullThresholdForAll)
-                + ", so do flow control, cached=" + Num(cachedAll)
+                "the consume request count exceeds threshold " + Num(fits)
+                + ", so do flow control, consume request count=" + Num(rounds)
                 + ", flowControlTimes=" + Num(times),
-                "cached=" + Num(cachedAll) + " over pullThresholdForAll="
+                "rounds=" + Num(rounds) + " x pullBatchSize=" + Num(batch)
+                + " = " + Num(reserved) + " over pullThresholdForAll="
                 + Num(_pullThresholdForAll));
             return true;
         }
@@ -952,15 +1007,33 @@ public sealed class DefaultLitePullConsumer
     private static string Num(long value) => value.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>The one place the buffer and its per-queue view change together: append
-    /// after a pull found messages.</summary>
+    /// after a pull round found messages. One round is booked <b>per queue this round
+    /// touched</b>, next to the rows it brought back, so the aggregate gate can budget the
+    /// round rather than the messages that happened to come with it.</summary>
     private void Enqueue(IReadOnlyList<MessageExt> msgs)
     {
         lock (_bufferLock)
         {
+            var perQueue = new Dictionary<MessageQueue, int>();
             foreach (MessageExt m in msgs)
             {
+                MessageQueue key = QueueKeyOf(m);
+                perQueue.TryGetValue(key, out int seen);
+                perQueue[key] = seen + 1;
+            }
+
+            foreach (MessageExt m in msgs)
+            {
+                MessageQueue key = QueueKeyOf(m);
                 _localBuffer.Enqueue(m);
-                CacheOf(QueueKeyOf(m)).Append(m);
+                QueueCache cache = CacheOf(key);
+                cache.Append(m);
+                // The round is booked once, on the first row of it that lands in this queue.
+                if (perQueue[key] > 0)
+                {
+                    cache.BeginRound(perQueue[key]);
+                    perQueue[key] = 0;
+                }
             }
 
             Monitor.PulseAll(_bufferLock);
@@ -998,6 +1071,50 @@ public sealed class DefaultLitePullConsumer
         if (!_queueCaches.TryGetValue(key, out QueueCache? cache)) return;
         cache.Remove(m);
         if (cache.IsEmpty) _queueCaches.Remove(key);
+    }
+
+    /// <summary>The one way a queue leaves this instance's assignment: its cached rows go
+    /// with it, and its whole accumulator (count / body bytes / offsets / <b>pending
+    /// rounds</b>) with them. Both ways out of an assignment -- the explicit
+    /// <see cref="Assign"/> narrowing and a rebalance round -- come through here, which is
+    /// what keeps those paths from drifting apart. A revoked queue must neither reach the
+    /// caller through <see cref="Poll"/> nor keep reserving aggregate budget for rounds the
+    /// application will never be handed. A sibling's accumulator is not touched, so its own
+    /// pending rounds survive losing a neighbour's rows.</summary>
+    private void ForgetQueues(IEnumerable<MessageQueue> dropped)
+    {
+        var gone = new HashSet<MessageQueue>(dropped);
+        if (gone.Count == 0) return;
+        lock (_bufferLock)
+        {
+            bool touched = false;
+            foreach (MessageQueue mq in gone)
+            {
+                if (_queueCaches.Remove(mq)) touched = true;
+            }
+
+            var kept = new List<MessageExt>(_localBuffer.Count);
+            foreach (MessageExt m in _localBuffer)
+            {
+                if (gone.Contains(QueueKeyOf(m)))
+                {
+                    touched = true;
+                    continue;
+                }
+
+                kept.Add(m);
+            }
+
+            if (!touched) return;
+
+            _localBuffer.Clear();
+            foreach (MessageExt m in kept)
+            {
+                _localBuffer.Enqueue(m);
+            }
+
+            Monitor.PulseAll(_bufferLock);
+        }
     }
 
     private string SubscriptionFor(string topic)
@@ -1289,6 +1406,7 @@ public sealed class DefaultLitePullConsumer
         HashSet<MessageQueue> old;
         bool changed;
         List<MessageQueue> revoked = new();
+        List<MessageQueue> dropped = new();
         lock (_lock)
         {
             old = new HashSet<MessageQueue>(_assigned);
@@ -1325,9 +1443,14 @@ public sealed class DefaultLitePullConsumer
                     // ...and its park with it: a re-assigned queue starts on the current
                     // assignment's own verdict, never on a deadline the old one armed.
                     _pullPause.Remove(mq);
+                    dropped.Add(mq);
                 }
             }
         }
+
+        // What the assignment narrowed away is also removed from the pollable buffer, with
+        // its accumulator and its pending rounds (see ForgetQueues).
+        ForgetQueues(dropped);
 
         foreach (MessageQueue mq in revoked)
         {
@@ -1409,25 +1532,28 @@ public sealed class DefaultLitePullConsumer
 
         lock (_bufferLock)
         {
-            var kept = new List<MessageExt>();
-            while (_localBuffer.Count > 0)
+            var kept = new List<MessageExt>(_localBuffer.Count);
+            foreach (MessageExt m in _localBuffer)
             {
-                MessageExt m = _localBuffer.Dequeue();
                 bool drop = m.Topic == mq.Topic && m.BrokerName == mq.BrokerName &&
                             m.QueueId == mq.QueueId && m.QueueOffset < offset;
-                if (!drop) kept.Add(m);
+                if (drop)
+                {
+                    // Pruning is a buffer removal like any other, so it goes through the same
+                    // accumulator step: what the gates read afterwards is what the buffer really
+                    // holds after the seek, and the round the pruned rows came in with is
+                    // released exactly as a poll would release it.
+                    RemoveFromCache(QueueKeyOf(m), m);
+                    continue;
+                }
+
+                kept.Add(m);
             }
 
-            // The pruned range is gone, so the per-queue views are rebuilt from what is
-            // left rather than patched message by message: after this point the view and
-            // the buffer agree by construction, and the seeked queue's span restarts at
-            // the offsets it really still holds.
             _localBuffer.Clear();
-            _queueCaches.Clear();
             foreach (MessageExt m in kept)
             {
                 _localBuffer.Enqueue(m);
-                CacheOf(QueueKeyOf(m)).Append(m);
             }
 
             Monitor.PulseAll(_bufferLock);
@@ -1931,14 +2057,22 @@ public sealed class DefaultLitePullConsumer
     private const long MiB = 1024 * 1024;
 
     /// <summary>A queue's slice of the local buffer: how many of its messages are cached,
-    /// how many stored bytes they occupy and the lowest/highest cached queue offset. The
-    /// only mutators are <see cref="AppendToLocalBufferForTest"/> / the pull append, the
-    /// poll drain and the seek rebuild -- every one of them changes the buffer and this
-    /// view in the same step under <c>_bufferLock</c>, which is what keeps the two from
-    /// drifting apart.</summary>
+    /// how many <b>body</b> bytes they occupy, the lowest/highest cached queue offset and
+    /// the pull rounds still waiting for the application. The only mutators are
+    /// <see cref="AppendToLocalBufferForTest"/> / the pull append, the poll drain and the
+    /// seek prune -- every one of them changes the buffer and this view in the same step
+    /// under <c>_bufferLock</c>, which is what keeps the two from drifting apart.</summary>
     private sealed class QueueCache
     {
         private readonly OffsetSpan _span = new();
+        // One entry per pull round whose messages are still (partly) cached, oldest round
+        // first, holding how many of that round's messages are left. The aggregate gate
+        // budgets a whole batch per round rather than the rows that round happened to
+        // bring back, so it needs this list and not Count. This queue's own messages always
+        // leave in round order -- poll() drains the shared buffer from its head and a seek
+        // drops a prefix of this queue's offsets -- so only the front round's remainder
+        // ever has to be tracked.
+        private readonly Queue<int> _rounds = new();
 
         public int Count { get; private set; }
         public long SizeBytes { get; private set; }
@@ -1946,19 +2080,35 @@ public sealed class DefaultLitePullConsumer
         public long MaxOffset => _span.Max;
         public long Span => _span.Span;
         public bool IsEmpty => Count == 0;
+        public int PendingRounds => _rounds.Count;
 
         public void Append(MessageExt m)
         {
             Count++;
-            SizeBytes += m.StoreSize;
+            SizeBytes += m.Body.Length;
             _span.Add(m.QueueOffset);
+        }
+
+        /// <summary>Book the round that just filled the buffer, only when it brought
+        /// messages: an empty round reserves nothing and must not hold budget forever.</summary>
+        public void BeginRound(int count)
+        {
+            if (count > 0) _rounds.Enqueue(count);
         }
 
         public void Remove(MessageExt m)
         {
             Count--;
-            SizeBytes -= m.StoreSize;
+            SizeBytes -= m.Body.Length;
             _span.Remove();
+            // Whatever left the buffer came out of the oldest round still represented here; a
+            // round that runs out is dropped, a half-drained one stays pending exactly as the
+            // gate budgets it.
+            if (_rounds.Count > 0)
+            {
+                int front = _rounds.Dequeue() - 1;
+                if (front > 0) _rounds.Enqueue(front);
+            }
         }
     }
 

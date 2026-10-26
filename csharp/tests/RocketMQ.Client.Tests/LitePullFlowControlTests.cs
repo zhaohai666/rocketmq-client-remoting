@@ -1,12 +1,13 @@
 // Offline + fake-cluster tests for the **lite-pull cache flow-control gates**.
 //
 // What is guarded here is the local buffer a lite consumer fills when the application is
-// slow (or never polls): four budgets -- one for the whole buffer and three per queue --
-// must refuse the pull BEFORE the request is built, and a refusal must re-schedule only
-// that one queue 50 ms later so the backlog can drain. The verdict is pinned two ways: the
-// measurements, counters and log cadence run entirely offline (a staged buffer plus the
-// same verdict the pull round calls), and "no request on a refused round / a request at the
-// boundary" is read off the wire from the fake broker.
+// slow (or never polls): four budgets -- one whole-instance budget over the pull rounds that
+// are still waiting to be polled, and three per-queue budgets over that queue's cached count,
+// body bytes and offset span -- must refuse the pull BEFORE the request is built, and a
+// refusal must re-schedule only that one queue 50 ms later so the backlog can drain. The
+// verdict is pinned two ways: the measurements, counters and log cadence run entirely
+// offline (a staged buffer plus the same verdict the pull round calls), and "no request on a
+// refused round / a request at the boundary" is read off the wire from the fake broker.
 //
 // Timing rule for this file: a refusal is asserted through the pause it recorded and the
 // request count it produced, never through how long a thread slept.
@@ -47,9 +48,12 @@ public class LitePullFlowControlTests
     /// route; the queue id travels in the request header only).</summary>
     private static MessageQueue WireQueue(int queueId) => new(Topic, MockCluster.BrokerName(0), queueId);
 
-    /// <summary>A cached message as the local buffer holds it after a pull: it carries the
-    /// queue it belongs to, its queue offset and the stored size the decoder recorded.</summary>
-    private static MessageExt Cached(MessageQueue mq, long queueOffset, int storeSize, int bodySize = 8)
+    /// <summary>A cached message as the local buffer holds it after a pull: the gate reads its
+    /// <b>body</b> length and its queue offset. The stored size of the broker's record travels
+    /// with it as a decoy -- every case that judges bytes leaves it at a value the body does
+    /// not have, so a gate that measured the wrong field cannot pass by accident.</summary>
+    private static MessageExt Cached(MessageQueue mq, long queueOffset, int bodySize,
+        int storeSize = 512)
         => new()
         {
             Topic = mq.Topic,
@@ -60,10 +64,12 @@ public class LitePullFlowControlTests
             Body = new byte[bodySize],
         };
 
-    private static List<MessageExt> Batch(MessageQueue mq, int count, int storeSize,
-        long firstOffset = 0, int bodySize = 8)
+    /// <summary>One hand-out from one pull round: <paramref name="count"/> messages of the same
+    /// queue, which is what makes it a single pending round for the aggregate gate.</summary>
+    private static List<MessageExt> Batch(MessageQueue mq, int count, int bodySize,
+        long firstOffset = 0, int storeSize = 512)
         => Enumerable.Range(0, count)
-            .Select(i => Cached(mq, firstOffset + i, storeSize, bodySize))
+            .Select(i => Cached(mq, firstOffset + i, bodySize, storeSize))
             .ToList();
 
     /// <summary>An assigned, never started consumer: the gates are judged with nothing on the
@@ -213,16 +219,25 @@ public class LitePullFlowControlTests
         }
     }
 
-    // ---------------------------------------------------------------- 1. the four knobs
+    // ---------------------------------------------------------------- 1. the knobs and the batch
 
     [Fact]
     public void Defaults_AreTheFourBudgets_AndStayExactlyAsWritten()
     {
         var c = new DefaultLitePullConsumer(GroupPrefix + "_Defaults");
-        Eq(10000, c.PullThresholdForAll, "the whole-buffer budget");
+        Eq(10000, c.PullThresholdForAll, "the whole-instance budget of pending rounds");
         Eq(1000, c.PullThresholdForQueue, "one queue's cached message count");
         Eq(100, c.PullThresholdSizeForQueue, "one queue's cached MiB");
         Eq(2000, c.ConsumeMaxSpan, "one queue's cached offset span");
+
+        // The lite path asks for a small batch (the push path's 32 is a different knob), and
+        // only its setter is floored: a request size of 0 would make the aggregate gate divide
+        // by zero, so the floor belongs to the knob, not to the gate.
+        Eq(10, c.PullBatchSize, "the lite path's own default batch");
+        c.SetPullBatchSize(0);
+        Eq(1, c.PullBatchSize, "the batch setter floors at 1");
+        c.SetPullBatchSize(32);
+        Eq(32, c.PullBatchSize, "and a real batch passes through untouched");
 
         // Plain budgets: nothing is rounded up, and a threshold of 0 has to mean "trip on
         // the first cached message" rather than "one message is always allowed".
@@ -351,21 +366,21 @@ public class LitePullFlowControlTests
             }
         }
 
-        // Size gate: one 2 MiB store record on the hot queue against a budget of 1 MiB,
-        // while the cold queue caches three times as many messages.
+        // Size gate: one 2 MiB body on the hot queue against a budget of 1 MiB, while the cold
+        // queue caches three times as many messages.
         using (var cluster = MockCluster.Start(1))
         {
             DefaultLitePullConsumer c = Lite("PerQueueSize", cluster, hot, cold);
             c.PullThresholdSizeForQueue = 1;
             Stage(c, Batch(cold, 3, 64));
-            Stage(c, new List<MessageExt> { Cached(hot, 0, 2 * MiB, bodySize: 4) });
+            Stage(c, new List<MessageExt> { Cached(hot, 0, 2 * MiB, storeSize: 4) });
             try
             {
                 c.Start();
                 Assert.True(WaitFor(() => c.LastPullPauseMillis(hot) == 50),
                     "the queue that really holds the bytes was refused");
                 Assert.True(WaitFor(() => LitePullsOf(cluster, 1) >= 3),
-                    "the sibling with 3 tiny messages keeps pulling: its own 0 MiB is the measure");
+                    "the sibling with 3 tiny messages keeps pulling: its own 192 bytes are the measure");
                 Eq(0, LitePullsOf(cluster, 0), "and the byte-over queue sent nothing");
             }
             finally
@@ -375,32 +390,32 @@ public class LitePullFlowControlTests
         }
     }
 
-    // ---------------------------------------------------------------- 4. stored size, not body length
+    // ---------------------------------------------------------------- 4. body length, not the stored record
 
-    /// <summary>The size gate reads the stored size the decoder records, never the body
-    /// length: a small body inside a large store record refuses, and the mirror case (large
-    /// body, small store record) must not.</summary>
+    /// <summary>The size gate reads the <b>body</b> length, which is what this client holds in
+    /// memory: a large body inside a small store record refuses, and the mirror case (a tiny
+    /// body inside a large store record) must not.</summary>
     [Fact]
-    public void SizeGate_MeasuresStoreSize_AndNeverTheBodyLength()
+    public void SizeGate_MeasuresBodyLength_AndNeverTheStoreSize()
     {
         MessageQueue mq = OfflineQueue(0);
-        var c = Offline("StoreSize", mq);
+        var c = Offline("BodyLength", mq);
         c.PullThresholdSizeForQueue = 1;
 
-        // A 4-byte body inside a 2 MiB store record: a body-length measurement would report
+        // A 5 MiB body whose stored record is 64 bytes: a storeSize measurement would report
         // 0 MiB and let the round through.
-        Stage(c, new List<MessageExt> { Cached(mq, 0, 2 * MiB, bodySize: 4) });
-        Eq(2 * MiB, c.CachedBytesOf(mq), "the accumulator sums storeSize, not body length");
-        Assert.True(Hit(c, mq), "the large store record is over the 1 MiB budget");
+        Stage(c, new List<MessageExt> { Cached(mq, 0, 5 * MiB, storeSize: 64) });
+        Eq(5 * MiB, c.CachedBytesOf(mq), "the accumulator sums body lengths, not storeSize");
+        Assert.True(Hit(c, mq), "the large body is over the 1 MiB budget");
         Eq(1, c.FlowControlForQueueTriggered, "the size gate shares the count gate's counter");
 
-        // Mirror case: a 5 MiB body whose store record is tiny must not refuse -- the
-        // control a body-length implementation gets wrong in the other direction.
-        var cold = Offline("StoreSizeControl", mq);
+        // Mirror case: a 2 MiB store record around a 4-byte body must not refuse -- the
+        // control a storeSize implementation gets wrong in the other direction.
+        var cold = Offline("BodyLengthControl", mq);
         cold.PullThresholdSizeForQueue = 1;
-        Stage(cold, new List<MessageExt> { Cached(mq, 0, 64, bodySize: 5 * MiB) });
-        Eq(64, cold.CachedBytesOf(mq), "only the stored bytes are counted");
-        Assert.False(Hit(cold, mq), "a large body inside a small store record stays inside the budget");
+        Stage(cold, new List<MessageExt> { Cached(mq, 0, 4, storeSize: 2 * MiB) });
+        Eq(4, cold.CachedBytesOf(mq), "only the body bytes are counted");
+        Assert.False(Hit(cold, mq), "a large store record around a small body stays inside the budget");
         Eq(0, cold.FlowControlForQueueTriggered, "a passing round counts nothing");
     }
 
@@ -490,59 +505,107 @@ public class LitePullFlowControlTests
         Assert.False(Hit(single, mq), "span 0 does not exceed a max span of 0");
     }
 
-    // ---------------------------------------------------------------- 7. aggregate gate
+    // ---------------------------------------------------------------- 7. aggregate gate: the rounds, not the rows
 
-    /// <summary>The whole-buffer budget is a separate budget: the same total that is over
-    /// <c>pullThresholdForAll</c> sits inside every queue's own count budget, and the
-    /// identical total against a threshold one higher releases every queue again.</summary>
+    /// <summary>The whole-instance budget is a <b>capacity projection</b>: every pull round
+    /// still waiting in the buffer reserves a whole <c>pullBatchSize</c>, whatever number of
+    /// messages that round happened to bring back. Four half-empty rounds are already 128
+    /// messages of reserved capacity against a budget of 100, while the buffer itself holds 8
+    /// rows and no queue is near its own count budget.</summary>
     [Fact]
-    public void AggregateGate_SumsEveryQueue_AndIsItsOwnBudget()
+    public void AggregateGate_BudgetsEveryPendingRound_NotTheMessagesThatArrived()
     {
-        MessageQueue q0 = OfflineQueue(0);
-        MessageQueue q1 = OfflineQueue(1);
-        MessageQueue q2 = OfflineQueue(2);
-        MessageQueue[] allQueues = { q0, q1, q2 };
-        var c = new DefaultLitePullConsumer(GroupPrefix + "_Aggregate");
-        c.Assign(allQueues);
-        c.PullThresholdForQueue = 1000;
-        c.PullThresholdSizeForQueue = int.MaxValue;
-        c.ConsumeMaxSpan = long.MaxValue;
-        c.PullThresholdForAll = 5;
+        MessageQueue[] queues = { OfflineQueue(0), OfflineQueue(1), OfflineQueue(2), OfflineQueue(3) };
+        var c = Offline("Aggregate", queues);
+        c.SetPullBatchSize(32);
+        c.PullThresholdForAll = 100;
 
-        Stage(c, Batch(q0, 2, 64));
-        Stage(c, Batch(q1, 2, 64, firstOffset: 100));
-        Stage(c, Batch(q2, 2, 64, firstOffset: 200));
-        Eq(6, c.CachedMessageCount, "the aggregate measures the whole buffer");
+        // One hand-out per queue: four rounds, two messages each.
+        foreach (MessageQueue mq in queues) Stage(c, Batch(mq, 2, 64));
+        Eq(8, c.CachedMessageCount, "the buffer itself is well under the aggregate budget");
+        Eq(4, c.PendingPullRounds, "one pending round per queue");
+        Eq(2, c.CachedMessageCountOf(queues[0]), "and no queue is near its own count budget");
 
-        // 6 cached against a budget of 5 refuses every queue, although no single queue is
-        // anywhere near its own count threshold -- which is what proves the aggregate is a
-        // separate budget and not a re-labelled per-queue gate.
-        foreach (MessageQueue mq in allQueues)
+        foreach (MessageQueue mq in queues)
         {
-            Assert.True(Hit(c, mq), $"{mq} is refused by the whole-buffer budget");
-            Eq(2, c.CachedMessageCountOf(mq), $"{mq} itself is 2 against its own budget of 1000");
+            Assert.True(Hit(c, mq), $"{mq}: 4 rounds x 32 = 128 reserved over a budget of 100");
         }
 
-        Eq(3, c.FlowControlForAllTriggered, "the aggregate counter took exactly one per refusal");
+        Eq(4, c.FlowControlForAllTriggered, "the aggregate counter took exactly one per refusal");
         Eq(0, c.FlowControlForQueueTriggered, "the per-queue count gate never fired");
         Eq(0, c.FlowControlForSpanTriggered, "the span gate never fired either");
 
-        // Control: the identical total against a budget of exactly 6 still pulls.
-        var exact = new DefaultLitePullConsumer(GroupPrefix + "_AggregateExact");
-        exact.Assign(allQueues);
-        exact.PullThresholdForQueue = 1000;
-        exact.PullThresholdSizeForQueue = int.MaxValue;
-        exact.ConsumeMaxSpan = long.MaxValue;
-        exact.PullThresholdForAll = 6;
-        Stage(exact, Batch(q0, 2, 64));
-        Stage(exact, Batch(q1, 2, 64, firstOffset: 100));
-        Stage(exact, Batch(q2, 2, 64, firstOffset: 200));
-        foreach (MessageQueue mq in allQueues)
+        // Paired control on the same buffers: a budget of exactly the reserved capacity still
+        // pulls, which is what makes the aggregate a budget of its own rather than a
+        // re-labelled per-queue gate.
+        var exact = Offline("AggregateExact", queues);
+        exact.SetPullBatchSize(32);
+        exact.PullThresholdForAll = 128;
+        foreach (MessageQueue mq in queues) Stage(exact, Batch(mq, 2, 64));
+        foreach (MessageQueue mq in queues)
         {
-            Assert.False(Hit(exact, mq), $"{mq}: 6 cached against a threshold of 6 must not refuse (>, not >=)");
+            Assert.False(Hit(exact, mq), $"{mq}: 128 reserved at a threshold of 128 must not refuse (>, not >=)");
         }
 
         Eq(0, exact.FlowControlForAllTriggered, "a passing round counts nothing");
+
+        // And it is the batch that multiplies: the very same four rounds at a batch of 5
+        // reserve 20, inside the budget of 100.
+        var smallBatch = Offline("AggregateSmallBatch", queues);
+        smallBatch.SetPullBatchSize(5);
+        smallBatch.PullThresholdForAll = 100;
+        foreach (MessageQueue mq in queues) Stage(smallBatch, Batch(mq, 2, 64));
+        foreach (MessageQueue mq in queues)
+        {
+            Assert.False(Hit(smallBatch, mq), $"{mq}: 4 rounds x 5 = 20 is inside a budget of 100");
+        }
+
+        Eq(0, smallBatch.FlowControlForAllTriggered, "the rounds are the same, the batch is not");
+    }
+
+    /// <summary>A round keeps its whole batch reserved until its last message leaves the
+    /// buffer: two one-message rounds refuse where one two-message round at the same size
+    /// does not, and draining releases the reservation round by round.</summary>
+    [Fact]
+    public void AggregateGate_ReleasesRoundByRound_AsTheApplicationPolls()
+    {
+        MessageQueue mq = OfflineQueue(0);
+        var c = Offline("AggregateRounds", mq);
+        c.SetPullBatchSize(4);
+        c.PullThresholdForAll = 4;
+
+        Stage(c, Batch(mq, 1, 64, firstOffset: 0));   // round 1 reserves a batch of 4
+        Stage(c, Batch(mq, 1, 64, firstOffset: 1));   // round 2 does the same -> 8 reserved
+        Eq(2, c.PendingPullRounds, "two half-empty rounds still count as two");
+        Eq(2, c.CachedMessageCount, "which is nothing at all in rows");
+        Assert.True(Hit(c, mq), "2 rounds x 4 reserve 8 over a budget of 4");
+
+        List<MessageExt> drained = c.Poll(200);
+        Eq(2, drained.Count, "both rows went to the application");
+        Eq(0, c.PendingPullRounds, "and with them both reservations");
+        Assert.False(Hit(c, mq), "a polled-away round stops reserving capacity");
+
+        // Control: the same two messages arriving as ONE round reserve exactly the budget.
+        var one = Offline("AggregateOneRound", mq);
+        one.SetPullBatchSize(4);
+        one.PullThresholdForAll = 4;
+        Stage(one, Batch(mq, 2, 64));
+        Eq(1, one.PendingPullRoundsOf(mq), "one append is one round");
+        Assert.False(Hit(one, mq), "one round at exactly the aggregate budget still pulls");
+
+        // A round keeps its whole batch reserved until its last message leaves the buffer:
+        // pruning a prefix with a seek takes the rows out but not the round they came in with.
+        var partial = Offline("AggregatePartialRound", mq);
+        partial.SetPullBatchSize(4);
+        partial.PullThresholdForAll = 4;
+        Stage(partial, Batch(mq, 3, 64));
+        Assert.False(Hit(partial, mq), "one round of three messages is inside the budget");
+        partial.Seek(mq, 2);
+        Eq(1, partial.CachedMessageCountOf(mq), "two rows left the buffer with the pruned range");
+        Eq(1, partial.PendingPullRoundsOf(mq), "the round still owes a row, so it still reserves");
+        Stage(partial, Batch(mq, 1, 64, firstOffset: 9));
+        Eq(2, partial.PendingPullRounds, "and the next round lands beside it");
+        Assert.True(Hit(partial, mq), "two rounds reserve 8, one over the budget of 4");
     }
 
     /// <summary>The judgment order is fixed -- aggregate, then count, then size, then span --
@@ -556,6 +619,7 @@ public class LitePullFlowControlTests
         // Aggregate over budget while the count gate is over budget too: only the aggregate
         // counter moves.
         var all = Offline("OrderAll", mq);
+        all.SetPullBatchSize(10);
         all.PullThresholdForAll = 1;
         all.PullThresholdForQueue = 1;
         Stage(all, Batch(mq, 3, 64));
@@ -627,11 +691,14 @@ public class LitePullFlowControlTests
         Eq(1, next.Warns.Count, "and it is the second warn");
         Assert.Contains("flowControlTimes=1001", next.Warns[0]);
 
-        // The aggregate gate keeps its own cadence on its own counter, and its warn names the
-        // request-count threshold in messages.
+        // The aggregate gate keeps its own cadence on its own counter, and its warn states the
+        // threshold in the unit it is written in: the number of rounds that fit.
         var all = Offline("CadenceAll", mq);
-        all.PullThresholdForAll = 1;
-        Stage(all, Batch(mq, 2, 64));
+        all.SetPullBatchSize(10);
+        all.PullThresholdForAll = 15;
+        Stage(all, Batch(mq, 1, 64, firstOffset: 0));
+        Stage(all, Batch(mq, 1, 64, firstOffset: 1));
+        Eq(2, all.PendingPullRounds, "two half-empty rounds reserve 20, over the budget of 15");
         // Quietly reach trip 1000 outside the capture, so the captured round is the 1001st.
         for (int i = 2; i <= 1001; i++)
         {
@@ -641,8 +708,9 @@ public class LitePullFlowControlTests
         Captured allWarn = CaptureGateLines(all, mq, 1);
         Eq(1001, all.FlowControlForAllTriggered, "the aggregate counter is separate from the queue one");
         Eq(0, all.FlowControlForQueueTriggered, "and it never borrowed the count/size counter");
-        Assert.Contains("the consume request count exceeds threshold 1", allWarn.Warns[0]);
-        Assert.Contains("cached=2", allWarn.Warns[0]);
+        // ceil(15 / 10) rounds fit, and the buffer holds 2 pending rounds.
+        Assert.Contains("the consume request count exceeds threshold 2", allWarn.Warns[0]);
+        Assert.Contains("consume request count=2", allWarn.Warns[0]);
         Assert.Contains("flowControlTimes=1001", allWarn.Warns[0]);
 
         // Span gate: the third counter, with one warn on trip 1.
@@ -682,7 +750,7 @@ public class LitePullFlowControlTests
         Assert.Contains("The cached message count exceeds the threshold 2, so do flow control", countWarn);
         Assert.Contains("minOffset=5, maxOffset=7, count=3, size=1 MiB", countWarn);
 
-        // Size gate: same shape, the byte threshold in MiB.
+        // Size gate: same shape, the byte threshold in MiB over the body total.
         var size = Offline("LineSize", mq);
         size.PullThresholdSizeForQueue = 1;
         Stage(size, Batch(mq, 2, 2 * MiB, firstOffset: 3));
@@ -692,13 +760,15 @@ public class LitePullFlowControlTests
         Assert.Contains("minOffset=3, maxOffset=4, count=2, size=4 MiB", sizeWarn);
         Assert.Contains(sizeLines.Debugs, l => l.Contains("over pullThresholdSizeForQueue=1"));
 
-        // Aggregate gate: its debug line names the whole-buffer threshold.
+        // Aggregate gate: its debug line names the whole-instance threshold and shows the
+        // projection the verdict was made from.
         var all = Offline("LineAll", mq);
+        all.SetPullBatchSize(10);
         all.PullThresholdForAll = 1;
         Stage(all, Batch(mq, 2, 64));
         Captured allLines = CaptureGateLines(all, mq, 1);
         string allDebug = Assert.Single(allLines.Debugs);
-        Assert.Contains("cached=2 over pullThresholdForAll=1", allDebug);
+        Assert.Contains("rounds=1 x pullBatchSize=10 = 10 over pullThresholdForAll=1", allDebug);
         Assert.Contains("flowControlTimes=1", allDebug);
     }
 
@@ -729,7 +799,8 @@ public class LitePullFlowControlTests
 
     /// <summary>The per-queue view must describe exactly what the buffer holds: it grows on
     /// append, shrinks as the application polls, is re-derived by a seek, and a queue this
-    /// instance no longer owns never refuses a pull from a stale accumulator.</summary>
+    /// instance no longer owns loses its rows, its accumulator and its pending rounds -- so a
+    /// stale view can never refuse a pull.</summary>
     [Fact]
     public void Accumulators_TrackTheBuffer_ThroughAppendPollSeekAndUnassign()
     {
@@ -746,9 +817,11 @@ public class LitePullFlowControlTests
         Eq(3, c.CachedMessageCount, "the buffer total");
         Eq(2, c.CachedMessageCountOf(q0), "queue 0's own count");
         Eq(1, c.CachedMessageCountOf(q1), "queue 1's own count");
-        Eq(1400, c.CachedBytesOf(q0), "queue 0's own stored bytes");
+        Eq(1400, c.CachedBytesOf(q0), "queue 0's own body bytes");
         Eq(10, c.CachedOffsetSpanOf(q0), "queue 0's own span");
         Eq(0, c.CachedOffsetSpanOf(q1), "one cached message spans 0");
+        Eq(2, c.PendingPullRounds, "one append books one round per queue it touched");
+        Eq(1, c.PendingPullRoundsOf(q0), "and the round is booked on the queue's own view");
 
         // A poll hands out the head of the FIFO (both queues interleaved) and the view
         // shrinks with it.
@@ -758,6 +831,7 @@ public class LitePullFlowControlTests
         Eq(0, c.CachedMessageCountOf(q0), "and so is queue 0's view");
         Eq(0, c.CachedBytesOf(q0), "its bytes are gone too");
         Eq(0, c.CachedOffsetSpanOf(q0), "and its span reads 0, never a stale leftover");
+        Eq(0, c.PendingPullRounds, "a drained round stops reserving capacity");
         Assert.False(Hit(c, q0), "a drained buffer releases the gate -- the consumer is not stuck");
 
         // Refill past the count gate, then let a seek prune the head: the view is rebuilt
@@ -772,23 +846,29 @@ public class LitePullFlowControlTests
         c.Seek(q0, 70);
         Eq(3, c.CachedMessageCountOf(q0), "the seek pruned the buffer and the view with it");
         Eq(20, c.CachedOffsetSpanOf(q0), "the span is re-derived from the offsets that are left");
+        Eq(1, c.PendingPullRoundsOf(q0),
+            "the pruned prefix leaves its round behind: it still owes rows to the application");
         Assert.False(Hit(c, q0), "and the round is allowed again");
 
-        // A revoked queue cannot refuse a pull from an accumulator no queue owns, even while
-        // its messages are still sitting in the buffer.
+        // A revoked queue cannot refuse a pull from an accumulator no queue owns, and its
+        // rows, its numbers and its reservations all go with the assignment.
         Stage(c, new List<MessageExt> { Cached(q0, 200, 500), Cached(q0, 201, 500) });
         Assert.True(Hit(c, q0), "queue 0 owns the backlog again for this round");
         c.Assign(new[] { q1 });
         Assert.False(Hit(c, q0), "a revoked queue cannot refuse a pull -- nothing owns it");
         Eq(DefaultLitePullConsumer.NoPullPause, c.LastPullPauseMillis(q0),
             "and its park went away with the assignment");
+        Eq(0, c.CachedMessageCountOf(q0), "its cached rows went too, and the buffer with them");
+        Eq(0, c.PendingPullRoundsOf(q0), "and so did the capacity those rounds reserved");
+        Eq(0, c.PendingPullRounds, "the whole-instance projection no longer counts a queue nobody owns");
 
         // While it is unowned its messages neither vanish nor drift: they are still cached,
         // so the whole-buffer budget counts them, and polling them away clears the view.
         var orphan = Offline("Orphaned", q1);
+        orphan.SetPullBatchSize(4);
         orphan.PullThresholdForAll = 0;
         Stage(orphan, new List<MessageExt> { Cached(q1, 0, 64) });
-        Assert.True(Hit(orphan, q1), "a cached message is part of the buffer the aggregate measures");
+        Assert.True(Hit(orphan, q1), "one pending round reserves capacity the aggregate measures");
         while (orphan.CachedMessageCount > 0) orphan.Poll(50);
         Eq(0, orphan.CachedMessageCountOf(q1), "the view cleared with the buffer");
         Assert.False(Hit(orphan, q1), "once it is polled away the aggregate is empty again");
@@ -966,6 +1046,7 @@ public class LitePullFlowControlTests
             Eq(frozen, LitePulls(cluster), "the client stops asking even though the application never polled");
             Eq(4, c.CachedMessageCountOf(mq), "counted per queue as well as in total");
             Eq(3, c.CachedOffsetSpanOf(mq), "and the span comes from the offsets that arrived");
+            Eq(1, c.PendingPullRoundsOf(mq), "one arrival is one pending round, whatever it brought");
         }
         finally
         {

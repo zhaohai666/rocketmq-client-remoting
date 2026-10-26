@@ -674,12 +674,16 @@ public sealed class DefaultMQPushConsumer
     // Orderly consumption: queue key set confirmed locked by broker LOCK_BATCH_MQ
     private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
     private int _pullThresholdForQueue = 1000;
-    // The remaining four flow-control thresholds: the byte gates are in MiB
-    // (&lt;=0 disables); the span is max-min of queueOffset in pending and
-    // counts only when STRICTLY greater; the two topic-level ones default to
-    // -1 (disabled) and are NEVER compared at pull time: each enabled budget is
-    // divided over this consumer's owned queues at rebalance, and the quotient
-    // becomes the matching per-queue knob (see DivideTopicThresholds).
+    // The remaining four flow-control thresholds: the byte gate counts whole
+    // MiB (the held body total is divided by 1 MiB with truncating integer
+    // arithmetic); the span is max-min of queueOffset over the held set. All
+    // three per-queue gates trip on a STRICT <c>&gt;</c> over the threshold as
+    // it stands: no floor and no off switch -- the legal range of each knob is
+    // enforced once, at start-up (see CheckConfigRanges). The two topic-level
+    // ones default to -1 (unset) and are NEVER compared at pull time: each
+    // configured budget is divided over this consumer's owned queues at
+    // rebalance, and the quotient becomes the matching per-queue knob
+    // (see DivideTopicThresholds).
     private int _pullThresholdSizeForQueue = 100;
     private long _consumeConcurrentlyMaxSpan = 2000;
     private int _pullThresholdForTopic = -1;
@@ -704,6 +708,8 @@ public sealed class DefaultMQPushConsumer
     // Queue key -> PopProcessQueue (popped-unacked count + whether rebalance
     // has revoked it)
     private readonly Dictionary<string, PopProcessQueue> _popQueues = new(StringComparer.Ordinal);
+    // The application's assignment-change callback, fired per topic whose queue set moved.
+    private IMessageQueueListener? _messageQueueListener;
     // POP orderly request dedup set (equality =
     // (shardingKeyIndex, pq reference, mq); shardingKeyIndex is always 0 and
     // mq uses the key string)
@@ -962,6 +968,29 @@ public sealed class DefaultMQPushConsumer
         _messageListener = listener;
     }
 
+    /// <summary>Install the assignment-change callback. It fires once per topic whose queue SET
+    /// moved at rebalance -- never for an unchanged round -- with that topic's full route set and
+    /// this instance's share of it.</summary>
+    public void SetMessageQueueListener(IMessageQueueListener? listener)
+    {
+        lock (_lock)
+        {
+            _messageQueueListener = listener;
+        }
+    }
+
+    /// <summary>The currently installed queue listener (null when the application never asked).</summary>
+    public IMessageQueueListener? MessageQueueListener
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _messageQueueListener;
+            }
+        }
+    }
+
     public int PullBatchSize
     {
         get => _pullBatchSize;
@@ -1017,7 +1046,9 @@ public sealed class DefaultMQPushConsumer
     }
 
     // Per-queue "pulled but not consumed" threshold; pull for that queue
-    // pauses once exceeded (default 1000).
+    // pauses once exceeded (default 1000). The gate compares with a strict >,
+    // so exactly this many cached messages still pull; the legal range is
+    // checked once at Start().
     // ⚠ While a topic-level budget is enabled this value is NOT the one the
     // user set: rebalance overwrites it with the divided quotient (see
     // DivideTopicThresholds), so reading it back gives the divided number.
@@ -1028,8 +1059,10 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary><c>pullThresholdSizeForQueue</c> (default 100): this queue's
-    /// "pulled but not consumed" byte threshold in <b>MiB</b>; &lt;=0 disables
-    /// this gate. While <see cref="PullThresholdSizeForTopic"/> is enabled
+    /// "pulled but not consumed" byte threshold in <b>MiB</b>, measured over the
+    /// message BODIES and divided with truncating integer arithmetic -- a
+    /// partially filled MiB is not charged, and the gate trips on a strict
+    /// &gt;. While <see cref="PullThresholdSizeForTopic"/> is enabled
     /// rebalance overwrites this with the divided quotient.</summary>
     public int PullThresholdSizeForQueue
     {
@@ -1039,18 +1072,19 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary><c>consumeMessageMaxSpan</c> (default 2000): span threshold for
     /// the queueOffset of this queue's "pulled but not consumed" messages;
-    /// hits only when STRICTLY greater (prevents one stuck head message from
-    /// piling up behind it indefinitely); &lt;=0 disables.</summary>
+    /// trips only when STRICTLY greater (prevents one stuck head message from
+    /// piling up behind it indefinitely). An orderly listener is never span-gated,
+    /// so this comparison only runs on the concurrent path.</summary>
     public long ConsumeConcurrentlyMaxSpan
     {
         get => _consumeConcurrentlyMaxSpan;
         set => _consumeConcurrentlyMaxSpan = value;
     }
 
-    /// <summary><c>pullThresholdForTopic</c> (default -1, disabled): the
-    /// "pulled but not consumed" message-count budget for this instance's share
-    /// of the topic. It is enforced by DIVISION, not by adding the queues up:
-    /// every rebalance that changes the assignment divides it by the number of
+    /// <summary><c>pullThresholdForTopic</c> (default -1, i.e. no topic budget):
+    /// the "pulled but not consumed" message-count budget for this instance's
+    /// share of the topic. It is enforced by DIVISION, not by adding the queues
+    /// up: every rebalance that changes the assignment divides it by the number of
     /// queues this consumer owns (all topics together) and writes the quotient
     /// into <see cref="PullThresholdForQueue"/> (see
     /// <see cref="DivideTopicThresholds"/>). The pull-time gate then only ever
@@ -1061,9 +1095,9 @@ public sealed class DefaultMQPushConsumer
         set => _pullThresholdForTopic = value;
     }
 
-    /// <summary><c>pullThresholdSizeForTopic</c> (default -1, disabled): the
-    /// byte budget for the same topic, in <b>MiB</b>. Enforced the same way as
-    /// <see cref="PullThresholdForTopic"/> -- divided into
+    /// <summary><c>pullThresholdSizeForTopic</c> (default -1, i.e. no topic
+    /// budget): the byte budget for the same topic, in <b>MiB</b>. Enforced the
+    /// same way as <see cref="PullThresholdForTopic"/> -- divided into
     /// <see cref="PullThresholdSizeForQueue"/> at rebalance, never summed over
     /// the queues at pull time.</summary>
     public int PullThresholdSizeForTopic
@@ -1200,18 +1234,20 @@ public sealed class DefaultMQPushConsumer
     /// are asserted verbatim by test cases; confirm the ledger before
     /// changing them.</para>
     /// <para>Why gate at <see cref="Start"/>: these values directly determine
-    /// buffer levels and thread-pool size. Configured as 0 or
-    /// <c>int.MaxValue</c> without this gate, either every pull round is
-    /// judged as backlog by "threshold &lt;= 0" and pulling stops PERMANENTLY
-    /// (the consumer silently receives nothing), or integer overflow bypasses
-    /// the flow-control check entirely. Waiting for a broker error is several
-    /// beats too late, and the error only lands in the log.</para>
+    /// buffer levels and thread-pool size, and the pull-time gates read the
+    /// number as it stands -- no floor, no off switch. Left unchecked, a 0
+    /// would make the FIRST cached message of a queue trip its count gate and
+    /// that queue would stop being pulled PERMANENTLY (the consumer silently
+    /// receives nothing), while an <c>int.MaxValue</c> would quietly disable the
+    /// check for good. Waiting for a broker error is several beats too late, and
+    /// the error only lands in the log.</para>
     /// <para>The -1 of <c>PullThresholdForTopic</c> /
-    /// <c>PullThresholdSizeForTopic</c> is a "disable this gate" sentinel: it
-    /// is out of range but not an error; the other fields have no such
-    /// exemption (writing -1 there is a startup error, not "unlimited"). An
-    /// off budget also opts out of the rebalance division, so its per-queue
-    /// knob keeps the user's value (see <see cref="DivideTopicThresholds"/>).</para>
+    /// <c>PullThresholdSizeForTopic</c> is the "no topic budget configured"
+    /// sentinel: it is out of range but not an error, and such a budget is
+    /// simply not divided at rebalance, so its per-queue knob keeps the user's
+    /// value (see <see cref="DivideTopicThresholds"/>). The other fields have no
+    /// such exemption (writing -1 there is a startup error, not "unlimited"),
+    /// and the per-queue gates never see the sentinel.</para>
     /// <para>public is for offline testability only: positive cases (boundary
     /// values must be allowed) cannot run after <see cref="Start"/>, and the
     /// test project has no InternalsVisibleTo relationship with this assembly.
@@ -3012,61 +3048,74 @@ public sealed class DefaultMQPushConsumer
     /// exactly is still allowed to pull, so a threshold reads as "how many may be
     /// cached", not "how many stop the pull".
     /// <list type="number">
-    /// <item>count &gt; <c>PullThresholdForQueue</c> (<c>Math.max(1,n)</c>
-    /// guard: 0 also counts as 1)</item>
-    /// <item>bytes &gt; <c>PullThresholdSizeForQueue</c>, in <b>MiB</b>
-    /// (&lt;=0 disables)</item>
-    /// <item>span <b>strictly greater than</b> <c>ConsumeConcurrentlyMaxSpan</c>
-    /// (max-min of queueOffset within the buffer)</item>
+    /// <item>held count &gt; <c>PullThresholdForQueue</c></item>
+    /// <item>held body MiB &gt; <c>PullThresholdSizeForQueue</c></item>
+    /// <item>held offset span &gt; <c>ConsumeConcurrentlyMaxSpan</c>, and this term
+    /// is <b>not judged at all for an orderly listener</b> -- the knob is named after
+    /// concurrent consumption, and an orderly queue has no run-ahead to guard, because
+    /// its cursor only moves once the batch in the listener's hands has settled</item>
     /// </list>
-    /// The verdict judges <b>this queue's own buffer only</b> and never reads a
-    /// sibling queue: a topic-level cache budget reaches it only through
-    /// <see cref="DivideTopicThresholds"/>, which splits the budget into the
-    /// per-queue knobs at rebalance. There is no pull-time topic aggregation
-    /// (see the classic client: <c>pullThresholdForTopic</c> is divided by the
-    /// queue count, not summed over the queues when a pull happens).
+    /// What all three terms measure is the queue's whole <b>held set</b>: the
+    /// pulled-but-undispatched buffer union the batches already handed to the listener
+    /// and not yet settled (<see cref="ProcessQueueEntriesLocked"/>, deduplicated by
+    /// queue offset). A dispatched batch has only moved, it has not left the queue -- it
+    /// leaves when it settles through an ack/complete or is requeued. Judging the buffer
+    /// alone would under-count and keep pulling while the listener still sits on
+    /// messages, which is exactly what these thresholds exist to stop.
+    /// The size term is the <b>integer (truncating) whole MiB of message BODY bytes</b>:
+    /// a 1 MiB budget tolerates a 1.9 MiB backlog, because 1.9 truncated is 1. The
+    /// stored-record size a broker charges for the whole storage record is a telemetry
+    /// number and never enters this comparison.
+    /// No threshold is floored here and none has a "this value switches me off" escape: the
+    /// gate reads each knob exactly as it stands, and keeping every knob inside its legal range
+    /// is <see cref="CheckConfigRanges"/>'s job at start-up, not this gate's.
+    /// The verdict never reads a sibling queue: a topic-level cache budget reaches it only
+    /// through <see cref="DivideTopicThresholds"/>, which splits the budget into the
+    /// per-queue knobs at rebalance. There is no pull-time topic aggregation.
     /// One hit only increments <see cref="FlowControlTriggered"/> by one.</summary>
     private bool FlowControlHit(MessageQueue mq, string key)
     {
-        int count;
-        double sizeMb;
+        bool orderly = IsOrderly();
+        long count;
+        long sizeMiB;
         long span;
         lock (_lock)
         {
-            if (_pending.TryGetValue(key, out Queue<MessageExt>? q) && q.Count > 0)
+            List<MessageExt> held = ProcessQueueEntriesLocked(key);
+            long bytes = 0;
+            long minOffset = 0;
+            long maxOffset = 0;
+            bool first = true;
+            foreach (MessageExt m in held)
             {
-                long bytes = 0;
-                long minOffset = long.MaxValue;
-                long maxOffset = long.MinValue;
-                foreach (MessageExt m in q)
+                bytes += m.Body.Length;
+                if (first)
                 {
-                    bytes += m.StoreSize;
+                    minOffset = maxOffset = m.QueueOffset;
+                    first = false;
+                }
+                else
+                {
                     if (m.QueueOffset < minOffset) minOffset = m.QueueOffset;
                     if (m.QueueOffset > maxOffset) maxOffset = m.QueueOffset;
                 }
+            }
 
-                count = q.Count;
-                sizeMb = bytes / (1024.0 * 1024.0);
-                span = maxOffset - minOffset;
-            }
-            else
-            {
-                count = 0;
-                sizeMb = 0;
-                span = 0;
-            }
+            count = held.Count;
+            sizeMiB = bytes / CacheSizeGateMib;
+            span = first ? 0 : maxOffset - minOffset;
         }
 
         string? reason = null;
-        if (count > Math.Max(1, _pullThresholdForQueue))
+        if (count > _pullThresholdForQueue)
         {
             reason = "count=" + count.ToString(CultureInfo.InvariantCulture);
         }
-        else if (_pullThresholdSizeForQueue > 0 && sizeMb > _pullThresholdSizeForQueue)
+        else if (sizeMiB > _pullThresholdSizeForQueue)
         {
-            reason = "size=" + sizeMb.ToString("F1", CultureInfo.InvariantCulture) + "MB";
+            reason = "size=" + sizeMiB.ToString(CultureInfo.InvariantCulture) + "MB";
         }
-        else if (_consumeConcurrentlyMaxSpan > 0 && span > _consumeConcurrentlyMaxSpan)
+        else if (!orderly && span > _consumeConcurrentlyMaxSpan)
         {
             reason = "span=" + span.ToString(CultureInfo.InvariantCulture);
         }
@@ -3133,6 +3182,10 @@ public sealed class DefaultMQPushConsumer
     /// <summary>Client-side cache threshold reached: pause this queue's pull
     /// for a full period before asking the broker again.</summary>
     public const int CacheFlowControlBackoffMillis = 50;
+
+    /// <summary>One MiB. The byte cache gate divides the held body total by this with
+    /// <b>integer</b> arithmetic, so a partially filled MiB is not charged.</summary>
+    public const long CacheSizeGateMib = 1024 * 1024;
 
     /// <summary>Broker-side flow control (response code 215) is a "busy right
     /// now" answer, NOT a capacity verdict on this client: retry early instead
@@ -4198,6 +4251,25 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>Unit-test entry: preset the "handed to the listener, not settled yet"
+    /// rows of one queue -- the other half of the held set the cache gate measures (see
+    /// <see cref="ProcessQueueEntriesForTest"/>). The dispatch itself fills this table, so
+    /// writing it directly is how a gate case stages a backlog without a thread pool.</summary>
+    public void SetInFlightForTest(string key, List<MessageExt>? msgs)
+    {
+        lock (_lock)
+        {
+            if (msgs is null or { Count: 0 })
+            {
+                _inFlightMsgs.Remove(key);
+            }
+            else
+            {
+                _inFlightMsgs[key] = new List<MessageExt>(msgs);
+            }
+        }
+    }
+
     /// <summary>Unit-test entry: clean one queue's expired head, returning the
     /// number of send-backs initiated this round (see CleanExpiredQueue).</summary>
     public int CleanExpiredQueueForTest(string key) => CleanExpiredQueue(key);
@@ -4280,6 +4352,22 @@ public sealed class DefaultMQPushConsumer
     /// division's two gating rules (only a changed assignment, only after the
     /// pull state was rebuilt) without racing the 20s timer.</summary>
     public void DoRebalanceForTest() => DoRebalance();
+
+    /// <summary>Unit-test entry: the subscription version this instance carries for a topic,
+    /// which is what the rebalance-change re-stamp moves. A topic that is not subscribed
+    /// reads -1.</summary>
+    public long SubVersionForTest(string topic)
+    {
+        lock (_lock)
+        {
+            return _subscriptionData.TryGetValue(topic, out SubscriptionData? sub) && sub is not null
+                ? sub.SubVersion : -1L;
+        }
+    }
+
+    /// <summary>Unit-test entry: the queues this instance owns right now -- the share a
+    /// rebalance-change notification hands the application listener.</summary>
+    public List<MessageQueue> AssignedQueuesForTest() => AssignedQueues();
 
     // ---------------- postSubscriptionWhenPull / pullFromWhichNode ----------------
 
@@ -4771,17 +4859,21 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>The "registered" view = in-flight (dispatched, not settled) ∪
     /// pulled-but-not-dispatched, i.e. the queue buffer msgTreeMap. Must be
-    /// called while holding the lock; dedup by reference only guards against
-    /// future new call sites writing overlaps.</summary>
+    /// called while holding the lock.
+    ///
+    /// Dedup is by <b>queue offset</b>, not by object identity: a batch that was handed to the
+    /// listener and a row still sitting in the buffer describe the same cached message when they
+    /// carry the same offset, and the gate must charge it once. Because the dispatch window is
+    /// ordered, the in-flight batch carries the LOWER offsets of the two parts.</summary>
     private List<MessageExt> ProcessQueueEntriesLocked(string key)
     {
         var outList = new List<MessageExt>();
-        var seen = new HashSet<MessageExt>();
+        var seen = new HashSet<long>();
         if (_inFlightMsgs.TryGetValue(key, out List<MessageExt>? inflight))
         {
             foreach (MessageExt m in inflight)
             {
-                if (seen.Add(m))
+                if (seen.Add(m.QueueOffset))
                 {
                     outList.Add(m);
                 }
@@ -4792,7 +4884,7 @@ public sealed class DefaultMQPushConsumer
         {
             foreach (MessageExt m in q)
             {
-                if (seen.Add(m))
+                if (seen.Add(m.QueueOffset))
                 {
                     outList.Add(m);
                 }
@@ -6185,9 +6277,10 @@ public sealed class DefaultMQPushConsumer
         return outList;
     }
 
-    /// <summary>Turn each enabled topic-level cache budget into a per-queue knob
-    /// for the queues this client owns right now: every budget (-1 means off) is
-    /// divided by that queue count -- ALL of this consumer's queues, across every
+    /// <summary>Turn each configured topic-level cache budget into a per-queue
+    /// knob for the queues this client owns right now: every budget (-1 means no
+    /// topic budget, so it is not divided) is divided by that queue count
+    /// -- ALL of this consumer's queues, across every
     /// topic -- and the quotient is written into the matching per-queue knob.
     /// This is the ONLY place a topic budget is enforced: the pull-time gate
     /// never aggregates sibling queues (see <see cref="FlowControlHit"/>).
@@ -6282,10 +6375,22 @@ public sealed class DefaultMQPushConsumer
     private void DoRebalance()
     {
         MQClientInstance c = Client();
+        // The assignment is remembered PER TOPIC: what a rebalance round owes its application is
+        // decided topic by topic, so a round that moved one topic's queues must not re-stamp or
+        // re-report the topics that kept theirs. `prev` is the flat view of the same table, used
+        // only to tell a newly owned queue from a continuing one when resolving initial offsets.
+        var wasByTopic = new SortedDictionary<string, HashSet<string>>(StringComparer.Ordinal);
         var prev = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
         foreach (MessageQueue mq in AssignedQueues())
         {
             prev[OffsetKey(mq)] = mq;
+            if (!wasByTopic.TryGetValue(mq.Topic, out HashSet<string>? keys) || keys is null)
+            {
+                keys = new HashSet<string>(StringComparer.Ordinal);
+                wasByTopic[mq.Topic] = keys;
+            }
+
+            keys.Add(OffsetKey(mq));
         }
 
         var assigned = new List<MessageQueue>();
@@ -6361,34 +6466,37 @@ public sealed class DefaultMQPushConsumer
         // otherwise redelivery restarts from 0.
         var assignedKeys = new HashSet<string>(StringComparer.Ordinal);
         var current = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
+        var nowByTopic = new SortedDictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (MessageQueue mq in assigned)
         {
             assignedKeys.Add(OffsetKey(mq));
             current[OffsetKey(mq)] = mq;
+            if (!nowByTopic.TryGetValue(mq.Topic, out HashSet<string>? keys) || keys is null)
+            {
+                keys = new HashSet<string>(StringComparer.Ordinal);
+                nowByTopic[mq.Topic] = keys;
+            }
+
+            keys.Add(OffsetKey(mq));
         }
 
-        // Did THIS round change the assignment? A SET comparison, not a count
-        // comparison: losing one queue while gaining another keeps the count but
-        // changes which buffers exist, and every topic budget has to be re-split
-        // over the new queue set.
-        bool changed = current.Count != prev.Count;
-        if (!changed)
-        {
-            foreach (string k in current.Keys)
-            {
-                if (!prev.ContainsKey(k))
-                {
-                    changed = true;
-                    break;
-                }
-            }
-        }
+        // Which topics' assignment SET moved this round? A SET comparison per topic, not a
+        // count comparison: losing one queue while gaining another keeps the count but changes
+        // which buffers exist, and every topic budget has to be re-split over the new queue
+        // set. A topic that kept exactly its queues -- in any order -- is not a change and
+        // owes nothing.
+        List<string> moved = ChangedTopics(wasByTopic, nowByTopic);
+        bool changed = moved.Count > 0;
 
         if (changed)
         {
             ClientLog.Info("rebalance result changed, group=" + ConsumerGroup
                 + " clientId=" + _clientId
-                + " assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture));
+                + " assigned=" + assigned.Count.ToString(CultureInfo.InvariantCulture)
+                + " topics=" + string.Join(",", moved));
+            // The assignment moved, so every broker that speaks the fingerprint protocol has to
+            // be handed the subscriptions again rather than the cheap subscription-free body.
+            c.ResetBrokerAddrHeartbeatFingerprintTable();
         }
 
         // Stall self-healing (isPullExpired): in the same pass also revoke the
@@ -6509,19 +6617,145 @@ public sealed class DefaultMQPushConsumer
 
         RebalancePullThreads();
 
-        // The division over the queue count THIS round produced, so it must run
-        // AFTER RebalancePullThreads rebuilt the per-queue state table: a shrink
-        // from 4 queues to 2 then divides by 2, not by the 4 it started from.
-        // Only a round that changed the assignment re-divides, so a hand-set
-        // per-queue knob survives an unchanged round.
-        // POP needs the same rule and gets it from the same call site: in this
-        // port _popQueues is only ever grown by RebalancePullThreads (see the
-        // DoRebalance header -- the broker-side queryAssignment /
-        // MessageQueueAssignment path is NOT implemented here), so there is no
-        // second table-owning path that would need its own change-gated call.
-        if (changed)
+        // The round's assignment moved the queue SET of at least one topic: pay what that change
+        // owes, in the fixed order (re-stamp -> re-divide -> immediate heartbeat -> application
+        // listener). The order matters: RebalancePullThreads() above is what rebuilt the
+        // per-queue pull state (_mqMap / _popQueues), and that table is the divisor, so dividing
+        // before it would use the previous round's queue count. An unchanged round leaves a
+        // hand-set per-queue knob alone and sends nothing extra -- including a round that only
+        // self-heals a stalled pull loop, which never re-stamps and never notifies.
+        AfterAssignmentChange(moved);
+    }
+
+    /// <summary>The topics whose assigned queue SET differs between two rounds. Exposed for the
+    /// offline cases: the round itself is only reachable through a live rebalance.</summary>
+    public static List<string> ChangedTopics(
+        IDictionary<string, HashSet<string>> before,
+        IDictionary<string, HashSet<string>> after)
+    {
+        var moved = new List<string>();
+        var topics = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (string t in before.Keys) topics.Add(t);
+        foreach (string t in after.Keys) topics.Add(t);
+        foreach (string topic in topics)
         {
-            DivideTopicThresholds();
+            bool had = before.TryGetValue(topic, out HashSet<string>? wasSet);
+            bool has = after.TryGetValue(topic, out HashSet<string>? nowSet);
+            var a = had ? wasSet! : new HashSet<string>(StringComparer.Ordinal);
+            var b = has ? nowSet! : new HashSet<string>(StringComparer.Ordinal);
+            if (!a.SetEquals(b)) moved.Add(topic);
+        }
+
+        return moved;
+    }
+
+    /// <summary>Everything a rebalance round whose queue set moved pays, in one place and in one
+    /// order that cannot drift: re-share the moved topics' subscription version, re-split the
+    /// topic cache budgets over the queues alive this round, hand every broker the beat that
+    /// carries the fresh versions, and finally tell the application's queue listener exactly
+    /// those topics. An unchanged round pays nothing.</summary>
+    private void AfterAssignmentChange(List<string> moved)
+    {
+        if (moved.Count == 0)
+        {
+            return;
+        }
+
+        RestampSubscriptionVersions(moved);
+        DivideTopicThresholds();
+        // The new version must reach the broker NOW rather than at the next periodic beat: the
+        // broker keys the filter results it caches for a subscription by its version, so a topic
+        // whose queues just moved would stay "unchanged" to the broker until that beat lands.
+        try
+        {
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("heartbeat after rebalance change failed: " + e.Message);
+        }
+
+        NotifyQueueChanged(moved);
+    }
+
+    /// <summary>Wall-clock milliseconds, one stamp shared by the round: the version is what makes
+    /// a broker re-read a subscription instead of reusing the filtered result it cached for the
+    /// old generation, so a topic whose queues moved has to look new to the broker even when its
+    /// filter expression did not change. Topics that did not move keep their version --
+    /// re-stamping everything would throw away the caching the broker does for the untouched
+    /// subscriptions.</summary>
+    private void RestampSubscriptionVersions(List<string> moved)
+    {
+        long newVersion = UtilAll.CurrentTimeMillis();
+        var stamped = new List<(string Topic, long Old)>();
+        lock (_lock)
+        {
+            foreach (string topic in moved)
+            {
+                if (!_subscriptionData.TryGetValue(topic, out SubscriptionData? sub))
+                {
+                    continue;
+                }
+
+                stamped.Add((topic, sub.SubVersion));
+                sub.SubVersion = newVersion;
+            }
+        }
+
+        // _lock is not reentrant-safe to hold while logging, so the lines are decided inside the
+        // critical section and written after releasing it.
+        foreach ((string topic, long old) in stamped)
+        {
+            ClientLog.Info(topic + " rebalance changed, also update version: "
+                + old.ToString(CultureInfo.InvariantCulture) + ", "
+                + newVersion.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    /// <summary>Fire the application's queue listener for the moved topics only: the callback is
+    /// a change notification, not a heartbeat, so an unchanged topic gets nothing. The signature
+    /// is (topic, the FULL route set, this instance's share), so the application can tell a
+    /// rebalance from a route change without asking again. A listener that throws is logged and
+    /// never breaks the rebalance round.</summary>
+    private void NotifyQueueChanged(List<string> moved)
+    {
+        IMessageQueueListener? listener;
+        List<MessageQueue> assignedSnapshot;
+        lock (_lock)
+        {
+            listener = _messageQueueListener;
+            assignedSnapshot = new List<MessageQueue>(_assigned);
+        }
+
+        if (listener is null)
+        {
+            return;
+        }
+
+        var byTopic = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in assignedSnapshot)
+        {
+            if (!byTopic.TryGetValue(mq.Topic, out List<MessageQueue>? list) || list is null)
+            {
+                list = new List<MessageQueue>();
+                byTopic[mq.Topic] = list;
+            }
+
+            list.Add(mq);
+        }
+
+        foreach (string topic in moved)
+        {
+            try
+            {
+                listener.MessageQueueChanged(topic, AllQueuesOfTopic(topic),
+                    byTopic.TryGetValue(topic, out List<MessageQueue>? mine)
+                        ? mine : new List<MessageQueue>());
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("message queue listener failed for " + topic + ": " + e.Message);
+            }
         }
     }
 

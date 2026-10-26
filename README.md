@@ -43,7 +43,7 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 | --- | --- | --- | --- | --- |
 | Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1673 passed + 4 skipped |
 | C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：68 个用例全绿（8025 项断言） |
-| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1062 passed |
+| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1078 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：1135 passed；`cargo clippy --all-targets` 零 warning |
 | Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：806 个测试函数（client 486 / common 135 / remoting 185）；`go vet` / `gofmt` 零告警 |
 | Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 65 个模块 + 37 套冒烟共 1222 项检查全绿 |

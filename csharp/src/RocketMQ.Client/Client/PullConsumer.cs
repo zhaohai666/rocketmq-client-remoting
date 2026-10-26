@@ -49,6 +49,10 @@ public sealed class DefaultMQPullConsumer
     private readonly Dictionary<string, IMessageQueueListener> _messageQueueListeners =
         new(StringComparer.Ordinal);
     private IMessageQueueListener? _messageQueueListener;
+    /// <summary>Per topic, the queue SET last handed to the listeners: a round that re-publishes
+    /// the same set is not a change. Keys are (topic, brokerName, queueId) identities.</summary>
+    private readonly Dictionary<string, HashSet<string>> _lastBalancedQueues =
+        new(StringComparer.Ordinal);
     private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy =
         new AllocateMessageQueueAveragely();
 
@@ -570,6 +574,15 @@ public sealed class DefaultMQPullConsumer
 
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
         List<MessageQueue> pulled = PulledQueues(realTopic);
+        // The FULL route set of the topic, in the caller's (namespace-free) spelling -- this is
+        // what a queue-change listener is handed next to this instance's share of it.
+        var allOfTopic = new List<MessageQueue>();
+        foreach (MessageQueue mq in SubscribeQueuesOfTopic(c, realTopic))
+        {
+            allOfTopic.Add(new MessageQueue(
+                NamespaceUtil.WithoutNamespace(mq.Topic, _namespace), mq.BrokerName, mq.QueueId));
+        }
+
         List<MessageQueue>? allocated = null;
         if (_messageModel == MessageModel.Broadcasting)
         {
@@ -617,8 +630,84 @@ public sealed class DefaultMQPullConsumer
         }
 
         outList.Sort();
-        return DedupeQueues(outList);
+        outList = DedupeQueues(outList);
+        // The classic pull consumer owes only this half of an assignment change: the application's
+        // listener hears about the topics whose queue SET actually moved, and nothing else.
+        NotifyAssignmentChanged(topic, allOfTopic, outList);
+        return outList;
     }
+
+    /// <summary>Fire the application's queue listeners for one topic, but only when its queue SET
+    /// differs from the set last handed out. A re-ordering of the same queues is not a change; a
+    /// same-count swap to another broker is. The very first view reports a change only when this
+    /// instance actually owns queues -- an empty opening has nothing for the application to react
+    /// to. A listener that throws is logged and never breaks the caller's lookup.</summary>
+    public bool NotifyAssignmentChanged(string topic, IReadOnlyList<MessageQueue> mqAll,
+        IReadOnlyList<MessageQueue> divided)
+    {
+        bool changed;
+        IMessageQueueListener? perTopic;
+        IMessageQueueListener? global;
+        lock (_lock)
+        {
+            if (!_lastBalancedQueues.TryGetValue(topic, out HashSet<string>? was))
+            {
+                changed = divided.Count > 0;
+            }
+            else
+            {
+                var now = new HashSet<string>(StringComparer.Ordinal);
+                foreach (MessageQueue mq in divided) now.Add(QueueIdentity(mq));
+                changed = !was.SetEquals(now);
+            }
+
+            _lastBalancedQueues[topic] = ToKeySet(divided);
+            _messageQueueListeners.TryGetValue(topic, out perTopic);
+            global = _messageQueueListener;
+        }
+
+        if (!changed)
+        {
+            return false;
+        }
+
+        if (perTopic is not null)
+        {
+            Fire(perTopic, topic, mqAll, divided);
+        }
+
+        // The single listener is a different sink from the topic-keyed one; it is skipped only
+        // when the application handed the same object to both.
+        if (global is not null && !ReferenceEquals(global, perTopic))
+        {
+            Fire(global, topic, mqAll, divided);
+        }
+
+        return true;
+    }
+
+    private static void Fire(IMessageQueueListener listener, string topic,
+        IReadOnlyList<MessageQueue> mqAll, IReadOnlyList<MessageQueue> divided)
+    {
+        try
+        {
+            listener.MessageQueueChanged(topic, mqAll, divided);
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("message queue listener failed for " + topic + ": " + e.Message);
+        }
+    }
+
+    private static HashSet<string> ToKeySet(IReadOnlyList<MessageQueue> queues)
+    {
+        var outSet = new HashSet<string>(StringComparer.Ordinal);
+        foreach (MessageQueue mq in queues) outSet.Add(QueueIdentity(mq));
+        return outSet;
+    }
+
+    private static string QueueIdentity(MessageQueue mq) =>
+        mq.Topic + "@" + mq.BrokerName + "@" + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>All queues as seen by the subscription info (offset reads, master not
     /// filtered), returned in the house ordering.</summary>

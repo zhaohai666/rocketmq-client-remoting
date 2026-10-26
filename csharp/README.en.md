@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1062 unit tests.
+  offline behaviour is pinned by 1078 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1062, Skipped:     0, Total:  1062, Duration: 4 m 41 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1078, Skipped:     0, Total:  1078, Duration: 4 m 40 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -283,8 +283,14 @@ consumer.PopThresholdForQueue = 96;      // this queue's outstanding-ACK ceiling
 Common knobs: `ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset` (also
 `ConsumeFromLastOffset` / `ConsumeFromTimestamp`), `SetConsumeThreadNums(n)`, `PullBatchSize`,
 `PullThresholdForQueue` / `PullThresholdSizeForQueue` / `PullThresholdForTopic` (pre-pull flow
-control: three per-queue gates, each enabled topic budget divided over the owned queues on a changed
-rebalance round), `MaxReconsumeTimes`, `SuspendCurrentQueueTimeMillis`,
+control: each per-queue gate judges everything that queue still holds -- the undispatched buffer plus
+the batches in the listener's hands that are not settled yet, deduplicated by queue offset; all three
+are strictly greater, the threshold is taken literally (never clamped to 1, and 0 is not "off" -- the
+legal ranges belong to the startup config check); the byte gate counts message **body** length in
+whole MiB by integer division, not `storeSize`; the span gate never runs for an orderly listener; the
+topic budgets are not summed across sibling queues at pull time, they are divided over the queues this
+round owns on a changed rebalance round and the quotient is written back as the per-queue knob),
+`MaxReconsumeTimes`, `SuspendCurrentQueueTimeMillis`,
 `SetAllocateMessageQueueStrategy(new AllocateMessageQueueConsistentHash())`,
 `Suspend()` / `Resume()` (stop pulling without going offline), `SetEnableMsgTrace(true)`,
 `consumer.SubscribedTopics()` / `ConsumedCount` / `ClientId`.
@@ -513,15 +519,27 @@ connection.
   fair semaphores) / transactions (two-phase + broker check-back) / delayed and timed /
   recall (`recallMessage`) / request-reply
 - ✅ Consuming: Push (long polling + POP + orderly + broadcasting + offset persistence +
-  startup range validation + pre-pull flow control + POP's outstanding-ACK gate (default 96, trips
+  startup range validation + the three per-queue cache gates before pulling (each judges everything
+  the queue still holds -- the undispatched buffer plus the batches handed to the listener and not
+  settled yet, deduplicated by queue offset; count / message **body** MiB by integer division / offset
+  span, all strictly greater with no floor clamped on the threshold and 0 not acting as an off switch;
+  the span gate never runs for an orderly listener; topic budgets divided over the owned queues at
+  rebalance, never summed across sibling queues at pull time), a 50 ms local re-schedule on a hit and
+  a warning on the 1st hit and every 1000th thereafter, and a rebalance round whose per-topic
+  assignment set moved pays the whole package in one order (only the moved topics re-share their
+  subscription version → then the division → then one immediate heartbeat to every broker → then the
+  queue listener for the moved topics only; an unchanged round and a stalled-loop self-heal pay none
+  of it), POP's outstanding-ACK gate (default 96, trips
   strictly above it, counted on the pull path's same flow-control total) + escape hatch for suspended listeners),
-  Pull (with consumer heartbeats), LitePull (pull / consumed / pending-commit offset tables +
+  Pull (with consumer heartbeats; an assignment change there owes only the listener half),
+  LitePull (pull / consumed / pending-commit offset tables +
   queue-set change listener + four cache gates judged before the pull offset is resolved:
-  whole-buffer count `PullThresholdForAll` 10000 / this queue's count `PullThresholdForQueue`
-  1000 / this queue's stored bytes `PullThresholdSizeForQueue` 100 MiB with integer division /
+  in-flight pull rounds × `PullBatchSize` (default 10) over `PullThresholdForAll` 10000 / this queue's count `PullThresholdForQueue`
+  1000 / this queue's body bytes `PullThresholdSizeForQueue` 100 MiB with integer division /
   this queue's offset span `ConsumeMaxSpan` 2000, each refusing only when strictly above its
-  threshold; a refusal re-schedules just this queue 50ms later while the broker's
-  `FLOW_CONTROL`(215) waits 20ms)
+  threshold; count and bytes share one trip counter while the span and the aggregate keep their own;
+  a refusal re-schedules just this queue 50ms later while the broker's
+  `FLOW_CONTROL`(215) waits 20ms; a revoked queue loses its rows, its accumulator and its rounds)
 - ✅ Queue allocation: six pluggable strategies
 - ✅ Namespaces: local prefix and server-side `nsd` / `ns`
 - ✅ Admin: topics / subscription groups / cluster and routes / statistics / message queries /
@@ -531,7 +549,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1062 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1078 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -617,7 +635,7 @@ Subcommands:
 | `trace` | End-to-end message tracing (needs `traceTopicEnable=true`) |
 | `hook` | CheckForbidden / FilterMessage hooks |
 | `backpressure` | Async-send fair semaphores: message and byte gates, rejection accounting, runtime expansion |
-| `flow-control` | the three per-queue cache gates before pulling (topic budgets divided over the owned queues at rebalance) + startup numeric gates |
+| `flow-control` | the three per-queue cache gates before pulling (each queue judged on everything it still holds: the undispatched buffer plus the batches in the listener's hands that are not settled yet; topic budgets divided over the owned queues at rebalance) + startup numeric gates |
 | `async-send` | Async send core: caller never blocks, thread accounting, no cross-talk, drain on `Shutdown` |
 | `validators-live` | Name validation: local fast rejection + valid names round trip + addressing failure classification |
 | `recall` | Timed message recall (enables and restores `recallMessageEnable` itself) |
@@ -691,7 +709,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1062 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1078 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 
