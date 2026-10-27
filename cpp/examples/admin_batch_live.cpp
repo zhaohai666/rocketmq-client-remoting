@@ -191,10 +191,8 @@ int main(int argc, char** argv) {
         check("consumer group read-forbidden config (353) queries without changing anything", false, e.what());
     }
 
-    bool readableRestored = false;
     try {
         GroupForbidden fb = admin.updateAndGetGroupReadForbidden(brokerAddr, groupA, topicA, true);
-        readableRestored = fb.readable;
         check("consumer group read-forbidden config (353) restores readability", fb.readable,
               "readable=" + std::string(fb.readable ? "true" : "false"));
     } catch (const std::exception& e) {

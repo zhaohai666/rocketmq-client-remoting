@@ -98,7 +98,16 @@ type consumerBroker struct {
 	// ---- POP bookkeeping (see pop_test.go) ----
 	// The POP branch keeps its own capture slices so the pull-path fixtures
 	// stay untouched; popFixture is the canned POP_MESSAGE answer.
-	popHeaders      []*remoting.PopMessageRequestHeader
+	popHeaders []*remoting.PopMessageRequestHeader
+	// popExt keeps the raw extFields of every POP_MESSAGE exactly as they
+	// arrived, so a test can read a value off the wire instead of off the
+	// header struct the client decoded.
+	popExt []*common.StringMap
+	// popArrivals is the arrival time of every POP_MESSAGE, so a test can
+	// measure the gap the client put between two rounds.
+	popArrivals     []int64
+	popScript       []popFixture
+	popTail         *popFixture
 	acks            []*remoting.AckMessageRequestHeader
 	batchAcks       []*remoting.BatchAckMessageRequestBody
 	changeInvisible []*remoting.ChangeInvisibleTimeRequestHeader

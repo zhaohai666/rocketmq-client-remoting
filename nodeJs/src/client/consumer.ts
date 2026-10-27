@@ -1670,9 +1670,49 @@ export class DefaultMQPushConsumer {
         this.consumerGroup, key, batch.length);
       return;
     }
+    // The POP retry naming is normalised at the CONCURRENT delivery entry —
+    // pull batches included, where it matches nothing — and the orderly
+    // delivery path never runs it.
+    if (!this.orderly) this._resetPopRetryTopic(batch);
     this._resetRetryTopicAndNamespace(batch);
     if (this.orderly) await this._consumeOrderlyBatch(mq, batch, epoch);
     else await this._consumeConcurrentlyBatch(mq, batch, epoch);
+  }
+
+  // _resetPopRetryTopic rewrites a POP retry topic back to the business topic
+  // it retries, so the listener sees the topic it subscribed to.
+  //
+  // A retried POP row is hidden under %RETRY%<group>_<topic>, or — under the
+  // newer retry naming — under %RETRY%<group>+<topic>: the prefix and the
+  // separator are broker-side bookkeeping, so everything after the separator is
+  // the real topic. Exactly %RETRY%<group> carries no separator and is left to
+  // _resetRetryTopicAndNamespace to restore from the RETRY_TOPIC property, and
+  // an ordinary topic matches neither prefix, which is what makes this step a
+  // no-op for a pull batch.
+  //
+  // With a namespace set, the name can carry the local prefix on BOTH sides of
+  // the separator, so the prefix is stripped first, the name is normalised, and
+  // the prefix is stripped from the result. The group inside the retry topic is
+  // the plain one: start() may have wrapped the namespace into consumerGroup,
+  // so the prefix is built from the unwrapped name.
+  private _resetPopRetryTopic(msgs: MessageExt[]): void {
+    if (msgs.length === 0) return;
+    const group = this.namespace ? MixAll.withoutNamespace(this.consumerGroup, this.namespace)
+      : this.consumerGroup;
+    const v1Prefix = MixAll.RETRY_GROUP_TOPIC_PREFIX + group + '_';
+    const v2Prefix = MixAll.RETRY_GROUP_TOPIC_PREFIX + group + '+';
+    for (const msg of msgs) {
+      let topic = msg.getTopic();
+      if (this.namespace) topic = MixAll.withoutNamespace(topic, this.namespace);
+      let normal: string | null = null;
+      if (topic.startsWith(v2Prefix)) normal = topic.slice(v2Prefix.length);
+      else if (topic.startsWith(v1Prefix)) normal = topic.slice(v1Prefix.length);
+      // Nothing to rewrite: an empty name after the separator is not a topic,
+      // and a name that matched neither prefix keeps its original topic.
+      if (!normal) continue;
+      if (this.namespace) normal = MixAll.withoutNamespace(normal, this.namespace);
+      msg.setTopic(normal);
+    }
   }
 
   // _resetRetryTopicAndNamespace rewrites the %RETRY% topic back to the origin

@@ -65,7 +65,7 @@ use crate::client::producer::{auto_bridged_dispatcher, SinkAdapter, TraceDispatc
 use crate::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, ConsumeOrderlyContext,
     ConsumeOrderlyStatus, ConsumeReturnType, MessageListenerConcurrently, MessageListenerOrderly,
-    PopResult, PopStatus, PullStatus,
+    PopStatus, PullStatus,
 };
 use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
@@ -2750,22 +2750,16 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             let mut state = lock(&inner.state);
             update_pull_from_which_node(&mut state, &mq, result.suggest_which_broker_id);
         }
-        if let Some(stats) = lock(&inner.stats).clone() {
-            stats.inc_pull_rt(
-                &cfg.consumer_group,
-                &mq.topic,
-                current_time_millis() - began,
-            );
-            if result.status == PullStatus::Found && !result.msg_found_list.is_empty() {
-                stats.inc_pull_tps(
-                    &cfg.consumer_group,
-                    &mq.topic,
-                    i64::try_from(result.msg_found_list.len()).unwrap_or(i64::MAX),
-                );
-            }
-        }
+        // Consume statistics: only a FOUND round records the pull round trip, and it records it even
+        // when no row came back. Idle rounds contribute nothing, so PULL_RT stays the latency of the
+        // rounds that carried work instead of an average diluted by every suspend-length poll that
+        // returned nothing. The round trip is read here, before the pre-delivery filter runs, so a
+        // slow user hook never lands inside the pull's own latency; the throughput count is fed from
+        // the list that survives that filter.
+        let pull_found = result.status == PullStatus::Found;
+        let pull_rt = current_time_millis() - began;
         let mut msgs = result.msg_found_list;
-        if result.status == PullStatus::Found && !msgs.is_empty() {
+        if pull_found && !msgs.is_empty() {
             msgs = filter_messages_for_delivery(
                 &cfg.consumer_group,
                 &inner.filter_hooks,
@@ -2773,6 +2767,16 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 Some(&sub),
                 msgs,
                 cfg.unit_mode,
+            );
+        }
+        if let Some(stats) = lock(&inner.stats).clone() {
+            record_pull_round_stats(
+                &stats,
+                &cfg.consumer_group,
+                &mq.topic,
+                pull_found,
+                pull_rt,
+                msgs.len(),
             );
         }
         let mut illegal = false;
@@ -3664,19 +3668,16 @@ fn record_pop_pull_stats(
     stats: &ConsumerStatsManager,
     group: &str,
     topic: &str,
-    result: &PopResult,
+    status: PopStatus,
+    delivered: usize,
     began: i64,
 ) {
-    if result.status != PopStatus::Found {
+    if status != PopStatus::Found {
         return;
     }
     stats.inc_pull_rt(group, topic, current_time_millis() - began);
-    if !result.msg_found_list.is_empty() {
-        stats.inc_pull_tps(
-            group,
-            topic,
-            i64::try_from(result.msg_found_list.len()).unwrap_or(i64::MAX),
-        );
+    if delivered > 0 {
+        stats.inc_pull_tps(group, topic, i64::try_from(delivered).unwrap_or(i64::MAX));
     }
 }
 
@@ -3686,6 +3687,27 @@ async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let key = mq_key(&mq);
     run_queue_pop_loop(inner.clone(), mq, token).await;
     mark_pull_loop_exited(&inner, &key, token);
+}
+
+/// Pull-path twin of [`record_pop_pull_stats`], split out so the FOUND gate can be tested instead of
+/// buried in the loop. Both legs are easy to lose silently: recording the round trip on every status
+/// buries the pull's own latency under idle rounds, and feeding the raw response to PULL_TPS
+/// overstates throughput by exactly the rows this client dropped before delivery.
+fn record_pull_round_stats(
+    stats: &ConsumerStatsManager,
+    group: &str,
+    topic: &str,
+    found: bool,
+    rt: i64,
+    delivered: usize,
+) {
+    if !found {
+        return;
+    }
+    stats.inc_pull_rt(group, topic, rt);
+    if delivered > 0 {
+        stats.inc_pull_tps(group, topic, i64::try_from(delivered).unwrap_or(i64::MAX));
+    }
 }
 
 async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
@@ -3789,50 +3811,134 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             return;
         }
         pq.touch(current_time_millis());
-        // Pull statistics: the same status table as the pull path, POP mode only; placed after the queue-revoked early exit so
-        // the discarded batch is not counted (those messages were never delivered).
+        // The pre-delivery pipeline runs first, so what it removes is never booked, never
+        // counted as delivered and never reaches the listener; the rows it removes are acked
+        // there and then.
+        let kept = if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
+            pq.inc_found_msg(i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX));
+            prepare_pop_batch_for_delivery(
+                &inner,
+                &cfg,
+                &mq,
+                &sub,
+                &result.msg_found_list,
+                &pq,
+            )
+        } else {
+            Vec::new()
+        };
+        // Pull statistics: the same status table as the pull path, POP mode only; placed after
+        // the queue-revoked early exit and after the pre-delivery pipeline, so a discarded batch
+        // is not counted at all and a dropped row counts as nothing but the round it cost.
         if let Some(stats) = lock(&inner.stats).clone() {
             let group = read_cfg(&inner).consumer_group;
-            record_pop_pull_stats(&stats, &group, &mq.topic, &result, began);
-        }
-        if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
-            pq.inc_found_msg(i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX));
-            let kept = filter_messages_for_delivery(
-                &cfg.consumer_group,
-                &inner.filter_hooks,
-                &mq,
-                Some(&sub),
-                result.msg_found_list.clone(),
-                cfg.unit_mode,
+            record_pop_pull_stats(
+                &stats,
+                &group,
+                &mq.topic,
+                result.status,
+                kept.len(),
+                began,
             );
-            let mut dropped_cnt = 0usize;
-            if kept.len() != result.msg_found_list.len() {
-                let kept_ids: BTreeSet<(String, i64)> = kept
-                    .iter()
-                    .map(|m| (m.msg_id.clone().unwrap_or_default(), m.queue_offset))
-                    .collect();
-                for msg in &result.msg_found_list {
-                    let id = (msg.msg_id.clone().unwrap_or_default(), msg.queue_offset);
-                    if !kept_ids.contains(&id) {
-                        ack_pop_msg(&inner, msg);
-                        pq.ack();
-                        dropped_cnt += 1;
-                    }
-                }
-                rmq_info!(
-                    "pop filter dropped {dropped_cnt} of {} messages (acked)",
-                    result.msg_found_list.len()
-                );
+        }
+        let kept_len = kept.len();
+        if !kept.is_empty() {
+            submit_pop_consume_request(&inner, kept, pq.clone(), mq.clone()).await;
+        }
+        let delay = pop_next_round_delay_millis(result.status, kept_len, cfg.pull_interval);
+        if delay > 0 {
+            if wait_or_stop(&mut rx, delay).await {
+                return;
             }
-            if !kept.is_empty() {
-                submit_pop_consume_request(&inner, kept, pq.clone(), mq.clone()).await;
-            }
-        } else if current_time_millis() - began < 200 {
-            // Empty result: if the broker did not suspend for poll_time (returning immediately) this would become a hot loop, so fall back to a backoff
+        } else if kept_len == 0 && current_time_millis() - began < 200 {
+            // The table said no wait, and the round handed over nothing in under 200 ms: the
+            // broker did not hold this poll open, so straight back to the top would spin hot
+            // against it. A round that really suspended never takes this nap.
             if wait_or_stop(&mut rx, 200).await {
                 return;
             }
         }
+    }
+}
+
+/// What a FOUND answer is reduced to before anything is booked or handed over: the same
+/// client-side tag pass and hook list a pulled batch gets, then the retry budget as an **early**
+/// guard -- a row strictly past the effective budget is dropped here instead of reaching the
+/// listener, while a row that has exactly used up its budget still goes through and stays under
+/// the listener-side handling.
+///
+/// Every row either step removed is acked immediately, with the ack the success path sends. An
+/// un-acked POP row simply comes back when its invisibility window closes, so "filtered out but
+/// not acked" would replay the same rows round after round. The rows acked here never entered the
+/// queue's answer debt -- the caller fed it with the whole popped count, so one credit back per
+/// row confirmed is what settles that bookkeeping.
+fn prepare_pop_batch_for_delivery(
+    inner: &Arc<Inner>,
+    cfg: &ConsumerConfig,
+    mq: &MessageQueue,
+    sub: &SubscriptionData,
+    popped: &[MessageExt],
+    pq: &Arc<PopProcessQueue>,
+) -> Vec<MessageExt> {
+    let filtered = filter_messages_for_delivery(
+        &cfg.consumer_group,
+        &inner.filter_hooks,
+        mq,
+        Some(sub),
+        popped.to_vec(),
+        cfg.unit_mode,
+    );
+    let budget = pop_max_reconsume_times(cfg);
+    let kept: Vec<MessageExt> = filtered
+        .into_iter()
+        .filter(|msg| msg.reconsume_times <= budget)
+        .collect();
+    if kept.len() == popped.len() {
+        return kept;
+    }
+    let kept_ids: BTreeSet<(String, i64)> = kept
+        .iter()
+        .map(|m| (m.msg_id.clone().unwrap_or_default(), m.queue_offset))
+        .collect();
+    let mut dropped_cnt = 0usize;
+    for msg in popped {
+        let id = (msg.msg_id.clone().unwrap_or_default(), msg.queue_offset);
+        if !kept_ids.contains(&id) {
+            ack_pop_msg(inner, msg);
+            pq.ack();
+            dropped_cnt += 1;
+        }
+    }
+    rmq_info!(
+        "pop filter dropped {dropped_cnt} of {} messages (acked)",
+        popped.len()
+    );
+    kept
+}
+
+/// The retry budget a POP round measures its rows against: the consumer's own number, or the
+/// default 16 while the knob is left unset.
+fn pop_max_reconsume_times(cfg: &ConsumerConfig) -> i32 {
+    if cfg.max_reconsume_times == -1 {
+        16
+    } else {
+        cfg.max_reconsume_times
+    }
+}
+
+/// The wait before the next pop on the same queue, decided by the answer the broker gave:
+///
+/// - FOUND with rows handed over: the configured pull cadence (`0` = straight back to the top);
+/// - FOUND with nothing left, and NO_NEW_MSG / POLLING_NOT_FOUND: nothing to wait for -- the
+///   broker already held this poll open, so the next round starts immediately;
+/// - POLLING_FULL: the queue's own popped-but-unacked budget is full, so this waits out the
+///   error back-off rather than pullInterval or an immediate re-pop.
+fn pop_next_round_delay_millis(status: PopStatus, kept_len: usize, pull_interval: i64) -> u64 {
+    match status {
+        PopStatus::Found if kept_len > 0 => pull_interval.max(0) as u64,
+        PopStatus::Found => 0,
+        PopStatus::NoNewMsg | PopStatus::PollingNotFound => 0,
+        PopStatus::PollingFull => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
     }
 }
 
@@ -3950,6 +4056,10 @@ async fn consume_pop_batch(
         return;
     }
     let mut msgs = msgs;
+    // A POP retry row reaches this entry still wearing `%RETRY%<group>_+<topic>`; the
+    // listener is handed the business topic it subscribed to instead. This batch only ever
+    // comes from the concurrent path, so the cut is unconditional here.
+    reset_pop_retry_topic(&inner, &mut msgs);
     reset_retry_topic_and_namespace(&inner, &mut msgs);
     let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
     context.ack_index = i32::try_from(msgs.len()).unwrap_or(i32::MAX) - 1;
@@ -4236,6 +4346,42 @@ fn reset_retry_topic_and_namespace(inner: &Inner, msgs: &mut [MessageExt]) {
     }
 }
 
+/// Cut the POP retry naming -- `%RETRY%<group>_<topic>` or `%RETRY%<group>+<topic>` -- off the
+/// topic a row is about to be delivered under, so the listener sees the topic it subscribed to.
+///
+/// The property-based restore cannot do this job: a POP retry row is stored under a name built
+/// from the business topic, and the retry-flag half of its ack checkpoint is what puts it back, so
+/// the name itself has to be read here. Getting it wrong is not cosmetic -- the ack target is
+/// rebuilt from the delivery name plus that flag, so a name left wrapped gets wrapped a second
+/// time when the row is confirmed.
+///
+/// Only this consumer's own group is recognised, in both spellings it can reach the broker in
+/// (start() may have folded the namespace into the group), and an empty tail is not a topic name.
+/// Runs at the concurrent delivery entries only: an orderly consumer keeps consuming the retry
+/// queue under the name it locked it in, because that name keys its offset bookkeeping.
+fn reset_pop_retry_topic(inner: &Inner, msgs: &mut [MessageExt]) {
+    if msgs.is_empty() {
+        return;
+    }
+    let cfg = read_cfg(inner);
+    let mut groups = vec![cfg.consumer_group.clone()];
+    if !cfg.namespace.is_empty() {
+        let plain = NamespaceUtil::without_namespace(&cfg.consumer_group, &cfg.namespace);
+        if plain != cfg.consumer_group {
+            groups.push(plain);
+        }
+    }
+    for msg in msgs.iter_mut() {
+        for group in &groups {
+            let normal = extra_info::parse_pop_normal_topic(&msg.topic, group);
+            if normal != msg.topic {
+                msg.topic = normal;
+                break;
+            }
+        }
+    }
+}
+
 fn build_consume_hook_context(
     inner: &Inner,
     msgs: &[MessageExt],
@@ -4437,10 +4583,17 @@ async fn consume_batch(
     let cfg = read_cfg(inner);
     let broadcast = cfg.message_model == MessageModel::BROADCASTING;
     let mut batch = batch;
-    reset_retry_topic_and_namespace(inner, &mut batch);
     let orderly = lock(&inner.listener)
         .as_ref()
         .is_some_and(MessageListener::is_orderly);
+    // The POP retry naming is cut at the CONCURRENT delivery entry, ahead of the
+    // property-based restore below; a pulled row simply matches nothing there. An
+    // orderly consumer keeps the name it locked the queue under, because a retry
+    // queue's offset bookkeeping is keyed on it.
+    if !orderly {
+        reset_pop_retry_topic(inner, &mut batch);
+    }
+    reset_retry_topic_and_namespace(inner, &mut batch);
 
     if orderly {
         let mut ocontext = ConsumeOrderlyContext::new(Some(mq.clone()));
@@ -8251,49 +8404,189 @@ mod tests {
         };
 
         // (1) FOUND + 2 messages: RT recorded once, TPS recorded once per message
-        record_pop_pull_stats(
-            &stats,
-            group,
-            topic,
-            &PopResult {
-                status: PopStatus::Found,
-                msg_found_list: vec![ext(topic, None), ext(topic, None)],
-                ..Default::default()
-            },
-            began,
-        );
+        record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 2, began);
         assert_eq!(rt().times(), 1);
         assert!(rt().value() >= 30, "RT should be this pop round's elapsed time: {}", rt().value());
         assert_eq!(tps().times(), 1);
         assert_eq!(tps().value(), 2);
 
-        record_pop_pull_stats(
-            &stats,
-            group,
-            topic,
-            &PopResult {
-                status: PopStatus::Found,
-                ..Default::default()
-            },
-            began,
-        );
+        record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 0, began);
         assert_eq!(rt().times(), 2, "an empty-handed FOUND round still records RT");
         assert_eq!(tps().times(), 1, "an empty list must not record TPS");
 
         // (3) POLLING_NOT_FOUND: neither cell records. Empty POP polls are the norm; counting the suspend
         //     duration into the average pull time would render the dashboard's pullRT meaningless.
-        record_pop_pull_stats(
-            &stats,
-            group,
-            topic,
-            &PopResult {
-                status: PopStatus::PollingNotFound,
-                ..Default::default()
-            },
-            began,
-        );
+        record_pop_pull_stats(&stats, group, topic, PopStatus::PollingNotFound, 0, began);
         assert_eq!(rt().times(), 2);
         assert_eq!(tps().times(), 1);
+
+        // (4) The count the stats take is the one left AFTER the pre-delivery pipeline, not the
+        //     number of rows the broker popped: three rows popped, one of them dropped before the
+        //     listener, books two deliveries.
+        record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 1, began);
+        assert_eq!(rt().times(), 3, "a round that delivered something records RT");
+        assert_eq!(tps().times(), 2);
+        assert_eq!(tps().value(), 3, "TPS counts only what was handed over");
+    }
+
+    /// The pull path books the same two cells under the same two gates: the round trip belongs to
+    /// FOUND rounds alone, and throughput counts the rows that survive the pre-delivery filter, not
+    /// the rows the broker sent.
+    #[test]
+    fn pull_round_stats_follow_the_found_gate_and_the_post_filter_count() {
+        let group = "GID_PullStats";
+        let topic = "PullStatsTopic";
+        let key = ConsumerStatsManager::key(topic, group);
+        let stats = ConsumerStatsManager::new();
+        let began = current_time_millis() - 30;
+
+        let rt = || {
+            stats
+                .topic_and_group_pull_rt()
+                .find(&key)
+                .unwrap_or_else(|| panic!("PULL_RT should have been recorded under {key}"))
+        };
+        let tps = || {
+            stats
+                .topic_and_group_pull_tps()
+                .find(&key)
+                .unwrap_or_else(|| panic!("PULL_TPS should have been recorded under {key}"))
+        };
+
+        // (1) A round that returned nothing books neither cell. Idle rounds are the norm, and an
+        //     average pull time diluted by them is the number the dashboard stops being able to use.
+        record_pull_round_stats(&stats, group, topic, false, 4_000, 0);
+        assert!(
+            stats.topic_and_group_pull_rt().find(&key).is_none(),
+            "a non-FOUND round must not record PULL_RT"
+        );
+        assert!(
+            stats.topic_and_group_pull_tps().find(&key).is_none(),
+            "a non-FOUND round must not record PULL_TPS"
+        );
+
+        // (2) FOUND with rows: the round trip of this round plus one delivery count per row.
+        record_pull_round_stats(&stats, group, topic, true, current_time_millis() - began, 2);
+        assert_eq!(rt().times(), 1);
+        assert!(
+            rt().value() >= 30,
+            "RT is this round's elapsed time, not a placeholder: {}",
+            rt().value()
+        );
+        assert_eq!(tps().times(), 1);
+        assert_eq!(tps().value(), 2);
+
+        // (3) FOUND but empty-handed: the round trip still belongs in the average, the nothing does
+        //     not belong in throughput.
+        record_pull_round_stats(&stats, group, topic, true, current_time_millis() - began, 0);
+        assert_eq!(rt().times(), 2, "an empty-handed FOUND round still records RT");
+        assert_eq!(tps().times(), 1, "an empty list must not record TPS");
+
+        // (4) The count the stats take is the one left after the pre-delivery pipeline: five rows
+        //     pulled, two dropped before the listener, so three deliveries.
+        record_pull_round_stats(&stats, group, topic, true, current_time_millis() - began, 3);
+        assert_eq!(rt().times(), 3);
+        assert_eq!(tps().times(), 2);
+        assert_eq!(tps().value(), 5, "PULL_TPS sums the delivered rows: 2 + 3");
+    }
+
+    /// The wait the next pop on the same queue waits out is decided by the answer, and only by
+    /// the answer: a FOUND round honors the configured cadence, an empty or nothing-new answer
+    /// re-pops at once, and a queue the broker says is full waits the error back-off.
+    #[test]
+    fn pop_round_pacing_follows_the_answer() {
+        assert_eq!(pop_next_round_delay_millis(PopStatus::Found, 2, 500), 500);
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::Found, 2, 0),
+            0,
+            "no configured cadence means straight back to the top"
+        );
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::Found, 0, 500),
+            0,
+            "a round that handed over nothing does not wait out the cadence"
+        );
+        assert_eq!(pop_next_round_delay_millis(PopStatus::NoNewMsg, 0, 500), 0);
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::PollingNotFound, 0, 500),
+            0,
+            "the broker already held this poll open"
+        );
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::PollingFull, 0, 500),
+            PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
+            "a full queue is not ready: the wait is the broker-driven one, not pullInterval"
+        );
+    }
+
+    /// The budget the early guard measures against is the consumer's own number, or 16 while the
+    /// knob is left unset -- and it is a strictly-greater cut, so the row that has exactly used up
+    /// its budget is still delivered.
+    #[test]
+    fn pop_budget_defaults_to_sixteen_and_is_strict() {
+        let cfg_with = |max_reconsume_times: i32| ConsumerConfig {
+            max_reconsume_times,
+            ..ConsumerConfig::default()
+        };
+        assert_eq!(pop_max_reconsume_times(&cfg_with(-1)), 16);
+        assert_eq!(pop_max_reconsume_times(&cfg_with(3)), 3);
+        assert_eq!(pop_max_reconsume_times(&cfg_with(0)), 0);
+    }
+
+    /// The budget guard runs BEFORE delivery and is a strictly-greater cut: the row that has
+    /// exactly used up its budget still reaches the listener, the row past it is dropped. The
+    /// dropped rows are acked there and then, and each one gives back the answer credit the
+    /// round took for it, so the queue's debt ends up holding only what really waits.
+    #[tokio::test]
+    async fn rows_past_the_budget_are_dropped_before_the_listener() {
+        let consumer = DefaultMQPushConsumer::new("G").unwrap();
+        consumer.update_config(|c| {
+            c.pop_mode = true;
+            c.max_reconsume_times = 3;
+        });
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        consumer.set_message_listener_concurrently(Arc::new(TopicRecordingListener(seen.clone())));
+        let inner = consumer.inner.clone();
+        let mq = queue("T", "broker-a", 0);
+        let sub = FilterAPI::build_subscription_data("T", Some("*")).unwrap();
+        let pq = PopProcessQueue::new();
+        pq.inc_found_msg(3);
+        let popped = vec![
+            pop_row("T", 100, 3),
+            pop_row("T", 101, 4),
+            pop_row("T", 102, 5),
+        ];
+        let kept = prepare_pop_batch_for_delivery(
+            &inner,
+            &read_cfg(&inner),
+            &mq,
+            &sub,
+            &popped,
+            &pq,
+        );
+        assert_eq!(kept.len(), 1, "only the row at the budget is deliverable");
+        assert_eq!(kept[0].queue_offset, 100);
+        assert_eq!(
+            pq.wait_ack_count(),
+            1,
+            "the two dropped rows gave their answer credits back"
+        );
+
+        // Control: the same three rows under a budget they all clear are handed over whole, and
+        // nothing is given back.
+        consumer.update_config(|c| c.max_reconsume_times = 9);
+        let pq2 = PopProcessQueue::new();
+        pq2.inc_found_msg(3);
+        let kept_all = prepare_pop_batch_for_delivery(
+            &inner,
+            &read_cfg(&inner),
+            &mq,
+            &sub,
+            &popped,
+            &pq2,
+        );
+        assert_eq!(kept_all.len(), 3, "a budget every row clears drops nothing");
+        assert_eq!(pq2.wait_ack_count(), 3);
     }
 
     /// Whenever popTime/invisibleTime is unavailable, **always treat it as a timeout**,
@@ -8620,6 +8913,175 @@ mod tests {
 
         // An empty batch does not error
         reset_retry_topic_and_namespace(&consumer.inner, &mut []);
+    }
+
+    /// A retried POP row is stored under `%RETRY%<group>_<topic>` or, under the newer retry
+    /// naming, `%RETRY%<group>+<topic>`. Both spellings of this consumer's own group are cut;
+    /// everything else is left exactly as it arrived.
+    #[test]
+    fn pop_retry_topic_is_cut_at_both_wire_spellings() {
+        let consumer = DefaultMQPushConsumer::new("MyGroup").unwrap();
+        let cases = [
+            ("%RETRY%MyGroup_OrderTopic", "OrderTopic"),
+            ("%RETRY%MyGroup+OrderTopic", "OrderTopic"),
+            // The '+' right after the group is the separator, so a business topic carrying an
+            // underscore is read whole instead of being cut at its first '_'.
+            ("%RETRY%MyGroup+A_B", "A_B"),
+            // Nothing after the separator is not a topic name, and a name built on another
+            // group is not this consumer's to rewrite.
+            ("%RETRY%MyGroup_", "%RETRY%MyGroup_"),
+            ("%RETRY%MyGroup+", "%RETRY%MyGroup+"),
+            ("%RETRY%MyGroup", "%RETRY%MyGroup"),
+            ("%RETRY%Other+OrderTopic", "%RETRY%Other+OrderTopic"),
+            ("OrderTopic", "OrderTopic"),
+        ];
+        for (arrived, delivered) in cases {
+            let mut msgs = vec![ext(arrived, None)];
+            reset_pop_retry_topic(&consumer.inner, &mut msgs);
+            assert_eq!(msgs[0].topic, delivered, "a POP row under {arrived}");
+        }
+    }
+
+    /// With a namespace, the group this consumer registers under is the wrapped one, and the
+    /// wire name can carry the wrap on both sides of the separator. Both spellings are
+    /// recognised, and the wrap left on the business topic is taken off by the restore that
+    /// follows -- the cut itself only ever removes the retry naming.
+    #[test]
+    fn pop_retry_topic_cut_names_both_spellings_of_this_group() {
+        let consumer = DefaultMQPushConsumer::new("Ns%MyGroup").unwrap();
+        consumer.update_config(|c| c.namespace = "Ns".to_string());
+        let cases = [
+            ("%RETRY%Ns%MyGroup+Ns%OrderTopic", "Ns%OrderTopic"),
+            ("%RETRY%Ns%MyGroup_Ns%OrderTopic", "Ns%OrderTopic"),
+            ("%RETRY%MyGroup+OrderTopic", "OrderTopic"),
+            ("%RETRY%MyGroup_OrderTopic", "OrderTopic"),
+        ];
+        for (arrived, cut) in cases {
+            let mut msgs = vec![ext(arrived, None)];
+            reset_pop_retry_topic(&consumer.inner, &mut msgs);
+            assert_eq!(msgs[0].topic, cut, "a POP row under {arrived}");
+            // The delivery name the listener finally gets is the plain business topic.
+            reset_retry_topic_and_namespace(&consumer.inner, &mut msgs);
+            assert_eq!(msgs[0].topic, "OrderTopic", "and the wrap comes off after the cut");
+        }
+    }
+
+    /// Where the cut is allowed to happen: both concurrent entries carry it and the orderly
+    /// entry does not, because an orderly consumer keeps consuming the retry queue under the
+    /// name that queue has. The legs differ only in the listener, so a cut that moved up into
+    /// the shared restore would be caught here.
+    #[tokio::test]
+    async fn pop_retry_topic_is_cut_at_the_concurrent_entries_only() {
+        let retry_topic = "%RETRY%MyGroup+OrderTopic";
+
+        // Leg 1: the POP batch entry.
+        let popper = DefaultMQPushConsumer::new("MyGroup").unwrap();
+        popper.update_config(|c| c.pop_mode = true);
+        let pop_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        popper.set_message_listener_concurrently(Arc::new(TopicRecordingListener(pop_seen.clone())));
+        let pq = PopProcessQueue::new();
+        pq.inc_found_msg(1);
+        submit_pop_consume_request(
+            &popper.inner,
+            vec![pop_row(retry_topic, 0, 0)],
+            pq,
+            queue(retry_topic, "broker-a", 0),
+        )
+        .await;
+        assert_eq!(
+            pop_seen.lock().unwrap().clone(),
+            vec!["OrderTopic".to_string()],
+            "a POP batch reaches the listener under the business topic"
+        );
+
+        // Leg 2: the pulled batch entry, same name, same cut.
+        let puller = DefaultMQPushConsumer::new("MyGroup").unwrap();
+        let pull_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        puller.set_message_listener_concurrently(Arc::new(TopicRecordingListener(pull_seen.clone())));
+        let mq = queue(retry_topic, "broker-a", 0);
+        let key = mq_key(&mq);
+        consume_batch(&puller.inner, &key, &mq, vec![ext(retry_topic, None)], None)
+            .await
+            .expect("consume_batch must not error");
+        assert_eq!(
+            pull_seen.lock().unwrap().clone(),
+            vec!["OrderTopic".to_string()],
+            "a pulled batch is cut the same way at the concurrent entry"
+        );
+
+        // Leg 3: the orderly entry keeps the name the queue is locked under.
+        let orderly = DefaultMQPushConsumer::new("MyGroup").unwrap();
+        let orderly_seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        orderly.set_message_listener_orderly(Arc::new(TopicRecordingOrderlyListener(
+            orderly_seen.clone(),
+        )));
+        let mq = queue(retry_topic, "broker-a", 0);
+        let key = mq_key(&mq);
+        consume_batch(&orderly.inner, &key, &mq, vec![ext(retry_topic, None)], None)
+            .await
+            .expect("consume_batch must not error");
+        assert_eq!(
+            orderly_seen.lock().unwrap().clone(),
+            vec![retry_topic.to_string()],
+            "the orderly entry is handed exactly the name its queue was locked under"
+        );
+    }
+
+    /// Records the topic of every row the listener was handed.
+    struct TopicRecordingListener(Arc<Mutex<Vec<String>>>);
+
+    impl MessageListenerConcurrently for TopicRecordingListener {
+        fn consume_message(
+            &self,
+            msgs: &[MessageExt],
+            _context: &mut ConsumeConcurrentlyContext,
+        ) -> ConsumeConcurrentlyStatus {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(msgs.iter().map(|m| m.topic.clone()));
+            ConsumeConcurrentlyStatus::ConsumeSuccess
+        }
+    }
+
+    struct TopicRecordingOrderlyListener(Arc<Mutex<Vec<String>>>);
+
+    impl MessageListenerOrderly for TopicRecordingOrderlyListener {
+        fn consume_message(
+            &self,
+            msgs: &[MessageExt],
+            _context: &mut ConsumeOrderlyContext,
+        ) -> ConsumeOrderlyStatus {
+            self.0
+                .lock()
+                .unwrap()
+                .extend(msgs.iter().map(|m| m.topic.clone()));
+            ConsumeOrderlyStatus::Success
+        }
+    }
+
+    /// A POP row under a given topic: its own offset as both CK offsets, a live popTime so the
+    /// batch is not judged timed out, and the reconsume count the budget is judged on.
+    fn pop_row(topic: &str, queue_offset: i64, reconsume_times: i32) -> MessageExt {
+        let mut m = ext(topic, None);
+        m.queue_id = 0;
+        m.queue_offset = queue_offset;
+        m.broker_name = Some("broker-a".to_string());
+        m.reconsume_times = reconsume_times;
+        m.put_property(
+            PROPERTY_POP_CK,
+            &extra_info::build_extra_info(
+                queue_offset,
+                current_time_millis(),
+                60_000,
+                0,
+                topic,
+                "broker-a",
+                0,
+                Some(queue_offset),
+            ),
+        );
+        m
     }
 
     // ---------------- local (BROADCASTING) offsets ----------------

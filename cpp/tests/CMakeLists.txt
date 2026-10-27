@@ -134,6 +134,21 @@ add_executable(rmq_test_pop_orderly test_pop_orderly.cpp)
 target_link_libraries(rmq_test_pop_orderly PRIVATE rocketmq::remoting)
 add_test(NAME pop_orderly COMMAND rmq_test_pop_orderly)
 
+# POP **pre-delivery pipeline** (tag re-check -> filter hook -> reconsume-budget drop, every dropped row
+# acked against the original popped list), the retry-topic prefix strip at the concurrent dispatch
+# entries, and the pull statistics / next-round pacing keyed on the rows that survive filtering.
+add_executable(rmq_test_pop_predelivery test_pop_predelivery.cpp)
+target_link_libraries(rmq_test_pop_predelivery PRIVATE rocketmq::remoting)
+add_test(NAME pop_predelivery COMMAND rmq_test_pop_predelivery)
+
+# PULL-path consume statistics: the real queuePullLoop rounds driven against the offline fake
+# endpoint, pinning PULL_RT to FOUND rounds only (including a FOUND whose rows were all filtered or
+# that carried no rows) and PULL_TPS to the post-filter deliverable count, read off the instance's
+# own ConsumerStatsManager cells.
+add_executable(rmq_test_pull_round_stats test_pull_round_stats.cpp)
+target_link_libraries(rmq_test_pull_round_stats PRIVATE rocketmq::remoting)
+add_test(NAME pull_round_stats COMMAND rmq_test_pull_round_stats)
+
 # BATCH_ACK_MESSAGE grouping: a fake endpoint records the decoded request frame off the socket, so the
 # merge rule (one entry per distinct merge key, the retry dimension splitting it, offset bits folded
 # relative to startOffset) and the no-custom-header JSON body are pinned on captured wire state.

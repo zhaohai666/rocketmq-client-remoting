@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **37** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-24 实测 **ALL GREEN**，共 **1222** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **43** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-27 实测 **ALL GREEN**，共 **1399** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -54,10 +54,15 @@ node --experimental-strip-types selfcheck.ts
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
 | `test/offset_persist_timer_smoke.ts` | 21 通过 / 0 失败 |
 | `test/pop_batch_ack_smoke.ts`（200151 请求形状） | 9 通过 / 0 失败 |
+| `test/pop_init_mode_smoke.ts`（起始策略到 POP initMode 的翻译） | 14 项检查通过 |
+| `test/pop_pre_deliver_filter_smoke.ts`（POP 轮次的交付前过滤；第 8 节把同一问题问给 pull 路径） | 27 项检查通过 |
+| `test/pop_retry_topic_reset_smoke.ts`（POP 重试主题名还原） | 17 项检查通过 |
+| `test/pop_round_reschedule_smoke.ts`（POP 轮次的重排、退避与记账） | 31 项检查通过 |
 | `test/pop_smoke.ts` | 11 组检查通过 |
 | `test/producer_smoke.ts` | 4 组检查通过 |
 | `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
 | `test/pull_schedule_smoke.ts` | 43 通过 / 0 失败 |
+| `test/pull_stats_contract_smoke.ts`（pull 路径 PULL_RT/PULL_TPS 记账：只有 FOUND 轮计入延迟——NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL / 报错 / 超时轮什么都不记；吞吐只按交付前过滤（二次 tag + FilterMessageHook）改写后的行数计，全部被滤掉的 FOUND 轮记 RT 而 TPS 为零） | 28 项检查通过 |
 | `test/rebalance_change_smoke.ts`（分配集合改变的轮次按序补齐：只给变动的 topic 重打订阅版本 → 再把 topic 预算除以本轮自有队列数 → 立刻心跳 → 只向变动的 topic 触发队列监听；集合未变与自愈重建轮什么都不欠） | 32 项检查通过 |
 | `test/smoke.ts`（协议帧/传输/ACL 签名） | 6 组检查通过 |
 | `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |

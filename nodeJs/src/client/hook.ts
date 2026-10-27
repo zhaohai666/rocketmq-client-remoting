@@ -110,6 +110,10 @@ export class FilterMessageContext {
   consumerGroup: string | null;
   topic: string | null;
   msgList: any[] | null;
+  // The queue the rows came from and the channel they arrived on, filled by
+  // every delivery path before the hooks run.
+  mq: MessageQueue | null;
+  accessChannel: string | null;
   unitMode: boolean;
   propertyKeys: string[] | null;
 
@@ -118,6 +122,8 @@ export class FilterMessageContext {
     this.consumerGroup = consumerGroup;
     this.topic = topic;
     this.msgList = msgList;
+    this.mq = null;
+    this.accessChannel = null;
     this.unitMode = false;
     this.propertyKeys = null;
   }

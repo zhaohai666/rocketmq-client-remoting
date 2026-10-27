@@ -78,6 +78,35 @@ pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
     }
 }
 
+/// The business topic a POP retry name hides, or the name itself when it hides none.
+///
+/// A retried POP row is stored under `%RETRY%<group>_<topic>`, or under the newer
+/// `%RETRY%<group>+<topic>`: everything after the separator is the topic the subscriber
+/// actually named. `+` is tried first because it is the unambiguous one -- a business topic
+/// may itself contain `_`, and cutting at the first `_` would hand back half a name.
+///
+/// Two names are deliberately left alone: `%RETRY%<group>` with nothing after the separator,
+/// since an empty tail is not a topic name, and any name built on a different group, since
+/// this consumer has no business rewriting another group's retry queue.
+pub fn parse_pop_normal_topic(topic: &str, cid: &str) -> String {
+    if topic.is_empty()
+        || cid.is_empty()
+        || !topic.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX)
+    {
+        return topic.to_string();
+    }
+    let head = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, cid);
+    for separator in [POP_RETRY_SEPARATOR_V2, POP_RETRY_SEPARATOR_V1] {
+        let prefix = format!("{head}{separator}");
+        if let Some(rest) = topic.strip_prefix(prefix.as_str()) {
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    topic.to_string()
+}
+
 /// Order matters: test V2 (contains `+`) first, then the `%RETRY%` prefix (V1); otherwise an ordinary topic
 /// would always be `"0"`.
 pub fn retry_of_topic(topic: &str) -> &'static str {
@@ -465,6 +494,30 @@ mod tests {
         // the segment-count difference between 7 and 8 is exactly the presence of msgQueueOffset
         assert_eq!(split(CK_NORMAL).unwrap().len(), 7);
         assert_eq!(split(CK_WITH_OFFSET).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn parse_pop_normal_topic_cuts_both_wire_spellings() {
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID_Topic", "GID"), "Topic");
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID+Topic", "GID"), "Topic");
+        // The '+' right after the group is the separator, so a topic carrying an
+        // underscore is read whole instead of being cut at its first '_'.
+        assert_eq!(
+            parse_pop_normal_topic("%RETRY%GID+A_B", "GID"),
+            "A_B"
+        );
+        // Nothing after the separator is not a topic name, so the retry name stays.
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID_", "GID"), "%RETRY%GID_");
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID+", "GID"), "%RETRY%GID+");
+        // The bare group retry topic and another group's retry topic are both left alone.
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID", "GID"), "%RETRY%GID");
+        assert_eq!(
+            parse_pop_normal_topic("%RETRY%Other+Topic", "GID"),
+            "%RETRY%Other+Topic"
+        );
+        assert_eq!(parse_pop_normal_topic("Topic", "GID"), "Topic");
+        assert_eq!(parse_pop_normal_topic("", "GID"), "");
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID_Topic", ""), "%RETRY%GID_Topic");
     }
 
     #[test]

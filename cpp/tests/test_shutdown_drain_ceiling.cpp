@@ -50,7 +50,9 @@ void busy(std::atomic<int64_t>& ran) {
     for (int i = 0; i < 200000; i++) {
         sink += i;
     }
-    ran.fetch_add(1);
+    // The accumulator is read back here so the loop above stays live; a batch only counts as run once
+    // its work has actually moved the total.
+    ran.fetch_add(sink > 0 ? 1 : 0);
 }
 
 // ---------------------------------------------------------------- consumer-side knob plumbing

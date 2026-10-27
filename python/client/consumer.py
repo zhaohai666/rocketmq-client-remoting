@@ -100,6 +100,12 @@ PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL = 0.02
 # long enough to avoid a hot retry loop, short enough to recover quickly.
 PULL_TIME_DELAY_WHEN_EXCEPTION = 0.5
 
+# Park after a POP round that answers POLLING_FULL (the queue's own popped-but-unacked budget is full
+# broker-side) or any status the round handling does not otherwise recognize (default 3000ms):
+# neither is "no messages right now" (that case re-pops immediately), it is "do not ask again so soon".
+# Folding it into the immediate path would spin against a full budget; a short idle-guard value would too.
+POP_TIME_DELAY_WHEN_POLLING_FULL = 3.0
+
 # A throttled consumer trips flow control on every pull round, so a per-trip warn would flood the
 # log; only every Nth trip gets one (the first, then the 1001st, ...).
 FLOW_CONTROL_WARN_EVERY_N_TRIPS = 1000
@@ -182,12 +188,19 @@ def execute_filter_hooks(hook_list: List["FilterMessageHook"], context: FilterMe
 def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMessageHook"],
                                  mq: MessageQueue, sub: Optional[SubscriptionData],
                                  msgs: List[MessageExt],
-                                 unit_mode: bool = False) -> List[MessageExt]:
+                                 unit_mode: bool = False,
+                                 retry_budget: Optional[int] = None) -> List[MessageExt]:
     """Pre-delivery filtering = client-side second-pass tag filtering + FilterMessageHook (shared by pull/POP paths).
 
     The hook receives the **mutable** ``msg_list``; how dropped messages are handled is decided by the caller:
     pull path = silently skipped (the offset still advances, no ack);
     POP path = must be acked immediately, otherwise the message is revived and redelivered once invisibleTime expires.
+
+    ``retry_budget`` is an **opt-in retry-budget pre-drop for the POP path only**: when it is not None, every
+    kept row whose reconsume count is **strictly greater** than the budget is removed before delivery (the
+    caller acks it exactly like a filter drop). Left None -- as the pull path always does -- the budget pass
+    never runs: the pull path advances its offset, so a pre-dropped pull row would vanish without a send-back.
+    The post-listener budget enforcement on the POP path is unchanged; this is an additional early guard.
     """
     out = client_side_tag_filter(sub, list(msgs))
     if out and hook_list:
@@ -195,6 +208,14 @@ def filter_messages_for_delivery(consumer_group: str, hook_list: List["FilterMes
         context.unit_mode = unit_mode
         execute_filter_hooks(hook_list, context)
         out = list(context.msg_list)
+    if retry_budget is not None and out:
+        within_budget = [m for m in out if m.reconsume_times <= retry_budget]
+        if len(within_budget) != len(out):
+            logger.info("retry budget: reconsume times over %d for %d of %d messages, "
+                        "dropped before delivery (group=%s mq=%s)",
+                        retry_budget, len(out) - len(within_budget), len(out),
+                        consumer_group, mq)
+        out = within_budget
     return out
 
 
@@ -1287,10 +1308,17 @@ class DefaultMQPushConsumer:
         execute_filter_hooks(self.filter_message_hook_list, context)
 
     def _filter_messages_for_delivery(self, mq: MessageQueue, sub: Optional[SubscriptionData],
-                                      msgs: List[MessageExt]) -> List[MessageExt]:
+                                      msgs: List[MessageExt],
+                                      retry_budget: Optional[int] = None) -> List[MessageExt]:
         """Pre-delivery filtering (see the module-level filter_messages_for_delivery for details)."""
         return filter_messages_for_delivery(self.consumer_group, self.filter_message_hook_list,
-                                            mq, sub, msgs, self.unit_mode)
+                                            mq, sub, msgs, self.unit_mode,
+                                            retry_budget=retry_budget)
+
+    def _pop_retry_budget(self) -> int:
+        """Effective retry budget for the POP pre-delivery step: the configured knob when it is not -1,
+        else the client-side default 16 (the same fallback the send-back header uses)."""
+        return 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
 
     def execute_consume_hook_before(self, context: ConsumeMessageContext) -> None:
         for hook in self.consume_message_hook_list:
@@ -2342,13 +2370,13 @@ class DefaultMQPushConsumer:
                 # when the response has no suggestWhichBrokerId, default to master=0
                 self._pull_from_which_node[mq] = result.suggest_which_broker_id \
                     if result.suggest_which_broker_id is not None else MixAll.MASTER_ID
-                # Consumption stats: pull RT is recorded every time, TPS only when there are messages
-                if self._stats_manager is not None:
+                # Consumption stats: only a FOUND round records the pull round trip, and it records it
+                # even when no row came back. Idle rounds contribute nothing, so PULL_RT stays the
+                # latency of the rounds that carried work instead of an average diluted by every
+                # suspend-length poll that returned nothing.
+                if self._stats_manager is not None and result.status == PullStatus.FOUND:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
                                                     int((time.time() - pull_began) * 1000))
-                    if result.status == PullStatus.FOUND and result.msg_found_list:
-                        self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
-                                                         len(result.msg_found_list))
             except RemotingTimeoutException as e:
                 # A long poll timing out with no new message during suspend is normal behavior: the broker
                 # clamps the suspend time to its own configured maximum (default ~15s),
@@ -2380,6 +2408,12 @@ class DefaultMQPushConsumer:
             if result.status == PullStatus.FOUND and result.msg_found_list:
                 result.msg_found_list = self._filter_messages_for_delivery(
                     mq, sub, result.msg_found_list)
+                # PULL_TPS counts what this round actually hands on: the filtered list. A row the second
+                # tag pass or a filter hook removed was never delivered, so counting the raw response
+                # would overstate the topic's throughput by exactly the rows this client dropped.
+                if self._stats_manager is not None and result.msg_found_list:
+                    self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
+                                                     len(result.msg_found_list))
 
             # The enqueue and the "does this thread still own the queue" check must be atomic: queues taken away by rebalance during the long poll
             # have this batch **discarded directly** -- not consumed, offset not advanced,
@@ -2532,40 +2566,53 @@ class DefaultMQPushConsumer:
                              mq, len(result.msg_found_list or ()))
                 return
             found = result.status == PopStatus.FOUND
+            kept: List[MessageExt] = []
             if found:
-                # Consumption stats: POP path
-                # like the pull path, RT/TPS must be recorded into the stats table, otherwise the POP consumer's
-                # the running-info report would always show 0 on the pull side -- on ops dashboards "this consumer is not
-                # pulling" and "this consumer did not start at all" would be indistinguishable. RT is recorded at the FOUND branch entry
-                # (before the null check), TPS only by the number actually popped.
+                # Consumption stats: the POP path, like the pull path, must record RT/TPS into the stats table,
+                # otherwise the POP consumer's running-info report would always show 0 on the pull side -- on ops
+                # dashboards "this consumer is not pulling" and "this consumer did not start at all" would be
+                # indistinguishable. RT is recorded for every FOUND round (including one whose batch the
+                # pre-delivery step emptied); TPS counts the rows that **survived** pre-delivery -- what this
+                # round actually delivers, not what the broker handed over.
+                popped = result.msg_found_list or []
+                if popped:
+                    # Pre-delivery step: second-pass tag filtering + FilterMessageHook + the retry-budget
+                    # pre-drop. The POP path **must ack the dropped ones**, otherwise the broker would revive
+                    # and redeliver them once invisibleTime expires -- presenting as "filtering not in effect".
+                    # Dropped rows are acked straight away and never enter the wait-ack accumulator below:
+                    # their settle completes inside this round, so an extra ``pq.ack()`` would drive the
+                    # ledger negative.
+                    kept = self._filter_messages_for_delivery(
+                        mq, sub, popped, retry_budget=self._pop_retry_budget())
+                    if len(kept) != len(popped):
+                        kept_ids = {id(m) for m in kept}
+                        for msg in popped:
+                            if id(msg) not in kept_ids:
+                                self._ack_pop_msg(msg)
+                        logger.info("pop filter dropped %d of %d messages (acked)",
+                                    len(popped) - len(kept), len(popped))
                 if self._stats_manager is not None:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
                                                     int((time.time() - began) * 1000))
-                    if result.msg_found_list:
+                    if kept:
                         self._stats_manager.inc_pull_tps(self.consumer_group, mq.topic,
-                                                         len(result.msg_found_list))
-            if found and result.msg_found_list:
-                pq.inc_found_msg(len(result.msg_found_list))
-                # Pre-delivery filtering: the POP path **must ack the dropped ones**,
-                # otherwise the broker would revive and redeliver them once invisibleTime expires -- presenting as "filtering not in effect".
-                kept = self._filter_messages_for_delivery(mq, sub, result.msg_found_list)
-                if len(kept) != len(result.msg_found_list):
-                    kept_ids = {id(m) for m in kept}
-                    for msg in result.msg_found_list:
-                        if id(msg) not in kept_ids:
-                            self._ack_pop_msg(msg)
-                            pq.ack()
-                    logger.info("pop filter dropped %d of %d messages (acked)",
-                                len(result.msg_found_list) - len(kept),
-                                len(result.msg_found_list))
+                                                         len(kept))
                 if kept:
+                    pq.inc_found_msg(len(kept))
                     self._submit_pop_consume_request(kept, pq, mq)
+                    # A round that delivered honors the configured pull cadence; with pull_interval == 0
+                    # the next round re-pops immediately (the long-poll time paces the rounds).
+                    if self.pull_interval > 0:
+                        time.sleep(self.pull_interval / 1000.0)
+                # A FOUND round whose batch came back empty (from the broker or from the pre-delivery
+                # step) re-pops immediately: an idle guard must not swallow this case.
+            elif result.status in (PopStatus.NO_NEW_MSG, PopStatus.POLLING_NOT_FOUND):
+                # Nothing to hand over right now is POP's normal idle state: re-pop immediately.
+                pass
             else:
-                # Empty result: if the broker did not suspend per poll_time (returns immediately) this becomes a hot loop;
-                # back off here per "this round was too short" to avoid hammering the broker.
-                if (time.time() - began) * 1000.0 < 200:
-                    time.sleep(0.2)
-            # NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL all go directly to the next round
+                # POLLING_FULL and any status the round handling does not recognize: the queue is not
+                # empty-but-unready, it is "do not ask again so soon" -- park 3000 ms.
+                time.sleep(POP_TIME_DELAY_WHEN_POLLING_FULL)
 
     def _submit_pop_consume_request(self, msgs: List[MessageExt], pq: PopProcessQueue,
                                     mq: MessageQueue) -> None:
@@ -2655,6 +2702,9 @@ class DefaultMQPushConsumer:
             pq.dec_found_msg(-len(msgs))
             return
 
+        # The POP-style retry wrapper is cut **first**, so the property-based restore and the namespace
+        # strip below both read the name the listener finally sees.
+        self._normalize_retry_topic(msgs)
         self._reset_retry_topic_and_namespace(msgs)
         context = ConsumeConcurrentlyContext(mq)
         # ackIndex's default value is Integer.MAX_VALUE (this port's default
@@ -3042,6 +3092,55 @@ class DefaultMQPushConsumer:
                 msg.topic = retry_topic
             if self.namespace:
                 msg.topic = NamespaceUtil.without_namespace(msg.topic, self.namespace)
+
+    # Both POP wire spellings, in the order the reference tries them: the `+` form is unambiguous
+    # about where the group name ends, so it wins when a business topic itself contains a `_`.
+    _RETRY_TOPIC_SEPARATORS = ("+", "_")
+
+    def _normalize_retry_topic(self, msgs: List[MessageExt]) -> None:
+        """Un-wrap POP-style retry topic names before delivery (concurrent delivery entries only).
+
+        A POP retry queue writes the original business topic into its own name, as
+        ``%RETRY%<group>_<topic>`` or ``%RETRY%<group>+<topic>``; the listener must see the business
+        topic, so either wrapper naming **this** consumer's group is cut here. Cutting only one of the
+        two spellings would break the settled ack rather than merely the display name: the ack target
+        is rebuilt from the message's topic plus the POP_CK retry flag, and that flag describes the V1
+        *or* the V2 form, so a topic left wrapped is confirmed against a name built twice over instead
+        of the queue this client actually popped it from.
+
+        Everything else is left precisely as it arrived, which makes this a no-op for ordinary pull
+        rows: a bare ``%RETRY%<group>`` (the classic retry queue -- its real topic is restored from
+        the RETRY_TOPIC property by ``_reset_retry_topic_and_namespace``), a wrapper naming a
+        different group, a wrapper with nothing left after the separator, and any ordinary topic. The
+        orderly delivery path must **not** call this.
+
+        Whatever remains after the cut keeps its own shape: the namespace prefix, when one is
+        configured, is stripped one step later by ``_reset_retry_topic_and_namespace``, which every
+        delivery entry runs right after this.
+        """
+        if not self.consumer_group:
+            return
+        # The group may be registered with the namespace already folded in, in which case the wire
+        # name carries it too; both spellings of this consumer's name are recognised.
+        names = {self.consumer_group}
+        if self.namespace:
+            unwrapped = NamespaceUtil.without_namespace(self.consumer_group, self.namespace)
+            if unwrapped:
+                names.add(unwrapped)
+        prefixes = [(MixAll.RETRY_GROUP_TOPIC_PREFIX + name + separator, separator)
+                    for separator in self._RETRY_TOPIC_SEPARATORS for name in names]
+        prefixes.sort(key=lambda pair: -len(pair[0]))
+        for msg in msgs:
+            topic = msg.topic
+            if not topic:
+                continue
+            for prefix, _ in prefixes:
+                if topic.startswith(prefix):
+                    rest = topic[len(prefix):]
+                    # An empty tail (the wire name is only the wrapper) must not erase the topic.
+                    if rest:
+                        msg.topic = rest
+                    break
 
     # ---------------- Broker-initiated requests: 220 / 221 / 307 / 309 ----------------
     # These four requests are sent by the broker (or mqadmin via the broker) back to the client.
@@ -3482,6 +3581,11 @@ class DefaultMQPushConsumer:
     def _consume_concurrent_batch(self, key: str, mq: MessageQueue, batch: List[MessageExt],
                                   epoch: Optional[int], listener, broadcast: bool) -> bool:
         """Consume one batch concurrently."""
+        # Concurrent delivery entry: unwrap POP-style retry topic names (%RETRY%<group>+Topic /
+        # %RETRY%<group>_Topic) before the listener runs, next to the property-based restore that
+        # ``_consume_batch_held`` already applied. Classic retry rows (bare ``%RETRY%<group>``) and
+        # ordinary topics -- i.e. every pull row -- pass through unchanged; the orderly path must not do this.
+        self._normalize_retry_topic(batch)
         context = ConsumeConcurrentlyContext(mq)
         hook_ctx = None
         if self.consume_message_hook_list:

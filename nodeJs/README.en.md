@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **37** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-24, **1222** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **43** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-27, **1399** checks in total. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -54,10 +54,15 @@ node --experimental-strip-types selfcheck.ts
 | `test/ns_failover_smoke.ts` | 12 checks passed |
 | `test/offset_persist_timer_smoke.ts` | 21 passed / 0 failed |
 | `test/pop_batch_ack_smoke.ts` (the 200151 request shape) | 9 passed / 0 failed |
+| `test/pop_init_mode_smoke.ts` (start policy translated to POP initMode) | 14 checks passed |
+| `test/pop_pre_deliver_filter_smoke.ts` (pre-delivery filter on the POP round; section 8 asks the pull path the same question) | 27 checks passed |
+| `test/pop_retry_topic_reset_smoke.ts` (POP retry-topic name normalisation) | 17 checks passed |
+| `test/pop_round_reschedule_smoke.ts` (POP round reschedule, backoff and booking) | 31 checks passed |
 | `test/pop_smoke.ts` | 11 check groups passed |
 | `test/producer_smoke.ts` | 4 check groups passed |
 | `test/pull_balance_view_smoke.ts` | 14 passed / 0 failed |
 | `test/pull_schedule_smoke.ts` | 43 passed / 0 failed |
+| `test/pull_stats_contract_smoke.ts` (pull-path PULL_RT/PULL_TPS booking: only FOUND rounds book latency — NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL / error / timeout rounds book nothing; throughput is fed the post-filter (second tag pass + FilterMessageHook) row count, and a FOUND round whose rows are all dropped books RT with zero TPS) | 28 checks passed |
 | `test/rebalance_change_smoke.ts` (a rebalance round whose per-topic assignment set moved pays, in order: only the moved topics get a fresh subscription version → the topic budgets are divided over the queues this round owns → one immediate heartbeat → the queue listener fires for the moved topics only; an unchanged round and a self-heal rebuild owe nothing) | 32 checks passed |
 | `test/smoke.ts` (frame / transport / ACL signing) | 6 check groups passed |
 | `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
@@ -399,7 +404,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 37 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 43 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

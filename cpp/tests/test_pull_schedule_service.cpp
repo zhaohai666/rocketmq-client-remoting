@@ -372,7 +372,9 @@ TopicRouteData routeN(int32_t n, const std::string& addr) {
     return route;
 }
 
-PullReply emptyPullReply(int64_t nextBeginOffset) {
+// Kept as scaffolding for the empty-answer shape of the pull protocol; the scripted replies below
+// build their own frames.
+[[maybe_unused]] PullReply emptyPullReply(int64_t nextBeginOffset) {
     PullReply r;
     r.code = ResponseCode::PULL_NOT_FOUND;
     r.ext["nextBeginOffset"] = std::to_string(nextBeginOffset);

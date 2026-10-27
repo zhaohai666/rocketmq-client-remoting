@@ -43,6 +43,13 @@ func (c *DefaultMQPushConsumer) consumeBatch(mq common.MessageQueue, batch []*co
 			c.consumerGroup, mq, len(batch), epoch, c.queueEpochOf(mq))
 		return false
 	}
+	// The POP retry naming is cut at the CONCURRENT delivery entry, ahead of the
+	// property-based restore below; pull rows simply match nothing there. An
+	// orderly consumer keeps the name it locked the queue under, because a retry
+	// queue's offset bookkeeping is keyed on it.
+	if !c.isOrderly() {
+		c.resetPopRetryTopic(batch)
+	}
 	c.resetRetryTopicAndNamespace(batch)
 	if c.isOrderly() {
 		return c.consumeOrderlyBatch(mq, batch, epoch)

@@ -43,6 +43,13 @@ final class ConsumerDefaults
     public const CONSUME_INIT_MODE_MIN = 0;
     public const CONSUME_INIT_MODE_MAX = 1;
 
+    /**
+     * The retry budget this consumer assumes when `maxReconsumeTimes` is left unset (-1): the number a
+     * message's own reconsume count is compared against, both when a POP batch is filtered before
+     * delivery and when a send-back asks for the broker-side limit.
+     */
+    public const MAX_RECONSUME_TIMES_WHEN_UNSET = 16;
+
     /** int32 upper bound: default for the orderly-consume "retries exhausted" check (-1 reads as it on this chain). */
     public const INT32_MAX = 0x7FFFFFFF;
 

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,7 +65,20 @@ func (b *consumerBroker) answerPop(req *remoting.RemotingCommand) *remoting.Remo
 
 	b.mu.Lock()
 	b.popHeaders = append(b.popHeaders, header)
+	b.popExt = append(b.popExt, req.ExtFields().Clone())
+	b.popArrivals = append(b.popArrivals, common.CurrentTimeMillis())
 	fixture := b.popFixture
+	if b.popTail != nil {
+		// A staged round wins while any is left; after that the tail answer keeps
+		// the loop occupied without replaying a batch.
+		if len(b.popScript) > 0 {
+			round := b.popScript[0]
+			b.popScript = b.popScript[1:]
+			fixture = &round
+		} else {
+			fixture = b.popTail
+		}
+	}
 	b.mu.Unlock()
 
 	if fixture == nil {
@@ -157,6 +171,40 @@ func (b *consumerBroker) setPopFixture(f popFixture) {
 	b.mu.Lock()
 	b.popFixture = &f
 	b.mu.Unlock()
+}
+
+// setPopScript stages one canned answer per POP round; once the staged rounds are
+// spent the broker keeps answering with tail. A test that asserts a per-round
+// number (the pull TPS increment, the wait-ACK debt, the gap to the next round)
+// needs the batch to be handed over exactly once, which a plain fixture cannot do:
+// the loop would replay the same rows every round.
+func (b *consumerBroker) setPopScript(tail popFixture, rounds ...popFixture) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.popScript = append([]popFixture(nil), rounds...)
+	b.popTail = &tail
+}
+
+// popExtSnapshot is the raw extFields of every POP_MESSAGE as the broker received
+// them, oldest first.
+func (b *consumerBroker) popExtSnapshot() []*common.StringMap {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]*common.StringMap(nil), b.popExt...)
+}
+
+// popArrivalsSnapshot is the arrival time of every POP_MESSAGE, oldest first.
+func (b *consumerBroker) popArrivalsSnapshot() []int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]int64(nil), b.popArrivals...)
+}
+
+// popCount is how many POP_MESSAGE requests reached the broker.
+func (b *consumerBroker) popCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.popHeaders)
 }
 
 func (b *consumerBroker) popHeadersSnapshot() []*remoting.PopMessageRequestHeader {
@@ -463,7 +511,10 @@ func TestPopConsumerCheckNeedAckOrDelayExtends(t *testing.T) {
 	// Born 45s ago: above table[2]=60? no — 45 >= 30 (table[1]) and < 60, so the
 	// next notch is 2 (60s).
 	msg.BornTimestamp = common.CurrentTimeMillis() - 45_000
-	msg.ReconsumeTimes = 5
+	// Staged EXACTLY at the budget (0): the pre-delivery guard only drops a row
+	// whose count is strictly above it, so this one must still reach the listener
+	// and be settled by the post-listener path under test here.
+	msg.ReconsumeTimes = 0
 	f.broker.mu.Lock()
 	f.broker.popFixture = &popFixture{
 		code:          remoting.RespSuccess,
@@ -490,8 +541,10 @@ func TestPopConsumerCheckNeedAckOrDelayGivesUp(t *testing.T) {
 	if popDelayLevel[len(popDelayLevel)-1] != 7200 {
 		t.Fatalf("last delay level = %d", popDelayLevel[len(popDelayLevel)-1])
 	}
+	var delivered int32
 	f, c := popFixtureWithConsumer(t, &countingConcurrentlyListener{
 		fn: func(_ []*common.MessageExt, _ *ConsumeConcurrentlyContext) ConsumeConcurrentlyStatus {
+			atomic.AddInt32(&delivered, 1)
 			return ReconsumeLater
 		},
 	}, func(c *DefaultMQPushConsumer) { c.SetMaxReconsumeTimes(0) })
@@ -500,7 +553,9 @@ func TestPopConsumerCheckNeedAckOrDelayGivesUp(t *testing.T) {
 	msg := popMessage("TopicA", 0, 11, "ancient")
 	// Older than 7200*1000*2 = 4h.
 	msg.BornTimestamp = common.CurrentTimeMillis() - (7200*1000*2 + 60_000)
-	msg.ReconsumeTimes = 3
+	// Exactly at the budget, so the pre-delivery guard passes it and the give-up
+	// decision below is the one being exercised.
+	msg.ReconsumeTimes = 0
 	f.broker.mu.Lock()
 	f.broker.popFixture = &popFixture{
 		code:          remoting.RespSuccess,
@@ -519,6 +574,11 @@ func TestPopConsumerCheckNeedAckOrDelayGivesUp(t *testing.T) {
 	}
 	if len(f.broker.changeInvisibleSnapshot()) != 0 {
 		t.Fatalf("should have given up, not extended: %v", f.broker.changeInvisibleSnapshot())
+	}
+	// The ACK above must be the listener's failure being settled, not the row
+	// filtered away before delivery: it reached the listener first.
+	if atomic.LoadInt32(&delivered) == 0 {
+		t.Fatal("the row was acked without ever being delivered")
 	}
 }
 

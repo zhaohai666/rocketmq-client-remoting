@@ -1222,12 +1222,15 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 pullFromWhichNode_[key] =
                     result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
             }
-            // Consume statistics (PullCallback.onSuccess: RT always recorded, TPS only when messages came back)
-            mqClient_->consumerStats().incPullRT(consumerGroup_, mq.topic,
-                                                 UtilAll::currentTimeMillis() - pullBegan);
-            if (result.isFound() && !result.msgFoundList.empty()) {
-                mqClient_->consumerStats().incPullTPS(consumerGroup_, mq.topic,
-                                                      static_cast<int64_t>(result.msgFoundList.size()));
+            // Consume statistics (PullCallback.onSuccess): PULL_RT is the latency of a pull round, and
+            // only a round that answered with messages has a delivery round trip to price: the FOUND arm
+            // alone records it, and it records it even for a round whose rows were all dropped later
+            // (the round still cost this client a full request). A round that returned no messages at all
+            // (NO_NEW_MSG / POLLING_NOT_FOUND / OFFSET_ILLEGAL) records nothing.
+            const bool pullFound = result.isFound();
+            if (pullFound) {
+                mqClient_->consumerStats().incPullRT(consumerGroup_, mq.topic,
+                                                     UtilAll::currentTimeMillis() - pullBegan);
             }
         } catch (const MQBrokerException& e) {
             // A broker that answers FLOW_CONTROL(215) throttled this request on its own window: that is a
@@ -1275,6 +1278,13 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             // hooks are user code and may block, so they cannot sit inside the enqueue critical section.
             // Messages removed on the pull path are not acked: the offset advances anyway, i.e. they are silently skipped.
             std::vector<MessageExt> deliverable = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
+            // PULL_TPS counts what this round actually hands on: the filtered list. A row the second tag
+            // pass or a filter hook removed was never delivered, so counting the raw response would
+            // overstate the topic's throughput by exactly the rows this client dropped.
+            if (!deliverable.empty()) {
+                mqClient_->consumerStats().incPullTPS(consumerGroup_, mq.topic,
+                                                      static_cast<int64_t>(deliverable.size()));
+            }
             if (deliverable.size() != result.msgFoundList.size()) {
                 filteredMessageCount_ +=
                     static_cast<int64_t>(result.msgFoundList.size() - deliverable.size());
@@ -1403,39 +1413,151 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
                          + std::to_string(result.msgFoundList.size()) + " messages un-acked");
             return;
         }
-        // Pull statistics after popping (PopCallback.onSuccess; the test is in recordPopPullStats)
-        recordPopPullStats(client().consumerStats(), mq.topic, result, began);
-        if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
-            pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
-            // Filtering before delivery (processPopResult): the POP path must ack the dropped entries,
-            // otherwise the broker revives and redelivers them when invisibleTime expires - which looks like "the filter did not take effect".
-            std::vector<MessageExt> kept = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
-            if (kept.size() != result.msgFoundList.size()) {
-                std::vector<MessageExt> dropped = droppedMessages(result.msgFoundList, kept);
-                filteredMessageCount_ += static_cast<int64_t>(dropped.size());
-                for (const MessageExt& msg : dropped) {
-                    ackPopMsg(msg);
-                    pq->ack();
-                }
-                logger_info("pop filter dropped " + std::to_string(dropped.size()) + " of "
-                            + std::to_string(result.msgFoundList.size()) + " messages (acked)");
-            }
-            if (!kept.empty()) submitPopConsumeRequest(kept, pq, mq);
-        } else if (UtilAll::currentTimeMillis() - began < 200) {
-            // Empty result: if the broker did not suspend for pollTime (returned at once) this would spin hot,
-            // so fall back to a backoff when the round was too short, keeping the broker from being flooded.
+        // Pull statistics after popping (PopCallback.onSuccess; the test is in recordPopPullStats):
+        // one round = pre-delivery pipeline first, then the statistics of what it left, then pacing.
+        processPopAnswer(mq, sub, result, pq, client().consumerStats(), began);
+        const int64_t nextRoundDelay = popNextRoundDelayMillis(
+            result.status, static_cast<int64_t>(result.msgFoundList.size()), pullIntervalMillis_);
+        if (nextRoundDelay > 0) {
+            notePullPause(static_cast<int32_t>(nextRoundDelay));
+            std::this_thread::sleep_for(std::chrono::milliseconds(nextRoundDelay));
+        } else if (result.msgFoundList.empty() && UtilAll::currentTimeMillis() - began < 200) {
+            // Nothing was delivered and the broker did not suspend for pollTime (it answered at once),
+            // so this would spin hot: fall back to a short nap to keep the broker from being flooded.
+            // An answer with rows kept and no configured pull interval deliberately takes neither nap:
+            // it goes straight into the next round.
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        // NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL all go straight into the next round
+    }
+}
+
+void DefaultMQPushConsumer::processPopAnswer(const MessageQueue& mq, const SubscriptionData& sub,
+                                             PopResult& result,
+                                             const std::shared_ptr<PopProcessQueue>& pq,
+                                             ConsumerStatsManager& stats, int64_t beganMs) {
+    if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
+        // The debt counts the raw answer: the broker handed over this many rows, and each of them
+        // leaves the debt either through an ack or through the consume side's confirmation.
+        pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
+        // Filtering before delivery (processPopResult), in the contract order tag re-check ->
+        // FilterMessageHook -> reconsume-budget drop. The POP path must ack every dropped entry,
+        // otherwise the broker revives and redelivers them when invisibleTime expires - which looks
+        // like "the filter did not take effect".
+        result.msgFoundList = preparePopBatchForDelivery(mq, &sub, result.msgFoundList, pq);
+        if (!result.msgFoundList.empty()) {
+            submitPopConsumeRequest(result.msgFoundList, pq, mq);
+        }
+    }
+    // Recorded on the rows that survived the pipeline, and only then: a round whose every row was
+    // filtered out still costs a pull (its round trip belongs in the pull time) but delivered nothing,
+    // so it must not add to the pull TPS.
+    recordPopPullStats(stats, mq.topic, result, beganMs);
+}
+
+int64_t DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus status, int64_t keptMsgCount,
+                                                       int32_t pullIntervalMillis) {
+    // The pacing table of one POP round. The two "the broker had nothing for us" answers and a FOUND
+    // whose rows were all filtered out need no wait of their own: long polling already suspended the
+    // request for pollTime, and the round's hot-loop guard covers the case where it did not.
+    switch (status) {
+        case PopStatus::FOUND:
+            if (keptMsgCount == 0) return 0;
+            // Rows were handed to the consume side: honour the consumer's pull interval, if it set one.
+            return pullIntervalMillis > 0 ? pullIntervalMillis : 0;
+        case PopStatus::NO_NEW_MSG:
+        case PopStatus::POLLING_NOT_FOUND:
+            return 0;
+        case PopStatus::POLLING_FULL:
+            return kPopBackoffWhenAnswerIsFull;
+    }
+    // An answer this client does not know: back off like a failed round rather than hammer it.
+    return kPopBackoffWhenAnswerIsFull;
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::dropRowsOverReconsumeBudget(
+    const std::vector<MessageExt>& msgs) const {
+    // The budget is the consumer's own maxReconsumeTimes, with -1 reading as the broker default 16
+    // (maxReconsumeTimesOrDefault). NOT the orderly-side resolution of -1 to the integer maximum:
+    // that one exists because orderly retries happen in place and are never counted by the broker, so
+    // using it here would drop nothing at all and the rows would be redelivered forever.
+    // The comparison is **strictly greater than**, so a row that reached the budget exactly is still
+    // delivered -- the broker only sends it to the dead-letter queue past it.
+    const int32_t budget = maxReconsumeTimesOrDefault();
+    std::vector<MessageExt> kept;
+    kept.reserve(msgs.size());
+    for (const MessageExt& m : msgs) {
+        if (m.reconsumeTimes > budget) {
+            logger_info("pop message over reconsume budget, ack it and keep it from being redelivered: "
+                        + m.msgId + " reconsumeTimes=" + std::to_string(m.reconsumeTimes)
+                        + " maxReconsumeTimes=" + std::to_string(budget));
+            continue;
+        }
+        kept.push_back(m);
+    }
+    return kept;
+}
+
+std::vector<MessageExt> DefaultMQPushConsumer::preparePopBatchForDelivery(
+    const MessageQueue& mq, const SubscriptionData* sub, const std::vector<MessageExt>& popped,
+    const std::shared_ptr<PopProcessQueue>& pq) {
+    std::vector<MessageExt> kept = filterMessagesForDelivery(mq, sub, popped);
+    kept = dropRowsOverReconsumeBudget(kept);
+    if (kept.size() == popped.size()) return kept;
+    // The difference is taken against the **original popped list**, not against the stage that
+    // produced the removal: every row that does not reach the listener owes exactly one ack.
+    std::vector<MessageExt> dropped = droppedMessages(popped, kept);
+    filteredMessageCount_ += static_cast<int64_t>(dropped.size());
+    for (const MessageExt& msg : dropped) {
+        ackPopMsg(msg);
+        if (pq) pq->ack();
+    }
+    logger_info("pop pre-delivery filter dropped " + std::to_string(dropped.size()) + " of "
+                + std::to_string(popped.size()) + " messages (acked)");
+    return kept;
+}
+
+void DefaultMQPushConsumer::stripPopRetryTopicPrefix(std::vector<MessageExt>& msgs) const {
+    // The broker republishes a POP retry of a subscription onto its own retry topic, and the business
+    // topic is the tail of the row's own topic name: "%RETRY%<group>+<topic>" or
+    // "%RETRY%<group>_<topic>". Both spellings are cut. Cutting only one would break the ack, not just
+    // the display name: the ack target is rebuilt from the row's topic plus the POP_CK retry flag, and
+    // that flag describes the '+' or the '_' form, so a row left wrapped is confirmed against a name
+    // built twice over rather than the queue this client actually popped it from.
+    std::vector<std::string> prefixes;
+    prefixes.push_back(std::string(MixAll::RETRY_GROUP_TOPIC_PREFIX) + consumerGroup_ + "+");
+    prefixes.push_back(std::string(MixAll::RETRY_GROUP_TOPIC_PREFIX) + consumerGroup_ + "_");
+    if (!namespace_.empty()) {
+        // The group can be registered with the namespace folded in (start() wraps it), in which case
+        // the wire name carries it; the plain spelling stays recognised too.
+        const std::string plain = NamespaceUtil::withoutNamespace(consumerGroup_, namespace_);
+        if (!plain.empty() && plain != consumerGroup_) {
+            prefixes.push_back(std::string(MixAll::RETRY_GROUP_TOPIC_PREFIX) + plain + "+");
+            prefixes.push_back(std::string(MixAll::RETRY_GROUP_TOPIC_PREFIX) + plain + "_");
+        }
+    }
+    std::sort(prefixes.begin(), prefixes.end(),
+              [](const std::string& a, const std::string& b) { return a.size() > b.size(); });
+
+    for (MessageExt& msg : msgs) {
+        for (const std::string& prefix : prefixes) {
+            // A longer topic naming another group, and a wrapper with nothing after the separator,
+            // stay exactly as they arrived: erasing the whole topic would leave nothing to restore.
+            if (msg.topic.size() <= prefix.size()) continue;
+            if (msg.topic.compare(0, prefix.size(), prefix) != 0) continue;
+            msg.topic = msg.topic.substr(prefix.size());
+            break;
+        }
     }
 }
 
 void DefaultMQPushConsumer::recordPopPullStats(ConsumerStatsManager& stats,
                                                const std::string& topic,
                                                const PopResult& result, int64_t beganMs) {
-    // The pull callback records RT every time, the POP callback only on FOUND, and it does so
-    // before the emptiness check; TPS counts only the messages actually popped. This asymmetry is kept on purpose: an empty-handed POP is
-    // the long-polling norm (POLLING_NOT_FOUND), and folding it into RT would dilute the average pull time with suspend durations.
+    // Symmetric with the pull path now: only a FOUND round records anything. RT is recorded before the
+    // emptiness check (a FOUND whose whole batch was filtered out before delivery still cost this client
+    // a round trip), and TPS counts only the rows the pre-delivery pipeline left to hand on. A non-FOUND
+    // answer (POLLING_NOT_FOUND above all) records nothing: folding it in would dilute the average pull
+    // time with rounds that delivered no message.
     if (result.status != PopStatus::FOUND) return;
     stats.incPullRT(consumerGroup_, topic, UtilAll::currentTimeMillis() - beganMs);
     if (!result.msgFoundList.empty()) {
@@ -1550,6 +1672,11 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
         return;
     }
 
+    // A POP retry of this subscription is delivered on "%RETRY%<group>_<topic>", which carries the
+    // business topic in its own name: restore it before the listener sees the row, then let the
+    // property-based restore handle the classic form and the namespace. Concurrent dispatch only --
+    // the orderly POP and orderly pull chains keep their current behaviour.
+    stripPopRetryTopicPrefix(msgs);
     resetRetryTopicAndNamespace(msgs);
     ConsumeConcurrentlyContext ctx(mq);
     // The POP path uses ackIndex as
@@ -2199,6 +2326,10 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
     // the broker writes redelivered messages into %RETRY%group and keeps the original topic in the RETRY_TOPIC property; without
     // restoring it, user code that branches on the topic takes the wrong path.
     std::vector<MessageExt> restored = batch;
+    // The underscore retry form is this consumer's own group + the business topic, so the topic can be
+    // read back off the row's topic. Concurrent dispatch only: the orderly branch below keeps the
+    // property-based restore as it stands.
+    if (!isOrderly()) stripPopRetryTopicPrefix(restored);
     resetRetryTopicAndNamespace(restored);
     const bool broadcast = (messageModel_ == MessageModel::BROADCASTING);
     // ---- Orderly consumption (one queue locked at a time, batch consumed in order) ----
@@ -3748,14 +3879,18 @@ void DefaultMQPushConsumer::wakeRebalanceLoop() {
 
 void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs) {
     // resetRetryAndNamespace (called before dispatch).
-    // A redelivered message's topic becomes the original business topic again and the namespace prefix is stripped.
+    // A redelivered message's topic becomes the original business topic again and the namespace prefix
+    // is stripped -- from EVERY row, not only from a restored one: the fetch happens under the wrapped
+    // topic name, so without this step the listener branches on "ns%Topic" instead of the "Topic" it
+    // subscribed to.
     const std::string groupTopic = MixAll::getRetryTopic(consumerGroup_);
     for (MessageExt& msg : msgs) {
         std::string retryTopic = msg.getProperty(MessageConst::PROPERTY_RETRY_TOPIC);
         if (!retryTopic.empty() && msg.topic == groupTopic) {
-            msg.setTopic(namespace_.empty()
-                             ? retryTopic
-                             : NamespaceUtil::withoutNamespace(retryTopic, namespace_));
+            msg.setTopic(retryTopic);
+        }
+        if (!namespace_.empty()) {
+            msg.setTopic(NamespaceUtil::withoutNamespace(msg.topic, namespace_));
         }
     }
 }

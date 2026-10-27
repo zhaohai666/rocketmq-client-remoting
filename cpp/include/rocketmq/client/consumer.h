@@ -108,6 +108,10 @@ constexpr int32_t kPullPauseWhenClientFlowControl = 50;
 constexpr int32_t kPullPauseWhenBrokerFlowControl = 20;
 // Every other broker error on the pull path (topic not created yet, subscription not latest, ...).
 constexpr int32_t kPullPauseWhenPullError = 500;
+// POP pacing for an answer that says "the broker's polling window is full", and for any POP answer
+// this client does not recognise: the same 3000ms back-off the pull scheduler applies to a round that
+// ended in an exception. Retrying at once would hit the same full window again.
+constexpr int32_t kPopBackoffWhenAnswerIsFull = 3000;
 
 // A throttled queue trips its cache gate on every round, so warning every round buries the signal in
 // noise: only every kFlowControlWarnEvery-th trip warns (the 1st, then the 1001st, ...). The trip count
@@ -726,6 +730,44 @@ public:
     // while the dashboard reads all zeros, which on a real broker only shows after two full 10s sampling windows -- so the decision itself must accept a PopResult fed directly offline.
     void recordPopPullStats(ConsumerStatsManager& stats, const std::string& topic,
                             const PopResult& result, int64_t beganMs);
+    // How long the POP loop waits before its next round on this queue. A pure decision over the
+    // answer, how many rows survived the pre-delivery pipeline and the configured pull interval, so
+    // the five pacing cases are pinnable offline instead of by wall-clock sampling (the suite already
+    // has slow legs). 0 = straight into the next round.
+    static int64_t popNextRoundDelayMillis(PopStatus status, int64_t keptMsgCount,
+                                           int32_t pullIntervalMillis);
+    // Everything one POP answer owes, in the contract order: the pre-delivery pipeline over the
+    // popped rows (which acks what it removed), the delivery of what survived, and the round's
+    // statistics keyed on that surviving set. The answer comes in by reference and its popped list is
+    // replaced by the kept rows, so the caller reads the same state the round ended with.
+    // Public because the ordering is the point: recording the statistics before the pipeline counts
+    // rows the listener never saw, and no offline test of the loop itself can wait for a real
+    // long-polling round.
+    void processPopAnswer(const MessageQueue& mq, const SubscriptionData& sub, PopResult& result,
+                          const std::shared_ptr<PopProcessQueue>& pq, ConsumerStatsManager& stats,
+                          int64_t beganMs);
+    // The whole POP pre-delivery pipeline, in contract order: client-side tag re-check, then the
+    // FilterMessageHook, then the reconsume-budget drop. **Every** row the pipeline removed is acked
+    // against the original popped list (a dropped row nobody acks comes back when invisibleTime
+    // expires, which reads as "the filter never worked"), and the queue's wait-ack debt goes down by
+    // the same number. Returns the rows that survive for delivery.
+    // Public so the acking of a dropped row is pinnable against a recorded endpoint: on a real broker
+    // a missing ack only shows up minutes later as duplicate delivery.
+    std::vector<MessageExt> preparePopBatchForDelivery(
+        const MessageQueue& mq, const SubscriptionData* sub,
+        const std::vector<MessageExt>& popped, const std::shared_ptr<PopProcessQueue>& pq);
+    // The last stage of that pipeline and POP-only: a row whose reconsume count is **strictly greater
+    // than** the effective budget (maxReconsumeTimes, -1 reading as the broker default 16) is removed
+    // before delivery. It is deliberately not part of filterMessagesForDelivery, which the pull path
+    // shares: a pull has no ack to give and its cursor advances anyway, so the pull path keeps
+    // delivering such a row.
+    std::vector<MessageExt> dropRowsOverReconsumeBudget(const std::vector<MessageExt>& msgs) const;
+    // Strip the POP retry-topic prefix "%RETRY%<group>_" off a row's topic, restoring the business
+    // topic the broker encoded into it. Only that underscore form is touched: the classic
+    // "%RETRY%<group>" form carries no topic at all, and the '+' separator form belongs to the other
+    // retry-topic encoding. Runs immediately before resetRetryTopicAndNamespace on the concurrent
+    // batch dispatch entries, so the property-based restore stays the fallback for the classic form.
+    void stripPopRetryTopicPrefix(std::vector<MessageExt>& msgs) const;
 
     // ---- Observation / injection surface of stall self-healing (isPullExpired) ----
     // Getting the stall criterion's direction wrong is a **silent** failure: a threshold too small keeps

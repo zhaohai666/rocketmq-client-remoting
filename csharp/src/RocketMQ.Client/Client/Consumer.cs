@@ -482,6 +482,48 @@ public sealed class DefaultMQPushConsumer
         return dropped;
     }
 
+    /// <summary>POP-only third leg of the pre-delivery pipeline (tag re-check
+    /// → IFilterMessageHook → this): drop every popped row whose reconsume
+    /// count is <b>strictly greater</b> than the effective budget. The budget
+    /// is the consumer's maxReconsumeTimes knob read through
+    /// <see cref="MaxReconsumeTimesOrDefault"/> -- <c>-1</c> means the broker
+    /// default 16, NOT unlimited (the unlimited reading belongs to the orderly
+    /// side's helper and must not be used here). The caller diffs the result
+    /// against the original popped list and acks every dropped row: the row is
+    /// done, its retries are spent, and without the ack the broker would revive
+    /// and redeliver it when invisibleTime expires.
+    /// <para>This step deliberately lives OUTSIDE
+    /// <see cref="FilterMessagesForDelivery"/>: that helper is shared with the
+    /// pull path, which has no ack to give and whose offset advances anyway --
+    /// the pull path must keep delivering an over-budget row (dropping it in
+    /// the shared helper would silently skip it without any budget verdict
+    /// being observable).</para></summary>
+    public List<MessageExt> DropOverReconsumeBudget(List<MessageExt> msgs)
+    {
+        if (msgs.Count == 0)
+        {
+            return msgs;
+        }
+
+        int budget = MaxReconsumeTimesOrDefault();
+        var kept = new List<MessageExt>(msgs.Count);
+        foreach (MessageExt m in msgs)
+        {
+            if (m.ReconsumeTimes > budget)
+            {
+                ClientLog.Info("pop message over the reconsume budget, message is being acked"
+                    + " and dropped before delivery: msgId=" + m.MsgId
+                    + ", reconsumeTimes=" + m.ReconsumeTimes
+                    + ", budget=" + budget);
+                continue;
+            }
+
+            kept.Add(m);
+        }
+
+        return kept;
+    }
+
     // ---------------- POP mode (5.x lightweight consumption) ----------------
     // When off, the original pull long-poll path runs exactly as before.
     public bool PopMode { get; set; }
@@ -3206,6 +3248,42 @@ public sealed class DefaultMQPushConsumer
             ? BrokerFlowControlBackoffMillis
             : PullExceptionBackoffMillis;
 
+    /// <summary>General POP-loop backoff (3000 ms) for an answer the
+    /// re-schedule decision cannot act on: a POLLING_FULL verdict or any
+    /// unknown status parks this queue's POP loop before the next round.</summary>
+    public const int PopExceptionBackoffMillis = 3000;
+
+    /// <summary>Pure POP re-schedule decision, keyed on what actually survives
+    /// the pre-delivery pipeline rather than the raw popped count:
+    /// <list type="bullet">
+    /// <item>Found with kept rows: wait PullIntervalMillis when it is &gt; 0,
+    /// otherwise go straight to the next round;</item>
+    /// <item>Found whose rows were ALL filtered out: straight to the next
+    /// round (the interval only paces real deliveries);</item>
+    /// <item>NoNewMsg / PollingNotFound: straight to the next round;</item>
+    /// <item>PollingFull and any other/unknown status: the 3000 ms
+    /// <see cref="PopExceptionBackoffMillis"/> back-off.</item>
+    /// </list>
+    /// A zero return means "next round now"; the loop's own hot-round guard
+    /// still naps a fast EMPTY round, and that guard must never replace the
+    /// 3000 ms answer. Public so the timing legs are pinnable offline without
+    /// racing a timer.</summary>
+    public static int PopNextRoundDelayMillis(PopStatus status, int keptCount,
+        int pullIntervalMillis)
+    {
+        switch (status)
+        {
+            case PopStatus.Found:
+                return keptCount > 0 && pullIntervalMillis > 0 ? pullIntervalMillis : 0;
+            case PopStatus.NoNewMsg:
+            case PopStatus.PollingNotFound:
+                return 0;
+            case PopStatus.PollingFull:
+            default:
+                return PopExceptionBackoffMillis;
+        }
+    }
+
     private void QueuePullLoop(MessageQueue mq)
     {
         // ⚠ Client() must NOT be used here: Shutdown() sets _started=false
@@ -3353,14 +3431,17 @@ public sealed class DefaultMQPushConsumer
                 // a missing value is not treated as "keep the old value")
                 UpdatePullFromWhichNode(key, result.SuggestWhichBrokerId);
 
-                // Consume statistics (RT recorded every time, TPS only when
-                // there are messages)
-                _mqClient!.ConsumerStats.IncPullRT(ConsumerGroup, mq.Topic,
-                    UtilAll.CurrentTimeMillis() - pullBegan);
-                if (result.IsFound && result.MsgFoundList.Count > 0)
+                // Consume statistics: only a FOUND round books anything. PULL_RT is
+                // this round's own client-side trip time, measured around the
+                // PullMessage call, and a FOUND round books it even when the answer
+                // carries no rows; a non-FOUND answer books nothing (a failed round
+                // never reaches this line, it unwinds into the catch below).
+                // PULL_TPS is fed further down, from the list that survives the
+                // pre-delivery filter.
+                if (result.IsFound)
                 {
-                    _mqClient.ConsumerStats.IncPullTPS(ConsumerGroup, mq.Topic,
-                        result.MsgFoundList.Count);
+                    _mqClient!.ConsumerStats.IncPullRT(ConsumerGroup, mq.Topic,
+                        UtilAll.CurrentTimeMillis() - pullBegan);
                 }
             }
             catch (MQBrokerException e)
@@ -3440,32 +3521,29 @@ public sealed class DefaultMQPushConsumer
                     Interlocked.Add(ref _filteredMessageCount, before - result.MsgFoundList.Count);
                 }
 
+                // PULL_TPS counts what this round actually hands on: the filtered list. A row the
+                // second tag pass or a filter hook removed was never delivered, so counting the raw
+                // response would overstate the topic's throughput by exactly the rows dropped here.
+                if (result.MsgFoundList.Count > 0)
+                {
+                    _mqClient!.ConsumerStats.IncPullTPS(ConsumerGroup, mq.Topic,
+                        result.MsgFoundList.Count);
+                }
+
                 // Retry-message topic restoration (processPullResult): the
                 // broker writes retry messages to %RETRY%group, but each
                 // message carries a RETRY_TOPIC property pointing at the
                 // original topic; restore it before dispatch, otherwise the
                 // upper listener sees the topic as %RETRY% rather than the
-                // business topic.
-                string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
+                // business topic. Runs outside the enqueue lock: it only
+                // rewrites the rows' own topic.
+                PreparePullRowsForDelivery(result.MsgFoundList, orderly);
+
                 lock (_lock)
                 {
                     Queue<MessageExt> dq = _pending[key];
                     foreach (MessageExt m in result.MsgFoundList)
                     {
-                        if (m.Topic == retryTopic)
-                        {
-                            string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
-                            if (!string.IsNullOrEmpty(orig))
-                            {
-                                // The namespace must also be stripped from
-                                // the restored topic before handing it to the
-                                // listener
-                                m.Topic = _namespace.Length == 0
-                                    ? orig!
-                                    : NamespaceUtil.WithoutNamespace(orig!, _namespace);
-                            }
-                        }
-
                         dq.Enqueue(m);
                     }
 
@@ -3515,11 +3593,14 @@ public sealed class DefaultMQPushConsumer
     /// Pull statistics for the POP path (the PopCallback.onSuccess convention).
     /// <para>
     /// The pull callback records RT every time, the POP callback only on
-    /// <c>FOUND</c>, and before the emptiness check; TPS is recorded only by
-    /// the truly popped count. Copy this asymmetry: an empty-handed POP
-    /// return is the norm for long polling (<c>POLLING_NOT_FOUND</c>), and
-    /// counting it in RT would dilute the average pull time with suspend
-    /// duration.
+    /// <c>FOUND</c>, and before the emptiness check; TPS is read from
+    /// <c>result.MsgFoundList</c>, which the POP loop has already replaced with
+    /// the batch that survived the pre-delivery pipeline before calling this.
+    /// Copy that asymmetry: PULL_RT is one round's own client-side trip time,
+    /// so it is only booked for a round that came back <c>FOUND</c> -- a
+    /// <c>POLLING_NOT_FOUND</c> / <c>NO_NEW_MSG</c> answer books neither RT nor
+    /// TPS, and a <c>FOUND</c> answer whose rows were all filtered out books RT
+    /// only.
     /// </para>
     /// <para>
     /// A missed record is a SILENT failure: messages pop and ack as usual,
@@ -3678,18 +3759,19 @@ public sealed class DefaultMQPushConsumer
                 return;
             }
 
-            // Pull statistics (the PopCallback.onSuccess convention; the
-            // verdict is in RecordPopPullStats)
-            RecordPopPullStats(Client().ConsumerStats, ConsumerGroup, mq.Topic, result, began);
-
+            // Pre-delivery pipeline (processPopResult), then the round's
+            // bookkeeping keys on what SURVIVES it:
+            //   ① tag re-check ② IFilterMessageHook ③ POP-only reconsume
+            // budget drop. EVERY dropped row is acked against the ORIGINAL
+            // popped list, otherwise the broker revives and redelivers it when
+            // invisibleTime expires -- showing up as "filtering did not take
+            // effect".
+            int keptCount = 0;
             if (result.Status == PopStatus.Found && result.MsgFoundList.Count > 0)
             {
                 pq.IncFoundMsg(result.MsgFoundList.Count);
-                // Pre-delivery filtering (processPopResult): the POP path MUST
-                // ack the removed ones, otherwise the broker revives and
-                // redelivers them when invisibleTime expires -- showing up as
-                // "filtering did not take effect".
                 List<MessageExt> kept = FilterMessagesForDelivery(mq, sub, result.MsgFoundList);
+                kept = DropOverReconsumeBudget(kept);
                 if (kept.Count != result.MsgFoundList.Count)
                 {
                     List<MessageExt> dropped = DroppedMessages(result.MsgFoundList, kept);
@@ -3704,21 +3786,39 @@ public sealed class DefaultMQPushConsumer
                         + result.MsgFoundList.Count + " messages (acked)");
                 }
 
-                if (kept.Count > 0)
+                // The answer the re-schedule and the stats see is the KEPT
+                // batch, not the raw popped one.
+                result.MsgFoundList = kept;
+                keptCount = kept.Count;
+                if (keptCount > 0)
                 {
                     SubmitPopConsumeRequest(kept, pq, mq);
                 }
             }
-            else if (UtilAll.CurrentTimeMillis() - began < 200)
+
+            // Pull statistics (the PopCallback.onSuccess convention), recorded
+            // AFTER the pipeline: a Found answer always books its round-trip
+            // time -- even when nothing is left to deliver -- and pull TPS
+            // counts only the kept rows, so a batch fully filtered out moves
+            // RT but not TPS.
+            RecordPopPullStats(Client().ConsumerStats, ConsumerGroup, mq.Topic, result, began);
+
+            // Re-schedule by answer (see PopNextRoundDelayMillis for the legs).
+            int nextRoundDelay = PopNextRoundDelayMillis(result.Status, keptCount,
+                PullIntervalMillis);
+            if (nextRoundDelay > 0)
+            {
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(nextRoundDelay));
+            }
+            else if (keptCount == 0 && UtilAll.CurrentTimeMillis() - began < 200)
             {
                 // Empty result: if the broker did not suspend per pollTime
                 // (returns immediately) this becomes a hot loop; back off here
                 // as a "round took too short" fallback to avoid hammering the
-                // broker.
+                // broker. The 3000 ms POLLING_FULL/unknown leg already waited
+                // above and is never reached here.
                 Thread.Sleep(200);
             }
-            // NoNewMsg / PollingNotFound / PollingFull all go straight to the
-            // next round
         }
     }
 
@@ -3862,6 +3962,11 @@ public sealed class DefaultMQPushConsumer
             return;
         }
 
+        // POP retry-topic prefix strip at the delivery entry, immediately
+        // BEFORE the property-based restore below (concurrent POP dispatch
+        // only: the consume-directly path and every orderly path must NOT
+        // strip). Runs on the popped rows as they enter the listener.
+        StripPopRetryTopicPrefix(msgs);
         ResetRetryTopicAndNamespace(msgs);
         var ctx = new ConsumeConcurrentlyContext(mq);
 
@@ -3923,20 +4028,133 @@ public sealed class DefaultMQPushConsumer
         ProcessPopConsumeResult(status, ctx, msgs, pq);
     }
 
+    /// <summary>Concurrent pull-delivery topic preparation, run on the popped
+    /// rows before they are enqueued: cut this group's POP retry wrapper first,
+    /// then restore the classic retry queue's topic from its RETRY_TOPIC
+    /// property.
+    ///
+    /// <paramref name="orderly"/> suppresses only the wrapper cut. An orderly
+    /// consumer consumes the queue it locked under the name that queue has, and a
+    /// retry queue's offset bookkeeping is keyed on it; the property-based restore
+    /// still runs, because it is what makes the business topic visible for both
+    /// consume modes. Public for the test project.</summary>
+    public void PreparePullRowsForDelivery(List<MessageExt> msgs, bool orderly)
+    {
+        if (!orderly)
+        {
+            StripPopRetryTopicPrefix(msgs);
+        }
+
+        ResetRetryTopicAndNamespace(msgs);
+    }
+
+    /// <summary>POP retry-topic prefix strip at the delivery entry: a row popped
+    /// from this group's POP retry queue carries the business topic inside its
+    /// own topic name, as either <c>%RETRY%&lt;group&gt;_&lt;topic&gt;</c> or
+    /// <c>%RETRY%&lt;group&gt;+&lt;topic&gt;</c>; cut whichever wrapper names
+    /// THIS consumer's group so the listener sees the business topic.
+    ///
+    /// Cutting only one spelling would break the ack rather than merely the
+    /// display name: the ack target is rebuilt from the message's topic plus the
+    /// POP_CK retry flag, and that flag describes the V1 <em>or</em> the V2 form,
+    /// so a topic left wrapped is confirmed against a name built twice over
+    /// instead of the queue this client actually popped it from.
+    ///
+    /// Everything else is left exactly as it arrived, which makes this a no-op on
+    /// ordinary pull rows: a bare <c>%RETRY%&lt;group&gt;</c> (the classic retry
+    /// queue -- its real topic is restored by
+    /// <see cref="ResetRetryTopicAndNamespace"/>), a wrapper naming a different
+    /// group, a wrapper with nothing after the separator, and any ordinary topic.
+    /// The plus form is tried first: it is unambiguous about where the group name
+    /// ends, so it wins when a business topic itself contains an underscore.
+    ///
+    /// Whatever remains after the cut keeps its own shape; the namespace prefix is
+    /// stripped one step later by <see cref="ResetRetryTopicAndNamespace"/>, which
+    /// every concurrent delivery entry runs immediately after this. The
+    /// consume-directly path and every orderly path must NOT call this.</summary>
+    public void StripPopRetryTopicPrefix(List<MessageExt> msgs)
+    {
+        if (msgs.Count == 0)
+        {
+            return;
+        }
+
+        string[] names;
+        if (_namespace.Length == 0)
+        {
+            names = new[] { ConsumerGroup };
+        }
+        else
+        {
+            // The group may be registered with the namespace already folded in,
+            // in which case the wire name carries it too; both spellings of this
+            // consumer's name are recognised.
+            string plain = NamespaceUtil.WithoutNamespace(ConsumerGroup, _namespace);
+            names = string.IsNullOrEmpty(plain) || plain == ConsumerGroup
+                ? new[] { ConsumerGroup }
+                : new[] { ConsumerGroup, plain };
+        }
+
+        string[] prefixes = new string[names.Length * 2];
+        int n = 0;
+        foreach (string name in names)
+        {
+            prefixes[n++] = MixAll.RetryGroupTopicPrefix + name + "+";
+            prefixes[n++] = MixAll.RetryGroupTopicPrefix + name + "_";
+        }
+
+        // Longest wrapper first, so the more specific spelling of the group wins.
+        Array.Sort(prefixes, (a, b) => b.Length.CompareTo(a.Length));
+
+        foreach (MessageExt m in msgs)
+        {
+            foreach (string prefix in prefixes)
+            {
+                if (!m.Topic.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                string rest = m.Topic.Substring(prefix.Length);
+                // An empty tail (the wire name is only the wrapper) must not
+                // erase the topic.
+                if (rest.Length > 0)
+                {
+                    m.Topic = rest;
+                }
+
+                break;
+            }
+        }
+    }
+
     /// <summary>Before consumption, restore retry messages' topic to the
-    /// original business topic (resetRetryAndNamespace). Equivalent to the
-    /// inline segment on the pull path; extracted here for POP reuse.</summary>
+    /// original business topic (resetRetryAndNamespace): the row's own topic
+    /// only names the classic retry queue, the business topic lives in the
+    /// RETRY_TOPIC property. Shared by the pull and POP delivery entries.
+    ///
+    /// The namespace is taken off EVERY row, not only off a restored one: the
+    /// fetch happens under the wrapped topic name, so without this step the
+    /// listener would branch on <c>ns%Topic</c> instead of the
+    /// <c>Topic</c> it subscribed to.</summary>
     private void ResetRetryTopicAndNamespace(List<MessageExt> msgs)
     {
         string retryTopic = MixAll.GetRetryTopic(ConsumerGroup);
         foreach (MessageExt m in msgs)
         {
-            if (m.Topic != retryTopic) continue;
-            string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
-            if (string.IsNullOrEmpty(orig)) continue;
-            // The namespace must also be stripped from the restored topic
-            // before handing it to the listener
-            m.Topic = _namespace.Length == 0 ? orig! : NamespaceUtil.WithoutNamespace(orig!, _namespace);
+            if (m.Topic == retryTopic)
+            {
+                string? orig = m.GetProperty(MessageConst.PropertyRetryTopic);
+                if (!string.IsNullOrEmpty(orig))
+                {
+                    m.Topic = orig!;
+                }
+            }
+
+            if (_namespace.Length != 0)
+            {
+                m.Topic = NamespaceUtil.WithoutNamespace(m.Topic, _namespace);
+            }
         }
     }
 

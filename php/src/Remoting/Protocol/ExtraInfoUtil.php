@@ -73,6 +73,38 @@ final class ExtraInfoUtil
     }
 
     /**
+     * Restores the ordinary topic that a POP retry topic name carries: ``%RETRY%<cid>+<topic>`` (V2)
+     * becomes what follows the ``+``, ``%RETRY%<cid>_<topic>`` (V1) becomes what follows the ``_``.
+     *
+     * Everything else is returned untouched, and each of those cases is a real one:
+     * - ``%RETRY%<cid>`` with no separator at all is the plain retry topic, its name carries no
+     *   ordinary topic to extract;
+     * - ``%RETRY%<otherCid>_...`` belongs to a different consumer group, so the name is not this
+     *   consumer's retry topic of either shape;
+     * - an ordinary topic never starts with ``%RETRY%``;
+     * - ``%RETRY%<cid>_`` / ``%RETRY%<cid>+`` have an empty tail, and delivering under an empty topic
+     *   is worse than delivering under the retry name.
+     *
+     * V2 is matched first because an ordinary topic may itself contain ``_``; a ``+`` directly after
+     * this group's name is the only unambiguous marker of the V2 shape.
+     */
+    public static function parsePopRetryTopic(string $topic, string $cid): string
+    {
+        if ($topic === '' || $cid === '' || !str_starts_with($topic, MixAll::RETRY_GROUP_TOPIC_PREFIX)) {
+            return $topic;
+        }
+        $head = MixAll::RETRY_GROUP_TOPIC_PREFIX . $cid;
+        foreach ([self::POP_RETRY_SEPARATOR_V2, self::POP_RETRY_SEPARATOR_V1] as $separator) {
+            $prefix = $head . $separator;
+            if (str_starts_with($topic, $prefix)) {
+                $normal = substr($topic, strlen($prefix));
+                return $normal === '' ? $topic : $normal;
+            }
+        }
+        return $topic;
+    }
+
+    /**
      * Splits the segments following the broker-side splitting semantics: **the trailing empty strings are
      * dropped**.
      * This is not nitpicking: ``"a b "`` splits into the two segments ``["a","b"]``, and the segment count

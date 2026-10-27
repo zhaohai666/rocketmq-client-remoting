@@ -54,6 +54,28 @@ func BuildPopRetryTopicV2(topic, consumerGroup string) string {
 	return RetryGroupTopicPrefix + consumerGroup + string(PopRetrySeparatorV2) + topic
 }
 
+// ParsePopNormalTopic is the inverse of the two builders above: it cuts the
+// `%RETRY%<group>` prefix and the separator off a POP retry topic and returns
+// the business topic behind it.
+//
+// The '+' (V2) name is checked first, so a business topic that happens to
+// contain '_' is still read from the '+' boundary. Only a name that actually
+// carries this group's prefix and one of the two separators is cut: plain
+// `%RETRY%<group>` and any non-retry topic come back unchanged, because there
+// is no separator to trim and guessing one would invent a topic name.
+func ParsePopNormalTopic(topic, consumerGroup string) string {
+	if !strings.HasPrefix(topic, RetryGroupTopicPrefix) {
+		return topic
+	}
+	if v2 := RetryGroupTopicPrefix + consumerGroup + string(PopRetrySeparatorV2); strings.HasPrefix(topic, v2) {
+		return topic[len(v2):]
+	}
+	if v1 := RetryGroupTopicPrefix + consumerGroup + string(PopRetrySeparatorV1); strings.HasPrefix(topic, v1) {
+		return topic[len(v1):]
+	}
+	return topic
+}
+
 // IsPopRetryTopicV2: a %RETRY% topic that
 // contains '+'. Deliberately NOT "starts with %RETRY%<group>+" — the no-group
 // form is the real test, and the extra group check would reject retry topics

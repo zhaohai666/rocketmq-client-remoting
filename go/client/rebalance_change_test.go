@@ -28,7 +28,13 @@ func rcStaleVersion(c *DefaultMQPushConsumer, topics ...string) int64 {
 	defer c.mu.Unlock()
 	for _, topic := range topics {
 		if sub := c.subscription[topic]; sub != nil {
-			sub.SubVersion = stale
+			// The table entry is swapped for a copy rather than edited in place, so
+			// a pull loop already holding the old subscription never reads a value
+			// that changed underneath it — the same rule restampSubscriptionVersions
+			// follows.
+			aged := *sub
+			aged.SubVersion = stale
+			c.subscription[topic] = &aged
 		}
 	}
 	return stale

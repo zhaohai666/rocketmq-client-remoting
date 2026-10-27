@@ -234,7 +234,10 @@ export class PullAPI {
 // processPullResult. The guard's "tagsSet non-empty" check is exactly why
 // FilterAPI's SUB_ALL branch must keep tagsSet EMPTY: subscribing to "*" means
 // switching filtering off entirely, not filtering out every message.
-function clientSideTagFilter(sub: SubscriptionData, msgs: MessageExt[]): MessageExt[] {
+//
+// Exported because the POP round applies the same step to its FOUND answer: one
+// rule, one implementation.
+export function clientSideTagFilter(sub: SubscriptionData, msgs: MessageExt[]): MessageExt[] {
   // tagsSet is a Set in this implementation — use .size, not .length.
   // `.length === 0` on a Set is always false, which would silently turn a '*'
   // subscription (empty tagsSet -> filtering off) into "filter out everything".

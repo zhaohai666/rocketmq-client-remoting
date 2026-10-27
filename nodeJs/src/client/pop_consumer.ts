@@ -33,11 +33,14 @@ import {
 } from './pop_api.ts';
 import { AckMessageRequestHeader, ChangeInvisibleTimeRequestHeader, PopMessageRequestHeader } from '../remoting/headers.ts';
 import { MESSAGE_REQUEST_MODE_POP } from '../remoting/pop_bodies.ts';
+import { ConsumeFromWhere } from '../remoting/heartbeat.ts';
 import { ResponseCode } from '../remoting/codes.ts';
 import { isLogicalQueueMockBrokerName } from '../remoting/static_topic.ts';
 import { MQBrokerException, RemotingTimeoutException } from '../remoting/exception.ts';
 import { ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus } from './consumer_result.ts';
-import { ConsumeMessageContext } from './hook.ts';
+import { ConsumeMessageContext, FilterMessageContext } from './hook.ts';
+import { clientSideTagFilter } from './pull_api.ts';
+import type { SubscriptionData } from '../common/subscriptionData.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('pop');
@@ -52,6 +55,22 @@ export const POP_MAX_INVISIBLE_TIME = 300000;
 // Fallback applied at request time when the configured value is out of range —
 // NOT an error.
 export const POP_DEFAULT_INVISIBLE_TIME = 60000;
+
+// The two start positions a POP request can name for a group that has never
+// popped this queue: MIN(0) replays from the queue's first message, MAX(1)
+// starts at its tail.
+export const POP_INIT_MODE_MIN = 0;
+export const POP_INIT_MODE_MAX = 1;
+
+// consumeInitMode translates the consumer's start policy into that position.
+// CONSUME_FROM_FIRST_OFFSET is the ONLY value that means MIN: every other
+// value, the default CONSUME_FROM_LAST_OFFSET included, means MAX. A POP group
+// configured to start at the tail therefore must not send MIN — the symptom of
+// that mistake is a fresh group replaying the whole backlog.
+export function consumeInitMode(consumeFromWhere: string | null | undefined): number {
+  return consumeFromWhere === ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET
+    ? POP_INIT_MODE_MIN : POP_INIT_MODE_MAX;
+}
 
 // The pause a POP round takes when this client's own gate stopped it. Same
 // number as the pull path's cache wait, and it is the duration named in the
@@ -123,16 +142,26 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     if (c._isStopped(stopFlag)) return;
     switch (result.popStatus) {
       case PopStatus.FOUND: {
-        // The RT counter is bumped for a FOUND answer even when the list is
-        // empty; only the TPS counter is conditioned on a non-empty list.
+        // The pre-delivery filter runs first, so what it removes never reaches
+        // the pull stats, never enters the queue's answer debt and never
+        // reaches the listener; the rows it removes are ACKed there and then.
+        processPopResult(c, mq, sub, result);
+        const msgs = result.msgFoundList;
+        // The RT counter is bumped for every FOUND answer — including one whose
+        // list is empty, whether the broker sent none or the filter removed
+        // them all. Only the TPS counter follows the delivered count.
         c._incPullRT(mq.getTopic(), Date.now() - begin);
-        if (result.msgFoundList.length === 0) {
-          // FOUND with an empty list retries immediately.
+        if (msgs.length === 0) {
+          // Nothing to hand over: re-pop immediately, and count no TPS for the
+          // round.
           continue;
         }
-        c._incPullTPS(mq.getTopic(), result.msgFoundList.length);
-        pq.incFoundMsg(result.msgFoundList.length);
-        submitPopConsume(c, mq, result.msgFoundList, pq);
+        c._incPullTPS(mq.getTopic(), msgs.length);
+        // The debt is fed with the DELIVERED count only: every one of these owes
+        // an answer, and the rows the filter already ACKed are not counted, so
+        // the counter returns to zero once the listener has settled this batch.
+        pq.incFoundMsg(msgs.length);
+        submitPopConsume(c, mq, msgs, pq);
         if (c.pullInterval > 0 && await c._sleepOrStop(c.pullInterval, stopFlag)) return;
         break;
       }
@@ -178,7 +207,9 @@ async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Pr
   header.invisibleTime = invisibleTime;
   header.pollTime = POP_BROKER_SUSPEND_MAX_TIME_MILLIS;
   header.bornTime = Date.now();
-  header.initMode = 0;
+  // The consumer's own start policy, translated: a tail-starting group must not
+  // ask the broker to replay the queue from its first message.
+  header.initMode = consumeInitMode(c.consumeFromWhere);
   // order stays false: this port does not do orderly POP.
   header.order = false;
   if (sub) {
@@ -189,6 +220,84 @@ async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Pr
   // top of the broker hold budget.
   const timeout = POP_BROKER_SUSPEND_MAX_TIME_MILLIS + POP_REQUEST_EXTRA_NETWORK_MILLIS;
   return client.popMessage(mq.getBrokerName(), resolved.addr, header, c.namespace, timeout);
+}
+
+// ---------------------------------------------------------------------------
+// pre-delivery filter
+// ---------------------------------------------------------------------------
+
+// processPopResult filters a FOUND pop answer before the round is booked or its
+// rows are handed over. Four steps, in this order:
+//
+//  (a) the client-side string tag check the pull result also gets. A
+//      subscription with a non-empty tag set drops a row whose TAGS property is
+//      absent or unknown to that set; an empty tag set (SUB_ALL) or a
+//      class/SQL92 expression switches the step off entirely and keeps
+//      everything, because then the broker's hash code set is the only filter.
+//  (b) the FilterMessageHook list, run over the mutable kept list. A hook that
+//      throws is logged and skipped: it must not cost the round its messages.
+//  (c) the retry budget, as an EARLY guard: a row whose reconsume count is
+//      STRICTLY past the effective budget (the knob, or 16 while the knob is
+//      -1) is dropped here instead of being handed to the listener. A row that
+//      has exactly reached the budget still goes through, and what the listener
+//      does not ACK stays governed by the post-listener budget handling in
+//      processPopConsumeResult.
+//  (d) every row (a)-(c) removed is ACKed immediately, with the same ACK the
+//      success path sends. An un-ACKed POP row just comes back when its
+//      invisibility window closes, so "filtered out but not acked" would replay
+//      the same rows round after round. The filter runs BEFORE the queue's
+//      answer debt is fed, so a dropped row never enters it: feeding the
+//      accumulator with the remaining count alone is what settles its
+//      bookkeeping.
+//
+// Nothing else about the round changes: the result's list is replaced by the
+// remaining rows and everything else sees only those.
+export function processPopResult(c: DefaultMQPushConsumer, mq: MessageQueue,
+  sub: SubscriptionData | undefined, result: PopResult): PopResult {
+  if (result.popStatus !== PopStatus.FOUND) return result;
+  const found = result.msgFoundList;
+  if (found.length === 0) return result;
+
+  let kept = clientSideTagFilter(sub as SubscriptionData, found);
+
+  const hooks = c.filterMessageHookList;
+  if (hooks.length > 0) {
+    const ctx = new FilterMessageContext();
+    ctx.consumerGroup = c.consumerGroup;
+    ctx.msgList = kept;
+    ctx.mq = mq;
+    ctx.unitMode = c.unitMode;
+    ctx.accessChannel = 'LOCAL';
+    for (const hook of hooks.slice()) {
+      try {
+        hook.filterMessage(ctx);
+      } catch (e) {
+        logger.error('execute filter hook error, hookName=%s: %s',
+          hook.getHookName(), (e as Error).message);
+      }
+    }
+    // A hook that replaced the list hands back its own; one that left it alone
+    // (or threw) leaves the list this step was given.
+    kept = Array.isArray(ctx.msgList) ? (ctx.msgList as MessageExt[]) : kept;
+  }
+
+  const maxReconsumeTimes = popMaxReconsumeTimes(c);
+  const deliverable = kept.filter((msg) => {
+    if (msg.getReconsumeTimes() > maxReconsumeTimes) {
+      logger.info('Reconsume times has reached %d, so ack msg=%s',
+        msg.getReconsumeTimes(), msg.getMsgId());
+      return false;
+    }
+    return true;
+  });
+
+  if (deliverable.length !== found.length) {
+    for (const msg of found) {
+      if (!deliverable.includes(msg)) void ackMessagePop(c, msg);
+    }
+  }
+  result.msgFoundList = deliverable;
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +344,10 @@ async function consumePopBatch(c: DefaultMQPushConsumer, mq: MessageQueue, batch
     return;
   }
 
+  // POP retry rows arrive under the retry topic the broker hid them on; the
+  // listener is handed the business topic they were subscribed to instead. The
+  // plain %RETRY%<group> restore and the namespace strip follow right after.
+  c._resetPopRetryTopic(batch);
   c._resetRetryTopicAndNamespace(batch);
   const ctx = new ConsumeConcurrentlyContext(mq);
 

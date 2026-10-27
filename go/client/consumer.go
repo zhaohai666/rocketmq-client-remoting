@@ -1623,6 +1623,11 @@ func (c *DefaultMQPushConsumer) beatAfterRebalance() {
 // subscription equality covers the version, so a broker that had suppressed this
 // client's unchanged subscriptions now takes them again — which is what stops a
 // queue this client just picked up from being served under a stale filter.
+//
+// Each topic's table entry is swapped for a copy that carries the new version, and
+// the shared object a pull loop or a beat may already be reading is left untouched:
+// a subscription published at one version is never rewritten afterwards, so a round
+// that is already in flight finishes with the version it started with.
 func (c *DefaultMQPushConsumer) restampSubscriptionVersions(topics []string) {
 	if len(topics) == 0 {
 		return
@@ -1636,9 +1641,11 @@ func (c *DefaultMQPushConsumer) restampSubscriptionVersions(topics []string) {
 			continue
 		}
 		common.LogInfof("%s rebalance changed, also update version: %d, %d", topic, sub.SubVersion, newVersion)
-		// The map holds the same pointers the instance's heartbeat builder reads, so
-		// the new version is what the next beat carries.
-		sub.SubVersion = newVersion
+		restamped := *sub
+		restamped.SubVersion = newVersion
+		// The new entry is what the next beat reads, because the heartbeat builder
+		// snapshots the table under this same lock.
+		c.subscription[topic] = &restamped
 	}
 }
 

@@ -221,6 +221,45 @@ final class DefaultMQPushConsumer
             : self::PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION;
     }
     /**
+     * The wait the POP round hands over to the next ``tick()`` when the broker said it is busy polling
+     * this queue (POLLING_FULL), or answered a status this client has no rule for. Unlike a round that
+     * simply found nothing, this is the broker pushing the request back, so no local polling interval
+     * applies and the queue waits this long instead.
+     */
+    public const POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL = 3000;
+    /**
+     * How long the queue waits before its next pop, judged from the status of the round that just ended.
+     *
+     * A round that delivered nothing has to wait for this client's own polling interval: this port sends
+     * ``pollTime = 0`` (see the class header), so an empty answer costs no suspend budget at the broker
+     * and re-popping at once would turn every idle queue into a hot loop inside one ``tick()``.
+     * ``POLLING_FULL`` and any status not listed here take the longer broker-driven wait instead.
+     * Pure and public because the three arms are state, not time: they are pinned offline without a
+     * broker that has to be made to answer in a particular way.
+     */
+    public static function popIdleBackoffMillisForStatus(
+        PopStatus $status,
+        int $popIntervalMillis,
+    ): int {
+        return match ($status) {
+            PopStatus::FOUND, PopStatus::NO_NEW_MSG, PopStatus::POLLING_NOT_FOUND => max(0, $popIntervalMillis),
+            PopStatus::POLLING_FULL => self::POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL,
+            default => self::POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL,
+        };
+    }
+    /**
+     * The retry budget a POP batch is judged against before delivery: this consumer's own limit, or the
+     * default of 16 while ``maxReconsumeTimes`` is left unset (-1). The pre-delivery drop compares the
+     * message's reconsume times as **strictly greater** than this number, so a message that has used
+     * exactly the whole budget is still delivered.
+     */
+    private function effectiveMaxReconsumeTimes(): int
+    {
+        return $this->maxReconsumeTimes === -1
+            ? ConsumerDefaults::MAX_RECONSUME_TIMES_WHEN_UNSET
+            : $this->maxReconsumeTimes;
+    }
+    /**
      * A throttled queue trips a cache gate on every pull round, so warning every round buries
      * the signal in noise: only every Nth trip warns (the 1st, then the 1001st, ...).
      */
@@ -1671,14 +1710,13 @@ final class DefaultMQPushConsumer
                 brokerId: $brokerId,
             );
             $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
-            // Consume stats: RT is recorded every time, TPS only when there are messages.
-            if ($this->statsManager !== null) {
+            // Consume stats: only a FOUND round records the pull round trip, and it records it even
+            // when no row came back. Idle rounds contribute nothing, so PULL_RT stays the latency of
+            // rounds that carried work instead of an average diluted by every no-message poll.
+            // PULL_TPS is fed further down, from the list that survives the pre-delivery filter.
+            if ($this->statsManager !== null && $result->status === PullStatus::FOUND) {
                 $this->statsManager->incPullRt($this->consumerGroup, $mq->topic,
                     (int) ((microtime(true) - $pullBegan) * 1000));
-                if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
-                    $this->statsManager->incPullTps($this->consumerGroup, $mq->topic,
-                        count($result->msgFoundList));
-                }
             }
         } catch (RemotingTimeoutException $e) {
             // Network timeout under short polling backs off and retries as an expected path.
@@ -1702,6 +1740,13 @@ final class DefaultMQPushConsumer
                 $result->msgFoundList,
                 $this->unitMode,
             );
+            // PULL_TPS counts what this round actually hands on: the filtered list. A row the second
+            // tag pass or a filter hook removed was never delivered, so counting the raw response would
+            // overstate the topic's throughput by exactly the rows this client dropped.
+            if ($this->statsManager !== null && $result->msgFoundList !== []) {
+                $this->statsManager->incPullTps($this->consumerGroup, $mq->topic,
+                    count($result->msgFoundList));
+            }
         }
 
         // Under the single-thread model, queue revocation cannot happen during a synchronous
@@ -2095,6 +2140,44 @@ final class DefaultMQPushConsumer
         }
     }
 
+    /**
+     * Hands the listener the ordinary topic of a POP retry topic: ``%RETRY%<group>+Topic`` and
+     * ``%RETRY%<group>_Topic`` both become ``Topic``, while exactly ``%RETRY%<group>`` and an ordinary
+     * topic keep their name (see ``ExtraInfoUtil::parsePopRetryTopic``).
+     *
+     * With a namespace the name is unwrapped first, then normalised, then the wrap is taken off the
+     * restored name again, so the rule reads the same on both sides of the namespace: the group inside
+     * the topic name is the one without the namespace prefix, while ``$this->consumerGroup`` carries it.
+     *
+     * Only the concurrent delivery entries call this, right before the listener runs. The orderly path
+     * does not: it consumes the queue it locked under the name that queue has, and the offset bookkeeping
+     * of a retry queue is keyed on it.
+     */
+    private function resetPopRetryTopic(array $msgs): void
+    {
+        if ($msgs === []) {
+            return;
+        }
+        $group = $this->consumerGroup;
+        if ($this->namespace !== '') {
+            $group = NamespaceUtil::withoutNamespace($group, $this->namespace);
+        }
+        foreach ($msgs as $msg) {
+            $topic = (string) $msg->topic;
+            if ($this->namespace !== '') {
+                $topic = NamespaceUtil::withoutNamespace($topic, $this->namespace);
+            }
+            $normal = ExtraInfoUtil::parsePopRetryTopic($topic, $group);
+            if ($normal === $topic) {
+                continue;
+            }
+            if ($this->namespace !== '') {
+                $normal = NamespaceUtil::withoutNamespace($normal, $this->namespace);
+            }
+            $msg->topic = $normal;
+        }
+    }
+
     // ---------------- Broker-initiated requests: 220 / 221 / 307 / 309 ----------------
 
     public function resetOffset(string $topic, array $offsetTable): void
@@ -2385,6 +2468,7 @@ final class DefaultMQPushConsumer
         bool $broadcast,
     ): bool {
         $listener = $this->messageListener;
+        $this->resetPopRetryTopic($batch);
         $context = new ConsumeConcurrentlyContext($mq);
         $hookCtx = null;
         if ($this->consumeMessageHookList !== []) {
@@ -2666,7 +2750,7 @@ final class DefaultMQPushConsumer
         if ($addr === null || $addr === '') {
             throw new MQClientException("Broker[$brokerName] master node does not exist");
         }
-        $maxReconsume = $this->maxReconsumeTimes === -1 ? 16 : $this->maxReconsumeTimes;
+        $maxReconsume = $this->effectiveMaxReconsumeTimes();
         $header = new ConsumerSendMsgBackRequestHeader();
         $header->offset = $msg->commitLogOffset;
         $header->group = $this->consumerGroup;
@@ -3152,53 +3236,100 @@ final class DefaultMQPushConsumer
             return false;
         }
         $found = $result->status === PopStatus::FOUND;
-        if ($found) {
-            if ($this->statsManager !== null) {
-                $this->statsManager->incPullRt($this->consumerGroup, $mq->topic,
-                    (int) ((microtime(true) - $began) * 1000));
-                if ($result->msgFoundList !== []) {
-                    $this->statsManager->incPullTps($this->consumerGroup, $mq->topic,
-                        count($result->msgFoundList));
-                }
-            }
+        $popped = $found ? $result->msgFoundList : [];
+        if ($found && $this->statsManager !== null) {
+            // The round's own cost, judged before anything is dropped: the RT of a POP round is the
+            // time the pop request took, whatever the pre-delivery step makes of the batch afterwards.
+            $this->statsManager->incPullRt($this->consumerGroup, $mq->topic,
+                (int) ((microtime(true) - $began) * 1000));
         }
-        if ($found && $result->msgFoundList !== []) {
-            $pq->incFoundMsg(count($result->msgFoundList));
+        if ($popped !== []) {
+            // The whole popped batch is booked first; every row the pre-delivery step drops pays its own
+            // ack back, so what is left waiting for an ack is exactly the batch handed to the listener.
+            $pq->incFoundMsg(count($popped));
             $kept = filter_messages_for_delivery(
                 $this->consumerGroup,
                 $this->filterMessageHookList,
                 $mq,
                 $sub,
-                $result->msgFoundList,
+                $popped,
                 $this->unitMode,
             );
-            if (count($kept) !== count($result->msgFoundList)) {
+            // The retry budget, applied here and nowhere else: a message that has already used more
+            // reconsumes than the budget will not be retried again by this client, so handing it to the
+            // listener would only produce another round trip. A POP row can be acked instead, which is
+            // why this belongs to the POP pre-delivery step; the pull path must never do it, because a
+            // pull advances the offset and a row skipped there is gone without any send-back.
+            $budget = $this->effectiveMaxReconsumeTimes();
+            $budgetDropped = [];
+            $deliverable = [];
+            foreach ($kept as $msg) {
+                if ($msg->getReconsumeTimes() > $budget) {
+                    $budgetDropped[] = $msg;
+                } else {
+                    $deliverable[] = $msg;
+                }
+            }
+            $kept = $deliverable;
+            if (count($kept) !== count($popped)) {
                 $keptIds = [];
                 foreach ($kept as $m) {
                     $keptIds[spl_object_id($m)] = true;
                 }
-                foreach ($result->msgFoundList as $msg) {
+                foreach ($popped as $msg) {
                     if (!isset($keptIds[spl_object_id($msg)])) {
                         $this->ackPopMsg($msg);
                         $pq->ack();
                     }
                 }
+            }
+            if (count($kept) + count($budgetDropped) !== count($popped)) {
                 Logger::info(sprintf(
                     'pop filter dropped %d of %d messages (acked)',
-                    count($result->msgFoundList) - count($kept),
-                    count($result->msgFoundList),
+                    count($popped) - count($kept) - count($budgetDropped),
+                    count($popped),
                 ));
             }
-            if ($kept !== []) {
-                $this->submitPopConsumeRequest($kept, $pq, $mq);
+            foreach ($budgetDropped as $msg) {
+                Logger::info(sprintf(
+                    'reconsume times has reached %d, so ack msg=%s',
+                    $budget,
+                    (string) ($msg->msgId ?? ''),
+                ));
+            }
+            if ($kept === []) {
+                // Everything this round popped was acked before delivery, so nothing of it is waiting for
+                // an ack and the next pop is allowed at once. No message reached the listener either, which
+                // is why this round records no delivery TPS.
                 return true;
+            }
+            if ($this->statsManager !== null) {
+                // TPS counts what the round actually delivered, not what the broker handed over.
+                $this->statsManager->incPullTps($this->consumerGroup, $mq->topic, count($kept));
+            }
+            $this->submitPopConsumeRequest($kept, $pq, $mq);
+            if ($this->pullInterval > 0) {
+                $this->idleUntil[$key] = microtime(true) + $this->pullInterval / 1000.0;
+                return false;
             }
             return true;
         }
-        // Empty result: an immediate return from short polling would turn into a hot loop, so fall back to
-        // idle backoff.
-        $this->idleUntil[$key] = microtime(true) + max(0, $this->popIntervalMillis) / 1000.0;
+        // Nothing was delivered: an immediate return from short polling would turn into a hot loop, so the
+        // round hands over the wait its status calls for (POLLING_FULL and any unknown status wait longer
+        // than a round that simply found nothing).
+        $this->idleUntil[$key] = microtime(true)
+            + self::popIdleBackoffMillisForStatus($result->status, $this->popIntervalMillis) / 1000.0;
         return false;
+    }
+
+    /**
+     * When the next pop of this queue is allowed, in seconds since the epoch, or null when nothing holds
+     * it back. PHP adaptation of the re-scheduled pop request: ``tick()`` leaves the round's wait behind
+     * as due time instead of sleeping, and the POP round sets it per status (see ``popOnce()``).
+     */
+    public function nextPopAllowedAt(string $queueKey): ?float
+    {
+        return $this->idleUntil[$queueKey] ?? null;
     }
 
     private function submitPopConsumeRequest(array $msgs, PopProcessQueue $pq, MessageQueue $mq): void
@@ -3268,6 +3399,7 @@ final class DefaultMQPushConsumer
             return;
         }
 
+        $this->resetPopRetryTopic($msgs);
         $this->resetRetryTopicAndNamespace($msgs);
         $context = new ConsumeConcurrentlyContext($mq);
         $context->ackIndex = count($msgs) - 1;

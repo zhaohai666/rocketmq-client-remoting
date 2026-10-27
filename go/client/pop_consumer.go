@@ -93,12 +93,25 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 		switch result.PopStatus {
 		case PopFound:
 			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
-			if len(result.MsgFoundList) == 0 {
+			kept, dropped := c.filterPopFound(mq, sub, result.MsgFoundList)
+			// A row this client removed on its own is a row it owns the answer
+			// for: ack it now. The rows never entered the ACK debt below, so the
+			// ack is the whole bookkeeping for them.
+			for _, msg := range dropped {
+				c.ackMessagePop(msg)
+			}
+			if len(kept) == 0 {
+				// Either the broker handed over nothing or the filter removed
+				// everything. No TPS is recorded for a batch nobody consumed, and
+				// the next pop is not delayed by pullInterval.
 				continue
 			}
-			c.incPullTPS(mq.Topic, int64(len(result.MsgFoundList)))
-			pq.IncFoundMsg(len(result.MsgFoundList))
-			c.submitPopConsume(mq, result.MsgFoundList, pq)
+			c.incPullTPS(mq.Topic, int64(len(kept)))
+			// The debt is exactly what the consume service is handed below, so
+			// every row of this round decrements it once and no filtered row adds
+			// a debt nothing will ever settle.
+			pq.IncFoundMsg(len(kept))
+			c.submitPopConsume(mq, kept, pq)
 			if interval := c.pullIntervalValue(); interval > 0 {
 				if c.sleepOrStop(stop, time.Duration(interval)*time.Millisecond) {
 					return
@@ -108,7 +121,9 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			// Retry immediately: the broker already held the poll open.
 			continue
 		default:
-			// POLLING_FULL and anything else: back off.
+			// POLLING_FULL and anything else: the broker asked us to come back
+			// later, so this waits out the exception back-off rather than
+			// pullInterval or an immediate re-pop.
 			if c.sleepOrStop(stop, popDelayWhenException*time.Millisecond) {
 				return
 			}
@@ -187,7 +202,7 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 		InvisibleTime: remoting.I64Ptr(invisibleTime),
 		PollTime:      remoting.I64Ptr(popBrokerSuspendMaxTimeMillis),
 		BornTime:      remoting.I64Ptr(born),
-		InitMode:      remoting.I32Ptr(0),
+		InitMode:      remoting.I32Ptr(c.popInitMode()),
 		// order stays false: this port does not do orderly POP.
 		Order: remoting.BoolPtr(false),
 	}
@@ -197,6 +212,97 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 	}
 	timeout := popBrokerSuspendMaxTimeMillis + popRequestExtraNetworkMillis
 	return inst.PopMessage(mq.BrokerName, addr, header, namespace, timeout)
+}
+
+// popInitMode maps the consumer's ConsumeFromWhere onto the POP request's
+// initMode, which is what decides where a group with no POP checkpoint yet starts
+// in the queue:
+//
+//	CONSUME_FROM_FIRST_OFFSET -> MIN (0), read from the oldest message
+//	anything else, the default CONSUME_FROM_LAST_OFFSET included -> MAX (1)
+//
+// Sending a constant here is what makes the mapping silently wrong: a fresh group
+// configured to start at the tail would replay the whole backlog, and the
+// subscription's policy would look respected on every other leg.
+func (c *DefaultMQPushConsumer) popInitMode() int32 {
+	if c.ConsumeFromWhere() == ConsumeFromWhereFirstOffset {
+		return common.ConsumeInitModeMin
+	}
+	return common.ConsumeInitModeMax
+}
+
+// ------------------------------------------------------- pre-delivery filter
+
+// filterPopFound applies the client-side rules a FOUND pop batch must pass before
+// anything about the round is recorded or handed over, and splits it into the rows
+// that survived and the rows this client removed itself.
+//
+// The steps run in this order, and each one works on what the previous kept:
+//
+//  1. the tag set — only when the subscription carries tags and is not in
+//     class/SQL92 mode. A row with no tag at all is dropped by this step, and a
+//     wildcard subscription (empty tag set) keeps everything instead of matching
+//     nothing.
+//  2. the FilterMessageHook list, over the rows step 1 kept. executeFilterHooks
+//     catches a hook that throws, so one bad hook costs the round its filter and
+//     nothing else.
+//  3. the retry budget: a row whose reconsumeTimes is STRICTLY greater than the
+//     effective maximum (the knob, or 16 while the knob is -1) is not delivered
+//     again. The boundary belongs to the strict comparison — a row that reached
+//     the maximum exactly has spent its last attempt and still gets delivered.
+//
+// The caller acks what comes back in `dropped` and submits only `kept`: an
+// un-acked POP row is simply revived by the broker and pops again, so filtering a
+// row without acking it turns one round into an endless re-pop of rows this client
+// has already decided not to deliver. Note that the rows removed here never reach
+// the pull stats or the wait-ACK debt either, and this early guard is additive to
+// the budget check processPopConsumeResult applies after the listener answered.
+func (c *DefaultMQPushConsumer) filterPopFound(mq common.MessageQueue, sub *remoting.SubscriptionData,
+	msgs []*common.MessageExt) (kept, dropped []*common.MessageExt) {
+
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	kept = clientSideTagFilter(sub, msgs)
+
+	if hooks := c.filterMessageHooks(); len(hooks) > 0 {
+		ctx := &FilterMessageContext{
+			ConsumerGroup: c.consumerGroup,
+			MsgList:       kept,
+			MQ:            mq,
+			UnitMode:      c.IsUnitMode(),
+			Props:         map[string]string{},
+			AccessChannel: AccessChannelLocal,
+		}
+		executeFilterHooks(hooks, ctx)
+		kept = ctx.MsgList
+	}
+
+	budget := c.popMaxReconsumeTimes()
+	withinBudget := make([]*common.MessageExt, 0, len(kept))
+	for _, msg := range kept {
+		if msg.ReconsumeTimes > budget {
+			common.LogInfof("pop reconsume times %d exceeds the limit %d, ack without delivering: msgId=%s mq=%v",
+				msg.ReconsumeTimes, budget, msg.MsgID, mq)
+			continue
+		}
+		withinBudget = append(withinBudget, msg)
+	}
+	kept = withinBudget
+
+	if len(kept) == len(msgs) {
+		return kept, nil
+	}
+	survivors := make(map[*common.MessageExt]struct{}, len(kept))
+	for _, msg := range kept {
+		survivors[msg] = struct{}{}
+	}
+	for _, msg := range msgs {
+		if _, ok := survivors[msg]; !ok {
+			dropped = append(dropped, msg)
+		}
+	}
+	return kept, dropped
 }
 
 // submitPopConsume splits one pop batch into consumeMessageBatchMaxSize chunks
@@ -238,6 +344,43 @@ func (c *DefaultMQPushConsumer) submitPopConsume(mq common.MessageQueue, msgs []
 	}
 }
 
+// resetPopRetryTopic hands the listener the business topic that a POP retry queue hides in its own
+// name, so a retried message arrives under the topic the listener subscribed to rather than under a
+// name it has never seen. Both wire spellings are cut — `%RETRY%<group>_<topic>` and
+// `%RETRY%<group>+<topic>` — because the ack of a delivered row is rebuilt from the message's topic
+// plus the POP_CK retry flag, and a flag that says "this is the V1/V2 retry form" only reproduces the
+// name the broker gave us if the topic handed over is the plain business topic.
+//
+// A wrapper naming another group, a bare `%RETRY%<group>` (whose real topic the property-based restore
+// recovers) and an ordinary topic are left alone, and so is a wrapper whose tail is empty: cutting
+// nothing would hand the listener an empty topic, which is worse than the retry name.
+//
+// The namespace is peeled on the way in AND on the way out, because the prefix can sit inside the
+// group segment of the retry name (`%RETRY%<ns>%<group>_<topic>`) and the business topic behind the
+// separator can carry it too.
+func (c *DefaultMQPushConsumer) resetPopRetryTopic(msgs []*common.MessageExt) {
+	if len(msgs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	namespace := c.namespace
+	c.mu.Unlock()
+	for _, msg := range msgs {
+		topic := msg.Topic
+		if namespace != "" {
+			topic = common.WithoutNamespace(topic, namespace)
+		}
+		normal := common.ParsePopNormalTopic(topic, c.consumerGroup)
+		if normal == "" {
+			continue
+		}
+		if namespace != "" {
+			normal = common.WithoutNamespace(normal, namespace)
+		}
+		msg.Topic = normal
+	}
+}
+
 func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []*common.MessageExt, pq *popProcessQueue) {
 	if len(batch) == 0 {
 		return
@@ -259,6 +402,7 @@ func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []
 		return
 	}
 	ctx := NewConsumeConcurrentlyContext(mq)
+	c.resetPopRetryTopic(batch)
 	c.resetRetryTopicAndNamespace(batch)
 
 	var hookCtx *ConsumeMessageContext
