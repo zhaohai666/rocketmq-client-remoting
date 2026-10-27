@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 837 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 848 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 517 | 50.9s |
-| `common` | 135 | 2.3s |
-| `remoting` | 185 | 1.3s |
-| **Total** | **837** (74 `*_test.go` files) | ~55s |
+| `client` | 528 | 54.3s |
+| `common` | 135 | 3.8s |
+| `remoting` | 185 | 1.6s |
+| **Total** | **848** (76 `*_test.go` files) | ~60s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -243,6 +243,32 @@ window):
 
 ```go
 consumer.SetPopMode(true)
+```
+
+There is ONE knob for the wait after a failed pull or pop round — `SetPullFailedBackoffMillis`,
+default 1000 ms. Any round that fails for a reason other than the broker's own flow control
+(a non-215 error, an unresolvable offset, a `POLLING_FULL` or unrecognised pop status) sleeps
+this single value before re-issuing. Each loop reads it once when it starts, so changing the
+knob after `Start` does not disturb a loop already running. Three arms stay fixed and do not go
+through the knob: the broker's `FLOW_CONTROL`(215) still waits 20ms, this client's own cache
+gate still waits 50ms, and a paused consumer still waits 1000ms.
+
+```go
+consumer.SetPullFailedBackoffMillis(2000) // optional, default 1000 ms
+```
+
+The gap between two pull rounds depends on ONE thing: whether that round actually handed
+messages over. A round that did — status FOUND and rows still left after this client's own tag
+pass and filter hooks, i.e. exactly what `PULL_TPS` just counted — waits `pullInterval`
+(`SetPullInterval`, default 0, and 0 means re-pull at once). A round that handed over nothing —
+a FOUND whose batch came back empty or was emptied by the local filtering, `NO_NEW_MSG`,
+`NO_MATCHED_MSG` — starts the next round immediately: the cadence paces rounds that delivered,
+so a further local wait on an idle round would only delay the next fetch. Failed
+rounds and `OFFSET_ILLEGAL` are outside this rule: a failure still sleeps the knob above (the
+broker's 215 stays 20ms), and `OFFSET_ILLEGAL` still goes through the freeze-and-rebuild.
+
+```go
+consumer.SetPullInterval(50) // optional, default 0: paces only a round that delivered
 ```
 
 ### PullConsumer
@@ -595,7 +621,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   74 test files, 837 test functions
+│   └── *_test.go                   76 test files, 848 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

@@ -63,7 +63,7 @@ if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
  *   independently in the multi-threaded model; under PHP single-thread, long polling would
  *   starve the other queues, so it becomes **short polling** (suspend=false) plus idle
  *   backoff ``pullIntervalMillis`` on empty results (1000ms by default). Semantic cost:
- *   offset correction of empty queues (correctTagsOffset) goes from ~once per 15s to ~once
+ *   offset correction of empty queues (correctTagsOffset) goes from once per suspend window to ~once
  *   per 1s, only more frequent never lazier; throughput cost: at most
  *   ``maxPullsPerQueuePerTick`` short-poll rounds per queue per single tick;
  * - **Consumption**: dispatch means synchronous consumption; PHP dispatches synchronously
@@ -142,6 +142,13 @@ final class DefaultMQPushConsumer
      */
     public int $pullThresholdForTopic = -1;
     public int $pullThresholdSizeForTopic = -1;
+    /**
+     * The cadence of the rounds that delivered: how long a queue waits before its next pull (or pop)
+     * round once the last one handed rows over. At 0, the default, a delivered round lets the very same
+     * queue re-pull inside the same ``tick()``; above 0 it arms this many milliseconds as the queue's
+     * next allowed round. Rounds that delivered nothing are not paced by this knob -- they keep the
+     * idle guard below.
+     */
     public int $pullInterval = 0;
     /**
      * Pull RPC timeout. WARNING: under long-poll semantics it should be 30000 (suspend budget);
@@ -149,6 +156,12 @@ final class DefaultMQPushConsumer
      * 5000 - a stuck connection need not wait 30s.
      */
     public int $pullTimeoutMillis = 5000;
+    /**
+     * This client's own idle guard for a round that delivered nothing: because the pull is a short poll
+     * (``pollTime = 0``, see the class header), an empty answer costs no broker suspend budget and returns
+     * at once, so re-polling immediately would turn every idle queue into a hot loop inside one ``tick()``.
+     * A round that handed rows over is not guarded by this knob -- it is paced by ``$pullInterval``.
+     */
     public int $pullIntervalMillis = 1000;
     /** Max short-poll rounds per queue within a single tick (new in the PHP adaptation; throughput knob). */
     public int $maxPullsPerQueuePerTick = 8;
@@ -206,45 +219,63 @@ final class DefaultMQPushConsumer
      * says nothing about this client's cache, so the retry is sooner than for any other error.
      */
     public const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL = 20;
-    /** Every other broker or client error on the pull/pop path (topic not created yet, ...). */
-    public const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 500;
+    /**
+     * Default of ``$failedRequestBackoffMillis``: the wait a round that failed for any other reason
+     * hands to the next ``tick()``.
+     */
+    public const DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS = 1000;
+    /**
+     * The wait before this client re-issues a pull (or a pop) for a queue whose last round failed for
+     * any reason other than the broker's own flow control. One number for the whole set of those
+     * failures: a broker or client error that is not FLOW_CONTROL(215), a round taken while this
+     * consumer is not running or the queue's subscription is gone, and a POP round the broker pushed
+     * back with POLLING_FULL (or answered with a status this client has no rule for).
+     * The schedule is built from the configured value (see ``start()``), so moving the knob afterwards
+     * does not alter a schedule that is already running.
+     */
+    public int $failedRequestBackoffMillis = self::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS;
+    /**
+     * The number the running schedule was built from: set by the setter before start() and re-taken by
+     * start() itself. Every armed failed-round wait reads this field and never the live knob, which is
+     * what keeps a post-start change off a schedule that is already running.
+     */
+    private int $scheduledFailedRequestBackoffMillis = self::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS;
     /**
      * The idle backoff for one failed request: FLOW_CONTROL(215) gets its own short pause, every
-     * other response code keeps the general error backoff. Pure and public because the two events
-     * look identical offline (both arrive as one MQBrokerException), so a mapping mistake has to be
-     * pinnable without a throttling broker.
+     * other response code takes the consumer's failed-round backoff. Pure and public because the two
+     * events look identical offline (both arrive as one MQBrokerException), so a mapping mistake has
+     * to be pinnable without a throttling broker; the backoff argument is the value in force for the
+     * consumer that armed the wait, and its default is the knob's own default.
      */
-    public static function pullBackoffMillisForResponseCode(?int $responseCode): int
-    {
+    public static function pullBackoffMillisForResponseCode(
+        ?int $responseCode,
+        int $failedRequestBackoffMillis = self::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS,
+    ): int {
         return $responseCode === ResponseCode::FLOW_CONTROL
             ? self::PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL
-            : self::PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION;
+            : max(0, $failedRequestBackoffMillis);
     }
-    /**
-     * The wait the POP round hands over to the next ``tick()`` when the broker said it is busy polling
-     * this queue (POLLING_FULL), or answered a status this client has no rule for. Unlike a round that
-     * simply found nothing, this is the broker pushing the request back, so no local polling interval
-     * applies and the queue waits this long instead.
-     */
-    public const POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL = 3000;
     /**
      * How long the queue waits before its next pop, judged from the status of the round that just ended.
      *
      * A round that delivered nothing has to wait for this client's own polling interval: this port sends
      * ``pollTime = 0`` (see the class header), so an empty answer costs no suspend budget at the broker
      * and re-popping at once would turn every idle queue into a hot loop inside one ``tick()``.
-     * ``POLLING_FULL`` and any status not listed here take the longer broker-driven wait instead.
-     * Pure and public because the three arms are state, not time: they are pinned offline without a
+     * ``POLLING_FULL`` and any status not listed here are a failed round, so they take the consumer's
+     * failed-round backoff instead -- the same number the pull path arms for a non-215 error.
+     * Pure and public because the arms are state, not time: they are pinned offline without a
      * broker that has to be made to answer in a particular way.
      */
     public static function popIdleBackoffMillisForStatus(
         PopStatus $status,
         int $popIntervalMillis,
+        int $failedRequestBackoffMillis = self::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS,
     ): int {
+        $backoff = max(0, $failedRequestBackoffMillis);
         return match ($status) {
             PopStatus::FOUND, PopStatus::NO_NEW_MSG, PopStatus::POLLING_NOT_FOUND => max(0, $popIntervalMillis),
-            PopStatus::POLLING_FULL => self::POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL,
-            default => self::POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL,
+            PopStatus::POLLING_FULL => $backoff,
+            default => $backoff,
         };
     }
     /**
@@ -525,6 +556,25 @@ final class DefaultMQPushConsumer
         return $this->awaitTerminationMillisWhenShutdown;
     }
 
+    /**
+     * Set the failed-round backoff: the wait a queue gets before its next pull (or pop) whenever the
+     * last round failed for a reason other than the broker's own flow control. 1000 ms when untouched.
+     * Before start() the number the schedule will be built from follows immediately; afterwards it is
+     * left alone, because the running schedule keeps the wait it was armed with.
+     */
+    public function setFailedRequestBackoffMillis(int $millis): void
+    {
+        $this->failedRequestBackoffMillis = $millis;
+        if (!$this->started) {
+            $this->scheduledFailedRequestBackoffMillis = max(0, $millis);
+        }
+    }
+
+    public function getFailedRequestBackoffMillis(): int
+    {
+        return $this->failedRequestBackoffMillis;
+    }
+
     public function setAllocateMessageQueueStrategy(AllocateMessageQueueStrategy $strategy): void
     {
         $this->allocateStrategy = $strategy;
@@ -708,6 +758,9 @@ final class DefaultMQPushConsumer
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
         $this->checkConfigRanges();
+        // The pull/pop schedule is built from the configured failed-round backoff exactly once, here:
+        // a knob moved after start() must not change the wait a running schedule already arms with.
+        $this->scheduledFailedRequestBackoffMillis = max(0, $this->failedRequestBackoffMillis);
         if ($this->messageModel === MessageModel::CLUSTERING) {
             $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         }
@@ -1636,11 +1689,16 @@ final class DefaultMQPushConsumer
 
     /**
      * One pull of a single queue (a single round).
-     * true = messages were pulled, another round can run immediately; false = this queue is done for this tick.
+     * true = messages were pulled and the queue may run another round at once; false = this queue is done for this tick.
+     * A round that delivered rows is the one case that can answer true, and only while ``pullInterval`` is 0:
+     * above zero the round arms that cadence on the queue instead, so the next one waits for it.
      */
     private function pullOnce(MessageQueue $mq, string $key, bool $orderly, float $now): bool
     {
         if (!$this->started) {
+            // A round taken outside the running consumer is a failed round: it armed no request at
+            // all, so it waits the configured failed-round backoff before it is tried again.
+            $this->armFailedRoundBackoff($key);
             return false;
         }
         $client = $this->requireClient();
@@ -1650,6 +1708,9 @@ final class DefaultMQPushConsumer
         }
         $sub = $this->subscriptionData[$mq->topic] ?? null;
         if ($sub === null) {
+            // Same as above: the queue has nothing to pull with, so it is held off for the
+            // failed-round backoff instead of being re-tried on every single tick.
+            $this->armFailedRoundBackoff($key);
             return false;
         }
         // Orderly consumption: queues not confirmed locked by the broker (LOCK_BATCH_MQ) are not pulled.
@@ -1683,6 +1744,9 @@ final class DefaultMQPushConsumer
             }
             $this->offsetTable[$key] = $offset;
         }
+        // The round remembers the cursor it asked for, so the reply can be judged against it once the
+        // round is over (diagnostic only, see the sanity warning at the end of the FOUND handling).
+        $prevRequestOffset = (int) $offset;
         try {
             $subExpression = ($this->postSubscriptionWhenPull && !$sub->isClassFilterMode())
                 ? ($sub->subString ?? '*') : null;
@@ -1771,16 +1835,55 @@ final class DefaultMQPushConsumer
                 $this->correctTagsOffset($key, $result->status, $result->nextBeginOffset);
             }
         }
+        // Offset sanity warning, at the end of a FOUND round: the cursor has advanced and the batch has
+        // been handed over, so a reply whose new cursor -- or whose first delivered row -- sits below
+        // the offset the round asked for is worth a line in the log. Purely diagnostic: nothing here
+        // changes the offset, the pacing or the stats.
+        if ($result->status === PullStatus::FOUND) {
+            $nextBeginOffset = (int) $result->nextBeginOffset;
+            $firstMsgOffset = $result->msgFoundList === []
+                ? PHP_INT_MAX
+                : (int) $result->msgFoundList[0]->queueOffset;
+            if (self::pullOffsetsLookWrong($nextBeginOffset, $firstMsgOffset, $prevRequestOffset)) {
+                Logger::warning(sprintf(
+                    'Pull offsets look wrong for %s: requested at %d, nextBeginOffset=%d, firstMsgOffset=%d',
+                    $mq,
+                    $prevRequestOffset,
+                    $nextBeginOffset,
+                    $firstMsgOffset,
+                ));
+            }
+        }
         if ($illegal) {
             $this->offsetIllegalRecover($key);
             return false;
         }
         if ($result->status === PullStatus::FOUND && $result->msgFoundList !== []) {
+            // A round that delivered rows is paced by ``pullInterval``, and only when that knob is above
+            // zero; the list tested here is the one this round handed over, which is also what PULL_TPS
+            // counted above. With a budget of zero the queue re-pulls at once, as it always did.
+            if ($this->pullInterval > 0) {
+                $this->idleUntil[$key] = microtime(true) + $this->pullInterval / 1000.0;
+                return false;
+            }
             return true; // Pulled something, run another round immediately
         }
         // Empty result: idle backoff (under short polling the broker returns immediately, with no suspend budget).
+        // A FOUND round whose rows were all dropped before delivery lands here too: nothing was handed over,
+        // so it is an empty round and keeps this guard, not the ``pullInterval`` cadence above.
         $this->idleUntil[$key] = microtime(true) + max(0, $this->pullIntervalMillis) / 1000.0;
         return false;
+    }
+
+    /**
+     * Pure check behind the FOUND-round sanity warning: a round that asked the queue at
+     * ``$prevRequestOffset`` may not be answered with a cursor, nor with a first delivered row, below
+     * that request point. A round whose list is empty passes ``PHP_INT_MAX`` as ``$firstMsgOffset``, so
+     * the row leg cannot fire without a row.
+     */
+    public static function pullOffsetsLookWrong(int $nextBeginOffset, int $firstMsgOffset, int $prevRequestOffset): bool
+    {
+        return $nextBeginOffset < $prevRequestOffset || $firstMsgOffset < $prevRequestOffset;
     }
 
     private function updateMsgAccCnt(string $key, array $msgs): void
@@ -1959,8 +2062,20 @@ final class DefaultMQPushConsumer
     private function armRequestBackoff(string $key, \Throwable $e): void
     {
         $millis = self::pullBackoffMillisForResponseCode(
-            $e instanceof MQBrokerException ? $e->responseCode : null);
+            $e instanceof MQBrokerException ? $e->responseCode : null,
+            $this->scheduledFailedRequestBackoffMillis);
         $this->idleUntil[$key] = microtime(true) + $millis / 1000.0;
+    }
+
+    /**
+     * Arm the failed-round backoff of the queue without a broker answer to read: the round never got
+     * as far as a request because this consumer is not running or the queue's subscription is gone,
+     * which is a failed round like any other non-215 one and waits the same configured number.
+     */
+    private function armFailedRoundBackoff(string $key): void
+    {
+        $this->idleUntil[$key] = microtime(true)
+            + $this->scheduledFailedRequestBackoffMillis / 1000.0;
     }
 
     // ---------------- Initial offset ----------------
@@ -3158,6 +3273,9 @@ final class DefaultMQPushConsumer
     private function popOnce(MessageQueue $mq, string $key, float $now): bool
     {
         if (!$this->started) {
+            // A round taken outside the running consumer is a failed round, and it armed no request
+            // at all: the configured failed-round backoff holds it off like any other non-215 failure.
+            $this->armFailedRoundBackoff($key);
             return false;
         }
         $client = $this->requireClient();
@@ -3183,6 +3301,9 @@ final class DefaultMQPushConsumer
         }
         $sub = $this->subscriptionData[$mq->topic] ?? null;
         if ($sub === null) {
+            // Nothing to pop with for this queue's topic: a failed round, held off by the configured
+            // backoff instead of being re-tried on every single tick.
+            $this->armFailedRoundBackoff($key);
             return false;
         }
         // The POP gate shares the cache-flow-control pause with the pull path: an over-due queue
@@ -3315,10 +3436,15 @@ final class DefaultMQPushConsumer
             return true;
         }
         // Nothing was delivered: an immediate return from short polling would turn into a hot loop, so the
-        // round hands over the wait its status calls for (POLLING_FULL and any unknown status wait longer
-        // than a round that simply found nothing).
+        // round hands over the wait its status calls for -- a round that simply found nothing waits for this
+        // client's own polling interval, while POLLING_FULL and any unknown status are failed rounds and
+        // wait the configured failed-round backoff.
         $this->idleUntil[$key] = microtime(true)
-            + self::popIdleBackoffMillisForStatus($result->status, $this->popIntervalMillis) / 1000.0;
+            + self::popIdleBackoffMillisForStatus(
+                $result->status,
+                $this->popIntervalMillis,
+                $this->scheduledFailedRequestBackoffMillis,
+            ) / 1000.0;
         return false;
     }
 

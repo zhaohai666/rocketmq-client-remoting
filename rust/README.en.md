@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1143 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1152 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -292,6 +292,26 @@ verification); for production set it to `false` and configure the system trust c
   queue count alive this round, send one immediate heartbeat to every broker, and report exactly the
   moved topics to the queue-change listener registered by `set_message_queue_listener`; a round whose
   sets did not move pays none of the four
+- ✅ PushConsumer's failed-round backoff is **one knob**: `set_pull_exception_backoff_millis` /
+  `pull_exception_backoff_millis()` (config field `pull_exception_backoff_millis`, default 1000ms;
+  this backoff carries **no ceiling** and no start-up `checkConfig` gate — a negative is read as 0
+  by this client). It is the wait before this client
+  re-issues a pull (or a pop) for a queue after a round that failed for any reason other than the
+  broker's own flow control — a broker or client error that is not `FLOW_CONTROL(215)`, a failed
+  initial-offset lookup, and a POP round answered with `POLLING_FULL` or with a status this client
+  has no rule for — so there is no hardcoded 3000ms park left on either path. Three separate waits
+  are not this knob and keep their own numbers: the broker's `215` answer still waits 20ms, this
+  client's own cache gate still waits 50ms, and a paused consumer still waits 1000ms. Each queue
+  loop takes the configured value **once when the loop is set up**, so moving the knob after
+  `start()` does not alter a loop that is already running
+- ✅ PushConsumer's pull round cadence is `pull_interval`, and it paces **only a round that
+  delivered**: a round whose status is FOUND and whose list is still non-empty after the
+  pre-delivery filter (the very list the throughput count is fed from) waits `pull_interval`, and a
+  cadence of 0 re-pulls straight away. A round that handed over nothing — FOUND emptied by the
+  filter, `NO_NEW_MSG`, `NO_MATCHED_MSG` — re-pulls immediately, because the cadence paces
+  deliveries and an idle guard stacked on top of such a round only delays the next fetch. An
+  `OFFSET_ILLEGAL` round keeps its own freeze / persist / revoke path and takes no cadence wait,
+  and a revoked queue still exits
 - ✅ PullConsumer / LitePullConsumer (incl. queue-change listener, three offset tables,
   pause / resume; LitePull judges four cache gates before the pull offset is resolved —
   the buffer's pending-round projection `pending rounds × pull_batch_size` (default 10) against

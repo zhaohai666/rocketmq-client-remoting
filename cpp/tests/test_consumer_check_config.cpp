@@ -139,6 +139,9 @@ void testDefaultsClearEveryGate() {
            num(c.pullThresholdForTopic()) + "/" + num(c.pullThresholdSizeForTopic()));
     expect(c.popInvisibleTime() == 60000 && c.popBatchNums() == 32, "defaults.pop",
            num(c.popInvisibleTime()) + "/" + num(c.popBatchNums()));
+    // The general pull / POP error backoff is a knob, not a constant: a fresh consumer starts at 1000ms.
+    expect(c.pullPauseWhenPullErrorMillis() == 1000, "defaults.pullPauseWhenPullError",
+           num(c.pullPauseWhenPullErrorMillis()));
 }
 
 // ---------------- Ranges: bounds legal, out-of-range rejected ----------------

@@ -448,29 +448,38 @@ func TestPopPollingNotFoundRePopsImmediately(t *testing.T) {
 	}
 }
 
-// POLLING_FULL is the broker asking to be approached later, so the round waits the
-// exception back-off — 3000 ms, not pullInterval and not an immediate re-pop.
-func TestPopPollingFullParksForTheExceptionBackoff(t *testing.T) {
-	if popDelayWhenException != 3000 {
-		t.Fatalf("POLLING_FULL back-off = %d ms, want 3000", popDelayWhenException)
-	}
+// POLLING_FULL is the broker asking to be approached later, so the round sleeps
+// the single generic failed-round back-off the consumer captured at setup — not
+// pullInterval, not an immediate re-pop, and not a hardcoded number. The knob is
+// set to a value no fixed arm uses, so only the loop reading the knob reproduces
+// this gap: a POLLING_FULL leg still wired to the old 3000 ms constant, or to the
+// 1000 ms default, or to an immediate re-pop, each lands outside the window.
+func TestPopPollingFullParksForTheConfiguredBackoff(t *testing.T) {
+	const backoffMs = 400
 	f, c := popFixtureWithConsumer(t, &countingConcurrentlyListener{
 		fn: func(_ []*common.MessageExt, _ *ConsumeConcurrentlyContext) ConsumeConcurrentlyStatus {
 			return ConsumeSuccess
 		},
-	})
+	}, func(c *DefaultMQPushConsumer) { c.SetPullFailedBackoffMillis(backoffMs) })
+	// The POP path must read the same knob the pull path does.
+	if got := c.PullFailedBackoffMillis(); got != backoffMs {
+		t.Fatalf("configured back-off reads %d ms, want %d", got, backoffMs)
+	}
 	f.broker.setPopFixture(popFixture{code: remoting.RespPollingFull})
 	startConsumer(t, c, "TopicA", "*")
 
 	arrivals := popArrivalsWithin(t, f.broker, 2, 10*time.Second)
 	gap := arrivals[1] - arrivals[0]
-	if gap < popDelayWhenException-200 {
-		t.Fatalf("POLLING_FULL re-armed after %dms, want at least the %dms back-off",
-			gap, popDelayWhenException)
+	// At least the configured wait ...
+	if gap < backoffMs-100 {
+		t.Fatalf("POLLING_FULL re-armed after %dms, want at least the %dms configured back-off",
+			gap, backoffMs)
 	}
-	if gap > popDelayWhenException+2000 {
-		t.Fatalf("POLLING_FULL re-armed after %dms, want the %dms back-off and nothing longer",
-			gap, popDelayWhenException)
+	// ... and strictly under the 1000 ms default, so this cannot be the loop
+	// ignoring the knob and falling back to any fixed arm.
+	if gap > 900 {
+		t.Fatalf("POLLING_FULL re-armed after %dms, want the %dms configured back-off and nothing"+
+			" closer to the 1000ms default or the old 3000ms constant", gap, backoffMs)
 	}
 }
 

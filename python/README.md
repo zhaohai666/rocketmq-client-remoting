@@ -24,11 +24,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1722 passed, 4 skipped（128.7s）
+.venv/bin/python -m pytest tests/ -q           # 1738 passed, 4 skipped（136.5s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` 收集 1726 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
+- `pytest` 收集 1742 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
   `tests/test_protocol_alignment.py`（可选的协议常量比对守卫，默认不启用）。
 - `selfcheck.py` 是 7 项协议编解码回环自检（JSON 头 / 二进制头 / V2 短字段头 /
   17 段存储格式 / 长 topic V2 magic / 6 段批量格式 / ACL 签名注入），无需集群；
@@ -365,7 +365,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 普通 / 顺序（selector）/ 定点 / 延迟定时 / 事务两阶段 / 批量 / 单向 / 异步（含公平信号量背压） | ✅ |
 | Request-Reply（325 发送 + 326 推回，同步与异步两种形态） | ✅ |
 | 定时消息撤回 `recall_message`（370，句柄来自 `SendResult.recall_handle`） | ✅ |
-| Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（度量该队列持有的全部消息：未派发缓冲 + 已交给监听器但尚未结算的批次；条数 / 消息体字节整除 MiB / 位点跨度都严格大于才停、阈值不做下限钳制，顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向变动的 topic 回调 `message_queue_listener`；集合未变的轮次与停摆自愈轮都不做任何事）、位点修正与重置、停摆自愈、挂起消息清扫 | ✅ |
+| Push Consumer：并发 / 顺序监听、广播、每队列三条缓存闸门（度量该队列持有的全部消息：未派发缓冲 + 已交给监听器但尚未结算的批次；条数 / 消息体字节整除 MiB / 位点跨度都严格大于才停、阈值不做下限钳制，顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、拉取与 POP 两条队列循环的等待档位（本客户端缓存闸门命中重排 50ms、收到 broker 的 `FLOW_CONTROL`(215) 只等 20ms、被 `suspend()` 暂停时每轮 1000ms、**把消息交进缓冲的那一轮**按 `pull_interval`（可配置，默认 0 即立即再拉）等待后才发起下一轮，而什么都没交出去的那一轮（回来的批是空的、被本机派发前过滤清空的批、`NO_NEW_MSG`、`NO_MATCHED_MSG`）立即再拉——节奏管的是交付出去的那一轮，在空轮次上再叠一道本地等待只会拖慢下一次拉取、因任何其他原因失败的那一轮，以及 POP 轮里 `POLLING_FULL` 与本机没有规则的返回状态，都按 `pull_time_delay_when_exception_millis`（可配置，默认 1000ms）等待后重发；该值在每条队列的循环建立时取走，客户端启动后再改只影响之后新建的循环）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向变动的 topic 回调 `message_queue_listener`；集合未变的轮次与停摆自愈轮都不做任何事）、位点修正与重置、停摆自愈、挂起消息清扫、FOUND 轮推进游标后跑一遍纯客户端算术自检（把本轮请求拉取的位点同响应带的 nextBeginOffset、以及本轮实际派发那一批最早一行的位点相比——派发的就是经过二次 tag 复查与过滤钩子之后剩下的行，被本机丢掉的行不算这一轮的首行，空批用可表示最大位点让这一半永不触发，任一小于此位点就记一条点名这三个数的 WARN；纯诊断、不改控制流——不重试、不退避、不改写位点、不回滚游标、不丢批，且要等行已交入缓冲、统计已记账之后才执行） | ✅ |
 | Pull Consumer：手动拉取 + 长轮询 + 手动提交位点 + 按时间戳查位点 | ✅ |
 | Lite Pull Consumer：`poll` / `assign` / `seek` / `pause` / `commit`、三张位点表、topic 队列变更监听、拉取前先过四道缓存闸门（尚未被 `poll` 取走的拉取轮数 × `pull_batch_size`（默认 10）对比 `pull_threshold_for_all` 10000 / 本队列条数 `pull_threshold_for_queue` 1000 / 本队列消息体字节 `pull_threshold_size_for_queue` 100 MiB 整除 / 本队列位点跨度 `consume_max_span` 2000，都严格大于才停；命中只重排这一个队列 50ms，broker 的 `FLOW_CONTROL`(215) 只等 20ms） | ✅ |
 | POP 消费循环（`pop_mode`，含 ack / 续期 / POP 顺序 / 待 ack 欠账闸门：本队列欠账严格大于 `pop_threshold_for_queue`（默认 96）才停、命中重排 50ms 并记进拉取路径那个全局流控计数） | ✅ |
@@ -514,7 +514,7 @@ python/
 ├── rocketmq_logging.py     日志桥接
 ├── selfcheck.py            无集群的协议编解码回环自检（7 项）
 ├── __main__.py             命令行入口（python -m selfcheck）
-├── tests/                  1726 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
+├── tests/                  1742 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
 ├── verify_*_live.py        真机联调脚本（见「真实集群联调」）
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  联调辅助脚本
 ├── pyproject.toml          零运行时依赖；requires-python >= 3.8

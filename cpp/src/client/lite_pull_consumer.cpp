@@ -497,7 +497,10 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         // push path uses (no second constant); every other code keeps the port's existing handling
         // (fall through to the loop's idle backoff).
         if (e.getResponseCode() == ResponseCode::FLOW_CONTROL) {
-            const int32_t pauseMs = DefaultMQPushConsumer::pullPauseMillisFor(e.getResponseCode());
+            // The push path's shared table: only the 215 row is consulted here, so the general error
+            // backoff handed in below never reaches the recorded pause.
+            const int32_t pauseMs = DefaultMQPushConsumer::pullPauseMillisFor(
+                e.getResponseCode(), kDefaultPullPauseWhenPullErrorMillis);
             parkUntil_[mq] = std::chrono::steady_clock::now() + std::chrono::milliseconds(pauseMs);
             lastLitePullPauseMillis_.store(pauseMs);
         }

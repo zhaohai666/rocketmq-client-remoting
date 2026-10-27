@@ -13,7 +13,7 @@
 // Key engineering points (established against a real broker; do not delete):
 //   - Pulling must be parallel per queue: with one thread polling sequentially, the suspend of an
 //     idle queue blocks delivery on every other queue (this once caused 'the first batch arrives, everything later is late').
-//   - The broker clamps the client's suspend time to its own brokerSuspendMaxTimeMillis, so idle
+//   - An idle queue's long poll outlasts our own request timeout, so idle
 //     queues still hit periodic client-side timeouts -- this is **benign**; treat it as debug and do not log ERROR.
 #ifndef ROCKETMQ_CLIENT_CONSUMER_H
 #define ROCKETMQ_CLIENT_CONSUMER_H
@@ -106,12 +106,11 @@ inline StartOffsetPlan planInitialOffset(int64_t stored, const std::string& cons
 //     is unrelated to how full the local cache is, so the loop retries sooner.
 constexpr int32_t kPullPauseWhenClientFlowControl = 50;
 constexpr int32_t kPullPauseWhenBrokerFlowControl = 20;
-// Every other broker error on the pull path (topic not created yet, subscription not latest, ...).
-constexpr int32_t kPullPauseWhenPullError = 500;
-// POP pacing for an answer that says "the broker's polling window is full", and for any POP answer
-// this client does not recognise: the same 3000ms back-off the pull scheduler applies to a round that
-// ended in an exception. Retrying at once would hit the same full window again.
-constexpr int32_t kPopBackoffWhenAnswerIsFull = 3000;
+// Every other failure of a pull or POP round: a broker error that is not FLOW_CONTROL(215), or a round
+// this client refused itself (no route / no broker in it). It is the wait before the loop re-issues
+// its request. Configurable per consumer (setPullPauseWhenPullErrorMillis); this is the value a
+// consumer starts with.
+constexpr int32_t kDefaultPullPauseWhenPullErrorMillis = 1000;
 
 // A throttled queue trips its cache gate on every round, so warning every round buries the signal in
 // noise: only every kFlowControlWarnEvery-th trip warns (the 1st, then the 1001st, ...). The trip count
@@ -330,6 +329,16 @@ public:
     void setSuspendCurrentQueueTimeMillis(int32_t t) { suspendCurrentQueueTimeMillis_ = t; }
     void setMaxReconsumeTimes(int32_t n) { maxReconsumeTimes_ = n; }
     void setPullIntervalMillis(int32_t t) { pullIntervalMillis_ = t; }
+    // Generic pull / POP error backoff: how long a queue's loop waits before it re-issues its request
+    // after a round that failed for any reason OTHER than the broker's FLOW_CONTROL(215) answer
+    // (pullPauseWhenPullErrorMillis, default 1000ms). A 215 answer keeps its own short pause, this
+    // client's own cache gate keeps 50ms, and a paused consumer keeps its fixed 1000ms pause delay --
+    // none of those three read this knob.
+    // Like every other value the round loops depend on, each loop copies this knob once when it starts
+    // (see queuePullLoop / queuePopLoop), so changing it later never alters a loop that is already
+    // running -- only a loop that starts from now on.
+    void setPullPauseWhenPullErrorMillis(int32_t t) { pullPauseWhenPullErrorMillis_ = t; }
+    int32_t pullPauseWhenPullErrorMillis() const { return pullPauseWhenPullErrorMillis_; }
     // Per-queue 'messages this queue holds' count threshold; pulling for that queue pauses above it
     // (pullThresholdForQueue, default 1000). "Holds" is the undispatched buffer plus the batches handed
     // to the listener that have not settled. The comparison is a plain strict greater-than: the value is
@@ -715,14 +724,35 @@ public:
     // and the counter it ticks have to be reachable offline.
     bool popFlowControlHitForTest(const MessageQueue& mq,
                                   const std::shared_ptr<PopProcessQueue>& pq);
-    // How long the pull loop pauses after a **failed** pull: the broker's FLOW_CONTROL(215) answer gets its
-    // own short pause, every other response code the general error backoff (see the kPullPause* constants).
-    // Public and static because the two events look identical offline (both arrive as one MQBrokerException),
-    // so a mapping mistake -- or a collapse back to one shared value -- has to be pinnable without a throttling broker.
-    static int32_t pullPauseMillisFor(int32_t responseCode);
+    // How long a pull or POP loop pauses after a **failed** round: the broker's FLOW_CONTROL(215)
+    // answer gets its own short pause, every other response code the general error backoff handed in
+    // (that backoff is the configurable knob above; the round loops pass the value they copied at
+    // start-up). Public and static because the two events look identical offline (both arrive as one
+    // MQBrokerException), so a mapping mistake -- or a collapse back to one shared value -- has to be
+    // pinnable without a throttling broker.
+    static int32_t pullPauseMillisFor(int32_t responseCode, int32_t pullErrorPauseMillis);
+    // The same table read through **this** consumer's configured error backoff: this is the pause this
+    // consumer's loops take, so a test can pin "setting the knob changes the wait" on recorded state
+    // instead of wall-clock sampling.
+    int32_t pullPauseMillisFor(int32_t responseCode) const {
+        return pullPauseMillisFor(responseCode, pullPauseWhenPullErrorMillis_);
+    }
+    // Offset sanity test for a FOUND pull round: true when the advanced cursor or the head of the
+    // delivered batch lies BELOW the cursor the round requested. Purely diagnostic (the loop only
+    // logs on true), so it is a pure static predicate: a rewind answer is hard to produce offline,
+    // so both legs must be pinnable without a broker.
+    // firstMsgOffset = queue offset of the first row handed to the consume side after this client's
+    // own filtering; an empty round passes the int64 max sentinel, which never fires the second leg.
+    static bool pullOffsetsLookWrong(int64_t nextBeginOffset, int64_t firstMsgOffset,
+                                     int64_t prevRequestOffset);
     // The pause the loop actually applied last (0 = nothing paused yet). The loop sleeps in its own thread,
     // so this is how the two flow-control paths stay observable without measuring wall time.
     int64_t lastPullPauseMillis() const { return lastPullPauseMillis_.load(); }
+    // The round cadence the PULL loop applied last: the configured pull interval when a round delivered
+    // rows, otherwise 0. It is the pull-path mirror of popNextRoundDelayMillis, kept separate from the
+    // pause arms above so a delivered round's pacing and a failed round's backoff stay distinguishable
+    // from outside without timing the sleep.
+    int64_t lastPullCadenceMillis() const { return lastPullCadenceMillis_.load(); }
     // Record one POP round into the pull statistics (the PopCallback.onSuccess of popMessage,
     // same convention as the pull path's PullCallback): on FOUND record pullRT (recorded before the
     // empty check), and record pullTPS only when messages were popped. These two cells are the sole
@@ -731,11 +761,13 @@ public:
     void recordPopPullStats(ConsumerStatsManager& stats, const std::string& topic,
                             const PopResult& result, int64_t beganMs);
     // How long the POP loop waits before its next round on this queue. A pure decision over the
-    // answer, how many rows survived the pre-delivery pipeline and the configured pull interval, so
-    // the five pacing cases are pinnable offline instead of by wall-clock sampling (the suite already
-    // has slow legs). 0 = straight into the next round.
+    // answer, how many rows survived the pre-delivery pipeline, the configured pull interval and the
+    // loop's general error backoff, so the pacing cases are pinnable offline instead of by wall-clock
+    // sampling (the suite already has slow legs). A POLLING_FULL answer and any answer this client
+    // does not recognise are failed rounds and wait the same configured error backoff every other
+    // failure waits. 0 = straight into the next round.
     static int64_t popNextRoundDelayMillis(PopStatus status, int64_t keptMsgCount,
-                                           int32_t pullIntervalMillis);
+                                           int32_t pullIntervalMillis, int32_t errorPauseMillis);
     // Everything one POP answer owes, in the contract order: the pre-delivery pipeline over the
     // popped rows (which acks what it removed), the delivery of what survived, and the round's
     // statistics keyed on that surviving set. The answer comes in by reference and its popped list is
@@ -901,6 +933,10 @@ private:
     // Record the pause the pull loop is about to take, so the two flow-control paths (client thresholds vs
     // the broker's FLOW_CONTROL(215)) stay distinguishable from outside without timing the sleep.
     void notePullPause(int32_t millis);
+    // Record the cadence the PULL loop is about to take at the end of a round that reached here (the
+    // configured pull interval when the round delivered rows, else 0). Separate storage from the pause
+    // arms so the last pacing wait and the last backoff wait stay distinguishable from outside.
+    void notePullCadence(int32_t millis);
     // Whether this queue has stalled (the isPullExpired criterion). The caller must hold lock_.
     bool pullStalledLocked(const std::string& key) const;
     // The loop function returned yet still owns this queue (it was not revoked by rebalance): mark it stalled
@@ -1034,6 +1070,9 @@ private:
     int32_t suspendCurrentQueueTimeMillis_ = 1000;
     int32_t maxReconsumeTimes_ = -1;
     int32_t pullIntervalMillis_ = 0;
+    // Generic pull / POP error backoff (pullPauseWhenPullErrorMillis, default 1000ms); every round
+    // loop copies it when it starts, so a change never alters a loop already running.
+    int32_t pullPauseWhenPullErrorMillis_ = kDefaultPullPauseWhenPullErrorMillis;
     int32_t pullThresholdForQueue_ = 1000;
     // Per-queue **byte** cap of pulled-but-unconsumed messages (MiB), pullThresholdSizeForQueue default 100
     int32_t pullThresholdSizeForQueue_ = 100;
@@ -1138,6 +1177,10 @@ private:
     // Milliseconds the pull loop paused for at its most recent pause decision (client thresholds, broker
     // flow control, or a failed pull); 0 until the first pause.
     std::atomic<int64_t> lastPullPauseMillis_{0};
+    // Milliseconds the PULL loop waited as its round cadence at the end of its most recent round that
+    // reached that point (the configured pull interval when the round delivered rows, else 0); 0 until
+    // the first such round.
+    std::atomic<int64_t> lastPullCadenceMillis_{0};
 
     // ---------------- Message trace / consume hooks ----------------
     bool enableMsgTrace_ = false;

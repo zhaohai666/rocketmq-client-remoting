@@ -425,8 +425,20 @@ pub struct ConsumerConfig {
     pub pull_threshold_for_topic: i32,
     /// Topic-level cache size threshold, default -1 (disabled).
     pub pull_threshold_size_for_topic: i32,
-    /// Interval between two pulls (default 0; unused by the pull loop here, the field is only kept).
+    /// Interval between two pulls (default 0 = no wait). The cadence paces **deliveries** on both
+    /// the pull and the POP path: only a round that handed rows over waits it out, a round that
+    /// handed over nothing re-pulls immediately.
     pub pull_interval: i64,
+    /// The **one** generic failed-round backoff in milliseconds, default 1000.
+    ///
+    /// It is the wait before this client re-issues a pull (or a pop) for a queue after a round that
+    /// failed for any reason other than the broker's own flow control: a broker or client error that
+    /// is not `FLOW_CONTROL(215)`, a failed initial-offset lookup, and a POP round the broker pushed
+    /// back with `POLLING_FULL` or answered with a status this client has no rule for.
+    /// The broker's `215` answer, this client's own cache gate and a paused consumer keep their own
+    /// fixed waits and ignore this knob. Each queue loop takes the configured value **when the loop
+    /// is set up**, so moving the knob afterwards does not alter a loop that is already running.
+    pub pull_exception_backoff_millis: i64,
     /// Pull RPC timeout (default 30000ms).
     pub pull_timeout_millis: i64,
     /// Long-polling suspend duration (default 20000ms).
@@ -516,6 +528,7 @@ impl Default for ConsumerConfig {
             pull_threshold_for_topic: -1,
             pull_threshold_size_for_topic: -1,
             pull_interval: 0,
+            pull_exception_backoff_millis: DEFAULT_PULL_EXCEPTION_BACKOFF_MILLIS,
             pull_timeout_millis: 30_000,
             pull_suspend_timeout_millis: 20_000,
             consume_message_batch_max_size: 1,
@@ -596,7 +609,12 @@ pub(crate) fn consume_timestamp_millis(text: &str) -> Result<i64> {
 /// Two easy-to-get-wrong "asymmetries" must be respected, otherwise valid configurations get rejected:
 /// * for `pull_threshold_for_topic` / `pull_threshold_size_for_topic`, `-1` is the
 ///   "unset, use the queue-level threshold" sentinel, and only `!= -1` enters the range check (`-2` must still be rejected);
-/// * the lower bound of `pull_interval` is **0** (not 1), and the `pop_batch_nums` criterion is `<= 0`.
+/// * the lower bound of `pull_interval` is **0** (not 1), and
+///   the `pop_batch_nums` criterion is `<= 0`.
+///
+/// `pull_exception_backoff_millis` is deliberately **not** gated here: the generic failed-round
+/// backoff carries no documented ceiling. `0` is legal and means "re-issue at once", and the loop
+/// clamps a negative to the same, so the number a running loop arms with is the configured one.
 fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     // consumeThreadMin
     if cfg.consume_thread_min < 1 || cfg.consume_thread_min > 1000 {
@@ -795,8 +813,11 @@ struct Inner {
 
 // ================================================================ Flow control constants
 
-/// Backoff after a pull/pop RPC error.
-pub const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION: u64 = 3000;
+/// Default of [`ConsumerConfig::pull_exception_backoff_millis`]: the wait a pull (or POP) round
+/// arms before re-issuing its request whenever the round failed for a reason other than the
+/// broker's own flow control. It is a per-client knob, not a constant: this number is only the
+/// value the knob carries when nobody sets it.
+pub const DEFAULT_PULL_EXCEPTION_BACKOFF_MILLIS: i64 = 1000;
 /// Backoff when the local cache (to consume / to ack) saturates flow control.
 pub const PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL: u64 = 50;
 /// Backoff when the broker answers `FLOW_CONTROL(215)`
@@ -816,6 +837,34 @@ pub(crate) const CACHE_SIZE_GATE_MIB: i64 = 1024 * 1024;
 /// [`FLOW_CONTROL_WARN_EVERY`]-th trip after it.
 pub fn is_flow_control_warn_trip(times: usize) -> bool {
     times > 0 && (times - 1) % FLOW_CONTROL_WARN_EVERY == 0
+}
+
+/// The wait a failed pull (or POP) request arms before this client re-issues it, decided by the
+/// answer alone:
+///
+/// * the broker's own throttle (`FLOW_CONTROL(215)`) gets its short fixed pause, which says "slow
+///   down" and nothing about a real failure;
+/// * every other failure -- a broker error, a client error, anything the round did not expect --
+///   gets the consumer's generic failed-round backoff.
+///
+/// The backoff is a **parameter**, not a read of the live knob: the loop captures the configured
+/// value when it is set up and passes that in, so moving the knob afterwards cannot change a wait a
+/// running loop already arms with.
+pub(crate) fn failed_request_backoff_millis(
+    err: &Error,
+    pull_exception_backoff_millis: u64,
+) -> u64 {
+    match err {
+        Error::Server {
+            response_code: response_code::FLOW_CONTROL,
+            ..
+        }
+        | Error::Broker {
+            response_code: response_code::FLOW_CONTROL,
+            ..
+        } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+        _ => pull_exception_backoff_millis,
+    }
 }
 
 impl Drop for Inner {
@@ -1129,6 +1178,25 @@ impl DefaultMQPushConsumer {
     /// Read the configured consume-executor termination ceiling back.
     pub fn await_termination_millis_when_shutdown(&self) -> i64 {
         read_cfg(&self.inner).await_termination_millis_when_shutdown
+    }
+
+    /// Set the **one** generic failed-round backoff: the wait before this client re-issues a pull
+    /// (or a pop) for a queue after a round that failed for any reason other than the broker's own
+    /// flow control -- a non-`FLOW_CONTROL(215)` error, a failed initial-offset lookup, and a POP
+    /// round answered with `POLLING_FULL` or with a status this client has no rule for.
+    /// 1000 ms when untouched.
+    ///
+    /// The broker's `215` answer (20 ms), this client's own cache gate (50 ms) and a paused
+    /// consumer (1000 ms) keep their own fixed waits and ignore this knob. Each queue loop takes the
+    /// configured value when it is set up, so changing it after `start()` does not alter a loop that
+    /// is already running.
+    pub fn set_pull_exception_backoff_millis(&self, millis: i64) {
+        self.update_config(|c| c.pull_exception_backoff_millis = millis);
+    }
+
+    /// Read the configured generic failed-round backoff back.
+    pub fn pull_exception_backoff_millis(&self) -> i64 {
+        read_cfg(&self.inner).pull_exception_backoff_millis
     }
 
     /// Read-only access to the shared [`MQClientInstance`]: the static-topic leg uses it to read endpoint rewrite results; errors when not started.
@@ -2624,10 +2692,63 @@ fn update_pull_from_which_node(state: &mut State, mq: &MessageQueue, suggest: Op
         .insert(mq.clone(), suggest.unwrap_or(MixAll::MASTER_ID as i64));
 }
 
+/// The wait before the next pull on the same queue, decided by what the round handed over:
+///
+/// * a round that **delivered** rows -- status FOUND with the post-filter list still non-empty,
+///   the same list the throughput count is fed from -- waits the configured pull cadence, and a
+///   cadence of `0` means straight back to the top;
+/// * a round that delivered nothing re-pulls immediately: FOUND emptied by the filter, NO_NEW_MSG
+///   and NO_MATCHED_MSG included. The cadence paces **deliveries**; parking on top of a round that
+///   fetched nothing would only delay the next fetch.
+///
+/// An OFFSET_ILLEGAL round is not a delivery round (its status is not FOUND), so it reaches no
+/// cadence wait here -- that path runs its own freeze/persist/revoke handling.
+fn pull_next_round_delay_millis(found: bool, delivered: usize, pull_interval: i64) -> u64 {
+    if found && delivered > 0 {
+        pull_interval.max(0) as u64
+    } else {
+        0
+    }
+}
+
+/// Whether the offsets a FOUND round came back with contradict the cursor it requested with:
+///
+/// * the cursor the round advanced to sits **below** the offset it asked from, or
+/// * the first row it handed over sits **below** that same offset.
+///
+/// Either shape means the round's own answer is inconsistent with the request it was made under,
+/// which is worth a line in the log and nothing else: the check reads the round's numbers, it
+/// decides no control flow, no offset, no wait.
+///
+/// `first_msg_offset` is the queue offset of the first row the round delivered **after** this
+/// client's own pre-delivery filter ran; an empty list is passed as `i64::MAX` so it can never
+/// look like a row from before the cursor.
+fn pull_offsets_look_wrong(
+    next_begin_offset: i64,
+    first_msg_offset: i64,
+    prev_request_offset: i64,
+) -> bool {
+    next_begin_offset < prev_request_offset || first_msg_offset < prev_request_offset
+}
+
+/// The one log line a round flagged by [`pull_offsets_look_wrong`] ends with: the queue plus all
+/// three offsets it compares, so a reader can tell which leg fired without guessing.
+fn pull_offset_warning(
+    key: &str,
+    next_begin_offset: i64,
+    first_msg_offset: i64,
+    prev_request_offset: i64,
+) -> String {
+    format!(
+        "pull offset sanity warning: queue={key} next_begin_offset={next_begin_offset} \
+         first_msg_offset={first_msg_offset} requested_offset={prev_request_offset}"
+    )
+}
+
 /// One queue's long-polling pull -> push into the to-consume buffer.
 ///
-/// One loop per queue (not a shared thread pool), because the broker suspends a separate long poll per queue;
-/// sharing one loop would let an empty queue's ~15s suspension block delivery for all the other queues.
+/// One loop per queue (not a shared thread pool), because each queue's long poll is suspended on
+/// its own; sharing one loop would let an empty queue's suspend window block delivery for all the other queues.
 ///
 /// This shell only handles the wrap-up: wherever the task body `return`s, it leaves a stall sentinel as long as it still
 /// owns the queue, and the next rebalance round rebuilds it (tokio tasks have no equivalent of `thread.is_alive()`).
@@ -2642,6 +2763,9 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         return;
     };
     let key = mq_key(&mq);
+    // The generic failed-round backoff is taken ONCE here, when the loop is set up: a knob moved
+    // later must not change the wait this running loop arms with.
+    let failed_round_backoff = read_cfg(&inner).pull_exception_backoff_millis.max(0) as u64;
     let mut rx = inner.stop.subscribe();
     while !stopped(&rx) && inner.started.load(Ordering::Acquire) {
         if !owns_queue(&inner, &key, token) {
@@ -2683,13 +2807,16 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 }
                 Err(e) => {
                     rmq_debug!("resolve initial offset failed for {mq:?}: {e}");
-                    if wait_or_stop(&mut rx, 1000).await {
+                    if wait_or_stop(&mut rx, failed_round_backoff).await {
                         return;
                     }
                     continue;
                 }
             },
         };
+        // The cursor this round requests with, kept under its own name because the round-end offset
+        // check compares the answer against it and the cursor itself moves on before then.
+        let prev_request_offset = offset;
         let sub_expression = pull_subscription_expression(&cfg, &sub);
         let sys_flag =
             PullSysFlag::build_sys_flag_basic(false, true, sub_expression.is_some(), false);
@@ -2720,24 +2847,14 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         {
             Ok(r) => r,
             Err(e) => {
-                // A client-side timeout while long polling in suspend with no new message is **normal behaviour**: the broker clamps the
-                // suspend duration to its own brokerSuspendMaxTimeMillis, so an idle queue times out periodically.
+                // A client-side timeout while long polling in suspend with no new message is **normal behaviour**: an
+                // idle queue answers on its own schedule, so our own request timeout can expire before the reply does.
                 let benign = matches!(e, Error::Timeout { .. } | Error::TooMuchRequest(_));
                 if benign {
                     rmq_debug!("pull long-poll timeout for {mq:?} (benign, will retry): {e}");
                     continue;
                 }
-                let delay = match &e {
-                    Error::Server {
-                        response_code: response_code::FLOW_CONTROL,
-                        ..
-                    }
-                    | Error::Broker {
-                        response_code: response_code::FLOW_CONTROL,
-                        ..
-                    } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
-                    _ => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
-                };
+                let delay = failed_request_backoff_millis(&e, failed_round_backoff);
                 // Most of the rest are expected paths such as the topic not existing yet: debug plus a short backoff keeps the loop from spinning hot
                 rmq_debug!("pull error for {mq:?}: {e}");
                 if wait_or_stop(&mut rx, delay).await {
@@ -2821,6 +2938,35 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         update_msg_acc_cnt(&inner, &key, &msgs);
         if illegal {
             handle_offset_illegal(&inner, &key).await;
+        }
+        // Offset sanity, at the very end of a FOUND round: the cursor has moved on and the batch has
+        // reached the consume side, so all this does is say out loud when the round's own answer
+        // contradicts the cursor it was asked from. Nothing below reads it.
+        if pull_found {
+            let first_msg_offset = msgs.first().map_or(i64::MAX, MessageExt::get_queue_offset);
+            if pull_offsets_look_wrong(
+                result.next_begin_offset,
+                first_msg_offset,
+                prev_request_offset,
+            ) {
+                rmq_warn!(
+                    "{}",
+                    pull_offset_warning(
+                        &key,
+                        result.next_begin_offset,
+                        first_msg_offset,
+                        prev_request_offset,
+                    )
+                );
+            }
+        }
+        // Round cadence: only a round that handed over rows waits the configured pull interval, so
+        // the cadence paces deliveries and never an idle or illegal round. An OFFSET_ILLEGAL round
+        // is not a delivery round, so it takes no wait here and its revoke path still exits at the
+        // next top-of-loop ownership check.
+        let delay = pull_next_round_delay_millis(pull_found, msgs.len(), cfg.pull_interval);
+        if delay > 0 && wait_or_stop(&mut rx, delay).await {
+            return;
         }
     }
 }
@@ -3716,6 +3862,9 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     };
     let key = mq_key(&mq);
     let cfg = read_cfg(&inner);
+    // Same capture rule as the pull loop: the generic failed-round backoff is read once when this
+    // loop is set up, so a knob moved afterwards cannot change a wait this loop already arms with.
+    let failed_round_backoff = cfg.pull_exception_backoff_millis.max(0) as u64;
     let mut invisible = cfg.pop_invisible_time;
     if !(MIN_POP_INVISIBLE_TIME..=MAX_POP_INVISIBLE_TIME).contains(&invisible) {
         invisible = DEFAULT_POP_INVISIBLE_TIME;
@@ -3785,17 +3934,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                     rmq_debug!("pop long-poll timeout for {mq:?} (benign, will retry)");
                     continue;
                 }
-                let delay = match &e {
-                    Error::Server {
-                        response_code: response_code::FLOW_CONTROL,
-                        ..
-                    }
-                    | Error::Broker {
-                        response_code: response_code::FLOW_CONTROL,
-                        ..
-                    } => PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
-                    _ => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
-                };
+                let delay = failed_request_backoff_millis(&e, failed_round_backoff);
                 rmq_debug!("pop error for {mq:?}: {e}");
                 if wait_or_stop(&mut rx, delay).await {
                     return;
@@ -3845,7 +3984,12 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         if !kept.is_empty() {
             submit_pop_consume_request(&inner, kept, pq.clone(), mq.clone()).await;
         }
-        let delay = pop_next_round_delay_millis(result.status, kept_len, cfg.pull_interval);
+        let delay = pop_next_round_delay_millis(
+            result.status,
+            kept_len,
+            cfg.pull_interval,
+            failed_round_backoff,
+        );
         if delay > 0 {
             if wait_or_stop(&mut rx, delay).await {
                 return;
@@ -3931,14 +4075,22 @@ fn pop_max_reconsume_times(cfg: &ConsumerConfig) -> i32 {
 /// - FOUND with rows handed over: the configured pull cadence (`0` = straight back to the top);
 /// - FOUND with nothing left, and NO_NEW_MSG / POLLING_NOT_FOUND: nothing to wait for -- the
 ///   broker already held this poll open, so the next round starts immediately;
-/// - POLLING_FULL: the queue's own popped-but-unacked budget is full, so this waits out the
-///   error back-off rather than pullInterval or an immediate re-pop.
-fn pop_next_round_delay_millis(status: PopStatus, kept_len: usize, pull_interval: i64) -> u64 {
+/// - POLLING_FULL, and any status this client has no rule for: the round failed to produce
+///   anything this side can act on, so it takes the SAME generic failed-round backoff the pull and
+///   POP error arms take -- never a private fixed park.
+///
+/// Like the pull path, the backoff comes in as a parameter: the loop captured the configured value
+/// when it was set up, so this stays pure and a post-start knob change cannot reach it.
+fn pop_next_round_delay_millis(
+    status: PopStatus,
+    kept_len: usize,
+    pull_interval: i64,
+    pull_exception_backoff_millis: u64,
+) -> u64 {
     match status {
         PopStatus::Found if kept_len > 0 => pull_interval.max(0) as u64,
-        PopStatus::Found => 0,
-        PopStatus::NoNewMsg | PopStatus::PollingNotFound => 0,
-        PopStatus::PollingFull => PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
+        PopStatus::Found | PopStatus::NoNewMsg | PopStatus::PollingNotFound => 0,
+        _ => pull_exception_backoff_millis,
     }
 }
 
@@ -5677,6 +5829,7 @@ impl DefaultMQPushConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::result::PullResult;
     use crate::common::message::Message;
     use crate::common::message_const::PROPERTY_KEYS;
     use crate::remoting::protocol::heartbeat::ExpressionType;
@@ -5925,11 +6078,17 @@ mod tests {
 
     #[test]
     fn flow_control_constants_match_contract() {
-        assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION, 3000);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL, 50);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, 20);
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_SUSPEND, 1000);
         assert_eq!(FLOW_CONTROL_WARN_EVERY, 1000);
+        // The generic failed-round wait is NOT one of these constants any more: it is a knob, and
+        // only its default lives here.
+        assert_eq!(DEFAULT_PULL_EXCEPTION_BACKOFF_MILLIS, 1000);
+        assert_eq!(
+            ConsumerConfig::default().pull_exception_backoff_millis,
+            DEFAULT_PULL_EXCEPTION_BACKOFF_MILLIS
+        );
     }
 
     /// Parameter wiring of the public send-back: errors when not started; broker name comes from the message / explicit argument.
@@ -5994,6 +6153,8 @@ mod tests {
             (-1, -1)
         );
         assert_eq!(cfg.pull_interval, 0);
+        // The one generic failed-round backoff: a knob, defaulting to 1000 ms.
+        assert_eq!(cfg.pull_exception_backoff_millis, 1000);
         assert_eq!(
             (cfg.pull_timeout_millis, cfg.pull_suspend_timeout_millis),
             (30_000, 20_000)
@@ -6379,7 +6540,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_is_illegal_except_pull_interval() {
+    fn zero_is_illegal_except_for_the_gates_whose_floor_is_zero() {
         for gate in RANGE_GATES {
             if gate.lo == 0 {
                 expect_accepted(gate, 0);
@@ -8492,30 +8653,295 @@ mod tests {
 
     /// The wait the next pop on the same queue waits out is decided by the answer, and only by
     /// the answer: a FOUND round honors the configured cadence, an empty or nothing-new answer
-    /// re-pops at once, and a queue the broker says is full waits the error back-off.
+    /// re-pops at once, and a queue the broker says is full waits the generic failed-round
+    /// backoff the caller passes in.
     #[test]
     fn pop_round_pacing_follows_the_answer() {
-        assert_eq!(pop_next_round_delay_millis(PopStatus::Found, 2, 500), 500);
         assert_eq!(
-            pop_next_round_delay_millis(PopStatus::Found, 2, 0),
+            pop_next_round_delay_millis(PopStatus::Found, 2, 500, 1000),
+            500
+        );
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::Found, 2, 0, 1000),
             0,
             "no configured cadence means straight back to the top"
         );
         assert_eq!(
-            pop_next_round_delay_millis(PopStatus::Found, 0, 500),
+            pop_next_round_delay_millis(PopStatus::Found, 0, 500, 1000),
             0,
             "a round that handed over nothing does not wait out the cadence"
         );
-        assert_eq!(pop_next_round_delay_millis(PopStatus::NoNewMsg, 0, 500), 0);
         assert_eq!(
-            pop_next_round_delay_millis(PopStatus::PollingNotFound, 0, 500),
+            pop_next_round_delay_millis(PopStatus::NoNewMsg, 0, 500, 1000),
+            0
+        );
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::PollingNotFound, 0, 500, 1000),
             0,
             "the broker already held this poll open"
         );
         assert_eq!(
-            pop_next_round_delay_millis(PopStatus::PollingFull, 0, 500),
-            PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
-            "a full queue is not ready: the wait is the broker-driven one, not pullInterval"
+            pop_next_round_delay_millis(PopStatus::PollingFull, 0, 500, 1000),
+            1000,
+            "a full queue is not ready: the wait is the generic failed-round backoff, not pullInterval"
+        );
+    }
+
+    /// The cadence a pull round waits out is decided by one thing only: whether the round handed
+    /// rows over. The `found` flag below is exactly the expression the loop feeds the helper with,
+    /// `status == PullStatus::Found`, so each leg is this client's own computed wait.
+    #[test]
+    fn pull_round_pacing_follows_the_delivery() {
+        let found = |status: PullStatus| status == PullStatus::Found;
+
+        // Delivered rows and a configured cadence: wait it out.
+        assert_eq!(
+            pull_next_round_delay_millis(found(PullStatus::Found), 2, 40),
+            40
+        );
+        // Delivered rows and no configured cadence: straight back to the top.
+        assert_eq!(
+            pull_next_round_delay_millis(found(PullStatus::Found), 2, 0),
+            0,
+            "a cadence of 0 means no wait at all"
+        );
+        // A FOUND round the pre-delivery filter emptied handed over nothing, so nothing is paced.
+        assert_eq!(
+            pull_next_round_delay_millis(found(PullStatus::Found), 0, 40),
+            0,
+            "the cadence paces deliveries, not fetches"
+        );
+        // An idle round re-pulls at once, whatever the cadence says.
+        for status in [PullStatus::NoNewMsg, PullStatus::NoMatchedMsg] {
+            assert_eq!(
+                pull_next_round_delay_millis(found(status), 0, 40),
+                0,
+                "{status:?} does not wait out the cadence"
+            );
+        }
+    }
+
+    /// An illegal round runs its own freeze/persist/revoke path and must not gain a cadence wait:
+    /// the loop derives `found` from the status alone, so this status is never a delivery round,
+    /// and the cadence is reachable through no other route.
+    #[test]
+    fn pull_illegal_round_takes_no_cadence() {
+        let found = PullStatus::OffsetIllegal == PullStatus::Found;
+        assert!(!found, "an illegal round is not a delivery round");
+        assert_eq!(pull_next_round_delay_millis(found, 0, 40), 0);
+        // No row count arms the cadence on that round either.
+        assert_eq!(pull_next_round_delay_millis(found, 8, 40), 0);
+    }
+
+    /// A message row carrying only what the offset checks read: its place in the queue.
+    fn offset_row(queue_offset: i64) -> MessageExt {
+        let mut m = ext("T", None);
+        m.queue_offset = queue_offset;
+        m
+    }
+
+    /// Leg one and the line it logs: the cursor the round advanced to sitting below the cursor it
+    /// requested with. All three numbers the check compared have to be readable from that one line,
+    /// because telling the two legs apart is exactly what a reader of the log needs to do.
+    #[test]
+    fn pull_offsets_sanity_warns_with_all_three_numbers() {
+        assert!(pull_offsets_look_wrong(90, 90, 100));
+
+        let no_rows = i64::MAX;
+        let line = pull_offset_warning("T@broker-a@0", 90, no_rows, 100);
+        assert!(line.contains("next_begin_offset=90"), "{line}");
+        assert!(
+            line.contains(&format!("first_msg_offset={no_rows}")),
+            "{line}"
+        );
+        assert!(line.contains("requested_offset=100"), "{line}");
+        assert!(line.contains("T@broker-a@0"), "{line}");
+    }
+
+    /// Leg two on its own: the cursor advanced as usual, but the first row the round hands over sits
+    /// below the offset the round requested with.
+    #[test]
+    fn pull_offsets_sanity_warns_when_a_row_precedes_the_request() {
+        assert!(pull_offsets_look_wrong(120, 95, 100));
+        // The same cursor and request with a row that does not precede it: nothing to warn about.
+        assert!(!pull_offsets_look_wrong(120, 100, 100));
+    }
+
+    /// A round whose numbers agree stays out of the log: this line is only worth reading when the
+    /// round contradicts the request it was made under.
+    #[test]
+    fn pull_offsets_sanity_stays_quiet_on_a_consistent_round() {
+        assert!(!pull_offsets_look_wrong(120, 100, 100));
+        assert!(!pull_offsets_look_wrong(100, 100, 100));
+        assert!(!pull_offsets_look_wrong(i64::MAX, i64::MAX, 100));
+    }
+
+    /// A FOUND round the pre-delivery filter emptied delivers no row, so its first-row number is the
+    /// `i64::MAX` stand-in -- and that stand-in must never read as a row from before the cursor.
+    #[test]
+    fn pull_offsets_sanity_ignores_an_empty_found_round() {
+        // The stand-in is derived the way the loop derives it: from the list this round delivers.
+        let msgs: Vec<MessageExt> = vec![];
+        let first_msg_offset = msgs.first().map_or(i64::MAX, MessageExt::get_queue_offset);
+        assert_eq!(first_msg_offset, i64::MAX);
+        assert!(!pull_offsets_look_wrong(120, first_msg_offset, 100));
+    }
+
+    /// The three inputs the loop feeds the check with, read off a real round the way the loop reads
+    /// them at its end, so these legs are this client's own round and not a hand-made argument list.
+    #[test]
+    fn pull_offsets_sanity_reads_the_round_the_way_the_loop_reads_it() {
+        let result = PullResult {
+            status: PullStatus::Found,
+            next_begin_offset: 120,
+            msg_found_list: vec![offset_row(95), offset_row(120)],
+            ..Default::default()
+        };
+        let prev_request_offset = 100_i64;
+
+        let pull_found = result.status == PullStatus::Found;
+        let msgs = result.msg_found_list.clone();
+        let first_msg_offset = msgs.first().map_or(i64::MAX, MessageExt::get_queue_offset);
+
+        assert!(pull_found, "only a FOUND round runs this check");
+        assert_eq!(first_msg_offset, 95);
+        assert!(
+            pull_offsets_look_wrong(
+                result.next_begin_offset,
+                first_msg_offset,
+                prev_request_offset
+            ),
+            "the numbers this round actually carries fire the warning"
+        );
+
+        // The very same round requested from its first row instead: consistent, so quiet.
+        assert!(!pull_offsets_look_wrong(
+            result.next_begin_offset,
+            first_msg_offset,
+            95
+        ));
+    }
+
+    /// The check only reads: a round it flags lands its cursor and arms its cadence exactly like the
+    /// identical round it does not flag. The two rounds below differ in nothing but the offset they
+    /// were requested with, and that is the one number deciding the flag.
+    #[test]
+    fn pull_offsets_sanity_leaves_the_round_bookkeeping_untouched() {
+        assert!(pull_offsets_look_wrong(120, 95, 200));
+        assert!(!pull_offsets_look_wrong(120, 95, 90));
+
+        let c = DefaultMQPushConsumer::new("G_pull_offsets_sanity").unwrap();
+        let mq = queue("T", "broker-a", 0);
+        let key = mq_key(&mq);
+
+        // The bookkeeping a FOUND round leaves behind when it requested from `requested` and answered
+        // with cursor 120: the cursor that landed, the correction that ran with it, and the wait the
+        // next round arms with out. Both rounds hand over two rows, so only the flag differs.
+        let round_bookkeeping = |requested: i64| -> (i64, i64, u64) {
+            lock(&c.inner.state)
+                .offset_table
+                .insert(key.clone(), requested);
+            {
+                let mut state = lock(&c.inner.state);
+                state.offset_table.insert(key.clone(), 120);
+                correct_tags_offset_locked(&mut state, &key, PullStatus::Found, 120);
+            }
+            let state = lock(&c.inner.state);
+            (
+                state.offset_table[&key],
+                state.consume_offsets.get(&key).copied().unwrap_or(-1),
+                pull_next_round_delay_millis(true, 2, 40),
+            )
+        };
+
+        let fired = round_bookkeeping(200);
+        let quiet = round_bookkeeping(90);
+        assert_eq!(fired.0, 120, "a flagged round still advances the cursor");
+        assert_eq!(fired.0, quiet.0, "the same cursor either way");
+        assert_eq!(fired.1, quiet.1, "the same correction either way");
+        assert_eq!(fired.2, 40, "a flagged round still waits out the cadence");
+        assert_eq!(fired.2, quiet.2, "the same wait either way");
+    }
+
+    /// The one generic failed-round backoff, pinned on all four legs. Every wait below is this
+    /// client's own armed backoff, computed from the mapping each loop runs -- no broker answer is
+    /// claimed here except the `FLOW_CONTROL(215)` code the mapping matches on.
+    #[test]
+    fn pull_and_pop_failed_rounds_share_one_backoff_knob() {
+        // (1) The default is 1000 ms, on the config, on the constant behind it, and on a fresh
+        //     consumer read back through its getter.
+        assert_eq!(DEFAULT_PULL_EXCEPTION_BACKOFF_MILLIS, 1000);
+        assert_eq!(
+            ConsumerConfig::default().pull_exception_backoff_millis,
+            1000
+        );
+        let consumer = DefaultMQPushConsumer::new("G_generic_backoff").unwrap();
+        assert_eq!(consumer.pull_exception_backoff_millis(), 1000);
+
+        // (2) The broker's own throttle is NOT this knob: 215 keeps its short fixed pause on both
+        //     the pull and the POP answer shape, whatever the knob says.
+        for knob in [1000_i64, 250] {
+            for err in [
+                Error::Broker {
+                    response_code: response_code::FLOW_CONTROL,
+                    message: "throttled".to_string(),
+                },
+                Error::Server {
+                    response_code: response_code::FLOW_CONTROL,
+                    remark: "throttled".to_string(),
+                },
+            ] {
+                assert_eq!(
+                    failed_request_backoff_millis(&err, knob.max(0) as u64),
+                    PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+                    "FLOW_CONTROL(215) keeps its own 20 ms wait at knob={knob}"
+                );
+            }
+        }
+
+        // (3) Moving the knob moves the wait BOTH the pull error arm and the POP error arm take.
+        consumer.set_pull_exception_backoff_millis(250);
+        assert_eq!(consumer.pull_exception_backoff_millis(), 250);
+        let knob = consumer.pull_exception_backoff_millis().max(0) as u64;
+        for err in [
+            Error::Broker {
+                response_code: response_code::SYSTEM_ERROR,
+                message: "broker says no".to_string(),
+            },
+            Error::client("no route for the topic"),
+        ] {
+            assert_eq!(
+                failed_request_backoff_millis(&err, knob),
+                250,
+                "a non-215 failure takes the configured wait, not a hardcoded 3000"
+            );
+        }
+        // The wait a running loop arms with comes from what it captured at setup, so a pure
+        // mapping fed the captured number is exactly what the loop does.
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::PollingFull, 0, 500, knob),
+            250
+        );
+
+        // (4) POLLING_FULL and a status this client has no rule for both take the knob value: no
+        //     private 3000 ms park anywhere on the POP path.
+        assert_eq!(
+            pop_next_round_delay_millis(PopStatus::PollingFull, 0, 500, 250),
+            250
+        );
+        // An unrecognised POP answer reaches the client as a broker error carrying its own code,
+        // and that arm resolves to the same knob.
+        let unknown_status_answer = Error::Broker {
+            response_code: 65534,
+            message: "a status this client has no rule for".to_string(),
+        };
+        assert_eq!(
+            failed_request_backoff_millis(&unknown_status_answer, 250),
+            250
+        );
+        assert_eq!(
+            failed_request_backoff_millis(&unknown_status_answer, 1000),
+            1000
         );
     }
 

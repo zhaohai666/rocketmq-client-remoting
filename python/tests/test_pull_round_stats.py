@@ -12,6 +12,12 @@ reverted, moved, or gated on the wrong field:
   check plus the registered filter hooks -- i.e. what the round hands on, not what the broker
   returned. A FOUND round whose whole batch the pre-delivery step removed therefore records RT and
   contributes nothing to TPS; a round that keeps 2 of 3 records 2.
+* the round's **re-schedule** is judged on what survived pre-delivery: a round that delivered rows
+  waits ``pull_interval`` (and nothing when that knob is 0), while a round that delivered nothing --
+  a FOUND batch that came back empty or was emptied by the filter, ``NO_NEW_MSG``,
+  ``NO_MATCHED_MSG`` -- re-pulls immediately, because such a round is itself a long poll and an extra
+  idle guard would only delay the next fetch.
+  The error arms (the broker's FLOW_CONTROL code and the generic backoff knob) are unchanged.
 
 The transport is an in-process double and the loop clock is swapped, so every park the loop takes
 is observed as a recorded value (same style as ``test_pop_delivery_guard``). The transport keeps
@@ -28,13 +34,15 @@ import pytest
 
 from client import consumer as consumer_mod
 from client.consumer import (DefaultMQPushConsumer, PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
-                             PULL_TIME_DELAY_WHEN_EXCEPTION, filter_messages_for_delivery)
+                             filter_messages_for_delivery)
 from client.consumer_result import PullResult, PullStatus
 from client.consumer_stats import ConsumerStatsManager
+from client.exception import MQBrokerException
 from client.hook import FilterMessageContext, FilterMessageHook
 from common.message import MessageExt, MessageQueue
 from common.message_const import MessageConst
 from common.subscription_data import FilterAPI, SubscriptionData
+from remoting.protocol.codes import ResponseCode
 
 GROUP = "GID_PullRoundStats"
 TOPIC = "PullRoundStatsTopic"
@@ -71,7 +79,10 @@ def push_consumer(**kw) -> DefaultMQPushConsumer:
 
 class Transport:
     """MQClientInstance double: replays scripted pull rounds and, once the script is spent, answers
-    an idle round after raising the consumer's stop event, so the loop always terminates."""
+    an idle round after raising the consumer's stop event, so the loop always terminates.
+
+    A scripted item that is an exception instance is raised on that round instead of returned, so
+    the same harness can drive the error arms of the loop."""
 
     def __init__(self, script=()):
         self._script = list(script)
@@ -81,6 +92,8 @@ class Transport:
     def pull_message(self, group, mq, offset, *args, **kw):
         if self._script:
             result = self._script.pop(0)
+            if isinstance(result, BaseException):
+                raise result
         else:
             if self.stop is not None:
                 self.stop.set()
@@ -125,6 +138,7 @@ class Round:
     """Everything one scripted run of the real loop left behind."""
 
     def __init__(self, c, key, transport, clock):
+        self.c = c
         self.transport = transport
         self.clock = clock
         self.pending = list(c._pending.get(key) or ())
@@ -175,8 +189,11 @@ class TestPullRtIsFoundRoundOnly:
         assert got.rt is None, "an idle long-poll round must record no pull RT"
         assert got.tps is None
         # The round is idle, not failed: it must not be routed through an error backoff either, so
-        # "recorded nothing" cannot be quietly earned by the round having been abandoned.
-        assert PULL_TIME_DELAY_WHEN_EXCEPTION not in got.clock.delays
+        # "recorded nothing" cannot be quietly earned by the round having been abandoned. The
+        # generic error wait is the consumer's own knob, so the value checked here is the one this
+        # consumer is configured with.
+        assert (got.c.get_pull_time_delay_when_exception_millis() / 1000.0
+                not in got.clock.delays)
         assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL not in got.clock.delays
 
     def test_idle_long_poll_window_never_reaches_the_recorded_rt(self, monkeypatch):
@@ -326,6 +343,91 @@ class TestPullTpsCountsDeliveredRows:
         assert got.rt is not None and got.rt.times == 1
         assert got.rt.value < IDLE_ROUND_WINDOW * 1000.0
         assert got.tps is not None and got.tps.times == 1 and got.tps.value == 2
+
+
+# ============================================================ the round's re-schedule
+
+
+class TestPullRoundReschedule:
+    """Which pull round parks before the next one, and for how long.
+
+    The whole table hangs on one distinction -- did this round hand a row to the buffer -- so every
+    leg here runs with ``pull_interval`` set to a value no other arm of the loop uses (50 ms,
+    against the broker flow-control 20 ms and the error knob's scripted 250 ms), except the leg that
+    pins the 0 meaning "re-pull immediately"."""
+
+    def test_delivered_round_waits_the_pull_interval_once(self, monkeypatch):
+        """pull_interval=50 and a round that delivers one row: exactly one 0.05 s park, and it lands
+        between the two rounds. Red when the wait is missing (the bug this file pins), when it is
+        taken on a round that delivered nothing, or when a whole run parks only once."""
+        got = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50),
+                               [found(msg(queue_offset=1, body=b"a"))])
+        assert [m.queue_offset for m in got.pending] == [1]
+        assert got.clock.delays == [0.05], \
+            "the delivered round waits pull_interval milliseconds, once"
+        # One wait per delivered round -- the cadence is per round, not once per loop.
+        two = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50),
+                               [found(msg(queue_offset=1, body=b"a")),
+                                found(msg(queue_offset=2, body=b"b"))])
+        assert [m.queue_offset for m in two.pending] == [1, 2]
+        assert two.clock.delays == [0.05, 0.05], two.clock.delays
+
+    def test_delivered_round_with_pull_interval_zero_parks_nothing(self, monkeypatch):
+        """The paired control on the other side of the same leg: the same delivered round with
+        pull_interval == 0 (the shipped default) re-pulls immediately."""
+        got = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=0),
+                               [found(msg(queue_offset=1, body=b"a"))])
+        assert [m.queue_offset for m in got.pending] == [1]
+        assert got.clock.delays == [], "pull_interval == 0 means re-pull immediately"
+
+    def test_found_batch_emptied_by_the_tag_pass_parks_nothing(self, monkeypatch):
+        """The leg that decides **where** the wait sits: FOUND with a full batch that the second-pass
+        tag check removes entirely delivered nothing, so it re-pulls immediately. Red for an
+        implementation that parks on the raw response status or on the popped list instead of on the
+        rows that survive pre-delivery."""
+        sub = FilterAPI.build_subscription_data(TOPIC, "TagA")
+        rows = [found(msg(queue_offset=1, tag="TagB", body=b"x"),
+                      msg(queue_offset=2, tag="TagB", body=b"y"))]
+        got = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50), rows, sub=sub)
+        assert got.pending == [], "the tag pass must keep nothing out of the buffer"
+        assert got.clock.delays == []
+
+    def test_found_batch_emptied_by_a_filter_hook_parks_nothing(self, monkeypatch):
+        """Same rule on the other stage of pre-delivery: the hook drops every row, so this is a
+        round that delivered nothing and the cadence does not apply."""
+        hook = _DropByBody([b"a"])
+        got = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50),
+                               [found(msg(queue_offset=1, body=b"a"))], hooks=[hook])
+        assert hook.calls == 1
+        assert got.pending == []
+        assert got.clock.delays == []
+
+    @pytest.mark.parametrize("idle_status", [PullStatus.NO_NEW_MSG, PullStatus.NO_MATCHED_MSG])
+    def test_idle_round_parks_nothing_even_with_a_pull_interval(self, monkeypatch, idle_status):
+        """The cadence paces rounds that delivered, so an idle round re-pulls at once even with the
+        interval configured: a further local wait there would only delay the next fetch.
+        A FOUND round whose batch came back empty is the third idle shape."""
+        got = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50),
+                               [PullResult(idle_status, next_begin_offset=7)])
+        assert got.transport.statuses == [idle_status, PullStatus.NO_NEW_MSG]
+        assert got.clock.delays == []
+        empty_found = _run_pull_rounds(monkeypatch, push_consumer(pull_interval=50), [found()])
+        assert empty_found.clock.delays == []
+
+    def test_a_delivered_round_does_not_reuse_the_error_arms(self, monkeypatch):
+        """The pacing change must not have swallowed either error arm: the broker's FLOW_CONTROL
+        answer still waits its own 20 ms and any other failure still waits the generic backoff this
+        loop snapshotted at setup -- and neither arm adds the cadence on top, because no row was
+        delivered."""
+        c = push_consumer(pull_interval=50)
+        c.set_pull_time_delay_when_exception_millis(250)
+        got = _run_pull_rounds(monkeypatch, c,
+                               [MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy"),
+                                RuntimeError("socket reset")])
+        assert got.clock.delays == [PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL, 0.25], \
+            got.clock.delays
+        assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
+        assert got.pending == []
 
 
 # ============================================================ the shared pre-delivery helper

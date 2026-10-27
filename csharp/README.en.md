@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1105 unit tests.
+  offline behaviour is pinned by 1130 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1105, Skipped:     0, Total:  1105, Duration: 4 m 44 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1130, Skipped:     0, Total:  1130, Duration: 4 m 53 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -291,6 +291,20 @@ whole MiB by integer division, not `storeSize`; the span gate never runs for an 
 topic budgets are not summed across sibling queues at pull time, they are divided over the queues this
 round owns on a changed rebalance round and the quotient is written back as the per-queue knob),
 `MaxReconsumeTimes`, `SuspendCurrentQueueTimeMillis`,
+`PullIntervalMillis` (default 0: it paces **only a round that delivered** -- after a pull round whose
+filtered batch still hands rows on to the listener it waits this long before the next round, and goes
+straight to the next round when it is 0; an idle round (an empty answer, one emptied by the second tag
+pass, `NO_NEW_MSG` / `NO_MATCHED_MSG`) does not wait, because the cadence is a rule about what was
+delivered and a local wait on an idle round would only delay the next fetch; an `OFFSET_ILLEGAL` round takes its own
+recovery path and a failed round takes its backoff, so neither consults this cadence),
+`PullExceptionBackoffMillis` (default 1000 ms: the **one** generic error backoff shared by the pull
+and the POP loop -- the wait before this consumer re-issues a request after a round that failed for
+any reason other than the broker's own flow control, i.e. an answer that is not a success, an
+exception whose code is not `FLOW_CONTROL`(215), and POP's `POLLING_FULL` / unknown status. Each loop
+takes the configured value once when it is set up, so changing it after start does not alter a loop
+that is already running. The other three waits are separate arms and do not move with it: a broker
+`FLOW_CONTROL`(215) still retries in 20 ms, this client's own cache-threshold gate still parks for
+50 ms, and a consumer held by `Suspend()` still looks back at the flag every 1000 ms),
 `SetAllocateMessageQueueStrategy(new AllocateMessageQueueConsistentHash())`,
 `Suspend()` / `Resume()` (stop pulling without going offline), `SetEnableMsgTrace(true)`,
 `consumer.SubscribedTopics()` / `ConsumedCount` / `ClientId`.
@@ -524,11 +538,18 @@ connection.
   settled yet, deduplicated by queue offset; count / message **body** MiB by integer division / offset
   span, all strictly greater with no floor clamped on the threshold and 0 not acting as an off switch;
   the span gate never runs for an orderly listener; topic budgets divided over the owned queues at
-  rebalance, never summed across sibling queues at pull time), a 50 ms local re-schedule on a hit and
-  a warning on the 1st hit and every 1000th thereafter, and a rebalance round whose per-topic
-  assignment set moved pays the whole package in one order (only the moved topics re-share their
-  subscription version → then the division → then one immediate heartbeat to every broker → then the
-  queue listener for the moved topics only; an unchanged round and a stalled-loop self-heal pay none
+  rebalance, never summed across sibling queues at pull time), a 50 ms local re-schedule on a hit, the
+  generic failed-round backoff `PullExceptionBackoffMillis` (default 1000 ms, the one knob both the
+  pull and the POP loop take when they are set up) for an answer that is not a success, an exception
+  that is not 215, or POP's `POLLING_FULL` / unknown status, while a broker `FLOW_CONTROL`(215) still
+  retries in 20 ms, a delivered round paced by `PullIntervalMillis` (default 0) while an idle round --
+  empty, emptied by the filter, `NO_NEW_MSG` / `NO_MATCHED_MSG` -- goes straight to the next round (the
+  cadence paces deliveries, so a local wait on an idle round would only delay the next fetch), and a warning on
+  the 1st hit and every 1000th thereafter, and a rebalance round
+  whose per-topic assignment set moved pays the whole package in one order (only the moved topics
+  re-share their subscription version → then the division → then one immediate heartbeat to every
+  broker → then the queue listener for the moved topics only; an unchanged round and a stalled-loop
+  self-heal pay none
   of it), POP's outstanding-ACK gate (default 96, trips
   strictly above it, counted on the pull path's same flow-control total) + escape hatch for suspended listeners),
   Pull (with consumer heartbeats; an assignment change there owes only the listener half),
@@ -549,7 +570,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1105 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1130 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -709,7 +730,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1105 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1130 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

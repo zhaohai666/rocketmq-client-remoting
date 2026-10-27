@@ -31,7 +31,6 @@ from client.consumer import (DefaultLitePullConsumer, DefaultMQPushConsumer, Pop
                              FLOW_CONTROL_WARN_EVERY_N_TRIPS,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
                              PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL,
-                             PULL_TIME_DELAY_WHEN_EXCEPTION,
                              is_flow_control_warn_trip)
 from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
                                     MessageListenerConcurrently, MessageListenerOrderly,
@@ -511,8 +510,9 @@ def test_one_hit_counts_one_tick_even_when_every_gate_matches():
 # ---------------- Broker FLOW_CONTROL(215) vs the generic pull/pop error backoff ----------------
 # The client's own threshold pause and the broker's answer are two different stalls:
 # 215 is transient producer-side throttling (retry in 20ms), every other broker error keeps the
-# 500ms generic backoff. Folding both into one delay either hammers a throttled broker or needlessly
-# stalls a healthy queue behind an 11x-longer wait.
+# generic backoff -- which is the consumer's own knob ``pull_time_delay_when_exception_millis``
+# (default 1000 ms), not a value the loop invents. Folding both into one delay either hammers a
+# throttled broker or needlessly stalls a healthy queue behind a far longer wait.
 
 def _drive_loop(monkeypatch, loop_attr, client_method, errors, c, mq, key, setup=None):
     """Run the real loop against a client that keeps failing; return the recorded backoffs.
@@ -568,20 +568,19 @@ def _error_loop_consumer(group):
     return c, mq, key
 
 
-def test_broker_flow_control_pull_retries_in_20ms_other_codes_keep_500ms(monkeypatch):
+def test_broker_flow_control_pull_retries_in_20ms_other_codes_take_the_error_backoff(monkeypatch):
     assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
-    assert PULL_TIME_DELAY_WHEN_EXCEPTION == 0.5
     c, mq, key = _error_loop_consumer("G_fc_broker_pull")
     delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
                          [MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy"),
                           MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")],
                          c, mq, key)
-    # 215 gets the short branch, any other broker code keeps the generic backoff:
-    # the two directions pin each other (reverting either branch turns this red).
-    assert delays == [0.02, 0.5], delays
+    # 215 gets the short branch, any other broker code takes the generic backoff (the knob's
+    # 1000 ms default): the two directions pin each other (reverting either branch turns this red).
+    assert delays == [0.02, 1.0], delays
 
 
-def test_broker_flow_control_pop_retries_in_20ms_other_codes_keep_500ms(monkeypatch):
+def test_broker_flow_control_pop_retries_in_20ms_other_codes_take_the_error_backoff(monkeypatch):
     pq = PopProcessQueue()
 
     def _setup():
@@ -592,7 +591,7 @@ def test_broker_flow_control_pop_retries_in_20ms_other_codes_keep_500ms(monkeypa
                          [MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy"),
                           MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")],
                          c, mq, key, setup=_setup)
-    assert delays == [0.02, 0.5], delays
+    assert delays == [0.02, 1.0], delays
 
 
 def test_plain_client_error_pull_loop_keeps_generic_backoff(monkeypatch):
@@ -602,7 +601,87 @@ def test_plain_client_error_pull_loop_keeps_generic_backoff(monkeypatch):
                          [RuntimeError("socket reset"),
                           MQBrokerException(ResponseCode.FLOW_CONTROL, "system busy")],
                          c, mq, key)
-    assert delays == [0.5, 0.02], delays
+    assert delays == [1.0, 0.02], delays
+
+
+# ---------------- the generic error backoff is a per-client knob ----------------
+# Four legs, because the knob is the only arm of the backoff table an application may retune: the
+# default it ships with, the broker's 215 answer (which must ignore it and stay at 20 ms), the value
+# a reconfigured knob puts on the wait, and the non-215 error taking exactly that value -- on both
+# the pull and the POP path.
+
+def test_generic_error_backoff_knob_pins_default_215_and_the_configured_value(monkeypatch):
+    # Leg 1: the default is 1000 ms, and that is what a generic pull error sleeps.
+    c, mq, key = _error_loop_consumer("G_fc_knob_default")
+    assert c.get_pull_time_delay_when_exception_millis() == 1000
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [RuntimeError("socket reset")], c, mq, key)
+    assert delays == [1.0], delays
+    # Leg 2: the broker's 215 answer keeps its own 20 ms however the knob is set -- the knob is
+    # never on that branch.
+    c2, mq2, key2 = _error_loop_consumer("G_fc_knob_broker_215")
+    c2.set_pull_time_delay_when_exception_millis(12345)
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [MQBrokerException(ResponseCode.FLOW_CONTROL, "broker throttling")],
+                         c2, mq2, key2)
+    assert delays == [PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL], delays
+    # Leg 3: a non-215 broker code sleeps the value the knob was set to, not the default.
+    c3, mq3, key3 = _error_loop_consumer("G_fc_knob_pull_set")
+    c3.set_pull_time_delay_when_exception_millis(250)
+    delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
+                         [MQBrokerException(ResponseCode.SYSTEM_BUSY, "busy")], c3, mq3, key3)
+    assert delays == [0.25], delays
+    # Leg 4: the POP path reads the same knob on its non-215 errors.
+    c4, mq4, key4 = _error_loop_consumer("G_fc_knob_pop_set")
+    c4.set_pull_time_delay_when_exception_millis(250)
+    pq = PopProcessQueue()
+
+    def _setup():
+        c4._pop_queues[key4] = pq
+
+    delays = _drive_loop(monkeypatch, "_queue_pop_loop", "pop_message",
+                         [RuntimeError("socket reset")], c4, mq4, key4, setup=_setup)
+    assert delays == [0.25], delays
+    # A negative value is read as 0 ("pull again at once"), never a sleep into the past.
+    c4.set_pull_time_delay_when_exception_millis(-1)
+    assert c4.get_pull_time_delay_when_exception_millis() == 0
+
+
+def test_error_backoff_knob_is_taken_when_the_loop_is_set_up(monkeypatch):
+    """The loop takes the configured value when it is set up: retuning the knob while a queue loop
+    is running does not change the wait that loop takes -- the next loop this consumer creates does."""
+    c, mq, key = _error_loop_consumer("G_fc_knob_snapshot")
+    c.set_pull_time_delay_when_exception_millis(250)
+    real_time = time
+    seen = []
+
+    class _Client(object):
+        def pull_message(self, *a, **k):
+            raise RuntimeError("socket reset")
+
+    class _FakeTime(object):
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        def sleep(self, seconds):
+            seen.append(seconds)
+            # Reconfigure the knob from inside a wait this loop already committed to.
+            c.pull_time_delay_when_exception_millis = 9000
+            if len(seen) == 2:
+                c._stop.set()
+
+    c._mq_client = _Client()
+    monkeypatch.setattr(consumer_mod, "time", _FakeTime())
+    th = threading.Thread(target=c._queue_pull_loop, args=(mq,))
+    c._queue_threads[key] = th
+    th.start()
+    deadline = real_time.time() + 10
+    while th.is_alive() and real_time.time() < deadline:
+        real_time.sleep(0.01)
+    c._stop.set()
+    th.join(timeout=5)
+    assert seen == [0.25, 0.25], \
+        "both rounds ran on the value the loop was set up with, not on the one set mid-loop"
 
 
 # ---------------- The client's own cache threshold vs the broker's 215 reply ----------------
@@ -613,11 +692,17 @@ def test_plain_client_error_pull_loop_keeps_generic_backoff(monkeypatch):
 def test_cache_flow_control_backoff_is_50ms_and_distinct_from_broker_215():
     assert PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL == 0.05
     assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
-    assert PULL_TIME_DELAY_WHEN_EXCEPTION == 0.5
+    # The generic error wait is the consumer's knob (default 1000 ms), not one of these constants,
+    # and it stays a third distinct number: an application that retunes it must not move either
+    # flow-control stall.
+    assert _consumer("G_fc_knob_defaults").get_pull_time_delay_when_exception_millis() == 1000
     # The pull-loop stall must actually use the constant, not a literal of its own.
     src = inspect.getsource(DefaultMQPushConsumer._queue_pull_loop)
     assert "PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL" in src
     assert "time.sleep(0.1)" not in src
+    # ... and the loop's generic error arm must read the knob, not a literal of its own either.
+    assert "pull_time_delay_when_exception_millis" in src
+    assert "time.sleep(0.5)" not in src
 
 
 def test_full_cache_pauses_the_pull_for_50ms_without_touching_the_broker(monkeypatch):
@@ -635,17 +720,19 @@ def test_full_cache_pauses_the_pull_for_50ms_without_touching_the_broker(monkeyp
 
 def test_buffer_at_the_threshold_pulls_instead_of_stalling(monkeypatch):
     # Paired control: one message exactly AT the threshold must not pause, so the loop reaches the
-    # broker and records the *error* backoff instead of the cache one.
+    # broker and records the *error* backoff instead of the cache one. The knob is set to a value
+    # no other arm of the table uses, so what is slept can only have come from the knob.
     c, mq, key = _error_loop_consumer("G_fc_cache_pass")
 
     def _setup():
         _gates_off(c)
         c.pull_threshold_for_queue = 1
+        c.set_pull_time_delay_when_exception_millis(777)
         _stage(c, mq, _n_sized(TOPIC, 100, 1))   # 1 message at a threshold of 1
 
     delays = _drive_loop(monkeypatch, "_queue_pull_loop", "pull_message",
                          [RuntimeError("socket reset")], c, mq, key, setup=_setup)
-    assert delays == [PULL_TIME_DELAY_WHEN_EXCEPTION], delays
+    assert delays == [0.777], delays
     assert c._flow_control_triggered == 0
 
 
@@ -835,16 +922,18 @@ def test_pop_cache_flow_control_pauses_the_pop_for_50ms_without_touching_the_bro
 
 def test_pop_debt_at_the_threshold_pops_instead_of_stalling(monkeypatch):
     # Paired control of the case above: debt exactly AT the threshold must not pause, so the loop
-    # reaches the broker and records the *error* backoff instead of the cache one.
+    # reaches the broker and records the *error* backoff instead of the cache one. The knob is set
+    # to a value no other arm uses, so the slept number can only have come from the knob.
     c, mq, key = _error_loop_consumer("G_fc_pop_cache_pass")
 
     def _setup():
         c.pop_threshold_for_queue = 1
+        c.set_pull_time_delay_when_exception_millis(777)
         c._pop_queues[key] = _pop_debt(1)      # 1 message at a threshold of 1
 
     delays = _drive_loop(monkeypatch, "_queue_pop_loop", "pop_message",
                          [RuntimeError("socket reset")], c, mq, key, setup=_setup)
-    assert delays == [PULL_TIME_DELAY_WHEN_EXCEPTION], delays
+    assert delays == [0.777], delays
     assert c._flow_control_triggered == 0
 
 

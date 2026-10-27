@@ -109,10 +109,14 @@ const PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL = 50;
 // the local buffer and the request already round-tripped, so the queue is
 // readable again as soon as the broker's pressure drops — a shorter wait.
 export const PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL = 20;
-// Every other failed pull (a system error, a busy answer, a dead connection):
-// retrying hot adds pressure to whatever is already wrong.
-export const PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED = 500;
-const PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION = 3000;
+// DEFAULT_PULL_RETRY_DELAY_MILLIS is the default of the ONE generic error
+// backoff: the wait a queue's loop takes before asking again after a round that
+// failed for any reason other than the broker's own flow control (a system error,
+// a busy answer, a dead connection, a broker the route cannot resolve, a queue
+// with no cursor yet). It is a per-client knob (pullRetryDelayMillis) rather than
+// a fixed constant: retrying hot at a sick broker adds pressure to whatever is
+// already wrong, so the patience this client shows is the operator's call.
+export const DEFAULT_PULL_RETRY_DELAY_MILLIS = 1000;
 // A throttled queue trips a cache gate on every pull round, so warning every round buries the
 // signal in noise: only every Nth trip warns (the first, then the 1001st, ...).
 const FLOW_CONTROL_WARN_EVERY = 1000;
@@ -135,16 +139,38 @@ export function isFlowControlWarnTrip(times: number): boolean {
 //     in the local buffer and the queue is readable again as soon as the broker's
 //     pressure drops, so no rebalance and no threshold rescan;
 //   * anything else (a system error, a busy answer, a dead connection, or no code
-//     at all because the failure never reached the wire): the generic pause, since
-//     retrying hot at a sick broker adds pressure to whatever is already wrong.
+//     at all because the failure never reached the wire): the generic pause this
+//     client was configured with.
+//
+// `pullRetryDelayMillis` is the loop's OWN copy of the knob, captured when the
+// queue's loop was set up: a caller who changes the knob afterwards does not
+// alter a round that is already scheduled. It defaults to the knob's own default,
+// so a caller that maps a code without a consumer in hand still gets 1000 ms.
 //
 // This client's OWN backlog threshold is not here: _flowControlHit stops the pull
 // before the request goes out and sleeps PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL,
 // so the two waits never meet.
-export function pullRetryDelayMillisFor(responseCode?: number): number {
+export function pullRetryDelayMillisFor(responseCode?: number,
+  pullRetryDelayMillis: number = DEFAULT_PULL_RETRY_DELAY_MILLIS): number {
   return responseCode === ResponseCode.FLOW_CONTROL
     ? PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL
-    : PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED;
+    : pullRetryDelayMillis;
+}
+
+// NO_MESSAGE_QUEUE_OFFSET stands in for "this round produced no row" wherever the
+// first row's queue offset is compared against a cursor: no cursor a round asked
+// with can sit above it, so an empty round can only trip the next-offset leg.
+const NO_MESSAGE_QUEUE_OFFSET = Number.MAX_SAFE_INTEGER;
+
+// pullOffsetsLookWrong is the offset sanity check of a FOUND pull round. The round
+// asked with `prevRequestOffset`; the answer either points the cursor backwards
+// (`nextBeginOffset`) or hands over a first row (`firstMsgOffset`) from before that
+// ask. Either way the cursor this client keeps and the queue it reads disagree, and
+// that is worth a line in the log — nothing else: the check changes no offset, no
+// wait and no counter, because the round's own values are all still correct to use.
+export function pullOffsetsLookWrong(nextBeginOffset: number, firstMsgOffset: number,
+  prevRequestOffset: number): boolean {
+  return nextBeginOffset < prevRequestOffset || firstMsgOffset < prevRequestOffset;
 }
 
 // ConsumeReturnType — the ORDINAL is a wire-format value: a SubAfter trace
@@ -192,6 +218,11 @@ export class DefaultMQPushConsumer {
   pullThresholdForTopic = DEFAULT_PULL_THRESHOLD_FOR_TOPIC;
   pullThresholdSizeForTopic = DEFAULT_PULL_THRESHOLD_SIZE_FOR_TOPIC;
   pullInterval = DEFAULT_PULL_INTERVAL;
+  // The generic error backoff, in ms: the wait before re-issuing a pull (or POP)
+  // request after a round that failed for any reason other than the broker's own
+  // flow control. Both loops take this value when a queue's loop is set up, so
+  // changing it after start() does not alter a loop already running.
+  pullRetryDelayMillis = DEFAULT_PULL_RETRY_DELAY_MILLIS;
   pullTimeoutMillis = DEFAULT_PULL_TIMEOUT_MILLIS;
   pullSuspendTimeoutMillis = DEFAULT_PULL_SUSPEND_TIMEOUT_MILLIS;
   consumeMessageBatchMaxSize = DEFAULT_CONSUME_MESSAGE_BATCH_MAX_SIZE;
@@ -327,6 +358,12 @@ export class DefaultMQPushConsumer {
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPullBatchSizeInBytes(n: number): this { this.pullBatchSizeInBytes = n; return this; }
   setPullInterval(ms: number): this { this.pullInterval = ms; return this; }
+  // SetPullRetryDelayMillis sets the generic error backoff (ms): how long a
+  // queue's loop waits before re-issuing a pull/POP request after a round that
+  // failed for any reason other than the broker's own flow control. A queue's
+  // loop keeps the value it was set up with.
+  setPullRetryDelayMillis(ms: number): this { this.pullRetryDelayMillis = ms; return this; }
+  getPullRetryDelayMillis(): number { return this.pullRetryDelayMillis; }
   setPullTimeoutMillis(ms: number): this { this.pullTimeoutMillis = ms; return this; }
   setPullSuspendTimeoutMillis(ms: number): this { this.pullSuspendTimeoutMillis = ms; return this; }
   setConsumeMessageBatchMaxSize(n: number): this { this.consumeMessageBatchMaxSize = n; return this; }
@@ -1259,10 +1296,14 @@ export class DefaultMQPushConsumer {
   //
   // Why one loop PER QUEUE rather than one shared pull dispatcher
   // thread: the push consumer long-polls (suspend=true), so an idle queue
-  // parks its request for up to ~15s. A shared loop would serialise those
-  // parks and starve every other queue.
+  // parks its own request for the whole suspend window. A shared loop would
+  // serialise those parks and starve every other queue.
   private async _queuePullLoop(mq: MessageQueue, stopFlag: string): Promise<void> {
     const key = mqKey(mq);
+    // The generic error backoff is taken ONCE, when this queue's loop is set up:
+    // a later setPullRetryDelayMillis() reaches the loops the next rebalance
+    // builds, never a round already in flight.
+    const retryDelayMillis = this.pullRetryDelayMillis;
     while (!this._isStopped(stopFlag)) {
       const pq = this.processQueueTable.get(key);
       if (!pq || pq.isDropped()) return;
@@ -1277,6 +1318,9 @@ export class DefaultMQPushConsumer {
         continue;
       }
 
+      // No subscription for this topic: there is no next round to schedule, so the
+      // loop exits and rebalance owns the queue. The error backoff does not apply
+      // here — it waits for a request this loop will never re-issue.
       const sub = this.subscription.get(mq.getTopic());
       if (!sub) return;
       if (this.orderly && !pq.isLocked()) {
@@ -1292,9 +1336,14 @@ export class DefaultMQPushConsumer {
       }
       let offset = this.offsetTable.get(key);
       if (offset === undefined) {
-        if (await this._sleepOrStop(1000, stopFlag)) return;
+        // No cursor for this queue yet, so the round never reached the wire:
+        // a failed round like any other, so it waits the generic backoff.
+        if (await this._sleepOrStop(retryDelayMillis, stopFlag)) return;
         continue;
       }
+      // The cursor THIS round asks with. The answer cannot be judged without it:
+      // by the time the round is handled, the cursor has already moved on.
+      const prevRequestOffset = offset;
 
       // The subscription expression goes on the wire only when
       // postSubscriptionWhenPull is on AND the subscription is not a class
@@ -1327,7 +1376,7 @@ export class DefaultMQPushConsumer {
         resolved = this._findBrokerAddressInSubscribe(realBrokerName, brokerId, false);
         if (!resolved) {
           logger.debug('The broker[%s] not exist', realBrokerName);
-          if (await this._sleepOrStop(500, stopFlag)) return;
+          if (await this._sleepOrStop(retryDelayMillis, stopFlag)) return;
           continue;
         }
       }
@@ -1348,15 +1397,15 @@ export class DefaultMQPushConsumer {
           this.pullTimeoutMillis, resolved.addr);
       } catch (e) {
         if (e instanceof RemotingTimeoutException) {
-          // A long poll timing out while suspended is NORMAL: the broker
-          // clamps the suspend time to its own brokerSuspendMaxTimeMillis
-          // (~15s) and ignores what we sent, so an idle queue times out
-          // periodically. Debug level, so the run log keeps ERROR=0.
+          // A long poll timing out while suspended is NORMAL: an idle queue
+          // answers on its own schedule, so our own request timeout can expire
+          // before the reply does and idle queues time out periodically.
+          // Debug level, so the run log keeps ERROR=0.
           logger.debug('pull long-poll timeout for %s (benign, will retry): %s', key, (e as Error).message);
         } else {
           logger.debug('pull error for %s: %s', key, (e as Error).message);
           const code = e instanceof MQBrokerException ? e.responseCode : undefined;
-          if (await this._sleepOrStop(pullRetryDelayMillisFor(code), stopFlag)) return;
+          if (await this._sleepOrStop(pullRetryDelayMillisFor(code, retryDelayMillis), stopFlag)) return;
         }
         continue;
       }
@@ -1393,11 +1442,30 @@ export class DefaultMQPushConsumer {
       // came back empty, the TPS only for a non-empty one.
       if (result.status === PullStatus.FOUND) {
         this._incPullRT(mq.getTopic(), Date.now() - begin);
+        // The sanity check closes the FOUND round: the cursor already advanced and
+        // the batch is already handed over, so a warning here can only describe the
+        // round, never change it. An emptied list has no first row to point at, so
+        // it stands in with the sentinel and only the next-offset leg can fire.
+        const firstMsgOffset = result.msgFoundList.length > 0
+          ? result.msgFoundList[0].getQueueOffset()
+          : NO_MESSAGE_QUEUE_OFFSET;
+        if (pullOffsetsLookWrong(result.nextBeginOffset, firstMsgOffset, prevRequestOffset)) {
+          logger.warn('the FOUND pull round does not line up with the offset it asked with,'
+            + ' queue=%s nextBeginOffset=%d firstMsgOffset=%d prevRequestOffset=%d',
+            key, result.nextBeginOffset, firstMsgOffset, prevRequestOffset);
+        }
         if (result.msgFoundList.length > 0) {
           this._incPullTPS(mq.getTopic(), result.msgFoundList.length);
+          // Round pacing: ONLY a round that handed rows over waits pullInterval,
+          // and only when the knob is above 0. The cadence is a pacing rule for what
+          // was delivered, so a round that delivered nothing — an empty FOUND answer,
+          // one the filter emptied, NO_NEW_MSG, NO_MATCHED_MSG — asks again at once:
+          // nothing but a delivered round may be held back, and a local wait on an idle
+          // one would only delay the next fetch. The error arms keep their own waits
+          // and are not touched by this.
+          if (this.pullInterval > 0 && await this._sleepOrStop(this.pullInterval, stopFlag)) return;
         }
       }
-      if (this.pullInterval > 0 && await this._sleepOrStop(this.pullInterval, stopFlag)) return;
     }
   }
 
@@ -2699,6 +2767,9 @@ export class DefaultMQPushConsumer {
     }
     if (this.pullInterval < 0 || this.pullInterval > 65535) {
       throw new Error('pullInterval Out of range [0, 65535]');    }
+    if (!Number.isFinite(this.pullRetryDelayMillis) || this.pullRetryDelayMillis < 0) {
+      throw new Error('pullRetryDelayMillis must be a finite number >= 0');
+    }
     if (this.consumeMessageBatchMaxSize < 1 || this.consumeMessageBatchMaxSize > 1024) {
       throw new Error('consumeMessageBatchMaxSize Out of range [1, 1024]');
     }

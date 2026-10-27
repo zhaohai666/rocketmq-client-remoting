@@ -78,7 +78,11 @@ export function consumeInitMode(consumeFromWhere: string | null | undefined): nu
 export const POP_DELAY_WHEN_CACHE_FLOW_CONTROL = 50;
 export const POP_DELAY_WHEN_BROKER_FLOW = 20;
 export const POP_DELAY_WHEN_SUSPEND = 1000;
-export const POP_DELAY_WHEN_EXCEPTION = 3000;
+// There is deliberately NO POP-specific error-backoff constant here: a failed POP
+// round, and an answer this client does not know how to read (POLLING_FULL
+// included), wait the consumer's single generic error backoff
+// (DefaultMQPushConsumer.pullRetryDelayMillis, default 1000 ms), the same knob the
+// pull path uses, so one setting moves both paths.
 
 // ---------------------------------------------------------------------------
 // pop loop
@@ -87,6 +91,10 @@ export const POP_DELAY_WHEN_EXCEPTION = 3000;
 // queuePopLoop pops one queue until it is retired or the consumer stops.
 export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, stopFlag: string): Promise<void> {
   const key = mqKey(mq);
+  // The generic error backoff is taken ONCE, when this queue's loop is set up:
+  // a later setPullRetryDelayMillis() reaches the loops the next rebalance
+  // builds, never a round already in flight.
+  const retryDelayMillis = c.pullRetryDelayMillis;
   while (!c._isStopped(stopFlag)) {
     const pq = c.popQueueTable.get(key);
     if (!pq || pq.isDropped()) return;
@@ -101,6 +109,9 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
       continue;
     }
 
+    // No subscription for this topic: there is no next round to schedule, so the
+    // loop exits and rebalance owns the queue; the error backoff waits for a
+    // request this loop will never re-issue.
     const sub = c.subscription.get(mq.getTopic());
     if (!sub) return;
     // Flow control on this queue's outstanding-ACK debt, against
@@ -119,9 +130,9 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
     try {
       result = await popOnce(c, mq, sub);
     } catch (e) {
-      // The code lives on MQBrokerException.responseCode — the field the remoting
-      // layer fills in — so reading anything else here silently disables the
-      // branch below and every throttled queue falls back to the long wait.
+      // The code lives on MQBrokerException.responseCode (the field the remoting
+      // layer fills in), so reading anything else here silently disables the
+      // branch below and every throttled queue falls back to the generic backoff.
       const code = e instanceof MQBrokerException ? e.responseCode : undefined;
       if (code === ResponseCode.FLOW_CONTROL) {
         // Broker-side flow control: back off briefly, do not rescan.
@@ -134,7 +145,7 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
         logger.debug('pop long-poll timeout for %s (benign, will retry): %s', key, (e as Error).message);
       } else {
         logger.debug('pop error for %s: %s', key, (e as Error).message);
-        if (await c._sleepOrStop(POP_DELAY_WHEN_EXCEPTION, stopFlag)) return;
+        if (await c._sleepOrStop(retryDelayMillis, stopFlag)) return;
       }
       continue;
     }
@@ -170,8 +181,8 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
         // Retry immediately: the broker already held the poll open.
         continue;
       default:
-        // POLLING_FULL and anything else: back off.
-        if (await c._sleepOrStop(POP_DELAY_WHEN_EXCEPTION, stopFlag)) return;
+        // POLLING_FULL and anything else: back off with the generic error delay.
+        if (await c._sleepOrStop(retryDelayMillis, stopFlag)) return;
         break;
     }
   }
@@ -217,7 +228,7 @@ async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Pr
     header.exp = sub.subString;
   }
   // Wire rule: poll=true always here, and the network timeout gets +10s on
-  // top of the broker hold budget.
+  // top of the poll window we ask for.
   const timeout = POP_BROKER_SUSPEND_MAX_TIME_MILLIS + POP_REQUEST_EXTRA_NETWORK_MILLIS;
   return client.popMessage(mq.getBrokerName(), resolved.addr, header, c.namespace, timeout);
 }

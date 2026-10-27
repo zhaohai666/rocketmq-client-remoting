@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -96,15 +97,13 @@ PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL = 0.05
 # branch); sharing one delay there would either hammer a throttled broker or stall a healthy queue.
 PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL = 0.02
 
-# Per-round backoff for any other broker/client error on the pull/pop path (default 500ms):
-# long enough to avoid a hot retry loop, short enough to recover quickly.
-PULL_TIME_DELAY_WHEN_EXCEPTION = 0.5
-
-# Park after a POP round that answers POLLING_FULL (the queue's own popped-but-unacked budget is full
-# broker-side) or any status the round handling does not otherwise recognize (default 3000ms):
-# neither is "no messages right now" (that case re-pops immediately), it is "do not ask again so soon".
+# Per-round backoff for any other broker/client error on the pull/pop path is **not** a constant of
+# this module: it is the per-client knob ``DefaultMQPushConsumer.pull_time_delay_when_exception_millis``
+# (default 1000ms), which a queue's pull/pop loop reads once when the loop is set up. Long enough to
+# avoid a hot retry loop, short enough to recover quickly.
+# The same knob answers a POP round that answers POLLING_FULL, or a status this client has no rule
+# for: neither is "no messages right now" (those re-pop immediately), it is "do not ask again so soon".
 # Folding it into the immediate path would spin against a full budget; a short idle-guard value would too.
-POP_TIME_DELAY_WHEN_POLLING_FULL = 3.0
 
 # A throttled consumer trips flow control on every pull round, so a per-trip warn would flood the
 # log; only every Nth trip gets one (the first, then the 1001st, ...).
@@ -869,10 +868,19 @@ class DefaultMQPushConsumer:
         self.pull_threshold_size_for_topic = -1
         self.pull_interval = 0
         self.pull_timeout_millis = 30000
-        # The suspend duration of long polling (the broker's own max suspend time defaults to 20000).
+        # The suspend duration this client asks for on a long poll (20000 ms by default).
         # Note: this property must be initialized here -- the pull loop reads it, and if missing it throws
         # AttributeError every round and is swallowed by the fallback except of _consume_loop, presenting as "the consumer receives nothing at all".
         self.pull_suspend_timeout_millis = 20000
+        # Generic pull/pop error backoff (default 1000ms): the wait a queue's loop takes before
+        # re-issuing a pull (or pop) after a round that failed for any reason **other than** the
+        # broker's FLOW_CONTROL(215) reply. A per-client knob, not a loop constant: each pull/pop
+        # loop reads it once when it is set up (see _queue_pull_loop / _queue_pop_loop), so changing
+        # it after the client started does not alter a loop already running -- the next
+        # rebalance-created loop takes the new value. The fixed arms of the backoff table stay
+        # module constants: the broker's 215 (20ms), this client's own cache thresholds (50ms) and a
+        # paused consumer (1000ms).
+        self.pull_time_delay_when_exception_millis = 1000
         self.consume_message_batch_max_size = 1
         self.pull_batch_size = 32
         self.pull_batch_size_in_bytes = 256 * 1024
@@ -1240,6 +1248,19 @@ class DefaultMQPushConsumer:
 
     def set_pull_suspend_timeout_millis(self, millis: int) -> None:
         self.pull_suspend_timeout_millis = int(millis)
+
+    def set_pull_time_delay_when_exception_millis(self, millis: int) -> None:
+        """Set the generic pull/pop error backoff in milliseconds.
+
+        The wait a queue's loop takes before re-issuing a pull (or pop) after a round that failed for
+        any reason other than the broker's FLOW_CONTROL(215) reply. A negative value is read as 0
+        (re-issue immediately). A loop that is already running keeps the value it was set up with;
+        the next loop this consumer creates takes the new one.
+        """
+        self.pull_time_delay_when_exception_millis = max(0, int(millis))
+
+    def get_pull_time_delay_when_exception_millis(self) -> int:
+        return self.pull_time_delay_when_exception_millis
 
     def set_await_termination_millis_when_shutdown(self, millis: int) -> None:
         """Bound how long shutdown() waits for the consume executors to drain in-flight batches.
@@ -1941,9 +1962,9 @@ class DefaultMQPushConsumer:
     # ---------------- Consume loops ----------------
     def _start_pull_loop(self) -> None:
         self._pulling = True
-        # Concurrent long-polling semantics: the broker suspends a
-        # long-poll request per queue and returns immediately once a message arrives -- so each queue must have its own pull thread,
-        # otherwise one empty queue's long poll (~15s suspend) would block the delivery of the other queues.
+        # Concurrent long-polling semantics: each queue's request is suspended on
+        # its own and returns as soon as that queue has a message -- so each queue must have its own pull thread,
+        # otherwise one empty queue's long poll would block the delivery of the other queues until its own window closes.
         self._rebalance_pull_threads()
 
     def _rebalance_pull_threads(self) -> None:
@@ -2308,6 +2329,10 @@ class DefaultMQPushConsumer:
         client = self._require_client()
         orderly = self._is_orderly()
         key = self._mq_key(mq)
+        # The generic error backoff is taken when this loop is set up, like the POP loop's invisible
+        # time: reconfiguring the knob later does not change a loop that is already running.
+        # ``max(0, ...)`` because a negative wait would make time.sleep raise instead of pull again.
+        error_backoff_seconds = max(0, self.pull_time_delay_when_exception_millis) / 1000.0
         while not self._stop.is_set() and self._started:
             if not self._owns_queue(key):
                 return
@@ -2346,6 +2371,10 @@ class DefaultMQPushConsumer:
                     time.sleep(1.0)
                     continue
                 self._offset_table[key] = offset
+            # The cursor this round asks with, remembered before the pull advances it: the sanity
+            # warning at the end of the FOUND round needs the value actually requested, not the
+            # (already-moved) table entry.
+            prev_request_offset = offset
             try:
                 # Only when post_subscription_when_pull is on and not class-filter mode is the subscription expression
                 # sent to the broker; not sent by default, with filtering falling back to the client's tag filtering.
@@ -2378,9 +2407,9 @@ class DefaultMQPushConsumer:
                     self._stats_manager.inc_pull_rt(self.consumer_group, mq.topic,
                                                     int((time.time() - pull_began) * 1000))
             except RemotingTimeoutException as e:
-                # A long poll timing out with no new message during suspend is normal behavior: the broker
-                # clamps the suspend time to its own configured maximum (default ~15s),
-                # ignoring the client's suspend_timeout_millis, so idle queues time out periodically.
+                # A long poll timing out with no new message during suspend is normal behavior: an idle
+                # queue answers on its own schedule, so our request timeout can expire before the reply
+                # does, and idle queues therefore time out periodically.
                 # This is not an error, debug level only, to avoid polluting the client's runtime logs (see logging.py).
                 logger.debug("pull long-poll timeout for %s (benign, will retry): %s", mq, e)
                 continue
@@ -2394,11 +2423,11 @@ class DefaultMQPushConsumer:
                 if e.response_code == ResponseCode.FLOW_CONTROL:
                     time.sleep(PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
                 else:
-                    time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                    time.sleep(error_backoff_seconds)
                 continue
             except Exception as e:  # noqa: BLE001
                 logger.debug("pull error for %s: %s: %s", mq, type(e).__name__, e)
-                time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                time.sleep(error_backoff_seconds)
                 continue
 
             # Client-side filtering before delivery:
@@ -2419,6 +2448,9 @@ class DefaultMQPushConsumer:
             # have this batch **discarded directly** -- not consumed, offset not advanced,
             # left to the new owner to redeliver from our last persisted offset, otherwise the two instances would consume the same message.
             illegal = False
+            # ``delivered`` is true only where a batch actually reaches the buffer, so a FOUND round
+            # whose batch the pre-delivery step emptied does not count as delivery.
+            delivered = False
             with self._lock:
                 if self._queue_threads.get(key) is not threading.current_thread():
                     logger.debug("queue %s revoked during pull, discard %d fetched messages",
@@ -2430,6 +2462,7 @@ class DefaultMQPushConsumer:
                 if result.status == PullStatus.FOUND and result.msg_found_list:
                     self._pending[key].extend(result.msg_found_list)
                     self._update_msg_acc_cnt(key, result.msg_found_list)
+                    delivered = True
                 # The pull cursor advances to nextBeginOffset; the "consumed offset" is tracked and persisted separately by _consume_offsets
                 if result.next_begin_offset is not None:
                     self._offset_table[key] = result.next_begin_offset
@@ -2448,6 +2481,36 @@ class DefaultMQPushConsumer:
                                                          result.next_begin_offset)
             if illegal:
                 self._offset_illegal_recover(key)
+            # Client-side arithmetic sanity check on a FOUND round, run once the round has advanced
+            # its cursor. Purely a diagnostic: it changes no control flow -- no retry, no backoff, no
+            # offset rewrite, no cursor rollback, no dropped batch -- and reads only three numbers
+            # this client already holds about the round; it runs after the rows were handed to the
+            # consume side and the stats booked. The round "does not add up" when the offset the
+            # response says comes next sits below the offset this round asked to pull from, or when
+            # the earliest row this round actually dispatches (after the tag pass and the filter hook)
+            # sits below that same requested offset. An emptied list has no first row to point at, so
+            # the largest representable offset stands in and only the next-offset leg can fire.
+            if result.status == PullStatus.FOUND:
+                first_msg_offset = (int(result.msg_found_list[0].queue_offset)
+                                    if result.msg_found_list else sys.maxsize)
+                next_begin_offset = result.next_begin_offset
+                if ((next_begin_offset is not None
+                     and int(next_begin_offset) < prev_request_offset)
+                        or first_msg_offset < prev_request_offset):
+                    logger.warning(
+                        "pull round offsets do not add up for %s: requested offset %d, "
+                        "next begin offset %s, first message offset %d",
+                        mq, prev_request_offset, next_begin_offset, first_msg_offset)
+            # A round that delivered rows honors the configured pull cadence; with pull_interval == 0
+            # the next round re-pulls immediately.
+            # Every other round re-pulls immediately too: a FOUND round whose batch came back empty or
+            # was emptied by the pre-delivery step, a NO_NEW_MSG / NO_MATCHED_MSG round and an
+            # OFFSET_ILLEGAL round handed nothing over, and the cadence is a pacing rule for what was
+            # delivered -- an idle guard on top of them would only delay the next fetch.
+            # The error arms above (the broker's FLOW_CONTROL(215) and the generic backoff) and the
+            # suspend pause are unchanged.
+            if delivered and self.pull_interval > 0:
+                time.sleep(self.pull_interval / 1000.0)
 
     def _update_msg_acc_cnt(self, key: str, msgs: List[MessageExt]) -> None:
         """The computation of ``msg_acc_cnt`` (backlog count).
@@ -2499,6 +2562,9 @@ class DefaultMQPushConsumer:
         init_mode = (CONSUME_INIT_MODE_MIN
                      if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET
                      else CONSUME_INIT_MODE_MAX)
+        # The generic error backoff is taken when this loop is set up, like the invisible time above:
+        # reconfiguring the knob later does not change a loop that is already running.
+        error_backoff_seconds = max(0, self.pull_time_delay_when_exception_millis) / 1000.0
         while not self._stop.is_set() and self._started:
             if not self._owns_queue(key):
                 return
@@ -2551,11 +2617,11 @@ class DefaultMQPushConsumer:
                 if e.response_code == ResponseCode.FLOW_CONTROL:
                     time.sleep(PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
                 else:
-                    time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                    time.sleep(error_backoff_seconds)
                 continue
             except Exception as e:  # noqa: BLE001
                 logger.debug("pop error for %s: %s: %s", mq, type(e).__name__, e)
-                time.sleep(PULL_TIME_DELAY_WHEN_EXCEPTION)
+                time.sleep(error_backoff_seconds)
                 continue
 
             # The queue is revoked by rebalance after popping: this batch is **neither consumed nor acked**
@@ -2611,8 +2677,9 @@ class DefaultMQPushConsumer:
                 pass
             else:
                 # POLLING_FULL and any status the round handling does not recognize: the queue is not
-                # empty-but-unready, it is "do not ask again so soon" -- park 3000 ms.
-                time.sleep(POP_TIME_DELAY_WHEN_POLLING_FULL)
+                # empty-but-unready, it is "do not ask again so soon", so this round waits the same
+                # generic error backoff the knob gives any other failed round.
+                time.sleep(error_backoff_seconds)
 
     def _submit_pop_consume_request(self, msgs: List[MessageExt], pq: PopProcessQueue,
                                     mq: MessageQueue) -> None:

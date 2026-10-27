@@ -29,9 +29,7 @@ import pytest
 
 from client import consumer as consumer_mod
 from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
-                             POP_TIME_DELAY_WHEN_POLLING_FULL,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
-                             PULL_TIME_DELAY_WHEN_EXCEPTION,
                              filter_messages_for_delivery)
 from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
                                     MessageListenerOrderly,
@@ -393,21 +391,23 @@ class _Orderly(_CaptureListener, MessageListenerOrderly):
 
 
 class TestPopReschedulePerStatus:
-    def test_polling_full_parks_three_seconds(self, monkeypatch):
+    def test_polling_full_parks_the_configured_error_backoff(self, monkeypatch):
         c = push_consumer()
         _pq, delivered, _t, clock = _run_pop_rounds(
             monkeypatch, c, [PopResult(PopStatus.POLLING_FULL)])
         assert delivered == []
-        assert clock.delays == [POP_TIME_DELAY_WHEN_POLLING_FULL], \
-            "POLLING_FULL parks 3000 ms, not the old 200 ms guard and not immediately"
+        assert clock.delays == [1.0], \
+            "POLLING_FULL waits the generic error backoff, whose default is 1000 ms"
 
-    def test_other_status_parks_three_seconds_too(self, monkeypatch):
-        """A status the round handling does not recognize shares the POLLING_FULL park."""
+    def test_other_status_parks_the_configured_error_backoff_too(self, monkeypatch):
+        """A status the round handling does not recognize shares the POLLING_FULL wait, and that
+        wait follows the knob rather than a private constant."""
         c = push_consumer()
+        c.set_pull_time_delay_when_exception_millis(250)
         weird = PopResult(PopStatus.POLLING_FULL)
         weird.status = "NOT_A_STATUS"
         _pq, _d, _t, clock = _run_pop_rounds(monkeypatch, c, [weird])
-        assert clock.delays == [3.0]
+        assert clock.delays == [0.25]
 
     def test_polling_not_found_and_no_new_msg_repop_immediately(self, monkeypatch):
         """Control for the case above: the idle statuses must not park at all -- red if the
@@ -511,10 +511,12 @@ class TestPopReschedulePerStatus:
         assert not th.is_alive()
         assert clock.delays == [PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL]
         assert PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL == 0.02
-        # The generic non-215 error branch on this port stays the loop's shared error backoff:
-        # the re-schedule work must not have turned it into the 3 s status park.
-        assert PULL_TIME_DELAY_WHEN_EXCEPTION == 0.5
-        assert PULL_TIME_DELAY_WHEN_EXCEPTION != POP_TIME_DELAY_WHEN_POLLING_FULL
+        # The generic non-215 error branch and a POLLING_FULL round take the same wait on this port:
+        # the consumer's knob, default 1000 ms. That number must stay distinct from the broker's
+        # FLOW_CONTROL(215) pause, which keeps its own 20 ms arm.
+        assert c.get_pull_time_delay_when_exception_millis() == 1000
+        assert (c.get_pull_time_delay_when_exception_millis() / 1000.0
+                != PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL)
 
 
 if __name__ == "__main__":

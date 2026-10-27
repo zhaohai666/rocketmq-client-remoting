@@ -1974,7 +1974,9 @@ final class DefaultLitePullConsumer
      * (``PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL``, reached through the shared code-to-wait
      * mapping) instead of hammering away on the next tick. Every other failure keeps the lite
      * path's existing behaviour -- log it and retry on the next tick -- so no other response
-     * code's handling changes here.
+     * code's handling changes here, and the mapping's other arm (the push consumer's configured
+     * failed-round backoff, whose default the call below leaves untouched) is never read on this
+     * path: the guard above only lets 215 through to it.
      */
     private function armBrokerThrottlePause(string $key, \Throwable $e): void
     {

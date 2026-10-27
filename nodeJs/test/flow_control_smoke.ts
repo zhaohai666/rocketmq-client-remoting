@@ -59,11 +59,11 @@ import { SubscriptionData } from '../src/common/subscriptionData.ts';
 import { PullResult, PullStatus } from '../src/client/consumer_result.ts';
 import { PopResult, processPopResponse } from '../src/client/pop_api.ts';
 import { PopMessageResponseHeader } from '../src/remoting/headers.ts';
-import { queuePopLoop, POP_DELAY_WHEN_EXCEPTION, POP_DELAY_WHEN_CACHE_FLOW_CONTROL } from '../src/client/pop_consumer.ts';
+import { queuePopLoop, POP_DELAY_WHEN_CACHE_FLOW_CONTROL } from '../src/client/pop_consumer.ts';
 import { MQBrokerException, RemotingTimeoutException } from '../src/remoting/exception.ts';
 import {
   DefaultMQPushConsumer, isFlowControlWarnTrip, pullRetryDelayMillisFor,
-  PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED,
+  PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, DEFAULT_PULL_RETRY_DELAY_MILLIS,
 } from '../src/client/consumer.ts';
 import { DefaultLitePullConsumer, litePullParkMillisFor } from '../src/client/lite_pull_consumer.ts';
 import { DefaultMQPullConsumer } from '../src/client/pull_consumer.ts';
@@ -409,25 +409,31 @@ function consumer(group: string): DefaultMQPushConsumer {
 }
 
 // ---- the three different waits a throttled or failed round produces ---------
-// 50 ms (this client's own cache gate), 20 ms (the broker's 215 answer) and
-// 500 ms (every other failure) have to stay three separate numbers: collapse
-// them and a throttled queue either hammers the broker or stalls the consumer.
-// The mapping is driven through the real loop with the waits RECORDED instead of
-// slept, so a branch that never runs cannot pass a value check by accident.
+// 50 ms (this client's own cache gate), 20 ms (the broker's 215 answer) and the
+// generic error backoff pullRetryDelayMillis (default 1000 ms) have to stay three
+// separate numbers: collapse them and a throttled queue either hammers the broker
+// or stalls the consumer. The mapping is driven through the real loop with the
+// waits RECORDED instead of slept, so a branch that never runs cannot pass a value
+// check by accident.
 {
   check('only the broker 215 answer gets the short 20ms wait',
     pullRetryDelayMillisFor(215) === 20 && PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL === 20);
-  check('every other broker answer gets the generic 500ms wait',
-    pullRetryDelayMillisFor(2) === 500 && PULL_TIME_DELAY_MILLS_WHEN_PULL_FAILED === 500);
+  check('every other broker answer gets the generic backoff, whose default is 1000ms',
+    pullRetryDelayMillisFor(2) === 1000 && DEFAULT_PULL_RETRY_DELAY_MILLIS === 1000);
   // Controls on the wire code: neighbours of 215 and the codes that mean something
   // else on a pull answer must NOT be treated as throttling.
   for (const code of [1, 2, 24, 25, 26, 214, 216, 1006, 3000]) {
-    check(`code ${code} does not get the 20ms wait`, pullRetryDelayMillisFor(code) === 500);
+    check(`code ${code} does not get the 20ms wait`, pullRetryDelayMillisFor(code) === 1000);
   }
   check('a failure that never reached the wire gets the generic wait',
-    pullRetryDelayMillisFor(undefined) === 500);
-  // The three waits stay apart (20 < 50 < 500): the cache gate's own value is
-  // asserted from the loop below, where it is the only pause that can appear.
+    pullRetryDelayMillisFor(undefined) === 1000);
+  // The second argument is the knob as the loop captured it: 215 stays at 20 ms
+  // whatever the knob says, and everything else follows the knob.
+  check('a configured backoff moves the generic arm only',
+    pullRetryDelayMillisFor(2, 7) === 7 && pullRetryDelayMillisFor(215, 7) === 20);
+  // The three waits stay apart (20 < 50 < the generic wait): the cache gate's own
+  // value is asserted from the loop below, where it is the only pause that can
+  // appear.
   check('the broker wait is shorter than the cache wait, the generic wait longer',
     pullRetryDelayMillisFor(215) < 50 && 50 < pullRetryDelayMillisFor(2));
 }
@@ -503,16 +509,16 @@ async function drivePullLoop(opts: {
     group: 'G_nodejs_fc_pull_failed',
     failWith: new MQBrokerException(2, 'system error', '127.0.0.1:10911'),
   });
-  check('a pull that failed for any other broker reason waits 500ms',
-    broken.waits.length === 1 && broken.waits[0] === 500, JSON.stringify(broken.waits));
+  check('a pull that failed for any other broker reason waits the generic backoff (1000ms)',
+    broken.waits.length === 1 && broken.waits[0] === 1000, JSON.stringify(broken.waits));
 
-  // Control: a failure with no broker code behind it is a generic failure — the
+  // Control: a failure with no broker code behind it is a generic failure. The
   // 20ms branch may not swallow it.
   const plain = await drivePullLoop({
     group: 'G_nodejs_fc_pull_plain', failWith: new Error('connection reset'),
   });
-  check('a failure carrying no broker code waits the generic 500ms',
-    plain.waits.length === 1 && plain.waits[0] === 500, JSON.stringify(plain.waits));
+  check('a failure carrying no broker code waits the generic 1000ms',
+    plain.waits.length === 1 && plain.waits[0] === 1000, JSON.stringify(plain.waits));
 
   // Control: an idle long-poll timeout is normal, so it retries immediately.
   const timedOut = await drivePullLoop({
@@ -526,9 +532,12 @@ async function drivePullLoop(opts: {
 // ---- the same discrimination on the POP round ------------------------------
 // The POP loop reads the broker code off the field the remoting layer actually
 // fills in; a wrong field name leaves the 20ms branch as dead code and every
-// throttled queue silently waits the long error backoff instead.
-async function drivePopLoop(group: string, failWith: Error): Promise<number[]> {
+// throttled queue silently waits the generic error backoff instead.
+async function drivePopLoop(group: string, failWith: Error,
+  retryDelay?: number): Promise<{ waits: number[], configured: number }> {
   const c = consumer(group);
+  if (retryDelay !== undefined) c.setPullRetryDelayMillis(retryDelay);
+  const configured = c.getPullRetryDelayMillis();
   const mq = queue();
   const anyC = c as any;
   c.subscription.set(TOPIC, new SubscriptionData(TOPIC, '*'));
@@ -548,18 +557,19 @@ async function drivePopLoop(group: string, failWith: Error): Promise<number[]> {
   const waits: number[] = [];
   anyC._sleepOrStop = async (ms: number) => { waits.push(ms); return false; };
   await queuePopLoop(c, mq, flag);
-  return waits;
+  return { waits, configured };
 }
 
 {
   const throttled = await drivePopLoop('G_nodejs_pop_fc_broker',
     new MQBrokerException(215, 'broker is flow controlling', '127.0.0.1:10911'));
   check('a POP round the broker throttled (215) is asked again after 20ms',
-    throttled.length === 1 && throttled[0] === 20, JSON.stringify(throttled));
+    throttled.waits.length === 1 && throttled.waits[0] === 20, JSON.stringify(throttled.waits));
   const broken = await drivePopLoop('G_nodejs_pop_fc_failed',
     new MQBrokerException(2, 'system error', '127.0.0.1:10911'));
-  check('control: any other POP failure waits the long error backoff',
-    broken.length === 1 && broken[0] === POP_DELAY_WHEN_EXCEPTION, JSON.stringify(broken));
+  check('control: any other POP failure waits exactly the consumer\'s generic backoff',
+    broken.waits.length === 1 && broken.waits[0] === broken.configured
+    && broken.configured === 1000, JSON.stringify(broken.waits));
 }
 
 // ---- the POP cache gate: one counter, one cadence, the same 50 ms ----------

@@ -928,7 +928,7 @@ void testCachePauseIsFiftyMillis() {
            std::to_string(kPullPauseWhenClientFlowControl));
     expect(kPullPauseWhenClientFlowControl != kPullPauseWhenBrokerFlowControl,
            "cachePause.differsFromBrokerPause");
-    expect(kPullPauseWhenClientFlowControl != kPullPauseWhenPullError,
+    expect(kPullPauseWhenClientFlowControl != kDefaultPullPauseWhenPullErrorMillis,
            "cachePause.differsFromErrorPause");
 }
 

@@ -3,6 +3,8 @@
 package client
 
 import (
+	"fmt"
+	"math"
 	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
@@ -17,6 +19,9 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		}
 	}()
 	orderly := c.isOrderly()
+	// The generic failed-round back-off is captured once when this loop is set
+	// up, so changing the knob after start never alters a loop already running.
+	failedDelay := c.failedRoundDelayValue()
 	for {
 		if c.stopRequested(stop) {
 			return
@@ -57,7 +62,12 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		}
 		offset, ok := c.pullCursor(mq)
 		if !ok {
-			if c.sleepOrStop(stop, time.Second) {
+			// The pull cursor could not be resolved: this round failed for a
+			// reason other than the broker's own flow control (the initial offset
+			// resolution errored, or the subscription this queue belongs to is
+			// gone), so it sleeps the generic failed-round back-off like any other
+			// non-flow-control failure.
+			if c.sleepOrStop(stop, failedDelay) {
 				return
 			}
 			continue
@@ -77,18 +87,22 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		c.mu.Unlock()
 
 		begin := common.CurrentTimeMillis()
+		// The cursor THIS round asked to pull from. The round's own offset check at
+		// the bottom compares against it, and the cursor itself moves on below, so the
+		// value has to be held for the whole round.
+		prevRequestOffset := offset
 		result, err := c.pullAPI.pullKernel(c.consumerGroup, mq, offset, sub, sysFlag, 0,
 			batchNums, batchBytes, suspend, timeout)
 		if err != nil {
 			if isTimeout(err) {
-				// A long poll timing out while suspended is NORMAL: the broker
-				// clamps the suspend time to its own brokerSuspendMaxTimeMillis
-				// (~15s) and ignores what we sent, so an idle queue times out
-				// periodically. Debug level, so the run log keeps ERROR=0.
+				// An idle queue's long poll answers on its own schedule, so our
+				// request timeout can expire before the reply does. That is the
+				// expected shape of an idle queue, not a failure: Debug level, so
+				// the run log keeps ERROR=0.
 				common.LogDebugf("pull long-poll timeout for %v (benign, will retry): %v", mq, err)
 			} else {
 				common.LogDebugf("pull error for %v: %v", mq, err)
-				if c.sleepOrStop(stop, pullRetryDelay(err)) {
+				if c.sleepOrStop(stop, pullRetryDelay(err, failedDelay)) {
 					return
 				}
 			}
@@ -130,17 +144,77 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 			c.offsetIllegalRecover(mq)
 			return
 		}
+		// Offset sanity warning: the cursor has moved to nextBeginOffset and the batch
+		// is already with the consume side, so all a round can still be asked is whether
+		// its own numbers hang together. It sits ahead of the stats and the cadence wait
+		// below because that wait can end the round on a stop request, and the rounds
+		// worth warning about are the delivered ones. Purely diagnostic: no offset is
+		// rewritten, no batch dropped, no wait added.
+		if warn := pullOffsetsSanityWarning(result, mq, prevRequestOffset); warn != "" {
+			common.LogWarnf("%s", warn)
+		}
 		if result.PullStatus == PullFound {
 			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
 			if len(result.MsgFoundList) > 0 {
 				c.incPullTPS(mq.Topic, int64(len(result.MsgFoundList)))
+				// Only a round that DELIVERED rows is paced by pullInterval, and
+				// only when it is positive. This is the same list the PULL_TPS
+				// counter above just recorded — what survived the tag pass and the
+				// filter hooks, i.e. what this queue was actually handed — not the
+				// rows the broker put on the wire.
+				if interval := c.pullIntervalValue(); interval > 0 {
+					if c.sleepOrStop(stop, time.Duration(interval)*time.Millisecond) {
+						return
+					}
+				}
 			}
+			// A FOUND round whose batch came back empty, or whose every row was
+			// dropped by the client's own filtering, delivered nothing, so it falls
+			// through and re-pulls at once like the idle statuses below.
 		}
-		interval := c.pullIntervalValue()
-		if interval > 0 && c.sleepOrStop(stop, time.Duration(interval)*time.Millisecond) {
-			return
-		}
+		// NO_NEW_MSG and NO_MATCHED_MSG (and a FOUND that delivered nothing) reach
+		// here and start the next round immediately: the cadence paces rounds that
+		// delivered, so an extra local wait on an idle round would only delay the
+		// next fetch. Failures are not here — each failure arm sleeps its own wait
+		// before continuing, and OFFSET_ILLEGAL leaves the loop.
 	}
+}
+
+// pullOffsetsLookWrong is the arithmetic behind a FOUND round's sanity warning: the
+// round asked to pull from prevRequestOffset, so a reply that puts the next cursor
+// — or its own first row — below that point describes a range the round did not ask
+// for. These two comparisons are the whole check; neither has any teeth.
+func pullOffsetsLookWrong(nextBeginOffset, firstMsgOffset, prevRequestOffset int64) bool {
+	return nextBeginOffset < prevRequestOffset || firstMsgOffset < prevRequestOffset
+}
+
+// firstPullMsgOffset is the queue offset of the first row of the list a round hands
+// to the consume side — read after this port's tag pass and filter hooks, so it is
+// the offset this queue was actually given. An empty list reports the largest int64:
+// a round that handed no row over has no row offset to judge.
+func firstPullMsgOffset(msgs []*common.MessageExt) int64 {
+	if len(msgs) == 0 {
+		return math.MaxInt64
+	}
+	return msgs[0].QueueOffset
+}
+
+// pullOffsetsSanityWarning is one round's offset check as a decision: "" when there
+// is nothing to report — every status but FOUND hands no rows over and moves no
+// cursor on its own reply, so only a FOUND round is judged — and otherwise the one
+// line that names all three offsets, so the log alone shows which comparison tripped.
+func pullOffsetsSanityWarning(result *PullResult, mq common.MessageQueue,
+	prevRequestOffset int64) string {
+	if result.PullStatus != PullFound {
+		return ""
+	}
+	firstMsgOffset := firstPullMsgOffset(result.MsgFoundList)
+	if !pullOffsetsLookWrong(result.NextBeginOffset, firstMsgOffset, prevRequestOffset) {
+		return ""
+	}
+	return fmt.Sprintf("pull offsets look wrong for %v: requested at %d, "+
+		"nextBeginOffset=%d, firstMsgOffset=%d",
+		mq, prevRequestOffset, result.NextBeginOffset, firstMsgOffset)
 }
 
 // pullCursor reads (or resolves) the queue's next pull offset.
@@ -488,8 +562,9 @@ func isTimeout(err error) bool {
 //     the local buffer, and the queue is quiet again as soon as the broker's
 //     pressure drops — so a short backoff, and no rebalance or threshold rescan;
 //   - anything else (a system error, a busy/dispatch answer, a dead connection):
-//     the longer generic wait, because retrying hot at a broker that is
-//     unhealthy adds pressure to whatever is already wrong.
+//     the generic failed-round back-off the caller captured at loop setup,
+//     because retrying hot at a broker that is unhealthy adds pressure to
+//     whatever is already wrong.
 //
 // This client's own backlog threshold is not here: flowControlHit stops the pull
 // BEFORE the request is sent and sleeps
@@ -497,11 +572,11 @@ func isTimeout(err error) bool {
 //
 // One loop serves both the concurrent and the orderly consumer (orderly is just
 // a flag on it), so both paths get the same discrimination.
-func pullRetryDelay(err error) time.Duration {
+func pullRetryDelay(err error, failedDelay time.Duration) time.Duration {
 	if isBrokerFlowControlError(err) {
 		return pullTimeDelayMillsWhenBrokerFlow
 	}
-	return pullTimeDelayMillsWhenPullFailed
+	return failedDelay
 }
 
 // isBrokerFlowControlError recognises the one failure answer that means "the

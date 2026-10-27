@@ -289,13 +289,21 @@ public class PopConsumerTests
 
     // ------------------------ POP re-schedule decision (pure) ------------------------
 
+    /// <summary>The generic error backoff a POP loop captures when it is set up, spelled
+    /// out as the default here so every leg below pins the decision and the knob value
+    /// in the same assertion.</summary>
+    private const int GenericErrorBackoff = 1000;
+
     [Fact]
     public void PopNextRound_FoundWithKeptRows_PacesByPullIntervalOrGoesStraightOn()
     {
         // Interval 0: no pace to wait, next round now.
-        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 2, 0));
-        // Interval > 0: the configured pace applies to a real delivery.
-        Assert.Equal(50, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 2, 50));
+        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 2, 0,
+            GenericErrorBackoff));
+        // Interval > 0: the configured pace applies to a real delivery -- and it is a
+        // different number from the error backoff, so the two legs stay separable.
+        Assert.Equal(50, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 2, 50,
+            GenericErrorBackoff));
     }
 
     [Fact]
@@ -303,30 +311,61 @@ public class PopConsumerTests
     {
         // A batch fully filtered out is an empty answer: the interval only paces
         // real deliveries.
-        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 0, 50));
+        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.Found, 0, 50,
+            GenericErrorBackoff));
     }
 
     [Fact]
     public void PopNextRound_EmptyAnswers_GoStraightOn()
     {
-        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.NoNewMsg, 0, 50));
+        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.NoNewMsg, 0, 50,
+            GenericErrorBackoff));
+        // A round that simply found nothing is NOT a failed round: whatever the knob is
+        // set to, it never takes the backoff.
         Assert.Equal(0,
-            DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.PollingNotFound, 0, 50));
+            DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.PollingNotFound, 0, 50,
+                GenericErrorBackoff));
     }
 
     [Fact]
-    public void PopNextRound_PollingFullAndUnknown_BackOffThreeSeconds()
+    public void PopNextRound_PollingFullAndUnknown_TakeTheGenericErrorBackoff()
     {
-        Assert.Equal(3000, DefaultMQPushConsumer.PopExceptionBackoffMillis);
+        // One knob for both loops: the POP leg reads the same configured value the pull
+        // path parks a failed round on, and that default is 1000 ms.
+        Assert.Equal(1000, GenericErrorBackoff);
         // Strictly above the 200 ms hot-round nap: the loop must never let that
         // guard replace this back-off.
-        Assert.True(DefaultMQPushConsumer.PopNextRoundDelayMillis(
-            PopStatus.PollingFull, 0, 50) > 200);
-        Assert.Equal(DefaultMQPushConsumer.PopExceptionBackoffMillis,
-            DefaultMQPushConsumer.PopNextRoundDelayMillis(PopStatus.PollingFull, 0, 50));
+        Assert.True(GenericErrorBackoff > 200);
+        Assert.Equal(GenericErrorBackoff, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.PollingFull, 0, 50, GenericErrorBackoff));
         // Any status the decision does not know falls into the same back-off.
-        Assert.Equal(DefaultMQPushConsumer.PopExceptionBackoffMillis,
-            DefaultMQPushConsumer.PopNextRoundDelayMillis((PopStatus)42, 0, 0));
+        Assert.Equal(GenericErrorBackoff, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            (PopStatus)42, 0, 0, GenericErrorBackoff));
+        // Controls that keep the three legs apart: an interval-paced round and an empty
+        // round are neither of them the backoff.
+        Assert.NotEqual(GenericErrorBackoff, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.Found, 3, 50, GenericErrorBackoff));
+        Assert.NotEqual(GenericErrorBackoff, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.PollingNotFound, 0, 50, GenericErrorBackoff));
+    }
+
+    /// <summary>The POLLING_FULL leg follows the knob: hard-code the wait inside the
+    /// decision and both halves of this test go red, because each half asks for a
+    /// different number out of the same call.</summary>
+    [Fact]
+    public void PopNextRound_PollingFullLeg_FollowsTheConfiguredKnob()
+    {
+        var c = new DefaultMQPushConsumer(Group) { PullExceptionBackoffMillis = 2500 };
+        Assert.Equal(2500, c.PullExceptionBackoffMillis);
+        Assert.Equal(c.PullExceptionBackoffMillis, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.PollingFull, 0, 50, c.PullExceptionBackoffMillis));
+
+        c.PullExceptionBackoffMillis = 700;
+        Assert.Equal(700, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.PollingFull, 0, 50, c.PullExceptionBackoffMillis));
+        // Moving the knob moves ONLY the failed-round leg.
+        Assert.Equal(0, DefaultMQPushConsumer.PopNextRoundDelayMillis(
+            PopStatus.PollingNotFound, 0, 50, c.PullExceptionBackoffMillis));
     }
 
     // ------------------------ POP-only reconsume budget drop ------------------------

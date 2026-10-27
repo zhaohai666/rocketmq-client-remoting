@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1143 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1152 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -254,6 +254,8 @@ ROCKETMQ_TLS_ENABLE=1 cargo run --quiet --example live_producer -- 127.0.0.1:987
   重试 / 死信、位点持久化、拉取停摆自愈、POP 的待 ack 欠账闸门（严格大于 `pop_threshold_for_queue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）
 - ✅ PushConsumer 每队列三道缓存闸门，按条数 → 字节 → 跨度固定顺序判：读的是这条队列**已拉未结**的整个持有集（缓冲里的 + 已经交给 listener 的那一批，按 `queueOffset` 去重），字节按消息 **body** 整除 MiB，跨度只对并发 listener 判；三条都是严格大于才停，配置原样生效——没有下限夹取，也没有"取某个值就关掉闸门"的出口，合法区间由启动期 `checkConfig` 守住
 - ✅ PushConsumer 的分配变化结算：只有某个 topic 的分配集合真的动了（增 / 减 / 同数量换 broker / 出现或消失）才付四件事，且按固定顺序——只给动了的 topic 重打订阅版本号（一轮一个墙钟毫秒）并打一条 INFO、把 topic 缓存预算除以本轮活着的队列数、立刻向所有 broker 发一次心跳、只把动了的 topic 报给 `set_message_queue_listener` 注册的队列变更监听；集合没动的轮次四件事一件都不付
+- ✅ PushConsumer 失败轮次退避只有**一个旋钮**：`set_pull_exception_backoff_millis` / `pull_exception_backoff_millis()`（配置字段 `pull_exception_backoff_millis`，默认 1000ms；这个退避**没有上限**，启动期 `checkConfig` 不守它，负数在本客户端读作 0）。它管的是一轮拉取（或 POP）因 broker 自身流控**以外**的原因失败后、重新发请求前等多久——非 `FLOW_CONTROL(215)` 的 broker / 客户端错误、初始位点取不到、POP 拿到 `POLLING_FULL` 或本客户端没有规则的状态，全走这一个值，不再有写死的 3000ms。三条独立的等待不受它影响：broker 的 `215` 仍等 20ms、本客户端自己的缓存闸门仍等 50ms、`suspend()` 期间仍等 1000ms。每条队列的循环**在建立时取一次**这个值，所以 `start()` 之后再动旋钮不会改变已经在跑的循环
+- ✅ PushConsumer 拉取路径的轮次节奏由 `pull_interval` 管，而它只给**交出过消息的那一轮**定时：状态是 FOUND 且投递前过滤之后仍非空（就是 TPS 计的那份列表）才等 `pull_interval`，配 0 就立刻再拉；什么都没交出的轮次——FOUND 被过滤清空、`NO_NEW_MSG`、`NO_MATCHED_MSG`——一律立刻再拉，因为节奏管的是交付，在空轮次上再叠一道等待只会推迟下一次取位。`OFFSET_ILLEGAL` 那轮照旧走自己的冻结 / 持久化 / 收回路径，不沾这个节奏；被收回的队列照样退出
 - ✅ PullConsumer / LitePullConsumer（含队列变更监听、三张位点表、pause / resume；LitePull
   解析拉取位点前先过四道缓存闸门——整个缓冲的待发轮次投影 `pending rounds × pull_batch_size`（默认 10）对 `pull_threshold_for_all` 10000 / 本队列条数
   `pull_threshold_for_queue` 1000 / 本队列 body 字节 `pull_threshold_size_for_queue` 100 MiB

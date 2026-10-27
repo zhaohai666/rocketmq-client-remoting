@@ -50,16 +50,16 @@ cd build && ctest --output-on-failure
 ```
 
 This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq::remoting`),
-70 test binaries and 44 tools under `build/examples/`. Measured on this machine:
+71 test binaries and 44 tools under `build/examples/`. Measured on this machine:
 
 ```
-100% tests passed out of 71
-Total Test time (real) = 28.63 sec   # ctest --output-on-failure -j4
+100% tests passed out of 72
+Total Test time (real) = 165.54 sec   # ctest --output-on-failure, serial
 ```
 
-The 71 cases are the 70 test binaries plus 1 codec-interop case. Assertions are summed from
-each binary's self-reported `N checks, M failures`: running all 70 serially gives **6,069 checks,
-0 failures**; `tests/interop_check.py` adds **73 PASS** — **6,142 assertions in total**.
+The 72 cases are the 71 test binaries plus 1 codec-interop case. Assertions are summed from
+each binary's self-reported `N checks, M failures`: running all 71 serially gives **8,299 checks,
+0 failures**; `tests/interop_check.py` adds **73 PASS** — **8,372 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -289,6 +289,16 @@ afterwards reports the quotient. A refusal re-schedules only this queue for
 `kPullPauseWhenClientFlowControl` = 50ms, while the broker's `FLOW_CONTROL`(215) waits
 `kPullPauseWhenBrokerFlowControl` = 20ms; the client-side flow-control total and the warn cadence
 (trips 1, 1001, 2001, ... warn, everything else debug) are shared with the POP path.
+Anything else that ends a pull or POP round in failure (a broker error that is not 215, a POP round this
+client got no rows out of -- a POLLING_FULL answer or an answer it does not recognise -- or a round this
+client refused itself) waits `setPullPauseWhenPullErrorMillis` (default 1000ms) before the loop re-issues
+its request; each round loop reads that knob once when it starts, so changing it later only reaches a
+loop that starts from then on. A POLLING_FULL answer and an unrecognised POP answer wait that same
+configured backoff, like any other failed round. `pullInterval` paces only a round that really delivered
+rows to the consume side: the pull loop re-pulls at once after a round that carried nothing (a FOUND the
+filter emptied, or a not-FOUND answer) -- the cadence is a pacing rule about what was delivered, so the
+interval never postpones the next fetch on an idle round -- and the error/paused/215 waits above stay
+untouched.
 
 When a rebalance round changes the queue SET of a topic (growth, shrink, a same-count hand-over to another
 broker, a topic that appears or disappears; re-ordering the same set is not a change) that round pays four

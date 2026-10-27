@@ -314,7 +314,7 @@ async function main() {
       plan: () => ({ code: ResponseCode.SYSTEM_ERROR }),
       minPulls: 2,
     });
-    check('the failing pull was actually issued twice (500 ms error backoff apart)',
+    check('the failing pull was actually issued twice (the 1000 ms generic error backoff apart)',
       s.pulls.length >= 2, `pulls=${s.pulls.length}`);
     check('a pull that threw a broker error books no PULL_RT',
       !s.book.rtSeen, `rt=${s.book.rtTimes}`);

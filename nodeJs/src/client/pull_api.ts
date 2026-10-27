@@ -187,7 +187,7 @@ export class PullAPI {
   // consumer uses: identical header and response shape, and the caller has
   // already set the FLAG_LITE_PULL_MESSAGE bit in sysFlag. The pull is always
   // a SHORT poll with no inline offset commit, so commitOffset is fixed at 0
-  // and the broker hold budget at 15s.
+  // and the suspend window we ask for at 15s.
   async pullKernelLite(mq: MessageQueue, offset: number, sub: SubscriptionData,
     sysFlag: number, maxMsgNums: number, timeoutMillis: number): Promise<PullResult> {
     return this.pullKernel(mq, offset, sub, sysFlag, 0, maxMsgNums, 15000, timeoutMillis,

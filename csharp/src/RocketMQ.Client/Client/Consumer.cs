@@ -18,10 +18,9 @@
 //   - Pulling must run per-queue in parallel: with a single sequential
 //     long-poll thread, an idle queue's suspend blocks delivery for all
 //     other queues (caused "first batch arrives, everything after is late").
-//   - The broker clamps the client-supplied suspend time to its own
-//     brokerSuspendMaxTimeMillis, so idle queues still time out
-//     periodically on the client side -- this is BENIGN; log at debug,
-//     never ERROR.
+//   - An idle queue's long poll outlasts our own request timeout, so idle
+//     queues still time out periodically on the client side -- this is BENIGN;
+//     log at debug, never ERROR.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -682,6 +681,12 @@ public sealed class DefaultMQPushConsumer
     private int _suspendCurrentQueueTimeMillis = 1000;
     private int _maxReconsumeTimes = -1;
     private int _pullIntervalMillis;
+    // The ONE generic error backoff, shared by the pull and the POP loop: the wait
+    // before re-issuing a request after a round that failed for any reason other than
+    // the broker's own flow control. The three other arms are separate numbers and do
+    // not move with it: broker FLOW_CONTROL(215) retries in 20 ms, this client's own
+    // cache-threshold gate parks for 50 ms, a paused consumer polls every 1000 ms.
+    private int _pullExceptionBackoffMillis = 1000;
     private bool _heartbeatEnabled = true;
     private int _heartbeatIntervalMillis = 30000;
 
@@ -1079,6 +1084,26 @@ public sealed class DefaultMQPushConsumer
     {
         get => _pullIntervalMillis;
         set => _pullIntervalMillis = value;
+    }
+
+    /// <summary>The ONE generic error backoff for both consume loops: the wait before
+    /// this consumer re-issues a pull (or pop) request after a round that failed for any
+    /// reason other than the broker's own flow control -- a non-success answer, any
+    /// exception that is not FLOW_CONTROL(215), or a POP status the re-schedule cannot
+    /// act on (<c>POLLING_FULL</c> or an unknown one). Default 1000 ms; a negative value
+    /// is clamped to 0 ("go again at once").
+    /// <para>Each loop reads this once when it is set up and keeps that value for its
+    /// life, so changing the knob after <see cref="Start"/> does not alter a loop that is
+    /// already running -- the same way the POP loop's invisible time is taken.</para>
+    /// <para>The three other waits are separate arms and do not move with it: a broker
+    /// FLOW_CONTROL(215) retries after <see cref="BrokerFlowControlBackoffMillis"/>
+    /// (20 ms), this client's own cache-threshold gate parks for
+    /// <see cref="CacheFlowControlBackoffMillis"/> (50 ms) and a paused consumer keeps
+    /// polling every 1000 ms.</para></summary>
+    public int PullExceptionBackoffMillis
+    {
+        get => _pullExceptionBackoffMillis;
+        set => _pullExceptionBackoffMillis = Math.Max(0, value);
     }
 
     public bool HeartbeatEnabled
@@ -3231,27 +3256,24 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>Broker-side flow control (response code 215) is a "busy right
     /// now" answer, NOT a capacity verdict on this client: retry early instead
-    /// of parking on the general exception backoff.</summary>
+    /// of parking on the generic error backoff
+    /// (<see cref="PullExceptionBackoffMillis"/>).</summary>
     public const int BrokerFlowControlBackoffMillis = 20;
-
-    /// <summary>General broker-error backoff for the pull loop.</summary>
-    public const int PullExceptionBackoffMillis = 500;
 
     /// <summary>The backoff the pull loop applies after a pull request was
     /// answered with an error response code. Shared by the concurrent and the
-    /// orderly path (both run in the same per-queue loop): FLOW_CONTROL(215)
-    /// retries in 20 ms, every other broker error keeps the general 500 ms
-    /// backoff. Public so the decision is pinnable offline without racing a
+    /// orderly path (both run in the same per-queue loop), and by the POP loop's
+    /// broker-error arm: FLOW_CONTROL(215) retries in 20 ms, every other broker
+    /// error waits the generic backoff. The generic value is the consumer's own
+    /// <see cref="PullExceptionBackoffMillis"/>, passed in by the loop that
+    /// captured it when it was set up, so this decision stays pure and one rule
+    /// keeps one name. Public so the arms are pinnable offline without racing a
     /// timer.</summary>
-    public static int PullBackoffMillisForBrokerResponse(int responseCode) =>
+    public static int PullBackoffMillisForBrokerResponse(int responseCode,
+        int pullExceptionBackoffMillis) =>
         responseCode == ResponseCode.FlowControl
             ? BrokerFlowControlBackoffMillis
-            : PullExceptionBackoffMillis;
-
-    /// <summary>General POP-loop backoff (3000 ms) for an answer the
-    /// re-schedule decision cannot act on: a POLLING_FULL verdict or any
-    /// unknown status parks this queue's POP loop before the next round.</summary>
-    public const int PopExceptionBackoffMillis = 3000;
+            : pullExceptionBackoffMillis;
 
     /// <summary>Pure POP re-schedule decision, keyed on what actually survives
     /// the pre-delivery pipeline rather than the raw popped count:
@@ -3261,15 +3283,17 @@ public sealed class DefaultMQPushConsumer
     /// <item>Found whose rows were ALL filtered out: straight to the next
     /// round (the interval only paces real deliveries);</item>
     /// <item>NoNewMsg / PollingNotFound: straight to the next round;</item>
-    /// <item>PollingFull and any other/unknown status: the 3000 ms
-    /// <see cref="PopExceptionBackoffMillis"/> back-off.</item>
+    /// <item>PollingFull and any other/unknown status: the generic error
+    /// backoff -- the same <see cref="PullExceptionBackoffMillis"/> the pull
+    /// path parks a failed round on, so one rule has one name.</item>
     /// </list>
     /// A zero return means "next round now"; the loop's own hot-round guard
     /// still naps a fast EMPTY round, and that guard must never replace the
-    /// 3000 ms answer. Public so the timing legs are pinnable offline without
-    /// racing a timer.</summary>
+    /// generic backoff. The backoff arrives as an argument, captured by the POP
+    /// loop when it was set up, so the decision stays pure. Public so the timing
+    /// legs are pinnable offline without racing a timer.</summary>
     public static int PopNextRoundDelayMillis(PopStatus status, int keptCount,
-        int pullIntervalMillis)
+        int pullIntervalMillis, int pullExceptionBackoffMillis)
     {
         switch (status)
         {
@@ -3280,9 +3304,72 @@ public sealed class DefaultMQPushConsumer
                 return 0;
             case PopStatus.PollingFull:
             default:
-                return PopExceptionBackoffMillis;
+                return pullExceptionBackoffMillis;
         }
     }
+
+    /// <summary>Pure PULL re-schedule decision, keyed on what actually survives
+    /// the pre-delivery filter (the same list PULL_TPS counts) rather than the raw
+    /// pulled count. It mirrors <see cref="PopNextRoundDelayMillis"/>: one rule, one
+    /// name, pinnable offline without racing a timer.
+    /// <list type="bullet">
+    /// <item>Found with delivered rows: wait PullIntervalMillis when it is &gt; 0,
+    /// otherwise go straight to the next round;</item>
+    /// <item>Found whose rows were ALL filtered out, or which came back empty:
+    /// straight to the next round (the interval only paces real deliveries);</item>
+    /// <item>NoNewMsg / NoMatchedMsg: straight to the next round -- the cadence
+    /// paces deliveries, so a local wait on an idle round would only delay the
+    /// next fetch;</item>
+    /// <item>OffsetIllegal: straight to the next round -- this path never reaches a
+    /// cadence wait, it freezes, persists, revokes and recovers the queue.</item>
+    /// </list>
+    /// A failed round (a broker error or an exception) never consults this helper:
+    /// it parks on <see cref="PullBackoffMillisForBrokerResponse"/> or the generic
+    /// error backoff before reaching here, so those two waits are not replaced by
+    /// the cadence. A zero return means "next round now". The interval arrives as an
+    /// argument, read fresh by the loop each round, so the decision stays pure.</summary>
+    public static int PullNextRoundDelayMillis(PullStatus status, int deliveredCount,
+        int pullIntervalMillis)
+    {
+        // Only a Found round can deliver rows; every other status -- including the
+        // OffsetIllegal path, which recovers outside this decision -- goes straight
+        // to the next round, and even a Found round waits only when it actually
+        // handed something on.
+        return status == PullStatus.Found && deliveredCount > 0 && pullIntervalMillis > 0
+            ? pullIntervalMillis
+            : 0;
+    }
+
+    /// <summary>The one status whose round the offset sanity check applies to: the
+    /// comparison needs both the cursor this round asked with and the row list the
+    /// same round produced, and only a FOUND round has a row list. Warning for any
+    /// other status would put a line in the log on every idle queue.</summary>
+    public static bool PullOffsetSanityApplies(PullStatus status) =>
+        status == PullStatus.Found;
+
+    /// <summary>Pure offset sanity test for a FOUND pull round, over the three
+    /// numbers that round alone knows: the cursor it asked with
+    /// (<paramref name="prevRequestOffset"/>), the cursor it was answered with
+    /// (<paramref name="nextBeginOffset"/>), and the queue offset of the first row
+    /// it hands to the consume side (<paramref name="firstMsgOffset"/>). Either of
+    /// the latter two sitting below the requested cursor means the round's own
+    /// numbers contradict each other, which is worth one WARN line. Nothing else:
+    /// the cursor and the cadence are decided by other code, and this decides
+    /// neither. A round with no row to point at passes
+    /// <see cref="long.MaxValue"/> (see <see cref="PullFirstMsgOffset"/>), so the
+    /// row leg stays silent for it instead of firing on a missing value. Public so
+    /// both legs are pinnable offline.</summary>
+    public static bool PullOffsetsLookWrong(long nextBeginOffset, long firstMsgOffset,
+        long prevRequestOffset) =>
+        nextBeginOffset < prevRequestOffset || firstMsgOffset < prevRequestOffset;
+
+    /// <summary>The queue offset of the first row of the list a round produces for
+    /// consumption -- the list AFTER the pre-delivery filter, which is the one the
+    /// warning is about. An empty list reports <see cref="long.MaxValue"/>: the
+    /// sentinel of <see cref="PullOffsetsLookWrong"/>'s row leg, so "no rows" is
+    /// never read as "a row that runs backwards".</summary>
+    public static long PullFirstMsgOffset(IReadOnlyList<MessageExt> msgs) =>
+        msgs.Count > 0 ? msgs[0].QueueOffset : long.MaxValue;
 
     private void QueuePullLoop(MessageQueue mq)
     {
@@ -3300,6 +3387,10 @@ public sealed class DefaultMQPushConsumer
         if (clientRef is null || !_started) return;
         MQClientInstance c = clientRef;
         bool orderly = IsOrderly();
+        // Taken once for the life of this loop, like the POP loop's invisible time:
+        // changing the generic error backoff after start() must not move a loop that
+        // is already running.
+        int errorBackoffMillis = PullExceptionBackoffMillis;
         string key = OffsetKey(mq);
         while (!_stop && _started)
         {
@@ -3453,15 +3544,15 @@ public sealed class DefaultMQPushConsumer
                 // general exception backoff.
                 ClientLog.Debug("pull broker error for " + mq + ": " + e.Message);
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(
-                    PullBackoffMillisForBrokerResponse(e.ResponseCode)));
+                    PullBackoffMillisForBrokerResponse(e.ResponseCode, errorBackoffMillis)));
                 continue;
             }
             catch (RemotingTimeoutException e)
             {
                 // A long poll with no new messages during suspend triggering a
-                // client timeout is normal behavior: the broker clamps the
-                // suspend time to its own brokerSuspendMaxTimeMillis,
-                // ignoring the client-supplied value, so idle queues time out
+                // client timeout is normal behavior: an idle queue answers on
+                // its own schedule, so our own request timeout can expire
+                // before the reply does and idle queues time out
                 // periodically. Not an error; debug only, to avoid polluting
                 // the runtime log.
                 ClientLog.Debug("pull long-poll timeout for " + mq
@@ -3471,7 +3562,7 @@ public sealed class DefaultMQPushConsumer
             catch (Exception e)
             {
                 ClientLog.Debug("pull error for " + mq + ": " + e.Message);
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(500));
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(errorBackoffMillis));
                 continue;
             }
 
@@ -3506,6 +3597,10 @@ public sealed class DefaultMQPushConsumer
                 }
             }
 
+            // The list that survives the pre-delivery filter -- the same one
+            // PULL_TPS counts -- is what decides the round's cadence below. An
+            // idle round leaves this at 0, so the cadence wait never runs for it.
+            int deliveredCount = 0;
             if (result.Status == PullStatus.Found && result.MsgFoundList.Count > 0)
             {
                 // Pre-delivery client-side filtering (processPullResult):
@@ -3551,6 +3646,11 @@ public sealed class DefaultMQPushConsumer
                     // (filter first, then count)
                     UpdateMsgAccCntLocked(key, result.MsgFoundList);
                 }
+
+                // Whatever survives the filter -- even an empty list -- is what
+                // the round delivered: a Found answer the filter emptied counts
+                // as nothing delivered, so its cadence is "next round now".
+                deliveredCount = result.MsgFoundList.Count;
             }
 
             // The pull cursor advances to nextBeginOffset; the "consumed
@@ -3585,6 +3685,44 @@ public sealed class DefaultMQPushConsumer
                 {
                     OffsetIllegalRecover(key, mq);
                 }
+            }
+
+            // Offset sanity, at the end of a FOUND round: the cursor has already
+            // advanced above and the batch has already been handed on, and `offset`
+            // is still this round's requested cursor because nothing between the
+            // request and here writes it. A breach writes one WARN carrying all
+            // three numbers and changes nothing else -- not the cursor just stored,
+            // not the buffer, not the cadence below (see PullOffsetsLookWrong). The
+            // check sits before the pace wait because that wait ends the round.
+            long prevRequestOffset = offset;
+            if (PullOffsetSanityApplies(result.Status))
+            {
+                long firstMsgOffset = PullFirstMsgOffset(result.MsgFoundList);
+                if (PullOffsetsLookWrong(result.NextBeginOffset, firstMsgOffset,
+                    prevRequestOffset))
+                {
+                    ClientLog.Warn("pull offset sanity warning for " + mq
+                        + ": nextBeginOffset=" + result.NextBeginOffset
+                        + " firstMsgOffset=" + firstMsgOffset
+                        + " prevRequestOffset=" + prevRequestOffset);
+                }
+            }
+
+            // Round cadence (see PullNextRoundDelayMillis for the legs): only a
+            // round that delivered rows is paced by PullIntervalMillis. An idle
+            // round -- empty, filtered out, NO_NEW_MSG or NO_MATCHED_MSG -- asks
+            // again at once, because the cadence paces deliveries and a local wait
+            // on an idle round would only delay the next fetch; and OffsetIllegal /
+            // a failed round never reach this line (they exit or back off above), so
+            // the cadence replaces neither the early retry nor the generic error
+            // backoff. The
+            // wait is stop-interruptible, like the loop's other waits, so a
+            // shutdown is never held up by it.
+            int nextRoundDelay = PullNextRoundDelayMillis(result.Status, deliveredCount,
+                PullIntervalMillis);
+            if (nextRoundDelay > 0)
+            {
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(nextRoundDelay));
             }
         }
     }
@@ -3659,6 +3797,11 @@ public sealed class DefaultMQPushConsumer
             ? ConsumeInitModeMin
             : ConsumeInitModeMax;
 
+        // The generic error backoff is taken exactly once for the life of this loop,
+        // like the invisible time above: the pull and the POP loop share one knob, and
+        // a knob changed after start() must not move a loop already running.
+        int errorBackoffMillis = PullExceptionBackoffMillis;
+
         while (!_stop && _started)
         {
             bool owns;
@@ -3721,18 +3864,18 @@ public sealed class DefaultMQPushConsumer
             }
             catch (MQBrokerException e)
             {
-                // Same split as the pull path: a broker FLOW_CONTROL(215) is a
-                // "busy right now" answer, so retry in 20 ms instead of parking
-                // on the general 500 ms error backoff.
+                // Same split as the pull path, same one knob: a broker
+                // FLOW_CONTROL(215) is a "busy right now" answer, so retry in 20 ms
+                // instead of parking on the generic error backoff.
                 ClientLog.Debug("pop broker error for " + key + ": " + e.Message);
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(
-                    PullBackoffMillisForBrokerResponse(e.ResponseCode)));
+                    PullBackoffMillisForBrokerResponse(e.ResponseCode, errorBackoffMillis)));
                 continue;
             }
             catch (Exception e)
             {
                 ClientLog.Debug("pop error for " + key + ": " + e.Message);
-                _stopEvent.Wait(TimeSpan.FromMilliseconds(PullExceptionBackoffMillis));
+                _stopEvent.Wait(TimeSpan.FromMilliseconds(errorBackoffMillis));
                 continue;
             }
 
@@ -3803,9 +3946,11 @@ public sealed class DefaultMQPushConsumer
             // RT but not TPS.
             RecordPopPullStats(Client().ConsumerStats, ConsumerGroup, mq.Topic, result, began);
 
-            // Re-schedule by answer (see PopNextRoundDelayMillis for the legs).
+            // Re-schedule by answer (see PopNextRoundDelayMillis for the legs): the
+            // POLLING_FULL / unknown-status leg parks on the same generic error
+            // backoff the pull path uses, captured when this loop was set up.
             int nextRoundDelay = PopNextRoundDelayMillis(result.Status, keptCount,
-                PullIntervalMillis);
+                PullIntervalMillis, errorBackoffMillis);
             if (nextRoundDelay > 0)
             {
                 _stopEvent.Wait(TimeSpan.FromMilliseconds(nextRoundDelay));
@@ -3815,8 +3960,8 @@ public sealed class DefaultMQPushConsumer
                 // Empty result: if the broker did not suspend per pollTime
                 // (returns immediately) this becomes a hot loop; back off here
                 // as a "round took too short" fallback to avoid hammering the
-                // broker. The 3000 ms POLLING_FULL/unknown leg already waited
-                // above and is never reached here.
+                // broker. The generic error-backoff leg for POLLING_FULL/unknown
+                // already waited above and is never reached here.
                 Thread.Sleep(200);
             }
         }

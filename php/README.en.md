@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 28 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 31 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,9 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains **28** suites — the list is derived
+the other dies — this guard cannot be skipped), then chains **31** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,772 assertions across the 28 suites pass**; any failure exits with a
+**guard CLEAN, all 4,937 assertions across the 31 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -225,7 +225,20 @@ while (true) {
 For orderly consumption use `MessageListenerOrderly` / `ConsumeOrderlyStatus`; broadcasting,
 start position and the numeric knobs are configured through `setMessageModel` /
 `setConsumeFromWhere` / `setConsumeThreadMin` and friends. `suspend()` / `resume()` /
-`isPaused()` pause and resume delivery; while suspended, `tick()` delivers nothing.
+`isPaused()` pause and resume delivery; while suspended, `tick()` delivers nothing. After a round
+that failed for any reason other than the broker's own flow control, the queue waits
+`setFailedRequestBackoffMillis()` milliseconds (read back with
+`getFailedRequestBackoffMillis()`, default 1000ms) before its next pull or pop request; `start()`
+takes the value when it builds the schedule, so changing it afterwards leaves a running schedule
+alone. A round that did not fail is paced in two separate ways. **A round that handed rows over**
+follows `pullInterval`: above zero it defers that queue's next round by that many milliseconds and
+reports "not now", and at zero (the default) the very same queue re-pulls inside the same `tick()`.
+The list it is judged on is the one actually handed over -- after the client-side tag pass and the
+filter hooks. **A round that handed nothing over** follows this port's own idle guard
+`pullIntervalMillis` (default 1000ms) and is not paced by `pullInterval` at all: this port sends
+`pollTime = 0` short polls, whose empty answers cost the broker no suspend budget, so re-polling one
+immediately would turn every idle queue into a hot loop. A `FOUND` round whose whole batch the
+pre-delivery filter removed counts as a round that handed nothing over.
 
 ### PullConsumer (DefaultMQPullConsumer)
 
@@ -428,7 +441,21 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   for the moved topics only; a round where nothing moved, and a stall self-heal round, do
   none of it. The POP outstanding-ACK gate stops a round only when this queue's debt is
   strictly above `popThresholdForQueue` (default 96) and a trip lands on the pull path's one
-  client-wide flow-control counter and warn cadence), Pull (whole-topic view and
+  client-wide flow-control counter and warn cadence. A failed round — any broker or client error
+  that is not `FLOW_CONTROL`(215), a round taken while the consumer is not running or whose queue
+  has no subscription, and a POP round answered `POLLING_FULL` or with a status this client has no
+  rule for — re-schedules just that queue by one configured value
+  (`setFailedRequestBackoffMillis` / `getFailedRequestBackoffMillis`, default 1000ms; `start()`
+  takes it when it builds the schedule, so a later change does not move a schedule already
+  running), while the broker's own `FLOW_CONTROL`(215) keeps its 20ms and this client's
+  cache-threshold gate its 50ms. A round that did not fail is paced two ways: the round that
+  **handed rows over** defers its queue by `pullInterval` (default 0 -- at 0 the same queue re-pulls
+  inside one `tick()`), judged on the list actually delivered, i.e. the one the tag pass and the
+  filter hooks left and `PULL_TPS` counts; the round that **handed nothing over** keeps this port's
+  own idle guard `pullIntervalMillis` (default 1000ms) and ignores `pullInterval`, because this port
+  sends `pollTime = 0` short polls whose empty answers cost the broker no suspend budget and would
+  otherwise be re-polled in a hot loop -- which includes a `FOUND` round the pre-delivery filter
+  emptied), Pull (whole-topic view and
   this-instance share view), LitePull (incl. topic queue-set change listener, reporting only
   the topics whose set moved; four cache gates judged before the pull offset is resolved — the
   queued pull rounds times `pullBatchSize` (default 10) against `pullThresholdForAll`
@@ -461,7 +488,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 28 suites with 4,772 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 31 suites with 4,937 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

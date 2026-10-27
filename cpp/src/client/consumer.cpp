@@ -1054,14 +1054,29 @@ bool DefaultMQPushConsumer::popFlowControlHitForTest(
 }
 
 // FLOW_CONTROL(215) is the only response code with its own pause on this path; the broker raised it
-// because of its own throttling window, which says nothing about this client's cache.
-int32_t DefaultMQPushConsumer::pullPauseMillisFor(int32_t responseCode) {
+// because of its own throttling window, which says nothing about this client's cache. Every other code
+// waits out the general error backoff the caller hands in: each round loop copies this consumer's
+// configured pullPauseWhenPullErrorMillis before its first round.
+int32_t DefaultMQPushConsumer::pullPauseMillisFor(int32_t responseCode,
+                                                  int32_t pullErrorPauseMillis) {
     return responseCode == ResponseCode::FLOW_CONTROL ? kPullPauseWhenBrokerFlowControl
-                                                     : kPullPauseWhenPullError;
+                                                     : pullErrorPauseMillis;
+}
+
+// Both legs compare against the SAME remembered request cursor: the cursor must not have moved
+// backwards past it, and neither may the first row actually handed on. A round that delivered no
+// rows passes the sentinel, so only the cursor leg can fire for it.
+bool DefaultMQPushConsumer::pullOffsetsLookWrong(int64_t nextBeginOffset, int64_t firstMsgOffset,
+                                                 int64_t prevRequestOffset) {
+    return nextBeginOffset < prevRequestOffset || firstMsgOffset < prevRequestOffset;
 }
 
 void DefaultMQPushConsumer::notePullPause(int32_t millis) {
     lastPullPauseMillis_.store(millis);
+}
+
+void DefaultMQPushConsumer::notePullCadence(int32_t millis) {
+    lastPullCadenceMillis_.store(millis);
 }
 
 int64_t DefaultMQPushConsumer::lastPullAt(const std::string& key) const {
@@ -1122,6 +1137,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
     MQClientInstance& c = client();
     const bool orderly = isOrderly();
     const std::string key = offsetKey(mq);
+    // The general error backoff is copied once when the loop starts, exactly like POP's invisible time
+    // in queuePopLoop: a later change to the knob never alters a loop that is already running.
+    const int32_t errorPauseMillis = pullPauseWhenPullErrorMillis_;
     while (!stop_.load() && started_.load()) {
         // Revoked by rebalance during long polling (the queue may have a new pull thread) means stale: exit this thread
         // outright and let the new owner take over from our last persisted offset, so two instances never consume the same message twice.
@@ -1189,6 +1207,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             offsetTable_[key] = offset;
         }
 
+        // Remembered for the FOUND-round offset sanity check below: a FOUND answer may legitimately
+        // carry rows BEHIND the requested cursor, so the value to compare against is this snapshot.
+        const int64_t prevRequestOffset = offset;
         PullResult result;
         try {
             // Whether the subscription bit is set
@@ -1235,25 +1256,28 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
         } catch (const MQBrokerException& e) {
             // A broker that answers FLOW_CONTROL(215) throttled this request on its own window: that is a
             // different event from every other broker error and gets a shorter pause, so the loop does not
-            // sit out 500ms while the throttle has already lifted. The rest (TOPIC_NOT_EXIST,
-            // PULL_NOT_FOUND and friends) are mostly expected paths (topic not created yet): debug + backoff.
-            const int32_t pause = pullPauseMillisFor(e.responseCode);
+            // sit out the whole general error backoff while the throttle has already lifted. The rest
+            // (TOPIC_NOT_EXIST, PULL_NOT_FOUND and friends) are mostly expected paths (topic not created
+            // yet): debug + backoff.
+            const int32_t pause = pullPauseMillisFor(e.responseCode, errorPauseMillis);
             logger_debug("pull broker error for " + mq.toString() + ": " + e.what()
                          + ", pause pull " + std::to_string(pause) + "ms");
             notePullPause(pause);
             std::this_thread::sleep_for(std::chrono::milliseconds(pause));
             continue;
         } catch (const RemotingTimeoutException& e) {
-            // Long polling timing out on the client when nothing arrives during suspend is normal: the broker clamps the
-            // suspend time to its own brokerSuspendMaxTimeMillis and ignores the client value,
-            // so idle queues time out periodically. Not an error: debug only, to keep the run log clean.
+            // Long polling timing out on the client when nothing arrives during suspend is normal: an idle
+            // queue answers on its own schedule, so our own request timeout can expire before the reply does
+            // and idle queues time out periodically. Not an error: debug only, to keep the run log clean.
             logger_debug("pull long-poll timeout for " + mq.toString()
                          + " (benign, will retry): " + e.what());
             continue;
         } catch (const std::exception& e) {
+            // Any other failure of the round: this client refused it (no route / no broker in it) or
+            // the reply broke on the way in. Same general error backoff the non-215 broker arm took.
             logger_debug("pull error for " + mq.toString() + ": " + e.what());
-            notePullPause(kPullPauseWhenPullError);
-            std::this_thread::sleep_for(std::chrono::milliseconds(kPullPauseWhenPullError));
+            notePullPause(errorPauseMillis);
+            std::this_thread::sleep_for(std::chrono::milliseconds(errorPauseMillis));
             continue;
         }
 
@@ -1272,6 +1296,13 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                          + " revoked during pull, discard fetched messages");
             return;
         }
+        // Whether this round hands rows to the consume side (the same deliverable list PULL_TPS counts).
+        // Only such a round is paced by pullIntervalMillis_; a round that delivered nothing re-pulls at
+        // once: the cadence paces what was delivered, and nothing was.
+        bool deliveredRows = false;
+        // Head of the list this round hands to the consume side (post-filter); the sentinel keeps an
+        // empty round from ever firing the second leg of the sanity check below.
+        int64_t firstMsgOffset = std::numeric_limits<int64_t>::max();
         if (result.status == PullStatus::FOUND && !result.msgFoundList.empty()) {
             // Client-side filtering before delivery (the filter stage of processPullResult):
             // a second tag filter first, then the FilterMessageHook. This must run before taking lock_ -
@@ -1282,6 +1313,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             // pass or a filter hook removed was never delivered, so counting the raw response would
             // overstate the topic's throughput by exactly the rows this client dropped.
             if (!deliverable.empty()) {
+                // This round handed rows to the consume side: it is the one the pull interval paces.
+                deliveredRows = true;
+                firstMsgOffset = deliverable.front().getQueueOffset();
                 mqClient_->consumerStats().incPullTPS(consumerGroup_, mq.topic,
                                                       static_cast<int64_t>(deliverable.size()));
             }
@@ -1318,6 +1352,31 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 handleOffsetIllegal(key, result.nextBeginOffset);
             }
         }
+        // End of a FOUND round, after the cursor advanced and the batch was handed on: the one
+        // diagnostic that catches an answer whose offsets lie BEHIND the cursor this round asked
+        // with. Warn only: it changes no offset, no wait, no counter -- the cursor above already
+        // stored nextBeginOffset whatever this test says.
+        if (result.status == PullStatus::FOUND &&
+            pullOffsetsLookWrong(result.nextBeginOffset, firstMsgOffset, prevRequestOffset)) {
+            logger_warn("pull offset sanity: round requested offset=" +
+                        std::to_string(prevRequestOffset) + ", answer nextBeginOffset=" +
+                        std::to_string(result.nextBeginOffset) + ", firstMsgOffset=" +
+                        std::to_string(firstMsgOffset) + ", queue=" + mq.toString());
+        }
+        // Round cadence: pullIntervalMillis_ paces ONLY a round that really delivered rows to the consume
+        // side (the same deliverable list PULL_TPS counts). Such a round waits the configured interval
+        // before the next fetch, or re-pulls at once when the interval is 0. A FOUND round the filter
+        // emptied waits 0 and re-pulls immediately -- the cadence is a rule about what was handed over,
+        // so a local wait on an idle round would only postpone the next fetch. The failed / paused / 215
+        // arms above all `continue` before reaching
+        // here, so this cadence never replaces any of their waits.
+        if (result.status == PullStatus::FOUND) {
+            const int32_t roundCadenceMillis = deliveredRows ? pullIntervalMillis_ : 0;
+            notePullCadence(roundCadenceMillis);
+            if (roundCadenceMillis > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(roundCadenceMillis));
+            }
+        }
     }
 }
 
@@ -1339,6 +1398,9 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
         consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET
             ? static_cast<int32_t>(ConsumeInitMode::MIN)
             : static_cast<int32_t>(ConsumeInitMode::MAX);
+    // The general error backoff is copied once when the loop starts, exactly like the invisible time
+    // above: a later change to the knob never alters a loop that is already running.
+    const int32_t errorPauseMillis = pullPauseWhenPullErrorMillis_;
 
     while (!stop_.load() && started_.load()) {
         if (!ownsQueue(key, token)) return;
@@ -1390,19 +1452,20 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             continue;
         } catch (const MQBrokerException& e) {
             // The same table the pull loop reads: FLOW_CONTROL(215) is the broker throttling its own
-            // window, so it waits out the short pause, while every other code keeps the general error
-            // backoff. Collapsing both into one wait either sits out 500ms after a throttle that has
-            // already lifted or hammers a busy broker 25x more often.
-            const int32_t pause = pullPauseMillisFor(e.responseCode);
+            // window, so it waits out the short pause, while every other code waits out this loop's
+            // general error backoff. Collapsing both into one wait either sits the whole backoff out
+            // after a throttle that has already lifted or hammers a busy broker far too often.
+            const int32_t pause = pullPauseMillisFor(e.responseCode, errorPauseMillis);
             logger_debug("pop broker error for " + key + ": " + e.what() + ", pause pop "
                          + std::to_string(pause) + "ms");
             notePullPause(pause);
             std::this_thread::sleep_for(std::chrono::milliseconds(pause));
             continue;
         } catch (const std::exception& e) {
+            // Any other failure of the round: the same general error backoff the non-215 broker arm took.
             logger_debug(std::string("pop error for ") + key + ": " + e.what());
-            notePullPause(kPullPauseWhenPullError);
-            std::this_thread::sleep_for(std::chrono::milliseconds(kPullPauseWhenPullError));
+            notePullPause(errorPauseMillis);
+            std::this_thread::sleep_for(std::chrono::milliseconds(errorPauseMillis));
             continue;
         }
         // The queue was revoked by rebalance after popping: this batch is neither consumed nor acked
@@ -1417,7 +1480,8 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
         // one round = pre-delivery pipeline first, then the statistics of what it left, then pacing.
         processPopAnswer(mq, sub, result, pq, client().consumerStats(), began);
         const int64_t nextRoundDelay = popNextRoundDelayMillis(
-            result.status, static_cast<int64_t>(result.msgFoundList.size()), pullIntervalMillis_);
+            result.status, static_cast<int64_t>(result.msgFoundList.size()), pullIntervalMillis_,
+            errorPauseMillis);
         if (nextRoundDelay > 0) {
             notePullPause(static_cast<int32_t>(nextRoundDelay));
             std::this_thread::sleep_for(std::chrono::milliseconds(nextRoundDelay));
@@ -1455,10 +1519,11 @@ void DefaultMQPushConsumer::processPopAnswer(const MessageQueue& mq, const Subsc
 }
 
 int64_t DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus status, int64_t keptMsgCount,
-                                                       int32_t pullIntervalMillis) {
-    // The pacing table of one POP round. The two "the broker had nothing for us" answers and a FOUND
-    // whose rows were all filtered out need no wait of their own: long polling already suspended the
-    // request for pollTime, and the round's hot-loop guard covers the case where it did not.
+                                                       int32_t pullIntervalMillis,
+                                                       int32_t errorPauseMillis) {
+    // The pacing table of one POP round. The two "nothing for us" answers and a FOUND whose rows were
+    // all filtered out add no wait of their own: this client sent those rounds asking for a suspended
+    // request, and the round's hot-loop guard covers everything a suspended request does not pace.
     switch (status) {
         case PopStatus::FOUND:
             if (keptMsgCount == 0) return 0;
@@ -1468,10 +1533,13 @@ int64_t DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus status, int64_t
         case PopStatus::POLLING_NOT_FOUND:
             return 0;
         case PopStatus::POLLING_FULL:
-            return kPopBackoffWhenAnswerIsFull;
+            // The broker's polling window is full: this is a round the client got no rows out of, so it
+            // waits the same generic error backoff every other failed round waits.
+            return errorPauseMillis;
     }
-    // An answer this client does not know: back off like a failed round rather than hammer it.
-    return kPopBackoffWhenAnswerIsFull;
+    // An answer this client does not know: back off like a failed round rather than hammer it, on the
+    // same configured error backoff.
+    return errorPauseMillis;
 }
 
 std::vector<MessageExt> DefaultMQPushConsumer::dropRowsOverReconsumeBudget(

@@ -167,7 +167,7 @@ func (p *pullAPI) pullKernel(group string, mq common.MessageQueue, offset int64,
 // uses: identical header and response shape, and the caller has already set the
 // FLAG_LITE_PULL_MESSAGE bit in sysFlag. The pull is always a SHORT poll with
 // no inline offset commit (the lite consumer owns its own commit path), so
-// commitOffset is fixed at 0 and the broker hold budget at 15s.
+// commitOffset is fixed at 0 and the suspend window we ask for at 15s.
 func (p *pullAPI) pullKernelLite(group string, mq common.MessageQueue, offset int64,
 	sub *remoting.SubscriptionData, sysFlag int32, maxMsgNums int32,
 	timeoutMillis int64) (*PullResult, error) {

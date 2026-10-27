@@ -21,10 +21,14 @@ const (
 	popMinInvisibleTime int64 = 5000
 	popMaxInvisibleTime int64 = 300000
 
+	// The three fixed POP waits stay distinct from the configurable generic
+	// back-off: this client's own cache gate (50 ms), the broker's flow-control
+	// answer (20 ms) and a paused consumer (1000 ms). Every OTHER failed round —
+	// a non-215 error or a POLLING_FULL / unrecognised status — sleeps the value
+	// the consumer captured at setup from the one shared knob.
 	popDelayWhenCacheFlowControl = 50
 	popDelayWhenBrokerFlow       = 20
 	popDelayWhenSuspend          = 1000
-	popDelayWhenException        = 3000
 
 	popDefaultInvisibleTime int64 = 60000
 )
@@ -36,6 +40,12 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			common.LogErrorf("pop loop panicked for %v: %v", mq, r)
 		}
 	}()
+
+	// The generic failed-round back-off is captured once when this loop is set
+	// up, so changing the knob after start never alters a loop already running.
+	// It is the single wait for every failed round that is not the broker's own
+	// flow control: a non-215 error or a POLLING_FULL / unrecognised status.
+	failedDelay := c.failedRoundDelayValue()
 
 	for {
 		if c.stopRequested(stop) {
@@ -80,7 +90,7 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 				common.LogDebugf("pop long-poll timeout for %v (benign, will retry): %v", mq, err)
 			} else {
 				common.LogDebugf("pop error for %v: %v", mq, err)
-				if c.sleepOrStop(stop, popDelayWhenException*time.Millisecond) {
+				if c.sleepOrStop(stop, failedDelay) {
 					return
 				}
 			}
@@ -122,9 +132,9 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			continue
 		default:
 			// POLLING_FULL and anything else: the broker asked us to come back
-			// later, so this waits out the exception back-off rather than
-			// pullInterval or an immediate re-pop.
-			if c.sleepOrStop(stop, popDelayWhenException*time.Millisecond) {
+			// later, so this waits out the generic failed-round back-off rather
+			// than pullInterval or an immediate re-pop.
+			if c.sleepOrStop(stop, failedDelay) {
 				return
 			}
 		}

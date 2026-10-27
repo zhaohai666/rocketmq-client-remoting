@@ -781,36 +781,49 @@ void testAnswerStatsKeyOnTheRowsThatSurvive() {
     expectInt(tps->times(), 1, "stats.pollingRecordsNoTps");
 }
 
-// The pacing decision as a table over (answer, kept count, pull interval) -> wait in ms, tested
-// directly so no leg depends on wall time.
+// The pacing decision as a table over (answer, kept count, pull interval, configured error backoff) ->
+// wait in ms, tested directly so no leg depends on wall time.
 void testRescheduleDecisionTable() {
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 3, 0), 0,
-              "pace.foundWithRowsAndNoIntervalGoesStraightOn");
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 3, 100), 100,
-              "pace.foundWithRowsWaitsThePullInterval");
+    // A value the loop never uses for any other arm, so a stale internal constant cannot satisfy it.
+    constexpr int32_t kProbeErrorBackoff = 400;
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 3, 0,
+                                                             kProbeErrorBackoff),
+              0, "pace.foundWithRowsAndNoIntervalGoesStraightOn");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 3, 100,
+                                                             kProbeErrorBackoff),
+              100, "pace.foundWithRowsWaitsThePullInterval");
     // The paired control: the interval paces rounds that DELIVERED rows, not rounds that had rows but
     // lost every one of them to the filter.
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 0, 100), 0,
-              "pace.foundWithNothingLeftIgnoresTheInterval");
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::NO_NEW_MSG, 0, 100), 0,
-              "pace.noNewMsgGoesStraightOn");
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_NOT_FOUND, 0, 500), 0,
-              "pace.pollingNotFoundGoesStraightOn");
-    // POLLING_FULL is the broker saying its polling window is full: back off, whatever else the round
-    // looked like -- an interval set, rows still kept, or a round that answered instantly.
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 0, 100), 3000,
-              "pace.pollingFullBacksOff");
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 4, 0), 3000,
-              "pace.pollingFullBacksOffEvenWithRowsKept");
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 0, 0), 3000,
-              "pace.pollingFullIsNotSwallowedByTheShortRoundNap");
-    // An answer this client does not know is treated like a failed round, not like an empty one.
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(static_cast<PopStatus>(7), 0, 100), 3000,
-              "pace.unknownAnswerBacksOff");
-    expectInt(kPopBackoffWhenAnswerIsFull, 3000, "pace.backoffIsTheExceptionPauseValue");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 0, 100,
+                                                             kProbeErrorBackoff),
+              0, "pace.foundWithNothingLeftIgnoresTheInterval");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::NO_NEW_MSG, 0, 100,
+                                                             kProbeErrorBackoff),
+              0, "pace.noNewMsgGoesStraightOn");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_NOT_FOUND, 0, 500,
+                                                             kProbeErrorBackoff),
+              0, "pace.pollingNotFoundGoesStraightOn");
+    // POLLING_FULL and an unknown answer are failed rounds: they wait the generic error backoff handed
+    // in, whatever else the round looked like -- an interval set, rows still kept, or a short round --
+    // and that backoff is the caller's configured value, not a private constant.
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 0, 100,
+                                                             kProbeErrorBackoff),
+              kProbeErrorBackoff, "pace.pollingFullWaitsTheConfiguredErrorBackoff");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 4, 0,
+                                                             kProbeErrorBackoff),
+              kProbeErrorBackoff, "pace.pollingFullWaitsItEvenWithRowsKept");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::POLLING_FULL, 0, 0,
+                                                             kProbeErrorBackoff),
+              kProbeErrorBackoff, "pace.pollingFullWaitsItEvenWithNoInterval");
+    // An answer this client does not know is treated like a failed round, not like an empty one: the
+    // same configured backoff, and the "found nothing" arms above (0) stay distinguishable from it.
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(static_cast<PopStatus>(7), 0, 100,
+                                                             kProbeErrorBackoff),
+              kProbeErrorBackoff, "pace.unknownAnswerWaitsTheConfiguredErrorBackoff");
     // An interval of zero or less is "no pacing", never a wait of its own.
-    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 1, -5), 0,
-              "pace.negativeIntervalIsNoWait");
+    expectInt(DefaultMQPushConsumer::popNextRoundDelayMillis(PopStatus::FOUND, 1, -5,
+                                                             kProbeErrorBackoff),
+              0, "pace.negativeIntervalIsNoWait");
 }
 
 // ---------------------------------------------------------------- (4) retry topic at the delivery entry

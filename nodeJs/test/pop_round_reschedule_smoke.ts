@@ -16,9 +16,10 @@
 //     looking at the broker's answer alone, so it is decided after the filter;
 //   * NO_NEW_MSG and POLLING_NOT_FOUND: the broker already held the poll open,
 //     so asking again at once costs nothing;
-//   * POLLING_FULL and any status this client does not know: back off 3000 ms;
+//   * POLLING_FULL and any status this client does not know: back off by the
+//     consumer's generic error backoff (pullRetryDelayMillis, default 1000 ms);
 //   * a failed round: 20 ms when the broker's own answer is the throttle code
-//     215, 3000 ms for any other failure.
+//     215, the generic backoff for any other failure.
 //
 // Every scenario below asserts the recorded wait list, so a branch that never
 // runs cannot pass by accident, and each rule has its paired control: FOUND with
@@ -30,7 +31,7 @@ import { FilterAPI } from '../src/common/subscriptionData.ts';
 import { PopResult, PopStatus, processPopResponse } from '../src/client/pop_api.ts';
 import { PopProcessQueue } from '../src/client/pop_process_queue.ts';
 import {
-  queuePopLoop, POP_DELAY_WHEN_EXCEPTION, POP_DELAY_WHEN_BROKER_FLOW,
+  queuePopLoop, POP_DELAY_WHEN_BROKER_FLOW,
 } from '../src/client/pop_consumer.ts';
 import { ConsumerStatsManager } from '../src/client/consumer_stats.ts';
 import { PopMessageResponseHeader } from '../src/remoting/headers.ts';
@@ -83,14 +84,18 @@ async function drive(opts: {
   pullInterval?: number;
   maxReconsumeTimes?: number;
   failWith?: Error;
+  retryDelayMillis?: number;
 }): Promise<{
   waits: number[], rounds: number, fed: number[], acks: string[],
   delivered: MessageExt[], debt: number[], debtOnFeed: number[],
+  retryDelayMillis: number,
   c: DefaultMQPushConsumer,
 }> {
   const c = new DefaultMQPushConsumer(opts.group);
   const anyC = c as any;
   c.pullInterval = opts.pullInterval ?? PULL_INTERVAL_MS;
+  if (opts.retryDelayMillis !== undefined) c.setPullRetryDelayMillis(opts.retryDelayMillis);
+  const retryDelayMillis = c.getPullRetryDelayMillis();
   if (opts.maxReconsumeTimes !== undefined) c.setMaxReconsumeTimes(opts.maxReconsumeTimes);
   c.subscription.set(TOPIC, FilterAPI.buildSubscriptionData(TOPIC, opts.expression));
   c.started = true;
@@ -151,7 +156,7 @@ async function drive(opts: {
     return true;
   };
   await queuePopLoop(c, mq, flag);
-  return { waits, rounds, fed, acks, delivered, debt, debtOnFeed, c };
+  return { waits, rounds, fed, acks, delivered, debt, debtOnFeed, retryDelayMillis, c };
 }
 
 async function main() {
@@ -260,16 +265,17 @@ async function main() {
       r2.rounds === 2, String(r2.rounds));
   }
 
-  // ---- 7. POLLING_FULL and an unknown status back off 3000 ms
+  // ---- 7. POLLING_FULL and an unknown status back off the generic backoff
   {
     const r = await drive({
       group: 'GID_pop_resched_pollingfull', expression: '*',
       first: popResult(ResponseCode.POLLING_FULL, []),
     });
-    check('POLLING_FULL parks the queue for 3000 ms',
-      r.waits.length === 1 && r.waits[0] === 3000, JSON.stringify(r.waits));
-    check('and the poll-full wait is the exported backoff, unchanged',
-      POP_DELAY_WHEN_EXCEPTION === 3000, String(POP_DELAY_WHEN_EXCEPTION));
+    check('POLLING_FULL parks the queue for the generic backoff, default 1000 ms',
+      r.waits.length === 1 && r.waits[0] === 1000, JSON.stringify(r.waits));
+    check('and the park equals what the consumer reports as its own backoff',
+      r.waits[0] === r.retryDelayMillis && r.retryDelayMillis === 1000,
+      `${r.waits[0]}/${r.retryDelayMillis}`);
     check('POLLING_FULL books nothing: no submit, no debt, no TPS',
       r.delivered.length === 0 && r.fed.length === 0
       && (r.c as any)._statsManager.topicAndGroupPullTPS.find(`${TOPIC}@GID_pop_resched_pollingfull`) == null);
@@ -277,8 +283,8 @@ async function main() {
     const odd = popResult(ResponseCode.SUCCESS, [row(0, 'TagA', 0)]);
     odd.popStatus = 'NOT_A_KNOWN_STATUS' as any;
     const r2 = await drive({ group: 'GID_pop_resched_unknown', expression: '*', first: odd });
-    check('a status this client does not know is parked for the same 3000 ms',
-      r2.waits.length === 1 && r2.waits[0] === 3000, JSON.stringify(r2.waits));
+    check('a status this client does not know is parked for the same generic backoff',
+      r2.waits.length === 1 && r2.waits[0] === r2.retryDelayMillis, JSON.stringify(r2.waits));
     check('control: an unknown status does not deliver the rows it carries',
       r2.delivered.length === 0 && r2.fed.length === 0,
       `${r2.delivered.length}/${JSON.stringify(r2.fed)}`);
@@ -297,8 +303,9 @@ async function main() {
       group: 'GID_pop_resched_failed', expression: '*',
       first: new PopResult(), failWith: new MQBrokerException(2, 'system error', '127.0.0.1:10911'),
     });
-    check('any other POP failure parks for 3000 ms',
-      failed.waits.length === 1 && failed.waits[0] === 3000, JSON.stringify(failed.waits));
+    check('any other POP failure parks for the generic backoff',
+      failed.waits.length === 1 && failed.waits[0] === failed.retryDelayMillis
+      && failed.retryDelayMillis === 1000, JSON.stringify(failed.waits));
     const timedOut = await drive({
       group: 'GID_pop_resched_timeout', expression: '*',
       first: new PopResult(), failWith: new RemotingTimeoutException('127.0.0.1:10911', 3000),
@@ -308,6 +315,24 @@ async function main() {
     check('a failed round books nothing at all',
       throttled.fed.length === 0 && failed.fed.length === 0
       && (failed.c as any)._statsManager.topicAndGroupPullRT.find(`${TOPIC}@GID_pop_resched_failed`) == null);
+  }
+
+  // ---- 9. the 215 arm stays put when the generic backoff moves
+  {
+    const moved = await drive({
+      group: 'GID_pop_resched_knob_flow', expression: '*', retryDelayMillis: 77,
+      first: new PopResult(), failWith: new MQBrokerException(215, 'flow', '127.0.0.1:10911'),
+    });
+    check('a configured backoff does NOT move the broker-throttle arm',
+      moved.waits.length === 1 && moved.waits[0] === 20 && moved.retryDelayMillis === 77,
+      JSON.stringify(moved.waits));
+    const movedFull = await drive({
+      group: 'GID_pop_resched_knob_full', expression: '*', retryDelayMillis: 77,
+      first: popResult(ResponseCode.POLLING_FULL, []),
+    });
+    check('while the poll-full arm follows the configured backoff',
+      movedFull.waits.length === 1 && movedFull.waits[0] === 77,
+      JSON.stringify(movedFull.waits));
   }
 
   console.log(`\npop round reschedule: ${pass} checks, ${fail} failed`);

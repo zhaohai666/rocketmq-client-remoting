@@ -24,7 +24,7 @@ public class RemotingSendRequestException : RemotingException
 
 /// <summary>
 /// "Expected" timeouts such as long-polling timeouts. Upper layers treat it as benign DEBUG —
-/// the broker clamps the issued suspend down to its own brokerSuspendMaxTimeMillis, so periodic
+/// an idle queue's long poll outlasts our own request timeout, so periodic
 /// timeouts on idle queues are normal behavior.
 /// </summary>
 public class RemotingTimeoutException : RemotingException

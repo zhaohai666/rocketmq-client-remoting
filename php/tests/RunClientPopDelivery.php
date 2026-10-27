@@ -29,11 +29,13 @@ declare(strict_types=1);
  *    sleep**: ``nextPopAllowedAt()`` says when the queue may pop again. A round that handed messages to
  *    the listener waits for ``pullInterval`` (and only when that is above zero -- otherwise it pops
  *    again at once); a round that popped everything away is allowed again at once and records no delivery
- *    TPS; ``POLLING_FULL`` and any status without a rule of its own wait 3000 ms, while a round that
+ *    TPS; ``POLLING_FULL`` and any status without a rule of its own are failed rounds and wait the
+ *    consumer's configured failed-round backoff (1000 ms by default), while a round that
  *    simply found nothing waits for this client's own polling interval, since this port's pop carries no
  *    suspend budget at the broker. TPS counts the messages delivered, not the messages popped; RT is the
- *    round's own cost. The error path keeps its own mapping -- FLOW_CONTROL(215) 20 ms, anything else
- *    the general error backoff -- and is asserted untouched next to the status arms so a change of the
+ *    round's own cost. The error path shares that configured backoff for everything but
+ *    FLOW_CONTROL(215), which keeps its own 20 ms; the two arms are asserted side by side on
+ *    deliberately different numbers (the polling interval against the backoff), so a change of the
  *    error branch cannot pass as a status rule.
  * 4. **The pull round's telemetry follows the same two figures as the POP round's.** ``PULL_RT`` is
  *    recorded by a FOUND round and by no other round -- a round that carried no message says nothing about
@@ -541,11 +543,16 @@ final class RunClientPopDelivery
         $this->checkSame(0, $this->call($c, 'effectiveMaxReconsumeTimes', []),
             'a budget of zero stays zero instead of falling back to the default');
 
-        $this->checkSame(3000, DefaultMQPushConsumer::POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL,
-            'POLLING_FULL hands the next pop a 3000 ms wait');
-        $this->checkSame(3000, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_FULL, 250),
+        $this->checkSame(1000, DefaultMQPushConsumer::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS,
+            'a failed round hands the next pull or pop a 1000 ms wait by default');
+        $this->checkSame(1000, $c->getFailedRequestBackoffMillis(),
+            'a fresh consumer carries that default');
+        $consts = (new \ReflectionClass(DefaultMQPushConsumer::class))->getConstants();
+        $this->check(!isset($consts['POP_TIME_DELAY_MILLS_WHEN_POLLING_FULL']),
+            'the busy-polling wait is the knob now, not a second hardcoded number');
+        $this->checkSame(1000, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_FULL, 250),
             'a busy-polling broker is not paced by this client\'s own interval');
-        $this->checkSame(3000, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_FULL, 0),
+        $this->checkSame(1000, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_FULL, 0),
             'even a client that polls back to back waits out POLLING_FULL');
         $this->checkSame(250, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_NOT_FOUND, 250),
             'a round that found nothing waits this client\'s own polling interval');
@@ -555,6 +562,17 @@ final class RunClientPopDelivery
             'a FOUND round that delivered nothing takes the round-that-found-nothing wait');
         $this->checkSame(0, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_NOT_FOUND, 0),
             'control: a client polling back to back is held back by nothing but a busy broker');
+        // The configured backoff, handed in as the value the schedule was built from: the failed arms
+        // follow it while the no-message arms stay on the client's own interval, so the two can never be
+        // collapsed onto one number without reddening these.
+        $this->checkSame(700, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_FULL, 250, 700),
+            'a moved knob makes POLLING_FULL wait the configured number');
+        $this->checkSame(250, DefaultMQPushConsumer::popIdleBackoffMillisForStatus(PopStatus::POLLING_NOT_FOUND, 250, 700),
+            'and leaves a round that found nothing on this client\'s own interval');
+        $this->checkSame(700, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(ResponseCode::SYSTEM_ERROR, 700),
+            'control: the pull path reads the same configured number for a non-215 error');
+        $this->checkSame(20, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(ResponseCode::FLOW_CONTROL, 700),
+            'and a moved knob never moves the 215 arm off 20 ms');
 
         $this->checkSame('Topic', ExtraInfoUtil::parsePopRetryTopic('%RETRY%GID+Topic', 'GID'),
             'the V2 name is rewritten to what follows the +');
@@ -835,9 +853,10 @@ final class RunClientPopDelivery
 
     /**
      * The three empty-handed statuses apart, read from the due time the round left behind instead of from
-     * a clock: a busy-polling broker is worth 3000 ms, a round that found nothing is worth this client's
-     * own polling interval, and a round that popped everything away is worth nothing at all. The
-     * intervals are deliberately all different numbers, so an arm that took the wrong one cannot pass.
+     * a clock: a busy-polling broker is worth the configured failed-round backoff (1000 ms by default), a
+     * round that found nothing is worth this client's own polling interval, and a round that popped
+     * everything away is worth nothing at all. The intervals are deliberately all different numbers, so an
+     * arm that took the wrong one cannot pass.
      */
     private function testRescheduleByStatus(): void
     {
@@ -853,8 +872,8 @@ final class RunClientPopDelivery
         $due = $c->nextPopAllowedAt($key);
         $this->checkSame(false, $verdict, 'a POLLING_FULL round ends this queue\'s popping for the tick');
         $this->check($due !== null, 'a POLLING_FULL round left a due time behind');
-        $this->check($due !== null && abs(($due - $before) - 3.0) < 0.05,
-            'POLLING_FULL defers the next pop by 3000 ms, not by this client\'s polling interval');
+        $this->check($due !== null && abs(($due - $before) - 1.0) < 0.05,
+            'POLLING_FULL defers the next pop by the configured 1000 ms backoff, not by this client\'s polling interval');
 
         // Leg 2: POLLING_NOT_FOUND -- the client's own interval, a different number from both neighbours.
         [$c2, $mq2, $key2] = $this->popConsumer('GID-PD-RESCHED2', 'PdResched2');
@@ -1014,21 +1033,21 @@ final class RunClientPopDelivery
 
     /**
      * The error path is its own rule and stays where it was: FLOW_CONTROL(215) is worth 20 ms because
-     * the broker throttled this request, anything else the general error backoff. Both are asserted with
-     * the status waits set to entirely different numbers, so an error branch that fell through to the
-     * status table would be caught rather than looking like a working re-schedule.
+     * the broker throttled this request, anything else the configured failed-round backoff. Both sit next
+     * to the status waits, which are set to entirely different numbers here, so an error branch that fell
+     * through to the status table would be caught rather than looking like a working re-schedule.
      */
     private function testErrorBackoffUntouched(): void
     {
         $this->checkSame(20, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(ResponseCode::FLOW_CONTROL),
             'a throttled request is retried after 20 ms');
-        $this->checkSame(500, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(ResponseCode::SYSTEM_ERROR),
-            'any other broker error keeps the general error backoff');
+        $this->checkSame(1000, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(ResponseCode::SYSTEM_ERROR),
+            'any other broker error takes the configured failed-round backoff');
 
         $legs = [
             [ResponseCode::FLOW_CONTROL, 0.02, 'a POP answered FLOW_CONTROL(215) waits 20 ms'],
-            [ResponseCode::SYSTEM_ERROR, 0.5, 'a POP answered any other error waits the general error backoff'],
-            [ResponseCode::TOPIC_NOT_EXIST, 0.5, 'control: a not-yet-created topic is not a throttling answer'],
+            [ResponseCode::SYSTEM_ERROR, 1.0, 'a POP answered any other error waits the configured failed-round backoff'],
+            [ResponseCode::TOPIC_NOT_EXIST, 1.0, 'control: a not-yet-created topic is not a throttling answer'],
         ];
         foreach ($legs as [$code, $expectedSeconds, $label]) {
             [$c, $mq, $key] = $this->popConsumer('GID-PD-ERR' . $code, 'PdErr' . $code);

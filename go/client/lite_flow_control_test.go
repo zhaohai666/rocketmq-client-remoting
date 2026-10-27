@@ -970,10 +970,11 @@ func TestLitePullBrokerFlowControlParksTheQueueForTwentyMillis(t *testing.T) {
 	if got := c.PullPauseMillisOf(mq); got != 0 {
 		t.Errorf("SYSTEM_BUSY parked the queue for %d ms, want the lite path's normal failure handling", got)
 	}
-	if got := pullRetryDelay(common.BrokerError(remoting.RespSystemBusy, "busy")); got != pullTimeDelayMillsWhenPullFailed {
-		t.Errorf("a busy answer maps to %s, want the generic pull wait %s", got, pullTimeDelayMillsWhenPullFailed)
+	const genericWait = time.Duration(defaultFailedRoundDelayMillis) * time.Millisecond
+	if got := pullRetryDelay(common.BrokerError(remoting.RespSystemBusy, "busy"), genericWait); got != genericWait {
+		t.Errorf("a busy answer maps to %s, want the generic pull wait %s", got, genericWait)
 	}
-	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "throttled")); got != pullTimeDelayMillsWhenBrokerFlow {
+	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "throttled"), genericWait); got != pullTimeDelayMillsWhenBrokerFlow {
 		t.Errorf("the shared 215 recognition mapped it to %s, want %s", got, pullTimeDelayMillsWhenBrokerFlow)
 	}
 	f.broker.pullCode = 0

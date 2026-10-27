@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 837 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 848 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 517 | 50.9s |
-| `common` | 135 | 2.3s |
-| `remoting` | 185 | 1.3s |
-| **合计** | **837**（74 个 `*_test.go`） | ~55s |
+| `client` | 528 | 54.3s |
+| `common` | 135 | 3.8s |
+| `remoting` | 185 | 1.6s |
+| **合计** | **848**（76 个 `*_test.go`） | ~60s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -235,6 +235,27 @@ POP 模式（消息对所有实例可见，靠 ack 与不可见时间推进）�
 
 ```go
 consumer.SetPopMode(true)
+```
+
+拉取/pop 失败后的通用退避只有一个旋钮（`SetPullFailedBackoffMillis`，默认 1000 ms）：一轮因
+broker 流控以外的任何原因失败——非 215 错误、位点无法解析、`POLLING_FULL` 或未识别的 pop
+状态——重发前都等这一个值。每个循环启动时各取一次，`Start` 之后再改不影响已在跑的循环。
+broker 的 `FLOW_CONTROL`(215) 仍固定等 20ms、本客户端缓存闸门仍固定等 50ms、暂停仍固定
+等 1000ms，这三条不走该旋钮。
+
+```go
+consumer.SetPullFailedBackoffMillis(2000) // 可选，默认 1000 ms
+```
+
+每一轮拉取之间的节奏只取决于这一轮有没有真的交出消息：交出了消息（状态为 FOUND，且本地标签过滤
+与过滤钩子之后仍有条目——也就是 `PULL_TPS` 记下的那一份）才等 `pullInterval`
+（`SetPullInterval`，默认 0；为 0 就立刻再拉一次）。一轮什么都没交出——FOUND 但批次本来为空
+或被本地过滤清空、`NO_NEW_MSG`、`NO_MATCHED_MSG`——立刻发起下一轮：节奏管的是交出过消息的那一轮，
+空轮次上再叠一道本地等待只会推迟下一次取消息。失败轮与 `OFFSET_ILLEGAL` 不走这条
+规则：失败仍等上面那个旋钮（broker 的 215 仍是 20ms），`OFFSET_ILLEGAL` 仍走冻结重建。
+
+```go
+consumer.SetPullInterval(50) // 可选，默认 0：只给交出了消息的那一轮定节奏
 ```
 
 ### PullConsumer
@@ -561,7 +582,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   74 个测试文件，837 个测试函数
+│   └── *_test.go                   76 个测试文件，848 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 

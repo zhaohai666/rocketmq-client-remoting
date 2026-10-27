@@ -1187,7 +1187,9 @@ void testLiteBrokerFlowControlTwentyMillis() {
         c->start();
         expect(waitFor([&] { return c->lastLitePullPauseMillis() == kPullPauseWhenBrokerFlowControl; }),
                "FLOW_CONTROL(215) records a 20 ms pause on the lite path");
-        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::FLOW_CONTROL), 20,
+        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::FLOW_CONTROL,
+                                                            kDefaultPullPauseWhenPullErrorMillis),
+                  20,
                   "the value is the push path's shared kPullPauseWhenBrokerFlowControl, not a new constant");
         c->shutdown();
     }
@@ -1207,9 +1209,10 @@ void testLiteBrokerFlowControlTwentyMillis() {
                "SYSTEM_BUSY pull reached the fake broker");
         expect(c->lastLitePullPauseMillis() == 0,
                "SYSTEM_BUSY does NOT rewrite the lite pause observer (keeps existing error backoff)");
-        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::SYSTEM_BUSY),
-                  kPullPauseWhenPullError,
-                  "the shared mapping still routes SYSTEM_BUSY to the pull-error pause (unchanged)");
+        expectInt(DefaultMQPushConsumer::pullPauseMillisFor(ResponseCode::SYSTEM_BUSY,
+                                                            kDefaultPullPauseWhenPullErrorMillis),
+                  kDefaultPullPauseWhenPullErrorMillis,
+                  "the shared mapping still routes SYSTEM_BUSY to the pull-error pause (the knob's default)");
         c->shutdown();
     }
 }

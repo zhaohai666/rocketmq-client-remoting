@@ -40,7 +40,7 @@ cd php
 # 改动后对相关文件做语法检查
 php -l src/Client/Producer.php
 
-# 离线自测入口：静态守卫 + 28 个套件顺序执行，不连真机
+# 离线自测入口：静态守卫 + 31 个套件顺序执行，不连真机
 php tests/run_all.php
 
 # 单个套件
@@ -53,8 +53,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 **28** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
-悄悄漏出自检。当前实测：**守卫 CLEAN，28 个套件 4,772 项断言全部通过**，任一失败即以非零码退出。
+守卫不能省），然后串起 **31** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
+悄悄漏出自检。当前实测：**守卫 CLEAN，31 个套件 4,937 项断言全部通过**，任一失败即以非零码退出。
 
 ## 快速上手
 
@@ -210,7 +210,15 @@ while (true) {
 
 顺序消费改用 `MessageListenerOrderly` / `ConsumeOrderlyStatus`；广播、起始位点、线程数值等
 通过 `setMessageModel` / `setConsumeFromWhere` / `setConsumeThreadMin` 等配置。挂起与恢复用
-`suspend()` / `resume()` / `isPaused()`，挂起期间 `tick()` 不再投递。
+`suspend()` / `resume()` / `isPaused()`，挂起期间 `tick()` 不再投递。一轮拉取（或弹出）失败后
+这个队列等多久再发下一次请求，由 `setFailedRequestBackoffMillis()` /
+`getFailedRequestBackoffMillis()` 配置，默认 1000ms；`start()` 取值建好调度，之后再改不会挪动
+已经在跑的调度。没失败的那一轮分两种：**交出了消息的轮次**看 `pullInterval`——大于 0 就把这个队列的
+下一轮推迟那么多毫秒，等于 0（默认）就同一个 `tick()` 里立刻再拉一次；判断依据是真正交出去的那份列表，
+即过完 tag 二次过滤与过滤钩子之后交给监听器的那一份。**什么都没交出去的轮次**看本端口自己的空轮间隔
+`pullIntervalMillis`（默认 1000ms），不受 `pullInterval` 影响：本端口发的是 `pollTime = 0` 的短轮询，
+空答案不消耗 broker 挂起预算，立刻重拉只会把每个空闲队列变成热循环；`FOUND` 但整批消息在交付前被过滤掉
+的轮次也算空轮。
 
 ### PullConsumer（DefaultMQPullConsumer）
 
@@ -392,7 +400,18 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   跨度；topic 预算在重平衡时按本轮持有的队列数摊到每队列。分配集合变化的那一轮按序补齐：
   只给变动的 topic 重打订阅版本 → 摊预算 → 立刻向所有 broker 心跳 → 只向变动的 topic 回调
   队列监听；集合未变的轮次与停摆自愈轮都不做任何事。POP 的待 ack 欠账闸门严格大于
-  `popThresholdForQueue`（默认 96）才停，命中记进拉取路径同一个流控计数与告警节奏）、
+  `popThresholdForQueue`（默认 96）才停，命中记进拉取路径同一个流控计数与告警节奏。失败轮次
+  ——非 `FLOW_CONTROL`(215) 的 broker/客户端错误、消费者未运行或该队列没有订阅、POP 的
+  `POLLING_FULL` 与没有规则的状态——一律按可配的一个值重排这一个队列
+  （`setFailedRequestBackoffMillis` / `getFailedRequestBackoffMillis`，默认 1000ms；
+  `start()` 时取值建好调度，之后再改不动已经在跑的调度），broker 自己的
+  `FLOW_CONTROL`(215) 仍只等 20ms、本客户端缓存阈值闸门仍等 50ms；没失败也没被闸门拦住的轮次
+  按两条各自的分隔节奏走——**交出了消息的那一轮**按 `pullInterval`（默认 0）重排本队列：大于 0 就
+  把下一轮推迟那么多毫秒并报告“本轮到此为止”，为 0 就同一个 `tick()` 里立刻再拉一次，判断用的是
+  **真正交出去的那份列表**（过完 tag 二次过滤与过滤钩子之后、`PULL_TPS` 统计的同一份）；
+  **什么都没交出去的那一轮**不受 `pullInterval` 约束，仍按本端口自己的空轮间隔
+  `pullIntervalMillis`（默认 1000ms）等待，因为本端口发的是 `pollTime = 0` 的短轮询，空答案不消耗
+  broker 挂起预算，立刻重拉只会变成热循环；`FOUND` 却被交付前过滤清空的轮次属于后者）、
   Pull（全量队列与本实例份额两种视图）、LitePull（含 topic 队列集合变更监听，只回调集合
   变动的 topic；拉取前先过四道缓存闸门——排队中的拉取轮次 × `pullBatchSize`（默认 10）
   对 `pullThresholdForAll` 10000 / 本队列条数 `pullThresholdForQueue` 1000 / 本队列消息体
@@ -415,7 +434,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：28 套件 4,772 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：31 套件 4,937 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 14 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP（含 BATCH_ACK 批量确认）/ POP 消费者 / TLS / Request-Reply / 压缩冒烟 / 静态 topic /
   SQL92 过滤 / 单向推送 / 生产端重注册 / 鉴权集群上的全部消息类型收发

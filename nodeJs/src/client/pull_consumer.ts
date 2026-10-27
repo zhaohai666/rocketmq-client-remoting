@@ -2,8 +2,8 @@
 //
 // Key constraint: `pull()` is a SHORT pull — suspend=false in sysFlag and
 // suspendTimeoutMillis=0 on the wire. Only `pullBlockIfNotFound` sets
-// suspend=true (the broker suspends the request for about 5s before answering
-// NO_NEW_MSG). Unconditionally writing suspend=true manifests as a 5s timeout
+// suspend=true, which makes the request wait for the window it carries instead
+// of answering at once). Unconditionally writing suspend=true manifests as a 5s timeout
 // on every idle pull.
 import { PullAPI } from './pull_api.ts';
 import { MQClient, DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE } from './mq_client.ts';
@@ -318,9 +318,10 @@ export class DefaultMQPullConsumer {
     );
   }
 
-  // pullBlockIfNotFound is a LONG poll: suspend=true. The broker holds the
-  // request up to brokerSuspendMaxTimeMillis and answers NO_NEW_MSG when
-  // nothing arrives in time — a benign timeout on the client is NORMAL here.
+  // pullBlockIfNotFound is a LONG poll: suspend=true, so the request carries a
+  // suspend window (suspendTimeoutMillis) instead of answering at once, and a
+  // round that finds nothing reports an idle status — a benign timeout on the
+  // client is NORMAL here.
   async pullBlockIfNotFound(mq: MessageQueue, subExpression: string | MessageSelector | null, offset: number,
     maxNums: number, timeoutMillis = this.pullTimeoutMillis,
     suspendTimeoutMillis = 20000): Promise<PullResult> {

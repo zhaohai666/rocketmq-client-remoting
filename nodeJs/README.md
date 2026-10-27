@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **43** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-27 实测 **ALL GREEN**，共 **1399** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **46** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-27 实测 **ALL GREEN**，共 **1468** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -44,7 +44,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
-| `test/flow_control_smoke.ts`（每队列三条闸门：只判本队列「持有」的一切——未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值按字面取值（不 clamp 到 1、0 不是「关闭」，合法区间由启动配置检查把守），字节闸门按消息体整 MiB 向下取整而不是 storeSize，跨度闸门不作用于顺序消费；命中原因按 条数 → 字节 → 跨度 的固定顺序、一次判定只记一个计数，告警第 1 次及其后每 1000 次；缓存闸门 50ms、broker 215 的 20ms、其余拉取失败 500ms；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 145 项检查通过 |
+| `test/flow_control_smoke.ts`（每队列三条闸门：只判本队列「持有」的一切——未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值按字面取值（不 clamp 到 1、0 不是「关闭」，合法区间由启动配置检查把守），字节闸门按消息体整 MiB 向下取整而不是 storeSize，跨度闸门不作用于顺序消费；命中原因按 条数 → 字节 → 跨度 的固定顺序、一次判定只记一个计数，告警第 1 次及其后每 1000 次；缓存闸门 50ms、broker 215 的 20ms、其余拉取失败走唯一的可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，拉取与 POP 两条路径共用、每条队列循环建立时取值）；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 146 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
@@ -57,10 +57,13 @@ node --experimental-strip-types selfcheck.ts
 | `test/pop_init_mode_smoke.ts`（起始策略到 POP initMode 的翻译） | 14 项检查通过 |
 | `test/pop_pre_deliver_filter_smoke.ts`（POP 轮次的交付前过滤；第 8 节把同一问题问给 pull 路径） | 27 项检查通过 |
 | `test/pop_retry_topic_reset_smoke.ts`（POP 重试主题名还原） | 17 项检查通过 |
-| `test/pop_round_reschedule_smoke.ts`（POP 轮次的重排、退避与记账） | 31 项检查通过 |
+| `test/pop_round_reschedule_smoke.ts`（POP 轮次的重排、退避与记账） | 33 项检查通过 |
 | `test/pop_smoke.ts` | 11 组检查通过 |
 | `test/producer_smoke.ts` | 4 组检查通过 |
 | `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
+| `test/pull_offset_sanity_smoke.ts`（FOUND 轮位点自检：nextBeginOffset 或交付首行低于本轮请求位点时告警；自洽轮、空 FOUND 轮与空闲状态都不告警；告警轮与自洽轮的存储位点、交付行数、节奏判定完全一致） | 23 项检查通过 |
+| `test/pull_round_pacing_smoke.ts`（轮次节奏：只有交出消息的轮才等 pullInterval；空 FOUND、被过滤空的轮、NO_NEW_MSG、NO_MATCHED_MSG 立刻重拉，OFFSET_ILLEGAL 不取节奏等待） | 25 项检查通过 |
+| `test/pull_retry_delay_knob_smoke.ts`（拉取/POP 通用错误退避作为一个旋钮：默认 1000ms、broker 215 仍是 20ms、改旋钮同时移动两条路径的等待、非 215 报错轮与 `POLLING_FULL` 轮都取旋钮值；每条队列的循环建立时取值，启动后再改不动已在跑的循环） | 18 项检查通过 |
 | `test/pull_schedule_smoke.ts` | 43 通过 / 0 失败 |
 | `test/pull_stats_contract_smoke.ts`（pull 路径 PULL_RT/PULL_TPS 记账：只有 FOUND 轮计入延迟——NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL / 报错 / 超时轮什么都不记；吞吐只按交付前过滤（二次 tag + FilterMessageHook）改写后的行数计，全部被滤掉的 FOUND 轮记 RT 而 TPS 为零） | 28 项检查通过 |
 | `test/rebalance_change_smoke.ts`（分配集合改变的轮次按序补齐：只给变动的 topic 重打订阅版本 → 再把 topic 预算除以本轮自有队列数 → 立刻心跳 → 只向变动的 topic 触发队列监听；集合未变与自愈重建轮什么都不欠） | 32 项检查通过 |
@@ -320,9 +323,9 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ 协议层：`RemotingCommand` 帧、JSON + RocketMQ 二进制双序列化、V2 短键 header、容错解析、消息 17/6 段编解码
 - ✅ 传输层：长连接惰性建连复用、同步/异步/单向、半包重组、opaque 匹配、GO_AWAY 重发一次、断连在途请求判死
 - ✅ Producer：同步 / 批量 / 单向 / 异步（公平信号量背压）/ 队列选择器 / 顺序 / 延迟与 5.x 定时 / 事务两阶段 + 回查 / Request-Reply（326 接收闭环）/ recallMessage / VIP channel（port-2）
-- ✅ PushConsumer：并发 / 顺序 / 广播、长轮询、位点持久化、流控阈值（每队列只判它「持有」的一切：未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值不 clamp、0 不是「关闭」，字节按消息体整 MiB 取整而不是 storeSize，跨度闸门不作用于顺序消费；topic 预算在重平衡改变分配时除以自有队列数，不在拉取时累计兄弟队列）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 除预算 → 立刻心跳 → 只向变动的 topic 触发队列监听）、307/220/221 应答、RETRY 还原、suspend/resume、核心线程数在线调整
+- ✅ PushConsumer：并发 / 顺序 / 广播、长轮询、位点持久化、流控阈值（每队列只判它「持有」的一切：未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值不 clamp、0 不是「关闭」，字节按消息体整 MiB 取整而不是 storeSize，跨度闸门不作用于顺序消费；topic 预算在重平衡改变分配时除以自有队列数，不在拉取时累计兄弟队列）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 除预算 → 立刻心跳 → 只向变动的 topic 触发队列监听）、307/220/221 应答、RETRY 还原、suspend/resume、核心线程数在线调整、失败轮重问的通用退避是一个可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，队列循环建立时取值，启动后再改不影响已在跑的循环；broker 215 的 20ms、本队列缓存闸门 50ms、暂停 1000ms 三条另有定值，不随这个旋钮动）；轮间节奏由 `pullInterval`（默认 0）管，且只管「真正交出消息」的那一轮——FOUND 且经客户端 tag 复查与 FilterMessageHook 改写之后仍然非空的批次等 `pullInterval`（为 0 就立刻重拉），空手而归的一轮（FOUND 回空、被过滤清空、NO_NEW_MSG、NO_MATCHED_MSG）什么都不等：这条节奏管的是交付出的那一次，本地再压一段只会推迟下一轮取消息
 - ✅ PullConsumer / LitePullConsumer：短/长轮询、assign+seek+commitSync、自动提交、topic 队列变更监听；LitePull 的 `poll()` 就地拉取、没有本地预取缓冲也没有后台拉取任务，因此每队列缓存闸门（条数 / 消息体整 MiB / 位点跨度 / 整个缓冲条数）无对象可判——该路径的退避按队列停在 broker 的 `FLOW_CONTROL`(215)：`litePullParkMillisFor` 把 215 映射成 20ms（`PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL`）、其余错误码不 park，`setPullParkUntil` / `getPullParkUntil` 记录并读回每个队列的 park 截止时刻，兄弟队列不受影响；broker 的拒绝码以 `MQBrokerException.responseCode` 交给调用方
-- ✅ POP 消费模式：POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401)、POP_CK 双路径、欠账流控（本队列待 ack 严格大于 `popThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数）、退避表
+- ✅ POP 消费模式：POP(200050)/ACK(200051)/CHANGE_INVISIBLE(200053)/BATCH_ACK(200151)/SET_MESSAGE_REQUEST_MODE(401)、POP_CK 双路径、欠账流控（本队列待 ack 严格大于 `popThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数）、退避：broker 215 只等 20ms、本队列闸门 50ms、暂停 1000ms，其余失败轮（含 `POLLING_FULL` 与不认识的状态）等 `pullRetryDelayMillis`（与拉取路径同一个旋钮，默认 1000ms）
 - ✅ Admin：topic CRUD、集群/运行时信息、订阅组、消费统计、连接查询、位点重置与读取、KV 配置、NameServer 配置（318/319）、消息查询/查看、consumeMessageDirectly
 - ✅ ACL（HMAC-SHA1 + Base64）与 RPC 钩子链（Namespace → Stream → 用户钩子）
 - ✅ 命名空间两套：`namespace` 前缀 + `namespaceV2` 线上盖章；clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`

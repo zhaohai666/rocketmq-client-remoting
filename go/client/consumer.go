@@ -44,19 +44,24 @@ import (
 
 // Consumer defaults.
 const (
-	defaultPullBatchSize               = int32(32)
-	defaultConsumeMessageBatchMaxSize  = 1
-	defaultConsumeThreadMin            = 20
-	defaultConsumeThreadMax            = 20
-	defaultAdjustThreadPoolNumsThresh  = int64(100000)
-	defaultConsumeConcurrentlyMaxSpan  = int64(2000)
-	defaultPullThresholdForQueue       = int64(1000)
-	defaultPullThresholdSizeForQueue   = int64(100)
-	defaultPullThresholdForTopic       = int64(-1)
-	defaultPullThresholdSizeForTopic   = int64(-1)
-	defaultPullInterval                = int64(0)
-	defaultPullTimeoutMillis           = int64(30000)
-	defaultPullSuspendTimeoutMillis    = int64(20000)
+	defaultPullBatchSize              = int32(32)
+	defaultConsumeMessageBatchMaxSize = 1
+	defaultConsumeThreadMin           = 20
+	defaultConsumeThreadMax           = 20
+	defaultAdjustThreadPoolNumsThresh = int64(100000)
+	defaultConsumeConcurrentlyMaxSpan = int64(2000)
+	defaultPullThresholdForQueue      = int64(1000)
+	defaultPullThresholdSizeForQueue  = int64(100)
+	defaultPullThresholdForTopic      = int64(-1)
+	defaultPullThresholdSizeForTopic  = int64(-1)
+	defaultPullInterval               = int64(0)
+	defaultPullTimeoutMillis          = int64(30000)
+	defaultPullSuspendTimeoutMillis   = int64(20000)
+	// defaultFailedRoundDelayMillis is the ONE generic back-off: the wait a pull
+	// (or pop) loop sleeps before re-issuing a request after a round failed for
+	// any reason other than the broker's own flow control. It lives on the
+	// consumer, not in a package constant, so both loops share one value.
+	defaultFailedRoundDelayMillis      = int64(1000)
 	defaultPullBatchSizeInBytes        = int32(256 * 1024)
 	defaultMaxReconsumeTimes           = int32(-1)
 	defaultSuspendCurrentQueueTimeMs   = int64(1000)
@@ -154,6 +159,10 @@ type DefaultMQPushConsumer struct {
 	pullInterval               int64
 	pullTimeoutMillis          int64
 	pullSuspendTimeoutMillis   int64
+	// failedRoundDelayMillis is the single configurable generic back-off both the
+	// pull and the POP loop sleep after a failed round that is not the broker's
+	// own flow control. Each loop captures it once at setup.
+	failedRoundDelayMillis     int64
 	consumeMessageBatchMaxSize int
 	pullBatchSize              int32
 	pullBatchSizeInBytes       int32
@@ -278,6 +287,7 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 		pullInterval:                  defaultPullInterval,
 		pullTimeoutMillis:             defaultPullTimeoutMillis,
 		pullSuspendTimeoutMillis:      defaultPullSuspendTimeoutMillis,
+		failedRoundDelayMillis:        defaultFailedRoundDelayMillis,
 		consumeMessageBatchMaxSize:    defaultConsumeMessageBatchMaxSize,
 		pullBatchSize:                 defaultPullBatchSize,
 		pullBatchSizeInBytes:          defaultPullBatchSizeInBytes,
@@ -610,6 +620,35 @@ func (c *DefaultMQPushConsumer) SetPullSuspendTimeoutMillis(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pullSuspendTimeoutMillis = ms
+}
+
+// SetPullFailedBackoffMillis sets the ONE generic back-off: how long a pull (or
+// POP) loop waits before re-issuing a request after a round failed for any reason
+// other than the broker's own flow control (default 1000 ms). The broker's
+// FLOW_CONTROL(215) answer, this client's own cache-threshold gate and a paused
+// consumer keep their own fixed waits and ignore this knob. A loop reads the
+// value once when it starts, so changing the knob after start does not disturb a
+// loop already running.
+func (c *DefaultMQPushConsumer) SetPullFailedBackoffMillis(ms int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failedRoundDelayMillis = ms
+}
+
+// PullFailedBackoffMillis reads the generic failed-round back-off.
+func (c *DefaultMQPushConsumer) PullFailedBackoffMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failedRoundDelayMillis
+}
+
+// failedRoundDelayValue reads the generic back-off as a duration. Each loop calls
+// it once at setup, so a running loop keeps the value the consumer was given when
+// it started even if the knob changes later.
+func (c *DefaultMQPushConsumer) failedRoundDelayValue() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Duration(c.failedRoundDelayMillis) * time.Millisecond
 }
 
 // SetConsumeMessageBatchMaxSize sets the listener batch size.

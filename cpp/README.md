@@ -46,17 +46,17 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、70 个测试二进制与
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、71 个测试二进制与
 44 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 71
-Total Test time (real) = 28.63 sec   # ctest --output-on-failure -j4
+100% tests passed out of 72
+Total Test time (real) = 165.54 sec   # ctest --output-on-failure（串行）
 ```
 
-71 个用例 = 70 个测试二进制 + 1 个编解码互调用例。断言数按二进制自报的
-`N checks, M failures` 汇总：逐个串行跑 `build/tests/` 下 70 个测试二进制，自报 checks 合计
-**6,069 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **6,142 项**。
+72 个用例 = 71 个测试二进制 + 1 个编解码互调用例。断言数按二进制自报的
+`N checks, M failures` 汇总：逐个串行跑 `build/tests/` 下 71 个测试二进制，自报 checks 合计
+**8,299 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,372 项**。
 
 不依赖集群的协议层自检：
 
@@ -278,6 +278,13 @@ topic），商至少 1；预算启用时它会覆盖手设的每队列值，之�
 命中只把这一个队列延后 `kPullPauseWhenClientFlowControl` = 50ms 重排，broker 侧的
 `FLOW_CONTROL`(215) 只等 `kPullPauseWhenBrokerFlowControl` = 20ms；客户端流控次数与告警节奏
 （第 1、1001、2001… 次告警，其余 debug）与 POP 路径共用一个计数器。
+除了这两种，一轮拉取/POP 因为别的原因失败（不是 215 的 broker 错误、POP 一轮本客户端没取出消息——
+POLLING_FULL 应答或本客户端认不出的应答、本客户端自己拒绝的一轮）等
+`setPullPauseWhenPullErrorMillis`（默认 1000ms）再发下一次请求；每条循环在启动时取一次这个值，
+之后再改只影响新起的循环，不影响已经在跑的循环。POLLING_FULL 应答和一个本客户端认不出的 POP
+应答，如今和别的失败轮一样等这一个配置好的 backoff。`pullInterval` 只给真正把消息交给消费端的一轮
+排节奏：拉取循环在一轮什么都没交付（被过滤清空的 FOUND、或非 FOUND 应答）之后立即再拉——节奏管的
+是交付出去的那一轮，间隔不会拖慢空轮的下一次取数；上面那几种失败/暂停/215 的等待完全不受影响。
 
 重平衡轮次里某个 topic 分到的队列**集合**变了（增长、缩减、同数量换 broker、topic 新出现或消失；
 同一集合换顺序不算）时，这一轮依次做四件事：只给变动的 topic 重打订阅版本（墙钟毫秒，日志
@@ -692,7 +699,7 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      70 个测试源文件 + interop_check.py = 71 个 ctest 用例
+├── tests/                      71 个测试源文件 + interop_check.py = 72 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

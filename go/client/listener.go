@@ -141,10 +141,7 @@ const (
 	// nothing landed in the local buffer, and the queue is readable again as
 	// soon as the broker's pressure drops.
 	pullTimeDelayMillsWhenBrokerFlow = 20 * time.Millisecond
-	// pullTimeDelayMillsWhenPullFailed is the wait for every other failed pull:
-	// a system error, a busy answer, a dead connection. Retrying those hot adds
-	// pressure to whatever is already wrong.
-	pullTimeDelayMillsWhenPullFailed = 500 * time.Millisecond
-	pullTimeDelayMillsWhenException  = 3000 * time.Millisecond
-	pullTimeDelayMillsWhenSuspend    = 1000 * time.Millisecond
+	// pullTimeDelayMillsWhenSuspend is the wait a PAUSED consumer takes before it
+	// looks again; this is the consumer's own pause, unrelated to any failure.
+	pullTimeDelayMillsWhenSuspend = 1000 * time.Millisecond
 )

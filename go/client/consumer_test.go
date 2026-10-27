@@ -54,8 +54,12 @@ type consumerBroker struct {
 	committed map[string]int64
 	clientIDs []string
 
-	pulls        []*remoting.PullMessageRequestHeader
-	pullExt      []*common.StringMap
+	pulls   []*remoting.PullMessageRequestHeader
+	pullExt []*common.StringMap
+	// pullArrivals is the arrival time of every PULL_MESSAGE, index-parallel to
+	// pulls, so a pacing test can measure the gap the consumer put between two
+	// rounds of one queue.
+	pullArrivals []int64
 	commits      []consumerCommit
 	sendBacks    []*remoting.ConsumerSendMsgBackRequestHeader
 	lockBodies   []*remoting.LockBatchRequestBody
@@ -89,6 +93,10 @@ type consumerBroker struct {
 	pullForcedLeft int
 	nextBegin      *int64
 	suggest        *int32
+	// pullReplayNext makes the STORE branch answer nextBegin too, not only a
+	// forced one, so a test can keep the consumer pulling at ONE offset and
+	// replay the same round shape instead of advancing past its rows.
+	pullReplayNext bool
 	// lockOKMQSet is what LOCK_BATCH_MQ(41) grants. nil => grant everything the
 	// client asked for.
 	lockOKMQSet []common.MessageQueue
@@ -373,6 +381,7 @@ func (b *consumerBroker) answerPull(req *remoting.RemotingCommand) *remoting.Rem
 	b.mu.Lock()
 	b.pulls = append(b.pulls, header)
 	b.pullExt = append(b.pullExt, req.ExtFields().Clone())
+	b.pullArrivals = append(b.pullArrivals, common.CurrentTimeMillis())
 	forced := b.pullCode
 	if forced != 0 && b.pullForcedLeft >= 0 {
 		// A scripted run of forced answers: after the requested count the broker
@@ -386,6 +395,7 @@ func (b *consumerBroker) answerPull(req *remoting.RemotingCommand) *remoting.Rem
 	}
 	next := b.nextBegin
 	suggest := b.suggest
+	replay := b.pullReplayNext
 	b.mu.Unlock()
 
 	if forced != 0 {
@@ -424,6 +434,11 @@ func (b *consumerBroker) answerPull(req *remoting.RemotingCommand) *remoting.Rem
 	nextBegin := maxOff
 	if len(found) > 0 {
 		nextBegin = found[len(found)-1].QueueOffset + 1
+	}
+	if replay && next != nil {
+		// The pinned answer wins, so the consumer's cursor stays put and the round
+		// the test is measuring comes back identically on the next pull.
+		nextBegin = *next
 	}
 	code := remoting.RespSuccess
 	if len(found) == 0 {
@@ -2129,10 +2144,11 @@ func TestShutdownAwaitTerminationDefaultsToTheClientBudget(t *testing.T) {
 
 // ---------------------------------------------------------------- pull backoffs
 
-// The broker's flow-control answer and this client's own backlog are different
-// events and must not share one wait. The mapping is exact, so the numbers are
-// asserted directly: the short wait belongs to response code 215 alone, and
-// every other failure keeps the generic one.
+// The broker's flow-control answer and every other failure are different events
+// and must not share one wait. The generic wait is no longer a package constant:
+// the caller hands it to pullRetryDelay, so the mapping is: response code 215
+// alone gets the fixed short wait, and every other failure gets exactly the wait
+// that was passed in.
 func TestPullRetryDelaySeparatesBrokerFlowFromEverythingElse(t *testing.T) {
 	if pullTimeDelayMillsWhenBrokerFlow != 20*time.Millisecond {
 		t.Errorf("broker flow-control backoff = %s, want 20ms", pullTimeDelayMillsWhenBrokerFlow)
@@ -2140,17 +2156,19 @@ func TestPullRetryDelaySeparatesBrokerFlowFromEverythingElse(t *testing.T) {
 	if pullTimeDelayMillsWhenFlowControl != 50*time.Millisecond {
 		t.Errorf("local cache backoff = %s, want 50ms", pullTimeDelayMillsWhenFlowControl)
 	}
-	if pullTimeDelayMillsWhenPullFailed != 500*time.Millisecond {
-		t.Errorf("generic pull backoff = %s, want 500ms", pullTimeDelayMillsWhenPullFailed)
+	// The generic wait is the consumer's knob, and its default is 1000 ms.
+	const genericWait = time.Duration(defaultFailedRoundDelayMillis) * time.Millisecond
+	if genericWait != 1000*time.Millisecond {
+		t.Errorf("generic pull backoff default = %s, want 1000ms", genericWait)
 	}
 
-	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "too many requests")); got != pullTimeDelayMillsWhenBrokerFlow {
+	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "too many requests"), genericWait); got != pullTimeDelayMillsWhenBrokerFlow {
 		t.Errorf("backoff after response code %d = %s, want the broker flow-control wait %s",
 			remoting.RespFlowControl, got, pullTimeDelayMillsWhenBrokerFlow)
 	}
 	// A server-shaped (not broker-shaped) 215 is the same event and gets the same
-	// short wait.
-	if got := pullRetryDelay(common.ServerError(remoting.RespFlowControl, "flow control")); got != pullTimeDelayMillsWhenBrokerFlow {
+	// short wait, whatever the caller passed in as the generic wait.
+	if got := pullRetryDelay(common.ServerError(remoting.RespFlowControl, "flow control"), genericWait); got != pullTimeDelayMillsWhenBrokerFlow {
 		t.Errorf("a server-kind 215 got %s, want the broker flow-control wait", got)
 	}
 
@@ -2170,16 +2188,65 @@ func TestPullRetryDelaySeparatesBrokerFlowFromEverythingElse(t *testing.T) {
 		common.TimeoutError("127.0.0.1:10911", 3000),
 		errors.New("a plain error"),
 	} {
-		if got := pullRetryDelay(other); got != pullTimeDelayMillsWhenPullFailed {
-			t.Errorf("backoff after %v = %s, want the generic wait %s", other, got, pullTimeDelayMillsWhenPullFailed)
+		if got := pullRetryDelay(other, genericWait); got != genericWait {
+			t.Errorf("backoff after %v = %s, want the generic wait %s", other, got, genericWait)
 		}
+	}
+}
+
+// The generic failed-round back-off is ONE knob on the consumer, not three
+// package constants. This pins all four legs the contract names:
+//   - the default is 1000 ms;
+//   - a broker FLOW_CONTROL(215) still gets the fixed 20 ms, whatever the knob;
+//   - setting the knob moves the wait BOTH loops take (the value each loop
+//     captures at setup comes straight from the knob);
+//   - a non-215 error yields the knob value, and the POP POLLING_FULL arm sleeps
+//     the same captured value rather than an old hardcoded one.
+//
+// The 20 / 50 / 1000 ms arms are deliberately kept fixed, so the 215 leg must NOT
+// follow the knob — moving it is the failure this test turns red on.
+func TestPullFailedBackoffIsOneKnobSharedByPullAndPop(t *testing.T) {
+	c := MustNewDefaultMQPushConsumer("GID_go_failed_backoff_knob")
+
+	// Leg 1: the default the knob starts at.
+	if got := c.PullFailedBackoffMillis(); got != 1000 {
+		t.Fatalf("default generic back-off = %d ms, want 1000", got)
+	}
+
+	// Leg 2: a 215 keeps the fixed 20 ms even when the knob says otherwise, so a
+	// mapping that routed the broker-flow arm through the knob fails here.
+	c.SetPullFailedBackoffMillis(250)
+	captured := c.failedRoundDelayValue()
+	if captured != 250*time.Millisecond {
+		t.Fatalf("loop would capture %s after SetPullFailedBackoffMillis(250), want 250ms", captured)
+	}
+	if got := pullRetryDelay(common.BrokerError(remoting.RespFlowControl, "throttled"), captured); got != 20*time.Millisecond {
+		t.Errorf("a 215 with the knob at 250ms got %s, want the fixed 20ms broker-flow wait", got)
+	}
+
+	// Leg 3: the non-215 (pull) arm and the POP setup both read the moved knob.
+	if got := pullRetryDelay(common.BrokerError(remoting.RespSystemBusy, "busy"), captured); got != 250*time.Millisecond {
+		t.Errorf("a non-215 with the knob at 250ms got %s, want the knob value", got)
+	}
+
+	// Leg 3 (POP path value the loop captures): the knob is what queuePopLoop
+	// reads at setup, so this value IS the POP non-215 / POLLING_FULL wait.
+	if got := c.failedRoundDelayValue(); got != 250*time.Millisecond {
+		t.Errorf("POP loop would capture %s, want the knob's 250ms", got)
+	}
+
+	// Restore and confirm the default arm again (a non-215 gets the 1000ms knob).
+	c.SetPullFailedBackoffMillis(defaultFailedRoundDelayMillis)
+	def := c.failedRoundDelayValue()
+	if got := pullRetryDelay(common.BrokerError(remoting.RespSystemError, "system error"), def); got != 1000*time.Millisecond {
+		t.Errorf("a non-215 at the default got %s, want the 1000ms default knob", got)
 	}
 }
 
 // The loop has to ACT on the distinction, and the state to wait on is the
 // message itself. The broker is scripted to refuse exactly this many pulls and
 // then answer normally: at the short backoff the run costs a fraction of a
-// second, at the generic one it costs count x 500ms, so a listener that has the
+// second, at the generic one it costs count x 1000ms, so a listener that has the
 // message inside a budget the generic wait cannot fit proves which delay the
 // loop slept for — with no wall-clock window to lose, because a loaded machine
 // only ever makes the retries slower.

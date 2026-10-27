@@ -804,15 +804,28 @@ final class RunClientFlowControl
             'the broker pause is 20 ms');
         $this->checkSame(50, DefaultMQPushConsumer::PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL,
             'the own-cache pause is 50 ms');
-        $this->checkSame(500, DefaultMQPushConsumer::PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION,
-            'the general error pause is 500 ms');
+        $this->checkSame(1000, DefaultMQPushConsumer::DEFAULT_FAILED_REQUEST_BACKOFF_MILLIS,
+            'the configured failed-round backoff defaults to 1000 ms');
+        $this->checkSame(1000, (new DefaultMQPushConsumer('GID-FC-BACKOFF-DEFAULT'))->getFailedRequestBackoffMillis(),
+            'a fresh consumer carries that default');
+        $consts = (new \ReflectionClass(DefaultMQPushConsumer::class))->getConstants();
+        $this->check(!isset($consts['PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION']),
+            'the general error pause is the knob now, not a second hardcoded number');
         $this->checkSame(20, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(215),
             'a 215 answer retries early');
         // Paired control: only 215 gets the early retry, so collapsing the branch onto one number
         // (or keying it on the wrong code) reddens this.
         foreach ([1, 2, 24, 25, 26, 500, 3000, null] as $code) {
-            $this->checkSame(500, DefaultMQPushConsumer::pullBackoffMillisForResponseCode($code),
-                'every other outcome (' . var_export($code, true) . ') keeps the general pause');
+            $this->checkSame(1000, DefaultMQPushConsumer::pullBackoffMillisForResponseCode($code),
+                'every other outcome (' . var_export($code, true) . ') keeps the configured backoff');
+        }
+        // The value the consumer armed with is what the mapping returns, so a schedule built from a
+        // moved knob cannot quietly keep using the default.
+        $this->checkSame(20, DefaultMQPushConsumer::pullBackoffMillisForResponseCode(215, 700),
+            'a moved knob still leaves the 215 arm at 20 ms');
+        foreach ([1, 25, null] as $code) {
+            $this->checkSame(700, DefaultMQPushConsumer::pullBackoffMillisForResponseCode($code, 700),
+                'every other outcome (' . var_export($code, true) . ') takes the configured 700 ms');
         }
     }
 
@@ -841,13 +854,13 @@ final class RunClientFlowControl
     {
         $throttled = $this->brokerBackoffRound('GID-FC-BROKER-215', ResponseCode::FLOW_CONTROL);
         $this->check($throttled > 0.015 && $throttled < 0.1,
-            'a 215 answer pauses for ~20 ms, not for the general 500 ms (' . $throttled . ')');
+            'a 215 answer pauses for ~20 ms, not for the configured failed-round backoff (' . $throttled . ')');
 
         // Paired control: any other broker error keeps the long backoff, so a branch that answers
         // 20 ms for everything is caught here rather than above.
         $other = $this->brokerBackoffRound('GID-FC-BROKER-25', ResponseCode::SYSTEM_ERROR);
-        $this->check($other > 0.4 && $other < 0.8,
-            'any other broker error keeps the ~500 ms backoff (' . $other . ')');
+        $this->check($other > 0.9 && $other < 1.4,
+            'any other broker error keeps the ~1000 ms configured backoff (' . $other . ')');
     }
 
     // ================================================================ 10. the POP gate on the wire

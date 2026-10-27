@@ -11,7 +11,7 @@ NameServer（取路由、动态取址）与 Broker（收发消息、心跳、位
   zlib 走内置 `ZLibStream`，LZ4 / ZSTD 通过 P/Invoke 调系统库。
 - 一个库覆盖生产者、Push / Pull / LitePull 三种消费者、管理端、消息轨迹、ACL、TLS。
 - 能力在真实 RocketMQ 5.5.1 集群（namesrv 9876 + broker 10911）上逐条联调，
-  离线行为由 1105 项单元测试锁死。
+  离线行为由 1130 项单元测试锁死。
 
 ## 先决条件
 
@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1105，已跳过:     0，总计:  1105，持续时间: 4 m 44 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1130，已跳过:     0，总计:  1130，持续时间: 4 m 53 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -278,6 +278,15 @@ consumer.PopThresholdForQueue = 96;      // 本队列待 ack 上限，严格大�
 去重；三条闸门都严格大于才停，阈值按字面取值，不 clamp 到 1、0 也不是「关闭」，合法区间由启动配置检查把守；
 字节闸门按消息体长度整 MiB 向下取整，不看 `storeSize`；跨度闸门不作用于顺序消费；topic 预算不在拉取时
 累计兄弟队列，而是在重平衡改变分配时除以本轮自有队列数、把商写回对应的每队列闸门）、`MaxReconsumeTimes`、`SuspendCurrentQueueTimeMillis`、
+`PullIntervalMillis`（默认 0：只给**真正交付了消息**的那一轮设节奏——一轮拉取过滤后仍要派发就等它那么多
+再发下一轮，为 0 就直接进下一轮；空轮（应答为空、被 tag 二次过滤清空、`NO_NEW_MSG` / `NO_MATCHED_MSG`）
+不等，节奏管的是交付，空轮次上再压一道本地等待只会推迟下一次拉取；`OFFSET_ILLEGAL` 走自己的恢复、
+失败轮走退避，都不进这个节奏）、
+`PullExceptionBackoffMillis`（默认 1000ms：拉取与 POP 两条循环共用的**唯一**通用错误退避——一轮请求
+除 broker 自己的流控之外的失败都按它退避，即应答不是成功、抛出的异常不是 `FLOW_CONTROL`(215)、以及
+POP 里 `POLLING_FULL` 和不认识的状态；循环在建立时取一次这个值，启动之后再改不动已经在跑的循环；
+其余三个等待是各自独立的闸门，不跟着这个旋钮移动：broker `FLOW_CONTROL`(215) 仍只等 20ms、本客户端
+自己的缓存阈值闸门仍停 50ms、被 `Suspend()` 暂停的消费者仍每 1000ms 回看一次标志）、
 `SetAllocateMessageQueueStrategy(new AllocateMessageQueueConsistentHash())`、
 `Suspend()` / `Resume()`（暂停拉取但不掉线）、`SetEnableMsgTrace(true)`、
 `consumer.SubscribedTopics()` / `ConsumedCount` / `ClientId`。
@@ -498,7 +507,12 @@ producer.TlsOptions = new TlsOptions
 - ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前每队列三条缓存闸门
   （只判该队列「持有」的一切：未派发缓冲 + 已交给监听器但尚未结算的批次，按位点去重；条数 /
   消息体字节整 MiB 向下取整 / 位点跨度都严格大于才停，阈值不做下限钳制、0 也不是「关闭」，
-  顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、命中后本地重排 50ms、告警第 1 次及其后每
+  顺序消费完全不判跨度；topic 预算在重平衡时摊到每队列）、命中后本地重排 50ms、失败轮（应答非成功 /
+  异常不是 215 / POP 的 `POLLING_FULL` 与不认识的状态）按 `PullExceptionBackoffMillis`（默认 1000ms，
+  拉取与 POP 共用这一个旋钮，循环建立时取一次值）退避、broker 的 `FLOW_CONTROL`(215) 仍只等 20ms、
+  只有真正交付了消息的一轮按 `PullIntervalMillis`（默认 0）设节奏、空轮（应答为空 / 被过滤清空 /
+  `NO_NEW_MSG` / `NO_MATCHED_MSG`）直接进下一轮（节奏管的是交付，空轮上再压一道本地等待只会推迟下一次拉取）、
+  告警第 1 次及其后每
   1000 次一次、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳
   → 只向变动的 topic 回调队列监听；集合未变的轮次与停摆自愈轮都不做任何事）、
   POP 的待 ack 欠账闸门（默认 96，严格大于才停，命中记进拉取路径同一个流控计数）+
@@ -516,7 +530,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1105 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1130 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -669,7 +683,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs  Schedules（定时任务锚定）
 │       ├── TopAddressing.cs        # 动态 NameServer 取址
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit，1105 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
+├── tests/RocketMQ.Client.Tests/    # xunit，1130 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
 └── examples/RocketMQ.Examples/     # rmq 真机联调工具（见上）
 ```
 

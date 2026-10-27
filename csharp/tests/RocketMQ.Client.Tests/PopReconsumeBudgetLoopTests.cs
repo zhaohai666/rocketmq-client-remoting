@@ -350,12 +350,13 @@ public class PopReconsumeBudgetLoopTests
         }
     }
 
-    /// <summary>A POLLING_FULL answer parks the queue for the 3000 ms
-    /// back-off: the gap between two consecutive pop rounds is that wait, not
-    /// the 200 ms hot-round nap. Control: the old "fall through to the next
-    /// round" reading answers within a few hundred ms and goes red.</summary>
+    /// <summary>A POLLING_FULL answer parks the queue on the generic error
+    /// backoff -- the consumer's configured PullExceptionBackoffMillis (1000 ms by
+    /// default): the gap between two consecutive pop rounds is that wait, not the
+    /// 200 ms hot-round nap. Control: the old "fall through to the next round"
+    /// reading answers within a few hundred ms and goes red.</summary>
     [Fact]
-    public void PopLoop_PollingFullAnswer_BackOffsThreeSeconds()
+    public void PopLoop_PollingFullAnswer_ParksOnTheGenericErrorBackoff()
     {
         using MockCluster cluster = StartCluster();
         cluster.SetReplyCode(RequestCode.PopMessage, ResponseCode.PollingFull);
@@ -365,17 +366,41 @@ public class PopReconsumeBudgetLoopTests
             InstanceName = "budget_pollingfull_" + Guid.NewGuid().ToString("N")[..8],
         };
         c.SetMessageListener(new HoldingListener());
+        int backoff = c.PullExceptionBackoffMillis;
+        Assert.Equal(1000, backoff);
 
         List<long> arrivals = PopRoundArrivals(cluster, c, 2);
         long gap = arrivals[1] - arrivals[0];
-        Assert.InRange(gap, DefaultMQPushConsumer.PopExceptionBackoffMillis - 100,
-            DefaultMQPushConsumer.PopExceptionBackoffMillis + 2000);
+        Assert.InRange(gap, backoff - 100, backoff + 2000);
+    }
+
+    /// <summary>The same measured leg with the knob moved: the POP loop takes the
+    /// configured value when it is set up, so a 1500 ms knob parks the queue for 1500 ms
+    /// and not for the default. Control: a loop that ignored the knob (or kept a
+    /// hard-coded wait) answers near 1000 ms here and goes red.</summary>
+    [Fact]
+    public void PopLoop_PollingFullAnswer_ParksOnTheKnobTheConsumerWasGiven()
+    {
+        using MockCluster cluster = StartCluster();
+        cluster.SetReplyCode(RequestCode.PopMessage, ResponseCode.PollingFull);
+        var c = new DefaultMQPushConsumer(Group)
+        {
+            PopMode = true,
+            PullExceptionBackoffMillis = 1500,
+            InstanceName = "budget_pollingfull_knob_" + Guid.NewGuid().ToString("N")[..8],
+        };
+        c.SetMessageListener(new HoldingListener());
+        Assert.Equal(1500, c.PullExceptionBackoffMillis);
+
+        List<long> arrivals = PopRoundArrivals(cluster, c, 2);
+        long gap = arrivals[1] - arrivals[0];
+        Assert.InRange(gap, 1400, 3500);
     }
 
     /// <summary>POLLING_NOT_FOUND is a normal empty answer: straight to the
     /// next round (only the 200 ms hot-round nap applies). Control: an
-    /// implementation that parks every empty status on the 3000 ms back-off
-    /// reads a gap over 2900 here and goes red.</summary>
+    /// implementation that parks every empty status on the generic error back-off
+    /// reads a gap over 900 here and goes red.</summary>
     [Fact]
     public void PopLoop_PollingNotFoundAnswer_GoesStraightToTheNextRound()
     {
@@ -395,9 +420,10 @@ public class PopReconsumeBudgetLoopTests
     }
 
     /// <summary>A Found answer WITH kept rows paces the next round by
-    /// PullIntervalMillis (800 ms here): the gap between the round that
-    /// delivered and the next round is that wait -- clearly above the 200 ms
-    /// nap and clearly below the 3000 ms back-off.</summary>
+    /// PullIntervalMillis (400 ms here): the gap between the round that
+    /// delivered and the next round is that wait -- clearly above the 200 ms nap
+    /// and clearly below the 1000 ms generic error backoff, so the pace leg and the
+    /// failed-round leg cannot be satisfied by the same number.</summary>
     [Fact]
     public void PopLoop_FoundWithKeptRows_PacesTheNextRoundByPullInterval()
     {
@@ -424,13 +450,13 @@ public class PopReconsumeBudgetLoopTests
         var c = new DefaultMQPushConsumer(Group)
         {
             PopMode = true,
-            PullIntervalMillis = 800,
+            PullIntervalMillis = 400,
             InstanceName = "budget_interval_" + Guid.NewGuid().ToString("N")[..8],
         };
         c.SetMessageListener(listener);
 
         List<long> arrivals = PopRoundArrivals(cluster, c, 2);
         long gap = arrivals[1] - arrivals[0];
-        Assert.InRange(gap, 750, 2500);
+        Assert.InRange(gap, 380, 900);
     }
 }

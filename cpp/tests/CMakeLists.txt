@@ -149,6 +149,14 @@ add_executable(rmq_test_pull_round_stats test_pull_round_stats.cpp)
 target_link_libraries(rmq_test_pull_round_stats PRIVATE rocketmq::remoting)
 add_test(NAME pull_round_stats COMMAND rmq_test_pull_round_stats)
 
+# PULL-path offset sanity warning: the pure rewind predicate, plus the real queuePullLoop FOUND round
+# ending in exactly one WARN (nextBegin behind prev, first delivered row behind prev, consistent and
+# empty/fully-filtered rounds quiet), read back from the process log file; the firing round must
+# store its own nextBeginOffset and keep the delivered-round cadence identical to a quiet round.
+add_executable(rmq_test_pull_offset_sanity test_pull_offset_sanity.cpp)
+target_link_libraries(rmq_test_pull_offset_sanity PRIVATE rocketmq::remoting)
+add_test(NAME pull_offset_sanity COMMAND rmq_test_pull_offset_sanity)
+
 # BATCH_ACK_MESSAGE grouping: a fake endpoint records the decoded request frame off the socket, so the
 # merge rule (one entry per distinct merge key, the retry dimension splitting it, offset bits folded
 # relative to startOffset) and the no-custom-header JSON body are pinned on captured wire state.

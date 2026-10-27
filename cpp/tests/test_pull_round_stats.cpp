@@ -9,6 +9,13 @@
 //          and a FOUND round that carried no rows at all still records RT.
 //   leg C  a FOUND round that keeps N of M rows records TPS == N, the post-filter deliverable count,
 //          never the raw msgFoundList size.
+//   leg D  the failed round of leg A, read as a WAIT: a non-215 broker answer makes the loop take this
+//          consumer's configured general error backoff (an untouched consumer takes the port's
+//          default), and a FLOW_CONTROL(215) answer keeps its own short pause whatever the knob says.
+//   leg E  the round cadence, read as the wait the loop recorded: a FOUND round that delivered rows
+//          waits the configured pull interval, while a FOUND round the filter emptied re-pulls at once
+//          (cadence 0), so a delivered-then-emptied sequence ends on 0 -- the pair that catches a
+//          cadence sleep hoisted out of the delivered branch.
 //
 // The evidence is read out of the consumer instance's own ConsumerStatsManager (the same object the
 // production loop calls): StatsItem.times() counts the incPullRT / incPullTPS invocations and
@@ -540,11 +547,178 @@ void testFoundRoundsRecordRtAlwaysAndTpsOnlyForDeliveredRows() {
     }
 }
 
+// ---------------------------------------------------------------- leg D: the failed round's wait
+
+// leg A's broker-exception round, read through the pause the REAL loop recorded: the general error
+// backoff is this consumer's configurable knob, so the round waits what the knob says and a loop that
+// ignored the knob shows up as a wrong recorded pause. The 215 round is the control on the other
+// side: no knob value changes it.
+void testFailedRoundWaitsTheConfiguredBackoff() {
+    constexpr int32_t kKnobProbeMillis = 137;
+
+    // The knob drives the wait the loop takes.
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        ep.scriptPull(errorReply());  // a non-215 broker code
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullPauseKnob");
+        c.setInstanceName("pull_pause_knob");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.setPullPauseWhenPullErrorMillis(kKnobProbeMillis);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            // Round 1 is the scripted error answer; the pause it records happens before round 2 is
+            // issued, so five rounds guarantee the decision below was taken.
+            assignQueueAndRunRounds(c, ep, 5);
+            expectInt(c.lastPullPauseMillis(), kKnobProbeMillis,
+                      "the failed round records the configured error backoff");
+            c.shutdown();
+        }
+    }
+    // Control 1: a consumer that never touched the knob waits the port's default.
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        ep.scriptPull(errorReply());
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullPauseDefault");
+        c.setInstanceName("pull_pause_default");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            assignQueueAndRunRounds(c, ep, 5);
+            expectInt(c.lastPullPauseMillis(), kDefaultPullPauseWhenPullErrorMillis,
+                      "the untouched knob records the default backoff");
+            c.shutdown();
+        }
+    }
+    // Control 2: the broker's FLOW_CONTROL(215) answer ignores the knob entirely.
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        PullReply throttled;
+        throttled.code = ResponseCode::FLOW_CONTROL;
+        ep.scriptPull(throttled);
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullPauseThrottled");
+        c.setInstanceName("pull_pause_throttled");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.setPullPauseWhenPullErrorMillis(kKnobProbeMillis);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            assignQueueAndRunRounds(c, ep, 5);
+            expectInt(c.lastPullPauseMillis(), kPullPauseWhenBrokerFlowControl,
+                      "a 215 answer keeps its own short pause even with the knob set");
+            c.shutdown();
+        }
+    }
+}
+
+// ---------------------------------------------------------------- leg E: the delivered round's cadence
+
+// The round cadence of the REAL queuePullLoop, read through the wait the loop recorded: the configured
+// pull interval paces ONLY a round that delivered rows, exactly the arm PULL_TPS counts. The paired
+// control is a FOUND round the filter emptied: it re-pulls at once, so its recorded cadence is 0. This
+// is the leg that catches a cadence sleep hoisted out of the delivered branch -- such a sleep would make
+// the emptied FOUND round wait the interval too, and the final read would be 40 instead of 0.
+void testDeliveredRoundPacesAndIdleFoundDoesNot() {
+    constexpr int32_t kCadenceProbeMillis = 40;
+
+    // A delivered FOUND round waits the configured interval, then the trailing NO_NEW_MSG spin leaves
+    // that last FOUND round's cadence in place (the not-FOUND rounds pace nothing).
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        ep.scriptPull(foundReply(3, {taggedRow("TagA", 0)}));  // FOUND, kept by the TagA filter
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullCadenceDelivered");
+        c.setInstanceName("pull_cadence_delivered");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.setPullIntervalMillis(kCadenceProbeMillis);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            assignQueueAndRunRounds(c, ep, 5);
+            expectInt(c.lastPullCadenceMillis(), kCadenceProbeMillis,
+                      "legE.deliveredRoundWaitsThePullInterval");
+            c.shutdown();
+        }
+    }
+    // The discriminator: a delivered round first records the interval, then a FOUND round the filter
+    // empties must bring the cadence back to 0. If the wait sat outside the delivered branch the empty
+    // round would keep it at 40 and this read fails.
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        ep.scriptPull(foundReply(3, {taggedRow("TagA", 0)}));  // round 1 delivers -> cadence 40
+        ep.scriptPull(foundReply(6, {taggedRow("TagB", 3)}));  // round 2 FOUND, all filtered -> cadence 0
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullCadenceIdleFound");
+        c.setInstanceName("pull_cadence_idle");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.setPullIntervalMillis(kCadenceProbeMillis);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            assignQueueAndRunRounds(c, ep, 5);
+            waitFor([&] { return listener->delivered() >= 1; }, 8000);
+            expectInt(listener->delivered(), 1, "legE.onlyTheRealDeliveryReachedTheListener",
+                      std::to_string(listener->delivered()));
+            // The last FOUND round to run delivered nothing, so the loop is pacing at 0.
+            expectInt(c.lastPullCadenceMillis(), 0, "legE.idleFoundRoundWaitsNothing");
+            c.shutdown();
+        }
+    }
+    // An interval of 0 paces even a delivered round nowhere: re-pull at once, so the recorded cadence
+    // stays 0 rather than inheriting any default.
+    {
+        MockEndpoint ep;
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        ep.setMaxOffset(0);
+        ep.scriptPull(foundReply(3, {taggedRow("TagA", 0)}));
+        auto listener = std::make_shared<CountingListener>();
+        DefaultMQPushConsumer c("GID_PullCadenceZeroInterval");
+        c.setInstanceName("pull_cadence_zero");
+        c.setNamesrvAddr(ep.address());
+        c.setMessageListener(listener);
+        c.setPullIntervalMillis(0);
+        c.subscribe(kTopic, "TagA");
+        {
+            QuietLog quiet;
+            c.start();
+            assignQueueAndRunRounds(c, ep, 5);
+            expectInt(c.lastPullCadenceMillis(), 0, "legE.zeroIntervalDeliveredRoundDoesNotWait");
+            c.shutdown();
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
     testNonFoundAndFailedRoundsRecordNothing();
     testFoundRoundsRecordRtAlwaysAndTpsOnlyForDeliveredRows();
+    testFailedRoundWaitsTheConfiguredBackoff();
+    testDeliveredRoundPacesAndIdleFoundDoesNot();
     std::printf("pull_round_stats: %d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }
