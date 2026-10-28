@@ -738,8 +738,13 @@ class LiteBroker {
   port = 0;
   queueNums: number;
   // Every pull in arrival order: the SKIP and the ASK-AGAIN are read here, so the
-  // test needs no clock assumptions about the client.
-  pulls: Array<{ queueId: number, offset: number, at: number }> = [];
+  // test needs no clock assumptions about the client. The expression fields are
+  // kept too, so the lite pull's own wire shape can be asserted.
+  pulls: Array<{
+    queueId: number, offset: number, at: number,
+    subVersion: string | undefined, expressionType: string | undefined,
+    subscription: string | undefined,
+  }> = [];
   private script = new Map<number, { code?: number, found?: boolean, left: number }>();
 
   constructor(queueNums: number) {
@@ -820,6 +825,16 @@ class LiteBroker {
     if (req.code === RequestCode.LITE_PULL_MESSAGE || req.code === RequestCode.PULL_MESSAGE) {
       return this.answerPull(req, resp);
     }
+    // seek() pins a cursor only inside [minOffset, maxOffset]; the fake answers a
+    // range wide enough for every offset these suites plant.
+    if (req.code === RequestCode.GET_MIN_OFFSET) {
+      resp.addExtField('offset', '0');
+      return resp;
+    }
+    if (req.code === RequestCode.GET_MAX_OFFSET) {
+      resp.addExtField('offset', '1000000');
+      return resp;
+    }
     return resp; // heartbeat / offset commit / every other code: SUCCESS
   }
 
@@ -827,7 +842,12 @@ class LiteBroker {
     const ext = req.extFields || {};
     const queueId = Number(ext['queueId'] || 0);
     const offset = Number(ext['queueOffset'] || 0);
-    this.pulls.push({ queueId, offset, at: Date.now() });
+    this.pulls.push({
+      queueId, offset, at: Date.now(),
+      subVersion: ext['subVersion'],
+      expressionType: ext['expressionType'],
+      subscription: ext['subscription'],
+    });
     const s = this.script.get(queueId);
     const scripted = s != null && s.left > 0;
     if (scripted) s!.left--;
@@ -866,8 +886,9 @@ async function driveLitePoll(opts: {
   if (opts.batchSize !== undefined) c.setPullBatchSize(opts.batchSize);
   await c.start();
   // Pin the cursors so the rounds under test are the only RPCs the loop makes and
-  // no offset-resolution branch can add a wait of its own.
-  for (const mq of mqs) c.seek(mq, 0);
+  // no offset-resolution branch can add a wait of its own. seek() itself asks the
+  // broker for the queue's range, hence the two answered boundary RPCs above.
+  for (const mq of mqs) await c.seek(mq, 0);
   const probe = mqs[(opts.queueIds.indexOf(opts.probeQueueId ?? opts.queueIds[0]) + opts.queueIds.length)
     % opts.queueIds.length];
   const waits: number[] = [];
@@ -917,6 +938,11 @@ async function driveLitePoll(opts: {
   check('a throttled round moved no cursor: the queue is asked at the same offset',
     asked[0].offset === 0 && asked[1].offset === 0,
     asked.map((p) => p.offset).join(','));
+  check('a lite pull carries subVersion 0 for a TAG expression',
+    asked.every((p) => p.subVersion === '0'), asked.map((p) => p.subVersion).join(','));
+  check('while the expression itself still rides the same request',
+    asked.every((p) => p.expressionType === 'TAG' && p.subscription === '*'),
+    asked.map((p) => `${p.expressionType}/${p.subscription}`).join(','));
 
   // Paired control on the SAME driver: SYSTEM_BUSY is not a broker throttle, so the
   // queue is not parked and today's single-queue idle guard is the only wait.

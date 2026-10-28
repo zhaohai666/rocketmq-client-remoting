@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1163 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1166 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -143,7 +143,7 @@ for mq in &mqs {
 
 ### LitePullConsumer（poll 模型 + 队列变更监听 + 位点三张表）
 
-这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `set_sub_expression_for_assign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。
+这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `set_sub_expression_for_assign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。`subscribe` / `assign` 互斥，先调用者定形；`seek` 依次判「队列是否持有」→「是否已启动」→ 位点落在 `[minOffset, maxOffset]` 内；`assign` 收窄与 `unsubscribe` 立刻撤销不再持有队列的光标、seek 定位、暂停位、park 与本地缓冲。
 
 ```rust
 use rocketmq_client_remoting::client::pull_consumer::DefaultLitePullConsumer;

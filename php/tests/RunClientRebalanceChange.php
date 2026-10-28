@@ -110,6 +110,12 @@ final class RcInstance extends MQClientInstance
 
     public function getMaxOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
     {
+        // Wide enough for any seek this suite plants, and answered locally like the other offset reads.
+        return 1000;
+    }
+
+    public function getMinOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
+    {
         return 0;
     }
 

@@ -56,7 +56,8 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
   }
 
   // ReadOffset answers from the table (memory modes) or the broker.
-  // -1 = unknown (no entry / broker says QUERY_NOT_FOUND).
+  // -1 = unknown (no entry / broker says QUERY_NOT_FOUND); -2 = the broker read
+  // itself failed, which is NOT "nobody committed" and must stay distinguishable.
   async readOffset(mq: MessageQueue, mode: ReadOffsetMode): Promise<number> {
     if (mode === ReadOffsetMode.READ_FROM_MEMORY || mode === ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE) {
       const offset = this.table.get(mqKey(mq));
@@ -67,7 +68,7 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
     const addr = this.mqClient.findBrokerAddrForQueue(mq);
     if (!addr) {
       logger.warning('readOffset: broker[%s] not exist for %s', mq.getBrokerName(), mqKey(mq));
-      return -1;
+      return -2;
     }
     try {
       const { found, offset } = await this.mqClient.queryConsumerOffset(addr, this.group, mq);
@@ -76,7 +77,7 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
       return offset;
     } catch (e) {
       logger.warning('readOffset failed for %s: %s', mqKey(mq), (e as Error).message);
-      return -1;
+      return -2;
     }
   }
 

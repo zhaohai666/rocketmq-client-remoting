@@ -69,7 +69,7 @@ async function main(): Promise<void> {
   // ---- seek backwards to the FIRST message and re-read it ----
   const first = await (async () => {
     if (firstSeen == null) return null;
-    consumer.seek(firstSeen.mq, firstSeen.offset);
+    await consumer.seek(firstSeen.mq, firstSeen.offset);
     const again = await consumer.poll(3000);
     for (const m of again) {
       if ((m.getBody() || Buffer.alloc(0)).toString('utf8') === firstSeen.body) return firstSeen.body;

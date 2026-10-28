@@ -236,7 +236,9 @@ async function main() {
     pull.setPersistConsumerOffsetInterval(150);
     const mqA = new MessageQueue('PersistSharedA', BROKER, 0);
     pull.updateConsumeOffset(mqA, 4);
-    lite.seek(new MessageQueue('PersistSharedB', BROKER, 0), 6);
+    // 10 is inside the range this cluster reports for both boundaries; a seek
+    // outside [minOffset, maxOffset] is refused by the consumer itself.
+    await lite.seek(new MessageQueue('PersistSharedB', BROKER, 0), 10);
     check('the pull facade is flushed by the sweep',
       await waitFor(() => cluster.commitKeys('PersistSharedA').length > 0, 6000),
       cluster.commits.join(','));

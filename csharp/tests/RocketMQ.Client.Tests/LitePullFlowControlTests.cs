@@ -88,6 +88,9 @@ public class LitePullFlowControlTests
         c.PullThresholdForQueue = int.MaxValue;
         c.PullThresholdSizeForQueue = int.MaxValue;
         c.ConsumeMaxSpan = long.MaxValue;
+        // Offline consumers have no broker; a seek in these cases only exercises the
+        // local prune, so the range check is satisfied by a wide fixed window.
+        c.SetSeekBoundsForTest(0, 1000);
         return c;
     }
 

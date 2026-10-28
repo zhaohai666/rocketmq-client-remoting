@@ -56,7 +56,13 @@ public sealed class DefaultLitePullConsumer
     // TAG/SQL92/CLASS_FILTER). A topic missing from this table is a plain TAG subscription,
     // which is exactly what every string-based subscription is today.
     private readonly Dictionary<string, string> _subscriptionType = new(StringComparer.Ordinal);
-    private bool _assignMode;
+    // 0 = not chosen yet, 1 = subscribe, 2 = assign. The first facade call that needs a
+    // delivery shape claims it; from then on the other shape is refused.
+    private const int ModeNone = 0;
+    private const int ModeSubscribe = 1;
+    private const int ModeAssign = 2;
+    private int _mode = ModeNone;
+    private bool _assignMode => _mode == ModeAssign;
     private readonly HashSet<MessageQueue> _assigned = new();
 
     private int _brokerSuspendMaxTimeMillis = 20000;
@@ -103,6 +109,9 @@ public sealed class DefaultLitePullConsumer
     private readonly Dictionary<MessageQueue, long> _consumeOffset = new();
     private readonly Dictionary<MessageQueue, long> _offsetTable = new();
     private readonly Dictionary<MessageQueue, long> _seekOffset = new();
+    // Offline test seam for the seek range check: when set, it answers the queue's
+    // min/max without a broker. Production code leaves it null and reads the broker.
+    private Func<MessageQueue, (long Min, long Max)>? _seekBoundsForTest;
     private long _nextAutoCommitDeadline = -1;
     private readonly HashSet<MessageQueue> _paused = new();
     private ILiteMessageQueueListener? _messageQueueListener;
@@ -507,6 +516,20 @@ public sealed class DefaultLitePullConsumer
     /// still refuses.</summary>
     public void MarkRunningForTest() => _running = true;
 
+    /// <summary>Supplies the broker boundary offsets a seek range check needs, so the
+    /// guard can be pinned offline. When never called the seek reads the real broker.</summary>
+    public void SetSeekBoundsForTest(long minOffset, long maxOffset) =>
+        _seekBoundsForTest = _ => (minOffset, maxOffset);
+
+    /// <summary>Whether this queue's paused flag is currently set.</summary>
+    public bool IsPausedForTest(MessageQueue mq)
+    {
+        lock (_lock)
+        {
+            return _paused.Contains(mq);
+        }
+    }
+
     /// <summary>Nothing parked: the queue's next round runs on the loop's own cadence.</summary>
     public const int NoPullPause = -1;
 
@@ -518,6 +541,26 @@ public sealed class DefaultLitePullConsumer
     public int TopicMetadataCheckIntervalMillis => _topicMetadataCheckIntervalMillis;
 
     // ---------------- subscription / allocation ----------------
+    /// <summary>Claims one of the two mutually exclusive delivery shapes. The first
+    /// caller decides; a later caller asking for the other shape is refused. Repeating
+    /// the same shape (for example resubscribing a topic) stays allowed.</summary>
+    private void ClaimMode(int mode)
+    {
+        lock (_lock)
+        {
+            if (_mode == ModeNone)
+            {
+                _mode = mode;
+                return;
+            }
+
+            if (_mode != mode)
+            {
+                throw new MQClientException("Subscribe and assign are mutually exclusive.");
+            }
+        }
+    }
+
     public void Subscribe(string topic, string subExpression = "*")
     {
         if (string.IsNullOrWhiteSpace(topic))
@@ -525,7 +568,7 @@ public sealed class DefaultLitePullConsumer
             throw new ArgumentException("Topic can not be null or empty.");
         }
 
-        _assignMode = false;
+        ClaimMode(ModeSubscribe);
         string ns = WithNamespace(topic);
         lock (_lock)
         {
@@ -554,7 +597,7 @@ public sealed class DefaultLitePullConsumer
         }
 
         ArgumentNullException.ThrowIfNull(selector);
-        _assignMode = false;
+        ClaimMode(ModeSubscribe);
         string ns = WithNamespace(topic);
         lock (_lock)
         {
@@ -599,6 +642,7 @@ public sealed class DefaultLitePullConsumer
             throw new ArgumentException("Topic can not be null or empty.");
         }
 
+        ClaimMode(ModeAssign);
         string ns = WithNamespace(topic);
         lock (_lock)
         {
@@ -624,7 +668,7 @@ public sealed class DefaultLitePullConsumer
             throw new ArgumentException("Message queues can not be null or empty.");
         }
 
-        _assignMode = true;
+        ClaimMode(ModeAssign);
         var set = new HashSet<MessageQueue>(messageQueues);
         var dropped = new List<MessageQueue>();
         lock (_lock)
@@ -632,12 +676,10 @@ public sealed class DefaultLitePullConsumer
             foreach (MessageQueue mq in _assigned)
             {
                 if (set.Contains(mq)) continue;
-                _nextOffset.Remove(mq);
-                _consumeOffset.Remove(mq);
-                // A queue this instance lets go also loses its park: the deadline belongs
-                // to the pull round of that assignment, and a stale one must neither delay
-                // a re-assigned queue nor be reported for a queue nobody owns.
-                _pullPause.Remove(mq);
+                // A queue this instance lets go loses every piece of per-queue state:
+                // cursors, pause flag, park deadline and seek pin. The buffered rows and
+                // accumulators follow in ForgetQueues below.
+                ForgetQueueStateLocked(mq);
                 dropped.Add(mq);
             }
 
@@ -1164,23 +1206,71 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
+    /// <summary>Caller holds <c>_lock</c>. Drops every per-queue decision this instance
+    /// made: both cursors, the paused flag, the parked deadline and the seek pin. The
+    /// buffered rows and their accumulator live under <c>_bufferLock</c> and go through
+    /// <see cref="ForgetQueues"/>.</summary>
+    private void ForgetQueueStateLocked(MessageQueue mq)
+    {
+        _nextOffset.Remove(mq);
+        _consumeOffset.Remove(mq);
+        _seekOffset.Remove(mq);
+        _paused.Remove(mq);
+        _pullPause.Remove(mq);
+    }
+
+    /// <summary>Removes a topic's subscription and every queue of that topic this
+    /// instance holds, dropping all per-queue state immediately instead of waiting for
+    /// the next rebalance round.</summary>
+    public void Unsubscribe(string topic)
+    {
+        string ns = WithNamespace(topic);
+        var dropped = new List<MessageQueue>();
+        lock (_lock)
+        {
+            _subscription.Remove(ns);
+            _subscriptionData.Remove(ns);
+            _subscriptionType.Remove(ns);
+            // The assign expression table survives: it is not a rebalance subscription
+            // and an unsubscribe only revokes the topic's queues and their state.
+            foreach (MessageQueue mq in _assigned)
+            {
+                if (mq.Topic != ns) continue;
+                ForgetQueueStateLocked(mq);
+                dropped.Add(mq);
+            }
+
+            foreach (MessageQueue mq in dropped) _assigned.Remove(mq);
+        }
+
+        ForgetQueues(dropped);
+    }
+
     private string SubscriptionFor(string topic)
     {
         lock (_lock)
         {
+            // Assign mode never reads the subscribe table: an assigned queue's filter is
+            // whatever the assign expression says, defaulting to "all".
+            if (_mode == ModeAssign)
+            {
+                return _assignSubExpr.TryGetValue(topic, out string? a) ? a : "*";
+            }
+
             if (_subscription.TryGetValue(topic, out string? s)) return s;
-            if (_assignSubExpr.TryGetValue(topic, out string? a)) return a;
         }
 
         return "*";
     }
 
     /// <summary>The expression type recorded for this topic; a topic without a selector
-    /// entry is TAG, which is every string-based subscription's type today.</summary>
+    /// entry is TAG, which is every string-based subscription's type today. Assign-mode
+    /// expressions are always TAG filters.</summary>
     private string SubscriptionTypeFor(string topic)
     {
         lock (_lock)
         {
+            if (_mode == ModeAssign) return ExpressionType.TAG;
             return _subscriptionType.TryGetValue(topic, out string? t) ? t : ExpressionType.TAG;
         }
     }
@@ -1481,15 +1571,11 @@ public sealed class DefaultLitePullConsumer
                 {
                     if (newSet.Contains(mq)) continue;
                     if (_offsetTable.ContainsKey(mq)) revoked.Add(mq);
-                    _nextOffset.Remove(mq);
-                    // Revoking a queue drops the **entire MessageQueueState** (pullOffset / consumeOffset /
-                    // seekOffset): keeping seekOffset would silently jump back to a position the
-                    // user pinned long ago whenever this queue returns to this instance.
-                    _consumeOffset.Remove(mq);
-                    _seekOffset.Remove(mq);
-                    // ...and its park with it: a re-assigned queue starts on the current
-                    // assignment's own verdict, never on a deadline the old one armed.
-                    _pullPause.Remove(mq);
+                    // Revoking a queue drops its **entire** per-queue state (pullOffset /
+                    // consumeOffset / seekOffset), its paused flag and its park: keeping the
+                    // seekOffset would silently jump back to a position the user pinned long
+                    // ago whenever this queue returns to this instance.
+                    ForgetQueueStateLocked(mq);
                     dropped.Add(mq);
                 }
             }
@@ -1585,6 +1671,37 @@ public sealed class DefaultLitePullConsumer
 
     public void Seek(MessageQueue mq, long offset)
     {
+        bool assigned;
+        bool assignMode;
+        lock (_lock)
+        {
+            assigned = _assigned.Contains(mq);
+            assignMode = _mode == ModeAssign;
+        }
+
+        // Membership is judged first: a queue this instance does not own is a rebalancing
+        // situation in subscribe mode and a plain assignment mistake in assign mode. Both
+        // are reported before the running state, so the caller learns the more useful fact.
+        if (!assigned)
+        {
+            string message = assignMode
+                ? "The message queue is not in assigned list, message queue: " + mq
+                : "The message queue is not in assigned list, may be rebalancing, message queue: " + mq;
+            throw new MQClientException(message);
+        }
+
+        if (!_running)
+        {
+            throw new MQClientException("The consumer not running, please start it first.");
+        }
+
+        (long minOffset, long maxOffset) = ReadSeekBounds(mq);
+        if (offset < minOffset || offset > maxOffset)
+        {
+            throw new MQClientException("Seek offset illegal, seek offset = " + offset
+                + ", min offset = " + minOffset + ", max offset = " + maxOffset);
+        }
+
         lock (_lock)
         {
             _seekOffset[mq] = offset;
@@ -1622,9 +1739,34 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    public void SeekToBegin(MessageQueue mq) => Seek(mq, RequireClient().GetMinOffset(mq));
+    /// <summary>Reads the queue's current boundaries in the fixed order (min, then max).
+    /// A failed read is not turned into a sentinel: the exception reaches the caller so a
+    /// seek is never pinned to an offset the broker never confirmed.</summary>
+    private (long Min, long Max) ReadSeekBounds(MessageQueue mq)
+    {
+        Func<MessageQueue, (long Min, long Max)>? boundsForTest = _seekBoundsForTest;
+        if (boundsForTest is not null)
+        {
+            return boundsForTest(mq);
+        }
 
-    public void SeekToEnd(MessageQueue mq) => Seek(mq, RequireClient().GetMaxOffset(mq));
+        MQClientInstance client = RequireClient();
+        long min = client.GetMinOffset(mq);
+        long max = client.GetMaxOffset(mq);
+        return (min, max);
+    }
+
+    public void SeekToBegin(MessageQueue mq)
+    {
+        long begin = RequireClient().GetMinOffset(mq);
+        Seek(mq, begin);
+    }
+
+    public void SeekToEnd(MessageQueue mq)
+    {
+        long end = RequireClient().GetMaxOffset(mq);
+        Seek(mq, end);
+    }
 
     public long Committed(MessageQueue mq)
     {
@@ -1647,7 +1789,9 @@ public sealed class DefaultLitePullConsumer
         }
         catch
         {
-            return -1;
+            // A failed broker read is not "no offset": -1 would silently reset the
+            // caller's view. Surface it as the offset-store failure it is.
+            throw new MQClientException("Fetch consume offset from broker exception");
         }
 
         lock (_lock)
@@ -1999,9 +2143,15 @@ public sealed class DefaultLitePullConsumer
         };
         lock (_lock)
         {
-            foreach (KeyValuePair<string, SubscriptionData> kv in _subscriptionData)
+            // Assigned queues are a local decision: nothing about them is a broker-side
+            // subscription, so an assign-mode heartbeat advertises no subscription entries
+            // at all. Subscribe mode still sends every current subscription.
+            if (_mode != ModeAssign)
             {
-                cd.AddSubscriptionData(kv.Value);
+                foreach (KeyValuePair<string, SubscriptionData> kv in _subscriptionData)
+                {
+                    cd.AddSubscriptionData(kv.Value);
+                }
             }
         }
 

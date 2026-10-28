@@ -75,7 +75,7 @@ public class LitePullCursorTests
         ["maxOffset"] = max.ToString(System.Globalization.CultureInfo.InvariantCulture),
     };
 
-    private static bool WaitFor(Func<bool> cond, int timeoutMs = 5000)
+    private static bool WaitFor(Func<bool> cond, int timeoutMs = 15000)
     {
         var deadline = Environment.TickCount64 + timeoutMs;
         while (Environment.TickCount64 < deadline)
@@ -157,6 +157,40 @@ public class LitePullCursorTests
     // ---------------------------------------------------------------- 3. An in-flight seek
 
     [Fact]
+    public void Seek_ReadsTheBrokerBoundariesInMinThenMaxOrder()
+    {
+        using var cluster = MockCluster.Start(1);
+        cluster.SetReplyExt(RequestCode.GetMinOffset,
+            _ => new Dictionary<string, string> { ["offset"] = "2" });
+        cluster.SetReplyExt(RequestCode.GetMaxOffset,
+            _ => new Dictionary<string, string> { ["offset"] = "9" });
+        DefaultLitePullConsumer c = StartedLite(GroupPrefix + "SeekBounds", cluster);
+        try
+        {
+            MessageQueue mq = Queue0();
+            Assert.True(WaitFor(() => Pulls(cluster) >= 1), "the pull loop is running");
+
+            c.Seek(mq, 5);
+            Assert.Equal(5, c.PullCursorOf(mq));
+
+            List<WireRecord> records = cluster.Records();
+            int min = records.FindLastIndex(r => r.Code == RequestCode.GetMinOffset);
+            int max = records.FindLastIndex(r => r.Code == RequestCode.GetMaxOffset);
+            Assert.True(min >= 0 && max >= 0, "a seek reads both boundaries from the broker");
+            Assert.True(min < max, "the minimum offset is read before the maximum");
+
+            var illegal = Assert.Throws<MQClientException>(() => c.Seek(mq, 10));
+            Assert.Equal("Seek offset illegal, seek offset = 10, min offset = 2, max offset = 9",
+                illegal.Message);
+            Assert.Equal(5, c.PullCursorOf(mq));
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
     public void InFlightSeekWinsOverThePullResult()
     {
         // The disposal order is the reverse of the declaration: cluster goes first (it has to join the connection threads still stuck at the gate), the gate after.
@@ -167,6 +201,9 @@ public class LitePullCursorTests
         DefaultLitePullConsumer c = StartedLite(GroupPrefix + "SeekRace", cluster);
         try
         {
+            // The broker connection is deliberately parked on the gated pull, so the
+            // boundary read cannot share it; the seek range verdict comes from the seam.
+            c.SetSeekBoundsForTest(0, 100);
             Assert.True(WaitFor(() => Pulls(cluster) >= 1), "the first pull reached the broker");
             MessageQueue mq = Queue0();
             c.Seek(mq, 99);

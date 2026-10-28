@@ -14,6 +14,41 @@ public class LitePullTests
     private static void Eq(long expected, long actual, string because) =>
         Assert.True(actual == expected, $"expected {expected}, actual {actual}, because {because}");
 
+    private static bool WaitFor(Func<bool> cond, int timeoutMs = 15000)
+    {
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (cond()) return true;
+            Thread.Sleep(20);
+        }
+
+        return cond();
+    }
+
+    private static MessageExt Buffered(MessageQueue mq, long queueOffset) => new()
+    {
+        Topic = mq.Topic,
+        BrokerName = mq.BrokerName,
+        QueueId = mq.QueueId,
+        QueueOffset = queueOffset,
+        Body = new byte[8],
+    };
+
+    /// <summary>The last decoded heartbeat that mentions this consumer group, or null
+    /// when none has arrived yet.</summary>
+    private static HeartbeatData? LastHeartbeatFor(MockCluster cluster, string group)
+    {
+        foreach (WireRecord rec in cluster.Records().AsEnumerable().Reverse())
+        {
+            if (rec.Code != RequestCode.HeartBeat) continue;
+            if (!HeartbeatData.Decode(rec.Body, out HeartbeatData hb)) continue;
+            if (hb.ConsumerDataSet.Any(cd => cd.GroupName == group)) return hb;
+        }
+
+        return null;
+    }
+
     // ---------------------------------------------- Pure state behaviour before start
 
     [Fact]
@@ -96,26 +131,35 @@ public class LitePullTests
         // a timeout problem.
         Assert.Throws<MQClientException>(() => c.Poll(-1));
 
-        // Assigning for real and then starting is still the supported path; seek, pause
-        // and resume move local state only and stay allowed before start.
-        c.Subscribe("MyTopic", "TagA || TagB");
-        c.Assign(new[] { mq });
-        Assert.Single(c.Assignment());
-        Assert.Equal(3, c.Assignment()[0].QueueId);
-        c.Seek(mq, 42);
-        c.Pause(new[] { mq });
-        c.Resume(new[] { mq });
-        c.Subscribe("MyTopic", "TagC");
+        // Assigning for real and then starting is still the supported path; pause and
+        // resume move local state only and stay allowed before start. Seek needs a running
+        // consumer, so before start it reports that rather than pinning a cursor.
+        var assigned = new DefaultLitePullConsumer();
+        assigned.Assign(new[] { mq });
+        Assert.Single(assigned.Assignment());
+        Assert.Equal(3, assigned.Assignment()[0].QueueId);
+        assigned.Pause(new[] { mq });
+        Assert.True(assigned.IsPausedForTest(mq));
+        assigned.Resume(new[] { mq });
+        Assert.False(assigned.IsPausedForTest(mq));
+        var notRunning = Assert.Throws<MQClientException>(() => assigned.Seek(mq, 42));
+        Assert.Equal("The consumer not running, please start it first.", notRunning.Message);
+
+        // A subscribe consumer is a separate shape and can resubscribe its own topic.
+        var subscribed = new DefaultLitePullConsumer();
+        subscribed.Subscribe("MyTopic", "TagA || TagB");
+        subscribed.Subscribe("MyTopic", "TagC");
+        Assert.Throws<MQClientException>(() => subscribed.Assign(new[] { mq }));
 
         // Running: the timeout is the caller's to get right, and the assign expression
         // is a pre-start setting -- the broker already knows the old one.
-        c.SetAutoCommit(false);
-        c.MarkRunningForTest();
-        Assert.Throws<ArgumentException>(() => c.Poll(-1));
-        Assert.Throws<MQClientException>(() => c.SetSubExpressionForAssign("MyTopic", "TagA"));
-        Assert.Throws<MQClientException>(() => c.SetSubExpressionForAssign("MyTopic", "*"));
-        Assert.Empty(c.Poll(20));
-        Eq(-1L, c.Committed(mq), "a running consumer with no client answers -1, not an error");
+        assigned.SetAutoCommit(false);
+        assigned.MarkRunningForTest();
+        Assert.Throws<ArgumentException>(() => assigned.Poll(-1));
+        Assert.Throws<MQClientException>(() => assigned.SetSubExpressionForAssign("MyTopic", "TagA"));
+        Assert.Throws<MQClientException>(() => assigned.SetSubExpressionForAssign("MyTopic", "*"));
+        Assert.Empty(assigned.Poll(20));
+        Eq(-1L, assigned.Committed(mq), "a running consumer with no client answers -1, not an error");
     }
 
     // ---------------------------------------------- The three offset tables (read/write, overwrite and guards)
@@ -167,6 +211,7 @@ public class LitePullTests
         c.Commit(new[] { q0 }, persist: false);
         Eq(5L, c.Committed(q0), "Commit(Set) does not write -1 when there is no delivery record");
 
+        c.SetSeekBoundsForTest(0, 100);
         c.Seek(q0, 2);
         Assert.Equal(2L, c.PullCursorOf(q0));
         Eq(2L, c.ConsumeCursorOf(q0), "seek must also move the consumed cursor, otherwise a replayed range would be skipped by the old offset");
@@ -261,5 +306,264 @@ public class LitePullTests
         c.SetAutoCommitIntervalMillis(2500);
         c.SetAutoCommitIntervalMillis(500);
         Eq(2500, c.AutoCommitIntervalMillis, "a rejected setting leaves the accepted interval running");
+    }
+
+    // ---------------------------------------------------------------- delivery-shape contract
+
+    [Fact]
+    public void SubscribeAndAssign_FirstShapeWins_AndTheOtherIsRefused()
+    {
+        var mq = new MessageQueue("ModeTopic", "broker-a", 0);
+
+        var subscribeFirst = new DefaultLitePullConsumer("GID_LiteModeSubscribe");
+        subscribeFirst.Subscribe("ModeTopic", "TagA");
+        subscribeFirst.Subscribe("ModeTopic", "TagB");   // the same shape again is allowed
+        var afterAssign = Assert.Throws<MQClientException>(() => subscribeFirst.Assign(new[] { mq }));
+        Assert.Equal("Subscribe and assign are mutually exclusive.", afterAssign.Message);
+        var afterExpression = Assert.Throws<MQClientException>(
+            () => subscribeFirst.SetSubExpressionForAssign("ModeTopic", "TagC"));
+        Assert.Equal("Subscribe and assign are mutually exclusive.", afterExpression.Message);
+
+        var assignFirst = new DefaultLitePullConsumer("GID_LiteModeAssign");
+        assignFirst.Assign(new[] { mq });
+        assignFirst.Assign(new[] { mq });                          // the same shape again is allowed
+        assignFirst.SetSubExpressionForAssign("ModeTopic", "TagA"); // and so is this assign-setting call
+        var afterSubscribe = Assert.Throws<MQClientException>(
+            () => assignFirst.Subscribe("ModeTopic", "*"));
+        Assert.Equal("Subscribe and assign are mutually exclusive.", afterSubscribe.Message);
+    }
+
+    [Fact]
+    public void AssignModeHeartbeat_CarriesNoSubscriptionEntries()
+    {
+        using var cluster = MockCluster.Start(1);
+        var mq = new MessageQueue("ModeHeartbeatTopic", MockCluster.BrokerName(0), 0);
+        var c = new DefaultLitePullConsumer("GID_LiteHeartbeatAssign");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-hb-assign");
+        // Even with an assign expression recorded, the heartbeat must stay subscription-free.
+        c.SetSubExpressionForAssign(mq.Topic, "TagA");
+        c.Assign(new[] { mq });
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => LastHeartbeatFor(cluster, c.ConsumerGroup) is not null),
+                "the assigned consumer sends a heartbeat");
+            HeartbeatData heartbeat = LastHeartbeatFor(cluster, c.ConsumerGroup)!;
+            ConsumerData data = Assert.Single(heartbeat.ConsumerDataSet);
+            Assert.Equal(c.ConsumerGroup, data.GroupName);
+            Assert.Empty(data.SubscriptionDataSet);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void Seek_JudgeMembershipBeforeRunning_AndUseTheModeSpecificMessage()
+    {
+        var mq = new MessageQueue("SeekTopic", "broker-a", 0);
+        var stranger = new MessageQueue("SeekTopic", "broker-a", 7);
+
+        var subscribeMode = new DefaultLitePullConsumer("GID_LiteSeekSubscribe");
+        subscribeMode.Subscribe("SeekTopic", "*");
+        // Not running at all, yet the membership verdict comes first.
+        var subscribeError = Assert.Throws<MQClientException>(() => subscribeMode.Seek(stranger, 0));
+        Assert.Equal("The message queue is not in assigned list, may be rebalancing, message queue: "
+                     + stranger, subscribeError.Message);
+
+        var assignMode = new DefaultLitePullConsumer("GID_LiteSeekAssign");
+        assignMode.Assign(new[] { mq });
+        var assignError = Assert.Throws<MQClientException>(() => assignMode.Seek(stranger, 0));
+        Assert.Equal("The message queue is not in assigned list, message queue: " + stranger,
+            assignError.Message);
+
+        // The queue is held, so the running guard is the next one.
+        var notRunning = Assert.Throws<MQClientException>(() => assignMode.Seek(mq, 0));
+        Assert.Equal("The consumer not running, please start it first.", notRunning.Message);
+    }
+
+    [Fact]
+    public void Seek_OutOfRangeReportsAllThreeNumbers_AndLeavesTheCursorUntouched()
+    {
+        var mq = new MessageQueue("SeekRangeTopic", "broker-a", 0);
+        var c = new DefaultLitePullConsumer("GID_LiteSeekRange");
+        c.Assign(new[] { mq });
+        c.MarkRunningForTest();
+        c.SetSeekBoundsForTest(10, 20);
+
+        var below = Assert.Throws<MQClientException>(() => c.Seek(mq, 5));
+        Assert.Equal("Seek offset illegal, seek offset = 5, min offset = 10, max offset = 20",
+            below.Message);
+        Eq(-1L, c.PullCursorOf(mq), "a refused seek pins nothing");
+
+        c.Seek(mq, 15);
+        Eq(15L, c.PullCursorOf(mq), "the accepted seek moves the pull cursor");
+
+        var above = Assert.Throws<MQClientException>(() => c.Seek(mq, 21));
+        Assert.Equal("Seek offset illegal, seek offset = 21, min offset = 10, max offset = 20",
+            above.Message);
+        Eq(15L, c.PullCursorOf(mq), "a refused seek leaves the pull cursor untouched");
+        Eq(15L, c.ConsumeCursorOf(mq), "and the consume cursor too");
+    }
+
+    [Fact]
+    public void Seek_BoundaryReadFailureSurfacesAnError_AndDoesNotPinMinusOne()
+    {
+        var mq = new MessageQueue("SeekFailureTopic", "broker-a", 0);
+        var c = new DefaultLitePullConsumer("GID_LiteSeekFailure");
+        c.Assign(new[] { mq });
+        c.MarkRunningForTest();
+
+        // No client and no test bounds: the boundary read cannot complete.
+        Assert.Throws<MQClientException>(() => c.Seek(mq, 0));
+        Eq(-1L, c.PullCursorOf(mq), "a failed boundary read must not pin -1 as a seek offset");
+    }
+
+    [Fact]
+    public void Committed_ThrowsOnFailedBrokerRead_WhileQueryNotFoundStaysMinusOne()
+    {
+        var mq = new MessageQueue("CommitTopic", MockCluster.BrokerName(0), 0);
+
+        using (var failing = MockCluster.Start(1))
+        {
+            failing.SetReplyCode(RequestCode.QueryConsumerOffset, ResponseCode.SystemError,
+                "offset store down");
+            var c = new DefaultLitePullConsumer("GID_LiteCommittedFail");
+            c.SetNamesrvAddr(failing.NamesrvAddr);
+            c.SetInstanceName("lite-committed-fail");
+            c.SetAutoCommit(false);
+            c.Assign(new[] { mq });
+            c.Start();
+            try
+            {
+                var ex = Assert.Throws<MQClientException>(() => c.Committed(mq));
+                Assert.Equal("Fetch consume offset from broker exception", ex.Message);
+            }
+            finally
+            {
+                c.Shutdown();
+            }
+        }
+
+        using (var missing = MockCluster.Start(1))
+        {
+            missing.SetReplyCode(RequestCode.QueryConsumerOffset, ResponseCode.QueryNotFound);
+            var c = new DefaultLitePullConsumer("GID_LiteCommittedMissing");
+            c.SetNamesrvAddr(missing.NamesrvAddr);
+            c.SetInstanceName("lite-committed-missing");
+            c.SetAutoCommit(false);
+            c.Assign(new[] { mq });
+            c.Start();
+            try
+            {
+                Eq(-1L, c.Committed(mq), "QUERY_NOT_FOUND is the only answer that means -1");
+            }
+            finally
+            {
+                c.Shutdown();
+            }
+        }
+    }
+
+    [Fact]
+    public void AssignNarrowing_DropsPausedParkedCursorsSeekAndBufferedState()
+    {
+        var q0 = new MessageQueue("ShrinkTopic", "broker-a", 0);
+        var q1 = new MessageQueue("ShrinkTopic", "broker-a", 1);
+        var c = new DefaultLitePullConsumer("GID_LiteShrink");
+        c.Assign(new[] { q0, q1 });
+        c.SetAutoCommit(false);
+        c.MarkRunningForTest();
+        c.SetSeekBoundsForTest(0, 100);
+        c.PullThresholdForAll = int.MaxValue;
+        c.PullThresholdForQueue = 1;
+        c.PullThresholdSizeForQueue = int.MaxValue;
+        c.ConsumeMaxSpan = long.MaxValue;
+
+        c.Seek(q0, 10);
+        c.AppendToLocalBufferForTest(new[] { Buffered(q0, 10), Buffered(q0, 11) });
+        c.Pause(new[] { q0 });
+        Assert.True(c.CacheFlowControlHitForTest(q0), "the cached rows park the queue");
+        Assert.True(c.PullParkRemainingMillis(q0) > 0, "the queue really holds a park deadline");
+
+        c.Assign(new[] { q1 });
+
+        Eq(-1L, c.PullCursorOf(q0), "the pull cursor went with the revoked queue");
+        Eq(-1L, c.ConsumeCursorOf(q0), "and the consume cursor too");
+        Assert.False(c.IsPausedForTest(q0), "the paused flag went with the queue");
+        Eq(DefaultLitePullConsumer.NoPullPause, c.LastPullPauseMillis(q0),
+            "the parked deadline went with the queue");
+        Eq(0, c.CachedMessageCountOf(q0), "the buffered rows went with the queue");
+        Eq(0, c.PendingPullRoundsOf(q0), "and its cache accumulator too");
+        Eq(0, c.CachedMessageCount, "the shared buffer holds nothing of it any more");
+
+        // Coming back must start from a clean state: the old seek pin is not resurrected.
+        c.Assign(new[] { q0, q1 });
+        Eq(-1L, c.PullCursorOf(q0), "the revoked seek offset did not come back with the queue");
+    }
+
+    [Fact]
+    public void Unsubscribe_DropsTheTopicsAssignedQueuesWithoutWaitingForRebalance()
+    {
+        using var cluster = MockCluster.Start(1);
+        var c = new DefaultLitePullConsumer("GID_LiteUnsubscribe");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-unsubscribe");
+        c.SetAutoCommit(false);
+        c.Subscribe("UnsubTopic", "*");
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => c.Assignment().Count > 0, 8000),
+                "the subscribe-mode rebalance assigned the topic's queue");
+            MessageQueue mq = c.Assignment()[0];
+            c.Pause(new[] { mq });
+            Assert.True(c.IsPausedForTest(mq));
+
+            c.Unsubscribe("UnsubTopic");
+
+            Assert.Empty(c.Assignment());
+            Assert.False(c.IsPausedForTest(mq), "the paused flag was dropped immediately");
+            Eq(-1L, c.PullCursorOf(mq), "the cursors were dropped immediately");
+
+            // The subscription table is gone too, so the next rebalance cannot hand the
+            // topic back (the loop runs every second).
+            Thread.Sleep(1200);
+            Assert.Empty(c.Assignment());
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void AssignModeLitePull_CarriesTheAssignExpressionWithTagVersionZero()
+    {
+        using var cluster = MockCluster.Start(1);
+        var mq = new MessageQueue("LiteTagVersionTopic", MockCluster.BrokerName(0), 0);
+        var c = new DefaultLitePullConsumer("GID_LiteTagVersion");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-tag-version");
+        c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+        c.SetAutoCommit(false);
+        c.SetSubExpressionForAssign(mq.Topic, "TagA");
+        c.Assign(new[] { mq });
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.LitePullMessage) > 0),
+                "the assigned queue is pulled");
+            WireRecord pull = cluster.Records().Last(r => r.Code == RequestCode.LitePullMessage);
+            Assert.Equal(ExpressionType.TAG, pull.Ext["expressionType"]);
+            Assert.Equal("TagA", pull.Ext["subscription"]);
+            Assert.Equal("0", pull.Ext["subVersion"]);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
     }
 }

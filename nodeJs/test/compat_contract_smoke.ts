@@ -140,11 +140,17 @@ function nearbyMQs(): MessageQueue[] {
   };
 
   // seek() itself gates on started (validating the service state), and so do both
-  // wrappers — nothing moves before start.
+  // wrappers — nothing moves before start. The queue must also be one this
+  // consumer holds: a cursor for a stranger would never be honoured by a round.
   await assert.rejects(() => c.seekToBegin(mq), /not running/);
   await assert.rejects(() => c.seekToEnd(mq), /not running/);
   assert.strictEqual(c.pullCursor.get(mqKey(mq)), undefined);
 
+  c.assign([mq]);
+  await assert.rejects(() => c.seek(mq, 7), /not running/,
+    'a stopped consumer refuses a seek even for a held queue');
+  await assert.rejects(() => c.seek(new MessageQueue('SeekTopic', 'broker-a', 1), 7),
+    /not in assigned list/, 'a queue this consumer does not hold is refused');
   c.started = true;
   await c.seekToBegin(mq);
   assert.strictEqual(c.pullCursor.get(mqKey(mq)), 7, 'seekToBegin pins the cursor at minOffset');

@@ -642,9 +642,10 @@ func TestLiteFlowControlAggregateChargesAFullBatchPerPendingRound(t *testing.T) 
 	}
 }
 
-// Revoking a queue retires its pending rounds from the whole-buffer budget, exactly
-// as the cached pull requests of that queue leave it: the messages it left behind
-// stay pollable, but they no longer reserve capacity or refuse a round.
+// Revoking a queue retires its pending rounds from the whole-buffer budget AND the
+// messages they left behind: a queue this consumer handed back must not stay
+// deliverable, so nothing of it keeps reserving capacity, refusing a round or
+// waiting to be polled.
 func TestLiteFlowControlRevokedQueueLeavesTheAggregateBudget(t *testing.T) {
 	c := liteFCConsumer(t, "GID_lite_fc_aggregate_revoke")
 	c.SetPullBatchSize(10)
@@ -667,8 +668,8 @@ func TestLiteFlowControlRevokedQueueLeavesTheAggregateBudget(t *testing.T) {
 	if c.flowControlHit(orphan) {
 		t.Errorf("the revoked queue was still refused: its stale rounds weigh on the whole-buffer budget")
 	}
-	if got := c.BufferedMessageCount(); got != 2 {
-		t.Errorf("retiring the queue's rounds left %d messages in the buffer, want the 2 kept for the application", got)
+	if got := c.BufferedMessageCount(); got != 0 {
+		t.Errorf("retiring the queue left %d of its messages in the buffer, want none", got)
 	}
 	if all, cache, span := liteFCTrips(c); all != 1 || cache != 0 || span != 0 {
 		t.Errorf("the round after the revoke ticked (%d, %d, %d), want only the refusal before it", all, cache, span)
@@ -785,9 +786,10 @@ func TestLiteFlowControlWarnCadenceUsesTheExposedCounter(t *testing.T) {
 
 // ---------------------------------------------------------------- accumulator lifetime
 
-// A queue this consumer no longer owns loses its accumulator: a leftover count for
-// a queue nobody holds must never refuse a pull, and its pause window goes with
-// it. The messages it left in the buffer stay for the application.
+// A queue this consumer no longer owns leaves nothing behind: a leftover count for
+// a queue nobody holds must never refuse a pull, its pause window goes with it, and
+// so do the rows it left in the buffer — Poll would otherwise hand out messages
+// from a queue the consumer has already given up.
 func TestLiteFlowControlRevokedQueueLosesItsAccumulator(t *testing.T) {
 	c := liteFCConsumer(t, "GID_lite_fc_revoke")
 	c.SetPullThresholdForQueue(2)
@@ -810,8 +812,9 @@ func TestLiteFlowControlRevokedQueueLosesItsAccumulator(t *testing.T) {
 	if got := c.PullPauseMillisOf(mq); got != 0 {
 		t.Errorf("the revoked queue kept its pause window of %d ms", got)
 	}
-	if got := c.BufferedMessageCount(); got != 3 {
-		t.Errorf("revoking a queue left %d messages in the buffer, want all 3 kept for the application", got)
+	if got := c.BufferedMessageCount(); got != 0 {
+		t.Errorf("revoking a queue left %d of its messages in the buffer, want none: "+
+			"Poll must never hand out a queue the consumer no longer holds", got)
 	}
 	if got := c.FlowControlCacheTriggered(); got != 1 {
 		t.Errorf("the allowed round after the revoke ticked the counter to %d, want it frozen at 1", got)
@@ -824,7 +827,13 @@ func TestLiteFlowControlRevokedQueueLosesItsAccumulator(t *testing.T) {
 // too: pruning takes the queue's OLDEST messages out of its OLDEST rounds, so a
 // round only stops counting once its last message is gone.
 func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
-	c := liteFCConsumer(t, "GID_lite_fc_seek")
+	// A holdable queue and a real offset range: Seek only moves a cursor the
+	// consumer can honour, so the fixture owns the queue and the broker reports
+	// offsets 0..6. The queue stays paused so the background loop never swaps the
+	// staged batch for a fetched one.
+	f := newClusterFixture(t, map[string]int{liteFCTopic: 1})
+	c, _ := liteFCStaged(t, f, "GID_lite_fc_seek", liteFCTopic, 0)
+	f.broker.add(liteFCTopic, 0, "a0", "a1", "a2", "a3", "a4", "a5")
 	liteFCSetBudgets(c, liteFCOff, liteFCOff, liteFCOff, 4)
 	mq := liteFCQueue(0)
 	liteFCStage(c, liteFCMsgs(0, 6, 16)...)
@@ -836,7 +845,7 @@ func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 		t.Fatalf("one round of 6 cached messages reads %d pending rounds, want 1", got.rounds)
 	}
 
-	c.Seek(mq, 4)
+	requireNoError(t, "Seek(4)", c.Seek(mq, 4))
 	stats := c.cacheStatsOf(mq)
 	if stats.count != 2 || stats.minOffset != 4 || stats.maxOffset != 5 || stats.span != 1 {
 		t.Errorf("after Seek(4) the queue reads %+v, want the 2 messages spanning 4..5", stats)
@@ -855,7 +864,7 @@ func TestLitePullSeekKeepsTheBacklogAccountingHonest(t *testing.T) {
 
 	// Rewinding below everything keeps the accounting untouched, and a re-fetched
 	// lower offset must extend the span rather than drive it negative.
-	c.Seek(mq, 0)
+	requireNoError(t, "Seek(0)", c.Seek(mq, 0))
 	if got := c.cacheStatsOf(mq); got.count != 2 || got.span != 1 || got.rounds != 1 {
 		t.Errorf("Seek back to 0 reads %+v, want the 2 cached messages and their round untouched", got)
 	}

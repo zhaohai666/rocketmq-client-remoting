@@ -4864,6 +4864,15 @@ class _LiteQueueCache:
             self.max_offset = max(self.offsets)
 
 
+# The lite consumer is in exactly one of these modes for its whole life. A call that
+# would switch it is refused: subscribe mode and assign mode build different
+# subscription tables, pull targets and heartbeats, so a mid-flight switch would
+# leave the running halves describing two different consumers.
+_LITE_MODE_NONE = 0
+_LITE_MODE_SUBSCRIBE = 1
+_LITE_MODE_ASSIGN = 2
+
+
 class DefaultLitePullConsumer:
     """Lite pull consumer.
 
@@ -4927,7 +4936,7 @@ class DefaultLitePullConsumer:
         self.subscription_expr_type: Dict[str, str] = {}
         # assign mode: the tag filter expression when the caller explicitly specifies queues (passed through to pull)
         self._assign_sub_expr: Dict[str, str] = {}
-        self._assign_mode = False
+        self._mode = _LITE_MODE_NONE
         self._assigned: Set[MessageQueue] = set()
 
         # The rebalance algorithm (subscribe mode)
@@ -5223,7 +5232,7 @@ class DefaultLitePullConsumer:
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
         if not topic or not topic.strip():
             raise ValueError("Topic can not be null or empty.")
-        self._assign_mode = False
+        self._claim_mode(_LITE_MODE_SUBSCRIBE)
         ns = self._with_namespace(topic)
         self.subscription[ns] = sub_expression
         self.subscription_expr_type[ns] = ExpressionType.TAG
@@ -5245,7 +5254,7 @@ class DefaultLitePullConsumer:
         expression = getattr(selector, "expression", None)
         if not expression:
             raise ValueError("Expression can't be null! %s" % selector_type)
-        self._assign_mode = False
+        self._claim_mode(_LITE_MODE_SUBSCRIBE)
         ns = self._with_namespace(topic)
         self.subscription[ns] = expression
         self.subscription_expr_type[ns] = selector_type
@@ -5256,10 +5265,25 @@ class DefaultLitePullConsumer:
         self.subscription_data[ns] = sub
 
     def unsubscribe(self, topic: str) -> None:
+        if not topic or not topic.strip():
+            return
         ns = self._with_namespace(topic)
         self.subscription.pop(ns, None)
-        self.subscription_data.pop(ns, None)
         self.subscription_expr_type.pop(ns, None)
+        # The assign expression table is not a rebalance subscription: an unsubscribe
+        # revokes the topic's queues and their state, not the caller's assign filter.
+        if ns not in self._assign_sub_expr:
+            self.subscription_data.pop(ns, None)
+        # The topic's queues leave with it immediately, instead of waiting for the next
+        # rebalance: their cursors, seek pin, paused flag and buffered rows all go with them.
+        revoked = [mq for mq in self._assigned if mq.topic == ns]
+        if revoked:
+            self._assigned -= set(revoked)
+            for mq in revoked:
+                self._next_offset.pop(mq, None)
+                self._consume_offset.pop(mq, None)
+                self._seek_offset.pop(mq, None)
+                self._drop_queue_cache(mq)
 
     def set_sub_expression_for_assign(self, topic: str, sub_expression: str) -> None:
         """Specify a tag filter expression for a topic's queues in assign mode (setSubExpressionForAssign).
@@ -5274,6 +5298,7 @@ class DefaultLitePullConsumer:
             raise MQClientException("set_sub_expression_for_assign only can be called before start.")
         if not topic or not topic.strip():
             raise ValueError("Topic can not be null or empty.")
+        self._claim_mode(_LITE_MODE_ASSIGN)
         ns = self._with_namespace(topic)
         self._assign_sub_expr[ns] = sub_expression
         try:
@@ -5286,15 +5311,17 @@ class DefaultLitePullConsumer:
         # consumer holds, which is exactly what a route lookup that returned nothing does by accident.
         if not message_queues:
             raise ValueError("Message queues can not be null or empty.")
-        self._assign_mode = True
+        self._claim_mode(_LITE_MODE_ASSIGN)
         queues = set(message_queues)
         # Reassigning drops the revoked queues along with their whole per-queue state
-        # (the pull cursor, the consumed cursor and the buffer accumulator disappear together). It does **not** touch the in-memory offset table
+        # (the pull cursor, the consumed cursor, the seek pin and the buffer accumulator
+        # disappear together). It does **not** touch the in-memory offset table
         # -- that cleanup hangs off the rebalance step that releases a no-longer-needed queue,
         # and assign mode does not go through rebalance, so persist does not happen here either.
         for mq in self._assigned - queues:
             self._next_offset.pop(mq, None)
             self._consume_offset.pop(mq, None)
+            self._seek_offset.pop(mq, None)
             self._drop_queue_cache(mq)
         self._assigned = queues
         for mq in self._assigned:
@@ -5329,7 +5356,7 @@ class DefaultLitePullConsumer:
                 % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
-        if not self.subscription and not self._assign_mode:
+        if not self.subscription and self._mode != _LITE_MODE_ASSIGN:
             raise MQClientException("subscription is not set, call subscribe() or assign() first")
         # Unconditionally validated at startup:
         # the loop below resolving initial offsets swallows exceptions; throwing late would be a silent degradation to consuming from max offset.
@@ -5362,7 +5389,7 @@ class DefaultLitePullConsumer:
             manager.unregister_client(self.client_id, self._mq_client)
             raise
         # assign mode resolves initial offsets at start
-        if self._assign_mode:
+        if self._mode == _LITE_MODE_ASSIGN:
             for mq in list(self._assigned):
                 if mq not in self._next_offset:
                     try:
@@ -5446,8 +5473,13 @@ class DefaultLitePullConsumer:
         # Writing PASSIVELY would misalign both.
         # See the same-named comment on the push consumer's _build_heartbeat
         cd.unit_mode = self.unit_mode
-        for sub in self.subscription_data.values():
-            cd.subscription_data_set.add(sub)
+        # Only rebalance subscriptions are announced. An assign-mode expression filters
+        # the queues this instance was handed; advertising it would make the broker treat
+        # the group as a subscriber of the whole topic.
+        for topic in self.subscription:
+            sub = self.subscription_data.get(topic)
+            if sub is not None:
+                cd.subscription_data_set.add(sub)
         hb.consumer_data_set.add(cd)
         return hb
 
@@ -5498,7 +5530,7 @@ class DefaultLitePullConsumer:
         while self._running:
             try:
                 now = time.time() * 1000.0
-                if not self._assign_mode and (self._last_rebalance_ts == 0
+                if self._mode != _LITE_MODE_ASSIGN and (self._last_rebalance_ts == 0
                                              or (now - self._last_rebalance_ts) > 1000):
                     self._rebalance()
                     self._last_rebalance_ts = now
@@ -5565,6 +5597,14 @@ class DefaultLitePullConsumer:
         # The expression type that goes on the wire must match the subscription data the heartbeat
         # registered; an unknown topic (assign mode without an explicit expression) keeps tag semantics.
         exp_type = self.subscription_expr_type.get(mq.topic, ExpressionType.TAG)
+        # A TAG subscription carries no version on the wire -- the tag string is the whole
+        # filter. A broker-evaluated expression (SQL92 / class filter) is compiled once per
+        # version, so the pull repeats the version the heartbeat registered for this topic.
+        sub_version = 0
+        if exp_type != ExpressionType.TAG:
+            stored_sub = self.subscription_data.get(mq.topic)
+            if stored_sub is not None:
+                sub_version = stored_sub.sub_version
         # Short poll (suspend=False), with offsets committed separately by auto-commit, not carried along on the pull request.
         # lite_pull=True sets FLAG_LITE_PULL_MESSAGE (buildSysFlag(false, block, true, false, true)),
         # and that flag decides the request code switches to LITE_PULL_MESSAGE(361): the broker distinguishes pull-mode subscription semantics by this code,
@@ -5575,7 +5615,7 @@ class DefaultLitePullConsumer:
         try:
             result = self._mq_client.pull_message(
                 self.consumer_group, mq, offset, self.pull_batch_size,
-                sys_flag, 0, sub, 0, exp_type,
+                sys_flag, 0, sub, sub_version, exp_type,
                 timeout_millis=30000, max_msg_bytes=-1,
                 suspend_timeout_millis=15000)
         except MQBrokerException as e:
@@ -5778,10 +5818,19 @@ class DefaultLitePullConsumer:
 
     def _drop_queue_cache(self, mq: MessageQueue) -> None:
         """Forget a revoked queue's cache state: the accumulator goes with the assignment it described,
-        and so does its parking time (a queue this instance no longer owns may never be refused)."""
+        so do its parking time and paused flag (a queue this instance no longer owns may never be
+        refused or skipped), and so do the rows it left in the buffer -- ``poll`` must never hand out
+        a queue the consumer has already given up."""
         with self._buffer_cond:
             self._queue_cache.pop(mq, None)
             self._pull_not_before.pop(mq, None)
+            self._paused.discard(mq)
+            kept: List[MessageExt] = []
+            for m in self._local_buffer:
+                if not (m.topic == mq.topic and m.broker_name == mq.broker_name
+                        and m.queue_id == mq.queue_id):
+                    kept.append(m)
+            self._local_buffer = deque(kept)
 
     def _enqueue(self, msgs: List[MessageExt]) -> None:
         with self._buffer_cond:
@@ -5944,6 +5993,22 @@ class DefaultLitePullConsumer:
         return out
 
     def seek(self, mq: MessageQueue, offset: int) -> None:
+        # A queue this consumer does not hold is refused first: writing a cursor for it
+        # would leave an entry nothing pulls, so the caller would watch an offset change
+        # that no round ever honours.
+        if mq not in self._assigned:
+            if self._mode == _LITE_MODE_SUBSCRIBE:
+                raise MQClientException(
+                    "The message queue is not in assigned list, may be rebalancing, message queue: %s" % mq)
+            raise MQClientException(
+                "The message queue is not in assigned list, message queue: %s" % mq)
+        self._require_running()
+        min_offset = self._mq_client.get_min_offset(mq)
+        max_offset = self._mq_client.get_max_offset(mq)
+        if offset < min_offset or offset > max_offset:
+            raise MQClientException(
+                "Seek offset illegal, seek offset = %d, min offset = %d, max offset = %d"
+                % (offset, min_offset, max_offset))
         self._seek_offset[mq] = offset
         self._next_offset[mq] = offset
         self._consume_offset[mq] = offset
@@ -5965,9 +6030,11 @@ class DefaultLitePullConsumer:
                     stat.remove(m)
 
     def seek_to_begin(self, mq: MessageQueue) -> None:
+        self._require_running()
         self.seek(mq, self._mq_client.get_min_offset(mq))
 
     def seek_to_end(self, mq: MessageQueue) -> None:
+        self._require_running()
         self.seek(mq, self._mq_client.get_max_offset(mq))
 
     def pull_cursor_of(self, mq: MessageQueue) -> int:
@@ -6081,6 +6148,23 @@ class DefaultLitePullConsumer:
 
     def assignment(self) -> List[MessageQueue]:
         return list(self._assigned)
+
+    def is_assign_mode(self) -> bool:
+        return self._mode == _LITE_MODE_ASSIGN
+
+    def _require_running(self) -> None:
+        if not self._started or self._mq_client is None:
+            raise MQClientException("The consumer not running, please start it first.")
+
+    def _claim_mode(self, mode: int) -> None:
+        """Pin this consumer's mode on first use and refuse any later call that would
+        switch it: the running halves (subscription table, pull targets, heartbeat)
+        would otherwise describe two different consumers at once."""
+        if self._mode == _LITE_MODE_NONE:
+            self._mode = mode
+            return
+        if self._mode != mode:
+            raise MQClientException("Subscribe and assign are mutually exclusive.")
 
     def fetch_message_queues(self, topic: str) -> List[MessageQueue]:
         return self._fetch_message_queues_by_full_name(self._with_namespace(topic))

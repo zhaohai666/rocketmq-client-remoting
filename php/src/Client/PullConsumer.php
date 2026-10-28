@@ -925,7 +925,16 @@ final class DefaultLitePullConsumer
     public array $subscriptionData = [];
     /** Tag filter expression for the specified topic in assign mode. */
     private array $assignSubExpr = [];
-    private bool $assignMode = false;
+    /**
+     * The lite consumer is in exactly one of these modes for its whole life. A call that would
+     * switch it is refused: subscribe mode and assign mode build different subscription tables,
+     * pull targets and heartbeats, so a mid-flight switch would leave the running halves
+     * describing two different consumers.
+     */
+    private const MODE_NONE = 0;
+    private const MODE_SUBSCRIBE = 1;
+    private const MODE_ASSIGN = 2;
+    private int $mode = self::MODE_NONE;
     /** @var array<string,MessageQueue> Assigned queues (key = mqKey) */
     private array $assigned = [];
 
@@ -1311,7 +1320,7 @@ final class DefaultLitePullConsumer
         if (trim($topic) === '') {
             throw new \InvalidArgumentException('Topic can not be null or empty.');
         }
-        $this->assignMode = false;
+        $this->claimMode(self::MODE_SUBSCRIBE);
         $ns = $this->withNamespace($topic);
         $this->subscription[$ns] = $subExpression;
         // Build SubscriptionData synchronously so the heartbeat registers the tag subscription with the broker.
@@ -1322,10 +1331,29 @@ final class DefaultLitePullConsumer
         }
     }
 
+    /**
+     * Drops a topic's subscription AND the queues this instance holds for it. A queue left behind
+     * would keep being pulled for a topic the caller has just left -- until a rebalance hands it
+     * away in subscribe mode, and forever in assign mode, where nothing ever would.
+     */
     public function unsubscribe(string $topic): void
     {
+        if (trim($topic) === '') {
+            return;
+        }
         $ns = $this->withNamespace($topic);
-        unset($this->subscription[$ns], $this->subscriptionData[$ns]);
+        unset($this->subscription[$ns]);
+        if (!isset($this->assignSubExpr[$ns])) {
+            unset($this->subscriptionData[$ns]);
+        }
+        foreach ($this->assigned as $key => $mq) {
+            if ($mq->topic !== $ns) {
+                continue;
+            }
+            unset($this->assigned[$key], $this->nextOffset[$key], $this->consumeOffset[$key],
+                $this->seekOffset[$key]);
+            $this->dropQueueCache($key);
+        }
     }
 
     public function setSubExpressionForAssign(string $topic, string $subExpression): void
@@ -1339,6 +1367,7 @@ final class DefaultLitePullConsumer
         if (trim($topic) === '') {
             throw new \InvalidArgumentException('Topic can not be null or empty.');
         }
+        $this->claimMode(self::MODE_ASSIGN);
         $ns = $this->withNamespace($topic);
         $this->assignSubExpr[$ns] = $subExpression;
         try {
@@ -1355,7 +1384,7 @@ final class DefaultLitePullConsumer
      */
     public function subscribeWithSelector(string $topic, MessageSelector $selector): void
     {
-        $this->assignMode = false;
+        $this->claimMode(self::MODE_SUBSCRIBE);
         $ns = $this->withNamespace($topic);
         $sub = build_selector_subscription_data($ns, $selector);
         $this->subscription[$ns] = $sub->subString ?? '*';
@@ -1371,6 +1400,7 @@ final class DefaultLitePullConsumer
         if (trim($topic) === '') {
             throw new \InvalidArgumentException('Topic can not be null or empty.');
         }
+        $this->claimMode(self::MODE_ASSIGN);
         $ns = $this->withNamespace($topic);
         $sub = build_selector_subscription_data($ns, $selector);
         $this->assignSubExpr[$ns] = $sub->subString ?? '*';
@@ -1387,14 +1417,14 @@ final class DefaultLitePullConsumer
         if ($messageQueues === []) {
             throw new \InvalidArgumentException('Message queues can not be null or empty.');
         }
-        $this->assignMode = true;
+        $this->claimMode(self::MODE_ASSIGN);
         $queues = [];
         foreach ($messageQueues as $mq) {
             $queues[self::mqKey($mq)] = $mq;
         }
         foreach (array_keys($this->assigned) as $key) {
             if (!isset($queues[$key])) {
-                unset($this->nextOffset[$key], $this->consumeOffset[$key]);
+                unset($this->nextOffset[$key], $this->consumeOffset[$key], $this->seekOffset[$key]);
                 // A queue taken out of the assignment loses its cache, its accumulators and its
                 // armed pauses in one step, so nothing stale can refuse a later pull round.
                 $this->dropQueueCache($key);
@@ -1429,7 +1459,7 @@ final class DefaultLitePullConsumer
         if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
             throw new MQClientException('name server address is not set');
         }
-        if ($this->subscription === [] && !$this->assignMode) {
+        if ($this->subscription === [] && $this->mode !== self::MODE_ASSIGN) {
             throw new MQClientException('subscription is not set, call subscribe() or assign() first');
         }
         if (!isset($this->allocateMessageQueueStrategy)) {
@@ -1465,7 +1495,7 @@ final class DefaultLitePullConsumer
         }
         $this->mqClient->start();
         // assign mode resolves initial offsets at start.
-        if ($this->assignMode) {
+        if ($this->mode === self::MODE_ASSIGN) {
             foreach (array_keys($this->assigned) as $key) {
                 if (!isset($this->nextOffset[$key])) {
                     try {
@@ -1559,8 +1589,13 @@ final class DefaultLitePullConsumer
             $this->consumeFromWhere,
         );
         $cd->unitMode = $this->unitMode;
-        foreach ($this->subscriptionData as $sub) {
-            $cd->subscriptionDataSet[] = $sub;
+        // Only rebalance subscriptions are announced. An assign-mode expression filters the queues
+        // this instance was handed; advertising it would make the broker treat the group as a
+        // subscriber of the whole topic.
+        foreach (array_keys($this->subscription) as $topic) {
+            if (isset($this->subscriptionData[$topic])) {
+                $cd->subscriptionDataSet[] = $this->subscriptionData[$topic];
+            }
         }
         $hb->consumerDataSet[] = $cd;
         return $hb;
@@ -1603,7 +1638,7 @@ final class DefaultLitePullConsumer
                 Logger::debug('lite heartbeat loop error');
             }
         }
-        if (!$this->assignMode && ($this->lastRebalanceTs === 0.0 || ($now - $this->lastRebalanceTs) > 1.0)) {
+        if ($this->mode !== self::MODE_ASSIGN && ($this->lastRebalanceTs === 0.0 || ($now - $this->lastRebalanceTs) > 1.0)) {
             $this->rebalance();
             $this->lastRebalanceTs = $now;
         }
@@ -1873,10 +1908,10 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * Drop one queue's cache with the queue: its messages leave the buffer and its accumulators
-     * and armed pauses leave with them, in the same step. Re-assigning that queue later therefore
-     * starts from an empty cache instead of from a stale record, and a queue this consumer no
-     * longer owns can never refuse a pull.
+     * Drop one queue's cache with the queue: its messages leave the buffer and its accumulators,
+     * armed pauses and paused flag leave with them, in the same step. Re-assigning that queue later
+     * therefore starts from an empty cache instead of from a stale record, and a queue this consumer
+     * no longer owns can neither refuse a pull nor be skipped by one.
      */
     private function dropQueueCache(string $key): void
     {
@@ -1884,7 +1919,11 @@ final class DefaultLitePullConsumer
             $this->bufferRetain(static fn(MessageExt $m): bool => self::messageCacheKey($m) !== $key);
             unset($this->queueCache[$key]);
         }
-        unset($this->cacheFlowControlUntil[$key], $this->pullIdleUntil[$key]);
+        unset(
+            $this->cacheFlowControlUntil[$key],
+            $this->pullIdleUntil[$key],
+            $this->paused[$key],
+        );
     }
 
     /**
@@ -2218,10 +2257,31 @@ final class DefaultLitePullConsumer
         return $out;
     }
 
-    /** seek: dial all three cursors back together and drop buffered messages below the new offset. */
+    /**
+     * seek: dial all three cursors back together and drop buffered messages below the new offset.
+     *
+     * A queue this consumer does not hold is refused first -- writing a cursor for it would leave
+     * an entry nothing pulls, so the caller would watch an offset change that no round ever
+     * honours -- and the offset is then held to the queue's own [minOffset, maxOffset] range.
+     */
     public function seek(MessageQueue $mq, int $offset): void
     {
         $key = self::mqKey($mq);
+        if (!isset($this->assigned[$key])) {
+            if ($this->mode !== self::MODE_ASSIGN) {
+                throw new MQClientException(
+                    'The message queue is not in assigned list, may be rebalancing, message queue: ' . $mq);
+            }
+            throw new MQClientException('The message queue is not in assigned list, message queue: ' . $mq);
+        }
+        $client = $this->requireClient();
+        $minOffset = $client->getMinOffset($mq);
+        $maxOffset = $client->getMaxOffset($mq);
+        if ($offset < $minOffset || $offset > $maxOffset) {
+            throw new MQClientException(sprintf(
+                'Seek offset illegal, seek offset = %d, min offset = %d, max offset = %d',
+                $offset, $minOffset, $maxOffset));
+        }
         $this->seekOffset[$key] = $offset;
         $this->nextOffset[$key] = $offset;
         $this->consumeOffset[$key] = $offset;
@@ -2263,12 +2323,15 @@ final class DefaultLitePullConsumer
 
     public function committed(MessageQueue $mq): ?int
     {
+        // The running check comes first: the in-memory table belongs to a session,
+        // and a consumer that never started has no committed offset to report.
+        $client = $this->requireClient();
         $key = self::mqKey($mq);
         $cached = $this->offsetTable[$key] ?? null;
         if ($cached !== null) {
             return $cached;
         }
-        $brokerOffset = $this->requireClient()->queryConsumerOffset($this->consumerGroup, $mq);
+        $brokerOffset = $client->queryConsumerOffset($this->consumerGroup, $mq);
         if ($brokerOffset !== null) {
             $this->offsetTable[$key] = $brokerOffset;
         }
@@ -2377,6 +2440,27 @@ final class DefaultLitePullConsumer
     public function assignment(): array
     {
         return array_values($this->assigned);
+    }
+
+    public function isAssignMode(): bool
+    {
+        return $this->mode === self::MODE_ASSIGN;
+    }
+
+    /**
+     * Pin this consumer's mode on first use and refuse any later call that would switch it:
+     * the running halves (subscription table, pull targets, heartbeat) would otherwise
+     * describe two different consumers at once.
+     */
+    private function claimMode(int $mode): void
+    {
+        if ($this->mode === self::MODE_NONE) {
+            $this->mode = $mode;
+            return;
+        }
+        if ($this->mode !== $mode) {
+            throw new MQClientException('Subscribe and assign are mutually exclusive.');
+        }
     }
 
     /** @return list<MessageQueue> */

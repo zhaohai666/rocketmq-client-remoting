@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **48** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 43 套逐条计出 **1500** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **48** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 43 套逐条计出 **1536** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -44,11 +44,11 @@ node --experimental-strip-types selfcheck.ts
 | `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
-| `test/flow_control_smoke.ts`（每队列三条闸门：只判本队列「持有」的一切——未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值按字面取值（不 clamp 到 1、0 不是「关闭」，合法区间由启动配置检查把守），字节闸门按消息体整 MiB 向下取整而不是 storeSize，跨度闸门不作用于顺序消费；命中原因按 条数 → 字节 → 跨度 的固定顺序、一次判定只记一个计数，告警第 1 次及其后每 1000 次；缓存闸门 50ms、broker 215 的 20ms、其余拉取失败走唯一的可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，拉取与 POP 两条路径共用、每条队列循环建立时取值）；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 146 项检查通过 |
+| `test/flow_control_smoke.ts`（每队列三条闸门：只判本队列「持有」的一切——未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值按字面取值（不 clamp 到 1、0 不是「关闭」，合法区间由启动配置检查把守），字节闸门按消息体整 MiB 向下取整而不是 storeSize，跨度闸门不作用于顺序消费；命中原因按 条数 → 字节 → 跨度 的固定顺序、一次判定只记一个计数，告警第 1 次及其后每 1000 次；缓存闸门 50ms、broker 215 的 20ms、其余拉取失败走唯一的可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，拉取与 POP 两条路径共用、每条队列循环建立时取值）；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 148 项检查通过 |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
-| `test/lite_surface_guards_smoke.ts`（lite 表面的误用闸门：空白 topic、空队列列表的 assign、已经在跑之后再设指派表达式、没启动就 poll / committed / 取队列，负超时排在状态检查之后） | 14 通过 / 0 失败 |
+| `test/lite_surface_guards_smoke.ts`（lite 表面的误用闸门：空白 topic、空队列列表的 assign、已经在跑之后再设指派表达式、没启动就 poll / committed / 取队列，负超时排在状态检查之后；subscribe 与 assign 互斥且先到者定形，assign 模式心跳不带任何订阅项；assign 收窄与 unsubscribe 都把被撤销队列的光标、park、暂停位与缓冲一起丢掉；seek 依次判「是否持有」（按模式区分文案）→ 是否运行 → [minOffset, maxOffset] 区间，committed 的 broker 读失败报错而不是回 -1） | 48 通过 / 0 失败 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
@@ -224,7 +224,7 @@ await puller.shutdown();
 
 ### LitePullConsumer（含 topic 队列变更监听）
 
-这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。
+这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。`subscribe` / `assign` 互斥，先调用者定形；`seek` 依次判「队列是否持有」→「是否已启动」→ 位点落在 `[minOffset, maxOffset]` 内；`assign` 收窄与 `unsubscribe` 立刻撤销不再持有队列的光标、seek 定位、暂停位、park 与本地缓冲。
 
 ```ts
 import { DefaultLitePullConsumer } from './src/client/lite_pull_consumer.ts';

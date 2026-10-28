@@ -51,12 +51,12 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 73
-Total Test time (real) = 149.89 sec   # ctest --output-on-failure（串行）
+Total Test time (real) = 145.90 sec   # ctest --output-on-failure（串行）
 ```
 
 73 个用例 = 72 个测试二进制 + 1 个编解码互调用例。断言数按每个二进制自己的汇总行汇总（措辞按二进制不同：`N checks, M failures`、
 `N passed, M failed`、`PASS=n FAIL=m`、`[PASS] n checks, [FAIL] m`、`checks=n fails=m`、`ALL PASS (n checks)` 等）：逐个串行跑 `build/tests/` 下 72 个测试二进制，各取自己那行汇总，checks 合计
-**8,384 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,457 项**。
+**8,391 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,464 项**。
 
 不依赖集群的协议层自检：
 
@@ -386,7 +386,7 @@ svc.shutdown();   // 先停调度，再排空在途 doPullTask，最后关消费
 
 ### 轻量拉消费者
 
-这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `setSubExpressionForAssign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。
+这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `setSubExpressionForAssign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。`subscribe` / `assign` 互斥，先调用者定形；`seek` 依次判「队列是否持有」→「是否已启动」→ 位点落在 `[minOffset, maxOffset]` 内；`assign` 收窄与 `unsubscribe` 立刻撤销不再持有队列的光标、seek 定位、暂停位、park 与本地缓冲。
 
 ```cpp
 #include "rocketmq/client/lite_pull_consumer.h"

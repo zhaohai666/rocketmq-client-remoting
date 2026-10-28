@@ -90,7 +90,12 @@ export class DefaultLitePullConsumer {
   messageModel: string = MessageModel.CLUSTERING;
   // wire fields read by MQClient.buildHeartbeatData:
   consumeType: string = ConsumeType.CONSUME_ACTIVELY;
-  get subscriptionDataSet(): SubscriptionData[] { return [...this.subscription.values()]; }
+  // ASSIGN mode registers no subscription with the broker: the queues were named
+  // explicitly, so there is nothing to rebalance and nothing to advertise. Only
+  // the subscribe() mode's topics ride the heartbeat.
+  get subscriptionDataSet(): SubscriptionData[] {
+    return this.mode === 'assign' ? [] : [...this.subscription.values()];
+  }
   unitMode = false;
   // instanceName / unitName / enableStreamRequestType: lite pull turns the stream
   // marker on by default — `@STREAM` is appended to the clientId and every
@@ -142,8 +147,16 @@ export class DefaultLitePullConsumer {
   getConsumeTimestamp(): string { return this.consumeTimestamp; }
 
   private subscription = new Map<string, SubscriptionData>();
+  // Which of subscribe()/assign() this consumer claimed. Whichever came first
+  // holds; the other is refused, so an assignment is never silently switched out
+  // from under the queues a caller already pinned.
+  private mode: 'none' | 'subscribe' | 'assign' = 'none';
   private assignedManual: MessageQueue[] | null = null; // assign() mode
   private assignedAuto: MessageQueue[] = [];            // subscribe() mode
+  // ASSIGN mode's per-topic expression. The caller names it with
+  // setSubExpressionForAssign(); assign() seeds '*' for a topic nobody named yet,
+  // which is the default the pull task builds when no expression was set.
+  private assignSubscription = new Map<string, SubscriptionData>();
   private paused = new Set<string>();
   private pullCursor = new Map<string, number>();       // mqKey -> next pull offset
   // mqKey -> the instant (epoch ms) until which poll() skips this queue, armed by
@@ -255,39 +268,89 @@ export class DefaultLitePullConsumer {
   }
   getTopicMetadataCheckIntervalMillis(): number { return this.topicMetadataCheckIntervalMillis; }
 
+  // subscribe() and assign() are mutually exclusive: the first claim holds, and the
+  // other side is refused with the same message however it is reached.
+  private claimMode(mode: 'subscribe' | 'assign'): void {
+    if (this.mode === 'none') { this.mode = mode; return; }
+    if (this.mode !== mode) throw new Error('Subscribe and assign are mutually exclusive.');
+  }
+
   subscribe(topic: string, subExpression = '*'): this {
     if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
+    this.claimMode('subscribe');
     const expr = subExpression || '*';
     this.subscription.set(topic, FilterAPI.buildSubscriptionData(topic, expr));
-    this.assignedManual = null;
     return this;
   }
 
   unsubscribe(topic: string): void {
     this.subscription.delete(topic);
+    // The topic's queues leave with it, without waiting for the next rebalance,
+    // and their per-queue state goes with them — the same revocation path a
+    // rebalance that no longer covers them takes.
+    const keep = (mq: MessageQueue) => mq.getTopic() !== topic;
+    for (const mq of this._assignedQueues().filter((mq) => !keep(mq))) this.dropQueueState(mq);
+    this.assignedAuto = this.assignedAuto.filter(keep);
+    if (this.assignedManual != null) this.assignedManual = this.assignedManual.filter(keep);
+  }
+
+  // setSubExpressionForAssign names the tag/SQL expression one assigned topic pulls
+  // with. It is a pre-start setting: a running consumer has already told the broker
+  // what filter this queue uses.
+  setSubExpressionForAssign(topic: string, subExpression: string): this {
+    if (!subExpression || !subExpression.trim()) {
+      throw new Error('subExpression can not be null or empty.');
+    }
+    if (this.started) throw new Error('setSubExpressionForAssign only can be called before start.');
+    if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
+    this.claimMode('assign');
+    this.assignSubscription.set(topic, FilterAPI.buildSubscriptionData(topic, subExpression));
+    return this;
   }
 
   // assign switches to MANUAL mode: the given queues are polled directly.
   // An empty list is refused: taken literally it would drop every queue held so far,
   // which is exactly what a route lookup that came back empty does by accident.
+  // The list is a set: a queue named twice is held once.
   assign(mqs: MessageQueue[]): this {
     if (!mqs || mqs.length === 0) {
       throw new Error('Message queues can not be null or empty.');
     }
-    this.assignedManual = [...mqs];
+    this.claimMode('assign');
+    const seen = new Set<string>();
+    const kept: MessageQueue[] = [];
     for (const mq of mqs) {
-      if (!this.subscription.has(mq.getTopic())) {
-        this.subscription.set(mq.getTopic(), FilterAPI.buildSubscriptionData(mq.getTopic(), '*'));
+      const key = mqKey(mq);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(mq);
+      if (!this.assignSubscription.has(mq.getTopic())) {
+        this.assignSubscription.set(mq.getTopic(), FilterAPI.buildSubscriptionData(mq.getTopic(), '*'));
       }
     }
+    // A queue this call no longer names loses its cursors, its armed park and its
+    // paused flag with the assignment; nothing stale may hold up a later round.
+    for (const mq of this.assignedManual ?? []) {
+      if (!seen.has(mqKey(mq))) this.dropQueueState(mq);
+    }
+    this.assignedManual = kept;
     return this;
+  }
+
+  // Drop every piece of per-queue state this consumer keeps: the pull cursor, the
+  // armed 215 park and the paused flag.
+  private dropQueueState(mq: MessageQueue): void {
+    const key = mqKey(mq);
+    this.pullCursor.delete(key);
+    this.pullParkUntil.delete(key);
+    this.paused.delete(key);
   }
 
   async start(): Promise<void> {
     if (this.started) return;
     Validators.checkGroup(this.consumerGroup);
     if (!this.nameServerAddr) throw new Error('name server address is not set');
-    if (this.subscription.size === 0 && !this.assignedManual) {
+    if (this.mode === 'none') {
       throw new Error('subscription is not set, call subscribe() or assign() first');
     }
     // The start instant is checked whatever the policy is: a malformed value must fail here rather
@@ -331,7 +394,13 @@ export class DefaultLitePullConsumer {
     this.pullAPI = new PullAPI(client, this.consumerGroup);
     await this.offsetStore.load().catch((e) =>
       logger.warning('load offset store failed: %s', (e as Error).message));
-    for (const topic of this.subscription.keys()) {
+    // Warm the route cache for every topic this consumer will pull: the
+    // subscribed topics in subscribe mode, the assigned queues' topics in assign
+    // mode (which advertises no subscription at all).
+    const routeTopics = this.mode === 'assign'
+      ? [...new Set((this.assignedManual ?? []).map((mq) => mq.getTopic()))]
+      : [...this.subscription.keys()];
+    for (const topic of routeTopics) {
       await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     }
     // Once the queues are resolved but before the group is registered at the broker,
@@ -358,7 +427,7 @@ export class DefaultLitePullConsumer {
     // The metadata comparison loop starts unconditionally, whether or not any
     // listener was registered.
     this._startMetadataLoop();
-    if (this.assignedManual == null) {
+    if (this.mode === 'subscribe') {
       await this._doRebalance();
       this._rebalanceTimer = setInterval(() => {
         this._doRebalance().catch((e) =>
@@ -394,7 +463,7 @@ export class DefaultLitePullConsumer {
 
   // _doRebalance assigns queues only in subscribe() mode.
   private async _doRebalance(): Promise<void> {
-    if (this.assignedManual != null || !this.mqClient) return;
+    if (this.mode !== 'subscribe' || !this.mqClient) return;
     const client = this.mqClient;
     const assigned: MessageQueue[] = [];
     for (const topic of this.subscription.keys()) {
@@ -432,6 +501,13 @@ export class DefaultLitePullConsumer {
       }
     }
     assigned.sort((a, b) => a.compareTo(b));
+    // A queue the new allocation no longer covers is revoked: its cursor, its
+    // armed park and its paused flag go with it, so a later round cannot keep
+    // serving a queue this consumer no longer owns.
+    const next = new Set(assigned.map(mqKey));
+    for (const mq of this.assignedAuto) {
+      if (!next.has(mqKey(mq))) this.dropQueueState(mq);
+    }
     this.assignedAuto = assigned;
   }
 
@@ -559,7 +635,7 @@ export class DefaultLitePullConsumer {
       idx = pos + 1;
       const mq = queues[pos];
       const key = mqKey(mq);
-      const sub = this.subscription.get(mq.getTopic());
+      const sub = this._subscriptionFor(mq.getTopic());
       if (!sub) continue;
       let offset = this.pullCursor.get(key);
       if (offset === undefined) {
@@ -635,11 +711,39 @@ export class DefaultLitePullConsumer {
     return this.commitSync();
   }
 
-  // seek moves the pull cursor for one queue (the next poll starts there).
-  seek(mq: MessageQueue, offset: number): void {
-    if (!this.started) throw new Error('The consumer not running, please start it first.');
-    if (offset < 0) throw new Error(`offset must be >= 0, got ${offset}`);
-    this.pullCursor.set(mqKey(mq), offset);
+  // seek repositions one queue: the next poll of it starts at `offset`.
+  //
+  // The queue must be one this consumer holds — writing a cursor for a stranger
+  // would leave an entry nothing pulls, so the caller would watch an offset
+  // change that no round ever honours — and the offset is held to the queue's own
+  // [minOffset, maxOffset] range. Reading those two bounds is also where the
+  // running-state check happens: they are broker RPCs, and a stopped consumer has
+  // no broker to ask.
+  async seek(mq: MessageQueue, offset: number): Promise<void> {
+    const held = this._assignedQueues().some((q) => mqKey(q) === mqKey(mq));
+    if (!held) {
+      throw new Error(this.mode === 'assign'
+        ? `The message queue is not in assigned list, message queue: ${mq}`
+        : `The message queue is not in assigned list, may be rebalancing, message queue: ${mq}`);
+    }
+    if (!this.started || !this.mqClient) {
+      throw new Error('The consumer not running, please start it first.');
+    }
+    // A bound the broker could not answer must not become a cursor: a negative
+    // cursor would only come back as OFFSET_ILLEGAL on the next poll.
+    const minOffset = await this._boundaryOffset(mq, 'min');
+    if (minOffset < 0) throw new Error(`Can not get min offset of queue ${mqKey(mq)}`);
+    const maxOffset = await this._boundaryOffset(mq, 'max');
+    if (maxOffset < 0) throw new Error(`Can not get max offset of queue ${mqKey(mq)}`);
+    if (offset < minOffset || offset > maxOffset) {
+      throw new Error(
+        `Seek offset illegal, seek offset = ${offset}, min offset = ${minOffset}, max offset = ${maxOffset}`);
+    }
+    const key = mqKey(mq);
+    this.pullCursor.set(key, offset);
+    // An explicit repositioning lifts a leftover throttle park: it belonged to
+    // the position that is being left behind.
+    this.pullParkUntil.delete(key);
     if (this.offsetStore) this.offsetStore.updateOffset(mq, offset, false);
   }
 
@@ -694,24 +798,27 @@ export class DefaultLitePullConsumer {
     if (!this.started) throw new Error('The consumer not running, please start it first.');
     const begin = await this._boundaryOffset(mq, 'min');
     if (begin < 0) throw new Error(`seekToBegin: minOffset unavailable for ${mqKey(mq)}`);
-    this.seek(mq, begin);
+    await this.seek(mq, begin);
   }
 
   async seekToEnd(mq: MessageQueue): Promise<void> {
     if (!this.started) throw new Error('The consumer not running, please start it first.');
     const end = await this._boundaryOffset(mq, 'max');
     if (end < 0) throw new Error(`seekToEnd: maxOffset unavailable for ${mqKey(mq)}`);
-    this.seek(mq, end);
+    await this.seek(mq, end);
   }
 
-  // committed(mq): the offset last committed for this queue (-1 if never
-  // committed).
-  committed(mq: MessageQueue): number {
-    if (!this.started) throw new Error('The consumer not running, please start it first.');
-    if (!this.offsetStore) return -1;
-    const snap = (this.offsetStore as any).tableSnapshot?.() as Map<string, number> | undefined;
-    const v = snap?.get(mqKey(mq));
-    return v !== undefined ? v : -1;
+  // committed(mq): the offset last committed for this queue — the in-memory
+  // commit table first, then the broker — with -1 for "nobody has committed".
+  // A broker read that FAILED is not "nobody committed": it throws, so a broken
+  // read cannot be mistaken for a fresh consumer.
+  async committed(mq: MessageQueue): Promise<number> {
+    if (!this.started || !this.offsetStore) {
+      throw new Error('The consumer not running, please start it first.');
+    }
+    const offset = await this.offsetStore.readOffset(mq, ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
+    if (offset === -2) throw new Error('Fetch consume offset from broker exception');
+    return offset;
   }
 
   pause(mqs: MessageQueue[]): void {
@@ -763,8 +870,20 @@ export class DefaultLitePullConsumer {
     await new Promise<void>((r) => setTimeout(r, Math.max(1, Math.floor(millis))));
   }
 
+  // _subscriptionFor picks the expression a queue pulls with: the assigned-topic
+  // expression in assign mode (subscribe() is refused there), the subscription
+  // table in subscribe mode.
+  private _subscriptionFor(topic: string): SubscriptionData | undefined {
+    return this.mode === 'assign'
+      ? this.assignSubscription.get(topic)
+      : this.subscription.get(topic);
+  }
+
+  private _assignedQueues(): MessageQueue[] {
+    return this.assignedManual != null ? this.assignedManual : this.assignedAuto;
+  }
+
   private _activeQueues(): MessageQueue[] {
-    const all = this.assignedManual != null ? this.assignedManual : this.assignedAuto;
-    return all.filter((mq) => !this.paused.has(mqKey(mq)));
+    return this._assignedQueues().filter((mq) => !this.paused.has(mqKey(mq)));
   }
 }

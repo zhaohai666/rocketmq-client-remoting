@@ -272,7 +272,9 @@ async fn run(namesrv: &str) -> Checker {
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
     for mq in &mqs {
-        c.seek(mq, 0);
+        if let Err(e) = c.seek(mq, 0).await {
+            ck.check("lite seek to begin", false, &e.to_string());
+        }
     }
 
     let got1 = match drain(&c, QUEUES as usize, 30).await {
@@ -330,7 +332,9 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
     for mq in &mqs {
-        c.seek(mq, 0);
+        if let Err(e) = c.seek(mq, 0).await {
+            ck.check("lite seek to begin", false, &e.to_string());
+        }
     }
     let ok2 = poll_until(|| mqs.iter().all(|mq| c.pull_cursor_of(mq) == 1), 20).await;
     ck.check(
@@ -347,20 +351,32 @@ async fn run(namesrv: &str) -> Checker {
         Err(e) => ck.check("S2 quiet window", false, &e),
     }
 
-    // ---------- S3 OFFSET_ILLEGAL: the out-of-range offset is corrected by the broker + messages really come back ----------
+    // ---------- S3 seek guard: an out-of-range offset is refused before anything is pinned ----------
     let mut ahead = Vec::new();
+    let mut refused = true;
     for mq in &mqs {
         let max_off = admin
             .get_max_offset(mq, 5000, Some(&broker_addr))
             .await
             .unwrap_or(0);
         ahead.push(max_off);
-        c.seek(mq, max_off + BIG_AHEAD);
+        match c.seek(mq, max_off + BIG_AHEAD).await {
+            Ok(()) => refused = false,
+            Err(e) => {
+                if !e.to_string().contains("Seek offset illegal") {
+                    ck.check("S3 out-of-range seek wording", false, &e.to_string());
+                }
+            }
+        }
     }
-    let ok3 = poll_until(|| mqs.iter().all(|mq| c.pull_cursor_of(mq) == 1), 20).await;
     ck.check(
-        "S3-after the broker corrects the out-of-range offset the cursor returns to maxOffset (out-of-range self-healing)",
-        ok3,
+        "S3 an offset past maxOffset is refused locally (Seek offset illegal)",
+        refused,
+        &format!("seekedTo={ahead:?}"),
+    );
+    ck.check(
+        "S3 the refused seek leaves the cursors where they were",
+        mqs.iter().all(|mq| c.pull_cursor_of(mq) == 1),
         &format!("{} seekedTo={ahead:?}", cursor_row(&c, &mqs)),
     );
 
@@ -391,7 +407,7 @@ async fn run(namesrv: &str) -> Checker {
         }
     };
     ck.check(
-        "S3-after self-healing all new messages arrive (previous implementation: cursor stuck at +1000, none seen)",
+        "S3-after the refused seek the consumer keeps delivering from where it was",
         got3.len() == QUEUES as usize,
         &format!("got={} bodies={:?}", got3.len(), got3),
     );
@@ -400,7 +416,7 @@ async fn run(namesrv: &str) -> Checker {
     let mut have = got3.clone();
     have.sort();
     ck.check(
-        "S3-exactly the 4 messages pinned after the out-of-range seek are received",
+        "S3-exactly the 4 messages pinned after the refused seek are received",
         have == want,
         &format!("bodies={have:?}"),
     );

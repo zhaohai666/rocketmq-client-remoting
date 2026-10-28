@@ -719,13 +719,29 @@ final class RunClientConsumer
         ];
     }
 
+    /** Whether any heartbeat mentioning the group reached the broker at all. */
+    private function heartbeatSeen(string $group): bool
+    {
+        foreach ($this->log as $e) {
+            if (($e['code'] ?? 0) !== RequestCode::HEART_BEAT) {
+                continue;
+            }
+            foreach (($e['consumers'] ?? []) as $cd) {
+                if (($cd['group'] ?? '') === $group) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /**
      * The subscription set a heartbeat registered for one group: topic => the cells the broker
      * installs from. Reads the last beat that mentions the group.
      *
      * @return array<string,array<string,mixed>>
      */
-    private function heartbeatSubs(string $group): array
+    private function heartbeatSubs(string $group, bool $requireRegistered = true): array
     {
         $found = [];
         foreach ($this->log as $e) {
@@ -742,7 +758,9 @@ final class RunClientConsumer
                 }
             }
         }
-        $this->check($found !== [], "heartbeat of $group registered a subscription set");
+        if ($requireRegistered) {
+            $this->check($found !== [], "heartbeat of $group registered a subscription set");
+        }
         return $found;
     }
 
@@ -1646,22 +1664,29 @@ final class RunClientConsumer
         $assignC->tick();
 
         $this->loadLog(getenv('RMQ_LOG'));
-        $assignSubs = $this->heartbeatSubs('GID-O-CONS');
-        $this->checkSame(['LAssignTopic', 'LClassTopic'], array_keys($assignSubs),
-            'assign-mode selector subscriptions are the ones registered');
-        $this->checkSame(ExpressionType::SQL92, $assignSubs['LAssignTopic']['expressionType'] ?? null,
+        // Assign mode advertises nothing: the heartbeat carries only rebalance subscriptions, and
+        // these expressions belong to individually assigned queues rather than to a topic-wide one.
+        $this->check($this->heartbeatSeen('GID-O-CONS'),
+            'the assign-mode heartbeat itself reached the broker');
+        $assignSubs = $this->heartbeatSubs('GID-O-CONS', false);
+        $this->checkSame([], array_keys($assignSubs),
+            'an assign-mode consumer announces no subscription in its heartbeat');
+
+        $assignReg = $assignC->subscriptionData['LAssignTopic'] ?? null;
+        $clsReg = $assignC->subscriptionData['LClassTopic'] ?? null;
+        $this->checkSame(ExpressionType::SQL92, $assignReg->expressionType ?? null,
             'setSubExpressionForAssignWithSelector registers SQL92');
-        $this->checkSame(ExpressionType::CLASS_FILTER, $assignSubs['LClassTopic']['expressionType'] ?? null,
+        $this->checkSame(ExpressionType::CLASS_FILTER, $clsReg->expressionType ?? null,
             'setSubExpressionForAssignWithSelector registers CLASS_FILTER');
-        $this->checkSame(true, $assignSubs['LClassTopic']['classFilterMode'] ?? null,
+        $this->checkSame(true, $clsReg->classFilterMode ?? null,
             'class-filter mode is the only thing CLASS_FILTER sets beyond the type');
-        $this->checkSame([], $assignSubs['LClassTopic']['tagsSet'] ?? null,
+        $this->checkSame([], $clsReg->tagsSet ?? null,
             'class-filter registration carries no compiled tag set');
 
         $assignSql = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LAssignTopic', 'GID-O-CONS');
         $this->checkSame($sql, $assignSql['subscription'] ?? null, 'assign-mode pull repeats the SQL92 expression');
         $this->checkSame(ExpressionType::SQL92, $assignSql['expressionType'] ?? null, 'assign-mode pull is typed SQL92');
-        $this->checkSame((int) $assignSubs['LAssignTopic']['subVersion'], (int) ($assignSql['subVersion'] ?? -1),
+        $this->checkSame((int) $assignReg->subVersion, (int) ($assignSql['subVersion'] ?? -1),
             'assign-mode pulled version matches the registered version');
 
         $assignCls = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LClassTopic', 'GID-O-CONS');
@@ -1707,6 +1732,86 @@ final class RunClientConsumer
         $m = new \ReflectionMethod(DefaultLitePullConsumer::class, $name);
         $m->setAccessible(true);
         return $m->invokeArgs($c, $args);
+    }
+
+    // ================================================================ 5c. LitePull: revocation, heartbeat scope, stopped commit
+
+    private function testLitePullRevocationHeartbeatAndStoppedCommit(ConsFakeBroker $broker): void
+    {
+        // ---- unsubscribe revokes the topic's queues, cursors and cache right away ----
+        $c = new DefaultLitePullConsumer('GID-P-CONS');
+        $c->setInstanceName('CONS-P');
+        $c->setNamesrvAddr($broker->addr);
+        $keep = new MessageQueue('LTopic', 'b-cons', 0);
+        $drop = new MessageQueue('LTagTopic', 'b-cons', 0);
+        $c->assign([$keep, $drop]);
+        $c->start();
+        $c->tick();
+        $this->checkSame(2, $c->pullCursorOf($keep), 'the kept queue pulled its first batch');
+        $this->checkSame(2, $c->pullCursorOf($drop), 'the dropped queue pulled its first batch before unsubscribe');
+
+        $c->unsubscribe('LTagTopic');
+        $this->checkSame([$keep], $c->assignment(), "unsubscribe takes the topic's queues out of the assignment");
+        $this->checkSame(-1, $c->pullCursorOf($drop), 'the revoked queue loses its pull cursor');
+        $this->checkSame(-1, $c->consumeCursorOf($drop), 'the revoked queue loses its consume cursor');
+
+        $this->loadLog(getenv('RMQ_LOG'));
+        $droppedBefore = count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTagTopic', 'GID-P-CONS'));
+        $keptBefore = count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-P-CONS'));
+        // A blank topic is not a topic: it must not revoke the whole assignment.
+        $c->unsubscribe('   ');
+        $this->checkSame([$keep], $c->assignment(), 'a blank unsubscribe leaves the assignment untouched');
+        $c->tick();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $this->checkSame($droppedBefore,
+            count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTagTopic', 'GID-P-CONS')),
+            'a revoked topic is never pulled again');
+        $this->checkSame($keptBefore + 1,
+            count($this->logWhere(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-P-CONS')),
+            'the queues the consumer still holds keep pulling');
+        $this->cleanup($c);
+
+        // ---- an assign-mode heartbeat advertises no subscription; subscribe mode is the control ----
+        $assignC = new DefaultLitePullConsumer('GID-Q-CONS');
+        $assignC->setInstanceName('CONS-Q');
+        $assignC->setNamesrvAddr($broker->addr);
+        $assignC->setSubExpressionForAssign('LAssignTopic', 'TagA');
+        $assignC->assign([new MessageQueue('LAssignTopic', 'b-cons', 0)]);
+        $assignC->start();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $this->check($this->heartbeatSeen('GID-Q-CONS'), 'the assign-mode heartbeat reached the broker');
+        $this->checkSame([], array_keys($this->heartbeatSubs('GID-Q-CONS', false)),
+            'an assigned queue carries no topic-wide subscription into the heartbeat');
+        $this->cleanup($assignC);
+
+        $subC = new DefaultLitePullConsumer('GID-R-CONS');
+        $subC->setInstanceName('CONS-R');
+        $subC->setNamesrvAddr($broker->addr);
+        $subC->subscribe('LTagTopic', 'TagA');
+        $subC->start();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $this->checkSame(['LTagTopic'], array_keys($this->heartbeatSubs('GID-R-CONS')),
+            'a subscribe-mode heartbeat does announce its subscription (control)');
+        $this->cleanup($subC);
+
+        // ---- committed refuses to answer once the consumer stopped, even with a memory commit ----
+        $stopped = new DefaultLitePullConsumer('GID-S-CONS');
+        $stopped->setInstanceName('CONS-S');
+        $stopped->setNamesrvAddr($broker->addr);
+        $mq = new MessageQueue('LTopic', 'b-cons', 0);
+        $stopped->assign([$mq]);
+        $stopped->start();
+        $stopped->commit(['LTopicb-cons0' => 1], false);
+        $this->checkSame(1, $stopped->committed($mq), 'a live consumer reports its in-memory commit');
+        $this->cleanup($stopped);
+        $message = null;
+        try {
+            $stopped->committed($mq);
+        } catch (MQClientException $e) {
+            $message = $e->getMessage();
+        }
+        $this->checkSame('The consumer not running, please start it first.', $message,
+            'a stopped consumer refuses to report a committed offset, even one it still holds in memory');
     }
 
     // ================================================================ 6. Shutdown drain (awaitTerminationMillisWhenShutdown)
@@ -1908,6 +2013,7 @@ final class RunClientConsumer
             $this->testPullSelectorWire($broker);
             $this->testLitePull($broker);
             $this->testLitePullSelectorWire($broker);
+            $this->testLitePullRevocationHeartbeatAndStoppedCommit($broker);
             $this->testShutdownDrain($broker);
         } finally {
             $broker->stop();

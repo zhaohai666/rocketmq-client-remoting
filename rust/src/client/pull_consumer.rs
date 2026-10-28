@@ -1647,6 +1647,9 @@ struct LiteState {
     subscription_data: BTreeMap<String, SubscriptionData>,
     /// Tag expressions in assign mode.
     assign_sub_expr: BTreeMap<String, String>,
+    /// Whether a mode was claimed at all: the first subscribe/assign call pins it, and a later
+    /// call describing the other half is refused instead of silently reinterpreting the consumer.
+    mode_claimed: bool,
     assign_mode: bool,
     /// Current assignment (`BTreeMap` keeps it ordered by queue key).
     assigned: BTreeMap<String, MessageQueue>,
@@ -1668,6 +1671,7 @@ impl Default for LiteState {
             subscription: BTreeMap::new(),
             subscription_data: BTreeMap::new(),
             assign_sub_expr: BTreeMap::new(),
+            mode_claimed: false,
             assign_mode: false,
             assigned: BTreeMap::new(),
             next_offset: BTreeMap::new(),
@@ -1899,6 +1903,21 @@ pub trait TopicMessageQueueChangeListener: Send + Sync {
 /// `shutdown()` clears both.
 fn lite_is_live(inner: &LiteInner) -> bool {
     inner.running.load(Ordering::Acquire) || inner.started.load(Ordering::Acquire)
+}
+
+/// Pin the consumer's mode on first use and refuse any later call that would switch it:
+/// the subscription table, the pull targets and the heartbeat would otherwise describe two
+/// different consumers at once.
+fn claim_mode(state: &mut LiteState, assign: bool) -> Result<()> {
+    if !state.mode_claimed {
+        state.mode_claimed = true;
+        state.assign_mode = assign;
+        return Ok(());
+    }
+    if state.assign_mode != assign {
+        return Err(Error::client("Subscribe and assign are mutually exclusive."));
+    }
+    Ok(())
 }
 
 /// Two modes:
@@ -2226,7 +2245,7 @@ impl DefaultLitePullConsumer {
         let topic = with_namespace(&self.config().namespace, topic);
         {
             let mut state = lock(&self.inner.state);
-            state.assign_mode = false;
+            claim_mode(&mut state, false)?;
             state
                 .subscription
                 .insert(topic.clone(), sub_expression.to_string());
@@ -2259,7 +2278,7 @@ impl DefaultLitePullConsumer {
         let topic = with_namespace(&self.config().namespace, topic);
         {
             let mut state = lock(&self.inner.state);
-            state.assign_mode = false;
+            claim_mode(&mut state, false)?;
             state
                 .subscription
                 .insert(topic.clone(), selector.expression.clone());
@@ -2276,11 +2295,40 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
+    /// Drops a topic's subscription AND every queue this instance holds for it, right away: the
+    /// cursor, the parked flag, the armed pause and the cached rows all belong to a queue the
+    /// caller has just left. In subscribe mode a rebalance would eventually hand the queue away;
+    /// in assign mode nothing ever would, so the queues would keep being pulled forever.
     pub fn unsubscribe(&self, topic: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
-        let mut state = lock(&self.inner.state);
-        state.subscription.remove(&topic);
-        state.subscription_data.remove(&topic);
+        let revoked: Vec<String> = {
+            let mut state = lock(&self.inner.state);
+            state.subscription.remove(&topic);
+            if !state.assign_sub_expr.contains_key(&topic) {
+                state.subscription_data.remove(&topic);
+            }
+            let keys: Vec<String> = state
+                .assigned
+                .iter()
+                .filter(|(_, mq)| mq.topic == topic)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in &keys {
+                state.assigned.remove(key);
+                state.next_offset.remove(key);
+                state.consume_offset.remove(key);
+                state.seek_offset.remove(key);
+                state.paused.remove(key);
+                state.pull_parks.remove(key);
+            }
+            keys
+        };
+        if !revoked.is_empty() {
+            let mut buffer = lock(&self.inner.buffer);
+            for key in &revoked {
+                buffer.revoke_queue(key);
+            }
+        }
     }
 
     /// In assign mode, set the tag
@@ -2303,6 +2351,7 @@ impl DefaultLitePullConsumer {
         }
         let topic = with_namespace(&self.config().namespace, topic);
         let mut state = lock(&self.inner.state);
+        claim_mode(&mut state, true)?;
         state
             .assign_sub_expr
             .insert(topic.clone(), sub_expression.to_string());
@@ -2332,7 +2381,7 @@ impl DefaultLitePullConsumer {
         }
         let revoked: Vec<String> = {
             let mut state = lock(&self.inner.state);
-            state.assign_mode = true;
+            claim_mode(&mut state, true)?;
             let keep: BTreeSet<String> = message_queues.iter().map(mq_key).collect();
             let dropped: Vec<String> = state
                 .assigned
@@ -2343,8 +2392,10 @@ impl DefaultLitePullConsumer {
             for key in &dropped {
                 state.next_offset.remove(key);
                 state.consume_offset.remove(key);
-                // A queue this instance no longer owns parks for nobody.
+                state.seek_offset.remove(key);
+                // A queue this instance no longer owns parks for nobody, and keeps no pause flag.
                 state.pull_parks.remove(key);
+                state.paused.remove(key);
             }
             state.assigned.retain(|k, _| keep.contains(k));
             for mq in message_queues {
@@ -2373,11 +2424,15 @@ impl DefaultLitePullConsumer {
     }
 
     /// The current subscription set carried into heartbeats.
+    ///
+    /// Only rebalance subscriptions count: an assign-mode expression is kept in the same table
+    /// (the pull path reads it per queue) but is never advertised as a topic-wide subscription.
     pub fn subscriptions(&self) -> Vec<SubscriptionData> {
-        lock(&self.inner.state)
-            .subscription_data
-            .values()
-            .cloned()
+        let state = lock(&self.inner.state);
+        state
+            .subscription
+            .keys()
+            .filter_map(|topic| state.subscription_data.get(topic).cloned())
             .collect()
     }
 
@@ -2764,8 +2819,45 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Pin the cursor and drop from the buffer this queue's messages earlier than `offset`.
-    pub fn seek(&self, mq: &MessageQueue, offset: i64) {
+    /// Pin all three cursors on `offset` and drop from the buffer this queue's messages earlier
+    /// than it.
+    ///
+    /// A queue this consumer does not hold is refused first -- writing a cursor for it would
+    /// leave an entry nothing pulls -- then the state, then the queue's own `[minOffset,
+    /// maxOffset]` range: an offset the broker would correct on the next round is a caller bug
+    /// worth reporting, not something to pin and watch get overwritten.
+    pub async fn seek(&self, mq: &MessageQueue, offset: i64) -> Result<()> {
+        let key = mq_key(mq);
+        {
+            let state = lock(&self.inner.state);
+            if !state.assigned.contains_key(&key) {
+                return Err(Error::client(if state.assign_mode {
+                    format!("The message queue is not in assigned list, message queue: {mq}")
+                } else {
+                    format!(
+                        "The message queue is not in assigned list, may be rebalancing, message queue: {mq}"
+                    )
+                }));
+            }
+        }
+        let client = Self::require_client(&self.inner)?;
+        let min_offset = client
+            .get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await?;
+        let max_offset = client
+            .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .await?;
+        if offset < min_offset || offset > max_offset {
+            return Err(Error::client(format!(
+                "Seek offset illegal, seek offset = {offset}, min offset = {min_offset}, max offset = {max_offset}"
+            )));
+        }
+        self.apply_seek(mq, offset);
+        Ok(())
+    }
+
+    /// The cursor pinning behind [`seek`](Self::seek), after its guards accepted the offset.
+    fn apply_seek(&self, mq: &MessageQueue, offset: i64) {
         let key = mq_key(mq);
         {
             let mut state = lock(&self.inner.state);
@@ -2782,8 +2874,7 @@ impl DefaultLitePullConsumer {
         let offset = client
             .get_min_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
             .await?;
-        self.seek(mq, offset);
-        Ok(())
+        self.seek(mq, offset).await
     }
 
     pub async fn seek_to_end(&self, mq: &MessageQueue) -> Result<()> {
@@ -2791,8 +2882,7 @@ impl DefaultLitePullConsumer {
         let offset = client
             .get_max_offset(mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
             .await?;
-        self.seek(mq, offset);
-        Ok(())
+        self.seek(mq, offset).await
     }
 
     /// Read the queue's committed offset: the in-memory commit table first (a value just committed
@@ -3556,11 +3646,17 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
         cfg.message_model,
         cfg.consume_from_where,
     );
-    cd.subscription_data_set = lock(&inner.state)
-        .subscription_data
-        .values()
-        .cloned()
-        .collect();
+    cd.subscription_data_set = {
+        let state = lock(&inner.state);
+        // Only rebalance subscriptions are announced. An assign-mode expression filters the queues
+        // this instance was handed; advertising it would make the broker treat the group as a
+        // subscriber of the whole topic.
+        state
+            .subscription
+            .keys()
+            .filter_map(|topic| state.subscription_data.get(topic).cloned())
+            .collect()
+    };
     cd.unit_mode = cfg.unit_mode;
     hb.consumer_data_set.push(cd);
     hb
@@ -4062,10 +4158,11 @@ mod tests {
     }
 
     #[test]
-    fn assign_switches_mode_and_keeps_subscription_expr_for_heartbeat() {
+    fn assign_expression_claims_assign_mode_and_stays_local() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        c.update_config(|cfg| cfg.client_id = Some("cid-assign".to_string()));
         c.set_sub_expression_for_assign("T", "TagA").unwrap();
-        assert!(!c.is_assign_mode());
+        assert!(c.is_assign_mode(), "the assign expression itself claims assign mode");
         c.assign(&[queue("T", "broker-a", 1), queue("T", "broker-a", 0)]).unwrap();
         assert!(c.is_assign_mode());
         // The assignment snapshot is ordered by key (deterministic iteration order)
@@ -4075,7 +4172,78 @@ mod tests {
         );
         assert_eq!(c.subscription_for("T"), "TagA");
         assert_eq!(c.subscription_for("other"), "*");
-        assert_eq!(c.subscriptions().len(), 1);
+        // The expression filters the queues this instance was handed; it is not a topic-wide
+        // subscription, so neither the heartbeat nor the subscription set carries it.
+        assert!(c.subscriptions().is_empty());
+        let hb = build_lite_heartbeat(&c.inner);
+        assert!(
+            hb.consumer_data_set[0].subscription_data_set.is_empty(),
+            "an assign-mode consumer advertises nothing"
+        );
+    }
+
+    #[test]
+    fn subscribe_and_assign_are_mutually_exclusive() {
+        let c = DefaultLitePullConsumer::new("LitePG_Mode").unwrap();
+        c.subscribe("T", "TagA").unwrap();
+        c.subscribe("T2", "TagB").unwrap(); // the same mode may be claimed again
+        for err in [
+            c.assign(&[queue("T", "broker-a", 0)]).err(),
+            c.set_sub_expression_for_assign("T", "TagA").err(),
+        ] {
+            let err = err.expect("assign-mode calls on a subscriber must be refused");
+            assert!(
+                err.to_string().contains("Subscribe and assign are mutually exclusive."),
+                "{err}"
+            );
+        }
+        assert!(
+            c.assignment().is_empty(),
+            "a refused assign must leave no assignment behind"
+        );
+
+        let a = DefaultLitePullConsumer::new("LitePG_Mode2").unwrap();
+        a.assign(&[queue("T", "broker-a", 0)]).unwrap();
+        a.assign(&[queue("T", "broker-a", 0)]).unwrap(); // the same mode may be claimed again
+        for err in [
+            a.subscribe("T", "TagA").err(),
+            a.subscribe_with_selector("T", &MessageSelector::by_sql("a > 1")).err(),
+        ] {
+            let err = err.expect("subscribe calls on an assigner must be refused");
+            assert!(
+                err.to_string().contains("Subscribe and assign are mutually exclusive."),
+                "{err}"
+            );
+        }
+        assert!(a.subscription().is_empty(), "a refused subscribe records nothing");
+    }
+
+    #[test]
+    fn unsubscribe_revokes_the_topics_queues_and_their_state() {
+        let c = DefaultLitePullConsumer::new("LitePG_Unsub").unwrap();
+        let drop_q = queue("T1", "broker-a", 0);
+        let keep_q = queue("T2", "broker-a", 0);
+        c.assign(&[drop_q.clone(), keep_q.clone()]).unwrap();
+        c.apply_seek(&drop_q, 3);
+        c.pause(std::slice::from_ref(&drop_q));
+        c.enqueue(vec![
+            msg("T1", "broker-a", 0, 3, "cached"),
+            msg("T2", "broker-a", 0, 0, "kept"),
+        ]);
+
+        c.unsubscribe("T1");
+        assert_eq!(c.assignment(), vec![keep_q.clone()], "only the other topic's queue remains");
+        assert_eq!(c.pull_cursor_of(&drop_q), -1, "the revoked queue loses its pull cursor");
+        assert_eq!(c.consume_cursor_of(&drop_q), -1, "the revoked queue loses its consume cursor");
+        assert!(
+            !lock(&c.inner.state).paused.contains(&mq_key(&drop_q)),
+            "the revoked queue keeps no pause flag"
+        );
+        assert_eq!(c.buffered_message_count(), 1, "only the revoked queue's cached rows are gone");
+
+        // A blank topic is not a topic: it must not revoke the whole assignment.
+        c.unsubscribe("   ");
+        assert_eq!(c.assignment(), vec![keep_q], "a blank unsubscribe leaves the assignment untouched");
     }
 
     /// The lite surface refuses the misuses that would otherwise answer with a value the caller
@@ -4312,12 +4480,14 @@ mod tests {
         assert_eq!(c.pending_commit_of(&q0), 5, "the named queue stays in the table");
     }
 
+    /// The cursor mechanics alone: `seek()` itself needs a live consumer for its guards, so the
+    /// pinning step is driven directly here.
     #[test]
-    fn seek_moves_both_cursors() {
+    fn apply_seek_moves_both_cursors() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         let q = queue("T", "broker-a", 0);
         c.assign(std::slice::from_ref(&q)).unwrap();
-        c.seek(&q, 2);
+        c.apply_seek(&q, 2);
         assert_eq!(c.pull_cursor_of(&q), 2, "seek moves the pull cursor");
         assert_eq!(c.consume_cursor_of(&q), 2, "seek must move the consumed cursor too");
     }
@@ -4395,11 +4565,11 @@ mod tests {
     }
 
     #[test]
-    fn seek_pins_offset_and_drops_earlier_buffered_messages() {
+    fn apply_seek_pins_offset_and_drops_earlier_buffered_messages() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.assign(&[queue("T", "broker-a", 0)]).unwrap();
         c.enqueue((0..5).map(|i| msg("T", "broker-a", 0, i, "b")).collect());
-        c.seek(&queue("T", "broker-a", 0), 3);
+        c.apply_seek(&queue("T", "broker-a", 0), 3);
         assert_eq!(c.buffered_message_count(), 2);
         let state = lock(&c.inner.state);
         assert_eq!(
@@ -4413,13 +4583,13 @@ mod tests {
     }
 
     #[test]
-    fn seek_does_not_touch_other_queues_buffer() {
+    fn apply_seek_does_not_touch_other_queues_buffer() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.enqueue(vec![
             msg("T", "broker-a", 0, 0, "x"),
             msg("T", "broker-a", 1, 0, "y"),
         ]);
-        c.seek(&queue("T", "broker-a", 0), 5);
+        c.apply_seek(&queue("T", "broker-a", 0), 5);
         assert_eq!(c.buffered_message_count(), 1);
     }
 
@@ -4627,14 +4797,12 @@ mod tests {
                         let Ok(request) = RemotingCommand::decode(&frame) else {
                             return;
                         };
+                        let request = ReqSnapshot::of(&request);
                         let mut response = answer_for(&request, response_code::SUCCESS);
                         if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
                             // Re-read on every request: a case that changes the queue count mid-run (scale in/out) must be visible to the
                             // next route refresh, otherwise "the set changed" cannot be tested.
-                            let topic = request
-                                .get_ext_field("topic")
-                                .unwrap_or_default()
-                                .to_string();
+                            let topic = request.ext("topic").unwrap_or_default().to_string();
                             lock(&seen).push(topic);
                             response.set_body(Some(route_body(
                                 &broker_name,
@@ -4678,7 +4846,7 @@ mod tests {
     }
 
     /// Read one whole frame and decode it (`decode` starts at totalLength, so the frame must come with its length prefix).
-    async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    async fn read_frame_from<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
         let mut len_buf = [0_u8; 4];
         stream.read_exact(&mut len_buf).await.ok()?;
         let total = i32::from_be_bytes(len_buf);
@@ -4691,14 +4859,50 @@ mod tests {
         Some(frame)
     }
 
-    async fn write_frame(stream: &mut tokio::net::TcpStream, command: &mut RemotingCommand) {
+    async fn read_frame(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        read_frame_from(stream).await
+    }
+
+    async fn write_frame_to<S: tokio::io::AsyncWrite + Unpin>(
+        stream: &mut S,
+        command: &mut RemotingCommand,
+    ) {
         let bytes = command.encode();
         let _ = stream.write_all(&bytes).await;
         let _ = stream.flush().await;
     }
 
+    async fn write_frame(stream: &mut tokio::net::TcpStream, command: &mut RemotingCommand) {
+        write_frame_to(stream, command).await;
+    }
+
+    /// The request fields a reply is built from, cloned out of the decoded frame so a gated reply can
+    /// be written after the connection's read loop has already moved on to the next request.
+    #[derive(Clone)]
+    struct ReqSnapshot {
+        code: i32,
+        opaque: i32,
+        serialize_type_current_rpc: i32,
+        ext_fields: crate::remoting::protocol::ext_fields::ExtFields,
+    }
+
+    impl ReqSnapshot {
+        fn of(request: &RemotingCommand) -> ReqSnapshot {
+            ReqSnapshot {
+                code: request.code,
+                opaque: request.opaque,
+                serialize_type_current_rpc: request.serialize_type_current_rpc,
+                ext_fields: request.ext_fields().clone(),
+            }
+        }
+
+        fn ext(&self, key: &str) -> Option<&str> {
+            self.ext_fields.get(key)
+        }
+    }
+
     /// A response carrying the request's `opaque` (the client pairs by opaque and drops mismatches as noise).
-    fn answer_for(request: &RemotingCommand, code: i32) -> RemotingCommand {
+    fn answer_for(request: &ReqSnapshot, code: i32) -> RemotingCommand {
         let mut response = RemotingCommand::create_response(code, None);
         response.opaque = request.opaque;
         response.serialize_type_current_rpc = request.serialize_type_current_rpc;
@@ -4739,6 +4943,9 @@ mod tests {
         /// An empty Vec means "the broker does not know this group" (it answers an empty list), which lands in the same branch as
         /// "not found" -- enough to exercise the fallback path of the balanced view.
         cid_list: Arc<Mutex<Vec<String>>>,
+        /// Scripted GET_MIN_OFFSET / GET_MAX_OFFSET answers `(min, max)`; `(0, 0)` by default,
+        /// which is also what an empty queue reports.
+        offset_bounds: Arc<Mutex<(i64, i64)>>,
     }
 
     impl FakeBroker {
@@ -4754,16 +4961,21 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 pull_scripts: Arc::new(Mutex::new(VecDeque::new())),
                 cid_list: Arc::new(Mutex::new(Vec::new())),
+                offset_bounds: Arc::new(Mutex::new((0, 0))),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut stream, _)) = listener.accept().await else {
+                    let Ok((stream, _)) = listener.accept().await else {
                         return;
                     };
                     let inner = Arc::clone(&inner);
                     tokio::spawn(async move {
-                        while let Some(frame) = read_frame(&mut stream).await {
+                        // Split read/write so a gated reply can be written by its own task while the
+                        // read loop keeps serving the requests that follow it on the same connection.
+                        let (mut reader, writer) = stream.into_split();
+                        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                        while let Some(frame) = read_frame_from(&mut reader).await {
                             let Ok(request) = RemotingCommand::decode(&frame) else {
                                 return;
                             };
@@ -4787,18 +4999,52 @@ mod tests {
                                 ),
                                 _ => {}
                             }
-                            if !request.is_oneway_rpc() {
-                                let mut response = if request.code == request_code::PULL_MESSAGE
-                                    || request.code == request_code::LITE_PULL_MESSAGE
-                                {
-                                    answer_pull(&request, &inner).await
-                                } else if request.code == request_code::GET_CONSUMER_LIST_BY_GROUP {
-                                    answer_consumer_list(&request, &inner)
-                                } else {
-                                    answer_for(&request, response_code::SUCCESS)
-                                };
-                                write_frame(&mut stream, &mut response).await;
+                            if request.is_oneway_rpc() {
+                                continue;
                             }
+                            let snapshot = ReqSnapshot::of(&request);
+                            let mut response = if snapshot.code == request_code::PULL_MESSAGE
+                                || snapshot.code == request_code::LITE_PULL_MESSAGE
+                            {
+                                let script = lock(&inner.pull_scripts).pop_front();
+                                match script {
+                                    Some(mut script) if script.gate.is_some() => {
+                                        // Departure gate: hold the reply in its own task until the gate
+                                        // opens; the read loop stays free for the next request.
+                                        let gate = script.gate.take();
+                                        let writer = Arc::clone(&writer);
+                                        tokio::spawn(async move {
+                                            if let Some(gate) = gate {
+                                                let _ = gate.await;
+                                            }
+                                            let mut response =
+                                                answer_pull(&snapshot, Some(script));
+                                            write_frame_to(&mut *writer.lock().await, &mut response)
+                                                .await;
+                                        });
+                                        continue;
+                                    }
+                                    other => answer_pull(&snapshot, other),
+                                }
+                            } else if snapshot.code == request_code::GET_CONSUMER_LIST_BY_GROUP {
+                                answer_consumer_list(&snapshot, &inner)
+                            } else if snapshot.code == request_code::GET_MIN_OFFSET
+                                || snapshot.code == request_code::GET_MAX_OFFSET
+                            {
+                                // The seek guard reads both bounds before it pins anything.
+                                let (min, max) = *lock(&inner.offset_bounds);
+                                let offset = if snapshot.code == request_code::GET_MIN_OFFSET {
+                                    min
+                                } else {
+                                    max
+                                };
+                                let mut response = answer_for(&snapshot, response_code::SUCCESS);
+                                response.add_ext_field("offset", &offset.to_string());
+                                response
+                            } else {
+                                answer_for(&snapshot, response_code::SUCCESS)
+                            };
+                            write_frame_to(&mut *writer.lock().await, &mut response).await;
                         }
                     });
                 }
@@ -4809,6 +5055,11 @@ mod tests {
         /// The received request codes, in arrival order.
         fn codes(&self) -> Vec<i32> {
             lock(&self.requests).iter().map(|(code, _)| *code).collect()
+        }
+
+        /// Script the `[minOffset, maxOffset]` this queue reports to the seek guard.
+        fn set_offset_bounds(&self, min: i64, max: i64) {
+            *lock(&self.offset_bounds) = (min, max);
         }
 
         /// The `queueOffset`s of the received PULL_MESSAGEs, in arrival order.
@@ -4918,12 +5169,9 @@ mod tests {
         }
     }
 
-    async fn answer_pull(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
-        let script = lock(&broker.pull_scripts).pop_front();
+    /// The reply to one pull: the popped script (FIFO) when there is one, otherwise the "empty broker" shape.
+    fn answer_pull(request: &ReqSnapshot, script: Option<ScriptedPull>) -> RemotingCommand {
         if let Some(script) = script {
-            if let Some(gate) = script.gate {
-                let _ = gate.await;
-            }
             let mut response = answer_for(request, script.code);
             for (key, value) in script.ext {
                 response.add_ext_field(key, &value);
@@ -4934,8 +5182,7 @@ mod tests {
             return response;
         }
         let requested = request
-            .ext_fields()
-            .get("queueOffset")
+            .ext("queueOffset")
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0);
         let mut response = answer_for(request, response_code::PULL_NOT_FOUND);
@@ -4945,7 +5192,7 @@ mod tests {
         response
     }
 
-    fn answer_consumer_list(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
+    fn answer_consumer_list(request: &ReqSnapshot, broker: &FakeBroker) -> RemotingCommand {
         let cids = lock(&broker.cid_list).clone();
         let body = GetConsumerListByGroupResponseBody {
             consumer_id_list: cids,
@@ -5756,20 +6003,86 @@ mod tests {
             "the first pull reaching the broker",
         )
         .await;
-        c.seek(&q, 99);
+        cluster.master.set_offset_bounds(0, 9);
+        c.seek(&q, 5).await.expect("5 is inside the queue's range");
         gate_tx.send(()).expect("open the gate");
         wait_until(
-            || cluster.master.pull_offsets().contains(&99),
-            "after seek the next PULL_MESSAGE starts from 99",
+            || cluster.master.pull_offsets().contains(&5),
+            "after seek the next PULL_MESSAGE starts from 5",
         )
         .await;
-        assert_eq!(c.pull_cursor_of(&q), 99, "an in-flight reply must not overwrite the offset seek wrote down");
+        assert_eq!(c.pull_cursor_of(&q), 5, "an in-flight reply must not overwrite the offset seek wrote down");
         assert_eq!(c.buffered_message_count(), 0, "the braked round must not enter the buffer");
         c.shutdown();
     }
 
-    // ------------------------------------------------------------ Balanced view
+    // ---------------------- seek: membership, state, then the queue's own range
 
+    /// The three refusals, in order: a queue this instance does not hold (with the mode's own
+    /// wording), then the consumer state, then the offset against the broker's `[min, max]`.
+    #[tokio::test]
+    async fn lite_seek_refuses_unheld_stopped_and_out_of_range() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let other = queue("Other", "broker-a", 0);
+
+        // Subscribe mode that never started: the queue cannot be held, and the wording warns
+        // that a rebalance may be what is missing.
+        let sub = DefaultLitePullConsumer::new("LitePG_SeekSub").unwrap();
+        sub.subscribe("T", "*").unwrap();
+        let err = sub
+            .seek(&q, 0)
+            .await
+            .expect_err("a subscriber that holds nothing cannot seek");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "MQClientException: The message queue is not in assigned list, may be rebalancing, message queue: {q}"
+            )
+        );
+
+        // Assign mode, queue never handed over: the plain wording, and membership is judged before state.
+        let c = DefaultLitePullConsumer::new("LitePG_SeekAssign").unwrap();
+        c.assign(std::slice::from_ref(&q)).unwrap();
+        let err = c
+            .seek(&other, 0)
+            .await
+            .expect_err("an assigned consumer cannot seek a queue it does not hold");
+        assert_eq!(
+            err.to_string(),
+            format!("MQClientException: The message queue is not in assigned list, message queue: {other}")
+        );
+
+        // Held but not started: the state check comes second.
+        let err = c.seek(&q, 0).await.expect_err("a stopped consumer cannot seek");
+        assert_eq!(
+            err.to_string(),
+            "MQClientException: The consumer not running, please start it first."
+        );
+
+        // Started: the offset is held to this queue's [min, max].
+        cluster.master.set_offset_bounds(2, 6);
+        let c = started_lite("lite_seek_range", "LitePG_SeekRange", &cluster, &q).await;
+        for bad in [1, 7] {
+            let err = c.seek(&q, bad).await.expect_err("out of range");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "MQClientException: Seek offset illegal, seek offset = {bad}, min offset = 2, max offset = 6"
+                )
+            );
+        }
+        c.seek(&q, 4).await.expect("4 is inside the range");
+        assert_eq!(c.pull_cursor_of(&q), 4, "seek pins the pull cursor");
+        assert_eq!(c.consume_cursor_of(&q), 4, "seek pins the consumed cursor too");
+        c.seek_to_begin(&q).await.expect("begin reads the queue's min first");
+        assert_eq!(c.pull_cursor_of(&q), 2);
+        c.seek_to_end(&q).await.expect("end reads the queue's max first");
+        assert_eq!(c.pull_cursor_of(&q), 6);
+        c.shutdown();
+    }
+
+    // ------------------------------------------------------------ Balanced view
     /// The group holds only this instance: the entire subscribe info is its own, sorted per the house convention.
     #[tokio::test]
     async fn balance_view_sole_instance_takes_every_queue() {

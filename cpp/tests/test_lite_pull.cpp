@@ -89,47 +89,64 @@ static void testLitePullPreStartBehavior() {
 
     c.subscribe("MyTopic", "TagA || TagB");
 
-    // assign (resolveInitialOffset fails while not started but must be swallowed, no crash)
+    // subscribe() claimed the mode: the two ways of choosing queues cannot be mixed, and
+    // an assign expression belongs to the assign path only.
     MessageQueue mq("MyTopic", "broker-a", 3);
-    c.assign({mq});
-    CHECK_EQ(c.assignment().size(), static_cast<size_t>(1), "assignment holds 1 queue after assign");
-    CHECK_EQ(c.assignment()[0].queueId, 3, "assignment queue id matches");
+    CHECK(refusedWith(threwMessage([&] { c.assign({mq}); }), "mutually exclusive"),
+          "assign() after subscribe() is refused");
+    CHECK(refusedWith(threwMessage([&] { c.setSubExpressionForAssign("MyTopic", "TagA"); }),
+                    "mutually exclusive"),
+          "setSubExpressionForAssign() after subscribe() is refused");
+    CHECK(c.assignment().empty(), "a refused assign leaves the assignment alone");
+    // A queue this consumer does not hold is refused before anything else, and in
+    // subscribe mode the refusal says the assignment may still be settling.
+    CHECK(refusedWith(threwMessage([&] { c.seek(mq, 0); }),
+                    "The message queue is not in assigned list, may be rebalancing, message queue:"),
+          "subscribe mode: a queue outside the assignment is refused as possibly rebalancing");
+
+    // assign (resolveInitialOffset fails while not started but must be swallowed, no crash)
+    DefaultLitePullConsumer a("LiteGuardAssign");
+    a.setSubExpressionForAssign("MyTopic", "TagA");
+    a.assign({mq});
+    CHECK_EQ(a.assignment().size(), static_cast<size_t>(1), "assignment holds 1 queue after assign");
+    CHECK_EQ(a.assignment()[0].queueId, 3, "assignment queue id matches");
+    CHECK(refusedWith(threwMessage([&] { a.subscribe("MyTopic", "*"); }), "mutually exclusive"),
+          "subscribe() after assign() is refused");
+    CHECK(refusedWith(threwMessage([&] { a.seek(MessageQueue("MyTopic", "broker-a", 9), 0); }),
+                    "The message queue is not in assigned list, message queue:"),
+          "assign mode: a stranger is refused without the rebalancing hint");
+    CHECK(refusedWith(threwMessage([&] { a.seek(mq, 0); }), "not running"),
+          "a held queue on a stopped consumer is refused as not running");
 
     // An empty poll and "no offset yet" are exactly what a queue at its tail looks like,
     // so a consumer that never started refuses instead of answering: this is how a missing
     // start() stays hidden forever.
-    CHECK(refusedWith(threwMessage([&] { c.committed(mq); }), "not running"),
+    CHECK(refusedWith(threwMessage([&] { a.committed(mq); }), "not running"),
           "committed() on a consumer that never started refuses");
-    CHECK(refusedWith(threwMessage([&] { c.poll(20); }), "not running"),
+    CHECK(refusedWith(threwMessage([&] { a.poll(20); }), "not running"),
           "poll() on a consumer that never started refuses");
     // The state check comes first: an unstarted consumer is reported as that, not as a
     // timeout problem.
-    CHECK(refusedWith(threwMessage([&] { c.poll(-1); }), "not running"),
+    CHECK(refusedWith(threwMessage([&] { a.poll(-1); }), "not running"),
           "the running check precedes the timeout check");
 
-    // seek must still record the offset while not started (no broker query)
-    c.seek(mq, 42);
-    CHECK_EQ(c.assignment().size(), static_cast<size_t>(1), "assignment unchanged after seek");
-
     // pause / resume do not crash while not started
-    c.pause({mq});
-    c.resume({mq});
-
-    c.subscribe("MyTopic", "TagC");
+    a.pause({mq});
+    a.resume({mq});
 
     // Running (the flag only: none of what follows reads the wire): the timeout is the
     // caller's to get right, and the assign expression is a pre-start setting because the
     // broker was told the old one at start.
-    c.setAutoCommit(false);
-    c.markRunningForTest();
-    CHECK(refusedWith(threwMessage([&] { c.poll(-1); }), "Timeout must not be negative"),
+    a.setAutoCommit(false);
+    a.markRunningForTest();
+    CHECK(refusedWith(threwMessage([&] { a.poll(-1); }), "Timeout must not be negative"),
           "a running consumer still refuses a negative timeout");
-    CHECK(refusedWith(threwMessage([&] { c.setSubExpressionForAssign("MyTopic", "TagA"); }),
+    CHECK(refusedWith(threwMessage([&] { a.setSubExpressionForAssign("MyTopic", "TagA"); }),
                     "only can be called before start"),
           "even a real expression is refused once the consumer runs");
-    CHECK(threwMessage([&] { c.poll(20); }) == "none",
+    CHECK(threwMessage([&] { a.poll(20); }) == "none",
           "a running consumer with an empty buffer answers with an empty batch");
-    CHECK_EQ(c.committed(mq), static_cast<int64_t>(-1),
+    CHECK_EQ(a.committed(mq), static_cast<int64_t>(-1),
              "a running consumer with no client says -1, not an error");
     // passing means no crash (the expressions live in private tables, covered by real-cluster verification)
     ++g_pass;
@@ -179,9 +196,15 @@ static void testLitePullOffsetTable() {
     c.commit(only0, false);
     CHECK_EQ(c.committed(q0), 5, "commit(Set) does not write -1 without a delivery record");
 
-    c.seek(q0, 2);
-    CHECK_EQ(c.pullCursorOf(q0), 2, "seek moves the pull cursor");
-    CHECK_EQ(c.consumeCursorOf(q0), 2, "seek must also move the consume cursor, else a replayed stretch would be skipped by the old offset");
+    // seek() holds the new offset to the queue's broker range, so it needs a live client;
+    // that path is exercised by the fake-broker cursor suite. Here the same table entry is
+    // planted through commit(map, persist=false), which moves no cursor.
+    std::map<MessageQueue, int64_t> planted;
+    planted[q0] = 2;
+    c.commit(planted, false);
+    CHECK_EQ(c.committed(q0), 2, "an explicit commit replaces the table entry");
+    CHECK_EQ(c.pullCursorOf(q0), -1, "an explicit commit moves no pull cursor");
+    CHECK_EQ(c.consumeCursorOf(q0), -1, "an explicit commit moves no consume cursor");
 
     c.assign({q0});
     CHECK_EQ(c.pullCursorOf(q1), -1, "the pull cursor disappears after assign revokes the queue");
@@ -194,8 +217,9 @@ static void testLitePullOffsetTable() {
     CHECK_EQ(c.committed(q1), 8, "a revoked queue gets no offset written");
 
     c.commit(only0, true);
-    // this q0 commit uses the current consume cursor (the seek above moved it and the pull cursor to 2 together)
-    CHECK_EQ(c.committed(q0), 2, "commit(Set) commits the consume cursor");
+    // commit(Set) writes the consume cursor, and no delivery happened here, so the table keeps
+    // the explicit value planted above.
+    CHECK_EQ(c.committed(q0), 2, "commit(Set) without a delivery record keeps the table entry");
     CHECK_EQ(c.committed(q1), -1, "persistAll drops unnamed queues from the in-memory table");
 }
 

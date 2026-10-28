@@ -91,6 +91,16 @@ const (
 	liteGateSpan  = "span"
 )
 
+// The lite consumer is in exactly one of these modes for its whole life. A call
+// that would switch it is refused: subscribe mode and assign mode build
+// different subscription tables, pull tasks and heartbeats, so a mid-flight
+// switch would leave the running halves describing two different consumers.
+const (
+	liteModeNone = iota
+	liteModeSubscribe
+	liteModeAssign
+)
+
 type TopicMessageQueueChangeListener interface {
 	OnChanged(topic string, messageQueues []common.MessageQueue)
 }
@@ -169,7 +179,7 @@ type DefaultLitePullConsumer struct {
 	subscriptionData map[string]*remoting.SubscriptionData
 	// assignSubExpr is the per-topic TAG expression for assign mode.
 	assignSubExpr          map[string]string
-	assignMode             bool
+	mode                   int
 	assigned               map[common.MessageQueue]struct{}
 	nextOffset             map[common.MessageQueue]int64
 	consumeOffset          map[common.MessageQueue]int64
@@ -693,18 +703,41 @@ func (c *DefaultLitePullConsumer) Subscribe(topic, subExpression string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.assignMode = false
+	if err := c.claimModeLocked(liteModeSubscribe); err != nil {
+		return err
+	}
 	c.subscription[topic] = subExpression
 	c.subscriptionData[topic] = sub
 	return nil
 }
 
-// Unsubscribe drops a topic from both tables.
+// Unsubscribe drops a topic from both tables AND the queues this instance holds
+// for it. Leaving the queues behind would keep pulling a topic the caller has
+// just left; waiting for the next rebalance would keep doing it until then.
 func (c *DefaultLitePullConsumer) Unsubscribe(topic string) {
+	if strings.TrimSpace(topic) == "" {
+		return
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	delete(c.subscription, topic)
-	delete(c.subscriptionData, topic)
+	if _, ok := c.assignSubExpr[topic]; !ok {
+		delete(c.subscriptionData, topic)
+	}
+	var revoked []common.MessageQueue
+	for mq := range c.assigned {
+		if mq.Topic != topic {
+			continue
+		}
+		delete(c.assigned, mq)
+		delete(c.nextOffset, mq)
+		delete(c.consumeOffset, mq)
+		delete(c.seekOffset, mq)
+		revoked = append(revoked, mq)
+	}
+	c.mu.Unlock()
+	for _, mq := range revoked {
+		c.dropQueueCache(mq)
+	}
 }
 
 // SetSubExpressionForAssign gives one topic its TAG expression in assign mode
@@ -724,6 +757,9 @@ func (c *DefaultLitePullConsumer) SetSubExpressionForAssign(topic, subExpression
 	}
 	if strings.TrimSpace(topic) == "" {
 		return common.ClientError("Topic can not be null or empty.")
+	}
+	if err := c.claimModeLocked(liteModeAssign); err != nil {
+		return err
 	}
 	c.assignSubExpr[topic] = subExpression
 	sub, err := remoting.FilterAPI{}.BuildSubscriptionData(topic, subExpression)
@@ -745,7 +781,10 @@ func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) error {
 		return common.ClientError("Message queues can not be null or empty.")
 	}
 	c.mu.Lock()
-	c.assignMode = true
+	if err := c.claimModeLocked(liteModeAssign); err != nil {
+		c.mu.Unlock()
+		return err
+	}
 	keep := make(map[common.MessageQueue]struct{}, len(mqs))
 	for _, mq := range mqs {
 		keep[mq] = struct{}{}
@@ -757,14 +796,15 @@ func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) error {
 		}
 		delete(c.nextOffset, mq)
 		delete(c.consumeOffset, mq)
+		delete(c.seekOffset, mq)
 		revoked = append(revoked, mq)
 	}
 	c.assigned = keep
 	c.mu.Unlock()
 
-	// A queue this consumer no longer owns must also lose its share of the
-	// backlog accounting: a leftover accumulator would keep refusing pulls for a
-	// queue that is not ours to judge.
+	// A queue this consumer no longer owns must also lose its paused flag, its
+	// cached messages and its share of the backlog accounting: all three belong
+	// to a queue that is not ours to judge or to serve any more.
 	for _, mq := range revoked {
 		c.dropQueueCache(mq)
 	}
@@ -782,7 +822,21 @@ func (c *DefaultLitePullConsumer) Assignment() []common.MessageQueue {
 func (c *DefaultLitePullConsumer) IsAssignMode() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.assignMode
+	return c.mode == liteModeAssign
+}
+
+// claimModeLocked pins the consumer's mode on first use and refuses any later
+// call that would change it. Callers hold mu.
+func (c *DefaultLitePullConsumer) claimModeLocked(mode int) error {
+	switch {
+	case c.mode == liteModeNone:
+		c.mode = mode
+		return nil
+	case c.mode == mode:
+		return nil
+	default:
+		return common.ClientError("Subscribe and assign are mutually exclusive.")
+	}
 }
 
 // SubscriptionExpressions snapshots topic -> raw expression (subscribe mode).
@@ -926,7 +980,7 @@ func (c *DefaultLitePullConsumer) checkConfigLocked() error {
 	if len(c.nameServerAddrs) == 0 {
 		return common.ClientError("name server address is not set")
 	}
-	if len(c.subscription) == 0 && !c.assignMode {
+	if len(c.subscription) == 0 && c.mode != liteModeAssign {
 		return common.ClientError("subscription is not set, call subscribe() or assign() first")
 	}
 	if _, err := parseConsumeTimestamp(c.consumeTimestamp); err != nil {
@@ -1148,7 +1202,40 @@ func (c *DefaultLitePullConsumer) PendingCommitOf(mq common.MessageQueue) int64 
 
 // ---------------------------------------------------------------- seek / cursors
 
-func (c *DefaultLitePullConsumer) Seek(mq common.MessageQueue, offset int64) {
+// Seek moves one queue's pull cursor to `offset`. A queue this consumer does not
+// hold is refused first: writing a cursor for it would leave an entry nothing
+// pulls, so the caller would watch an offset change that no round ever honours.
+// The offset itself is then held to the queue's own [minOffset, maxOffset] range,
+// which is also where the running-state check happens.
+func (c *DefaultLitePullConsumer) Seek(mq common.MessageQueue, offset int64) error {
+	c.mu.Lock()
+	_, held := c.assigned[mq]
+	subscribeMode := c.mode == liteModeSubscribe
+	c.mu.Unlock()
+	if !held {
+		if subscribeMode {
+			return common.ClientError(
+				"The message queue is not in assigned list, may be rebalancing, message queue: " + mq.String())
+		}
+		return common.ClientError("The message queue is not in assigned list, message queue: " + mq.String())
+	}
+	instance, err := c.requireInstance()
+	if err != nil {
+		return err
+	}
+	minOffset, err := instance.GetMinOffset(mq, litePullRPCTimeoutMillis)
+	if err != nil {
+		return err
+	}
+	maxOffset, err := instance.GetMaxOffset(mq, litePullRPCTimeoutMillis)
+	if err != nil {
+		return err
+	}
+	if offset < minOffset || offset > maxOffset {
+		return common.ClientError(fmt.Sprintf(
+			"Seek offset illegal, seek offset = %d, min offset = %d, max offset = %d",
+			offset, minOffset, maxOffset))
+	}
 	c.mu.Lock()
 	c.seekOffset[mq] = offset
 	c.nextOffset[mq] = offset
@@ -1160,6 +1247,7 @@ func (c *DefaultLitePullConsumer) Seek(mq common.MessageQueue, offset int64) {
 	// two never part company (pruneBufferLocked is the only place that does both).
 	c.pruneBufferLocked(mq, offset)
 	c.bufMu.Unlock()
+	return nil
 }
 
 // SeekToBegin pins the cursor at the queue's minimum offset.
@@ -1172,8 +1260,7 @@ func (c *DefaultLitePullConsumer) SeekToBegin(mq common.MessageQueue) error {
 	if err != nil {
 		return err
 	}
-	c.Seek(mq, offset)
-	return nil
+	return c.Seek(mq, offset)
 }
 
 // SeekToEnd pins the cursor at the queue's maximum offset.
@@ -1186,15 +1273,20 @@ func (c *DefaultLitePullConsumer) SeekToEnd(mq common.MessageQueue) error {
 	if err != nil {
 		return err
 	}
-	c.Seek(mq, offset)
-	return nil
+	return c.Seek(mq, offset)
 }
 
 // Committed reads the queue's committed offset: the in-memory commit table
 // first (a persist=false Commit's value counts), then the broker, with the
 // broker's answer backfilled into the table. -1 means nobody has committed.
+// A consumer that never started has no committed offset to report -- the table
+// belongs to a session that is not running, so it is not read.
 func (c *DefaultLitePullConsumer) Committed(mq common.MessageQueue) (int64, error) {
 	c.mu.Lock()
+	if !c.started {
+		c.mu.Unlock()
+		return -1, common.ClientError("The consumer not running, please start it first.")
+	}
 	if off, ok := c.offsetTable[mq]; ok {
 		c.mu.Unlock()
 		return off, nil
@@ -1651,8 +1743,14 @@ func (c *DefaultLitePullConsumer) sendHeartbeatToAllBrokers() int {
 	hb := remoting.NewHeartbeatData(c.clientID)
 	cd := remoting.NewConsumerData(c.consumerGroup, ConsumeTypeActively, c.messageModel, c.consumeFromWhere)
 	cd.UnitMode = c.unitMode
-	for _, sub := range c.subscriptionData {
-		cd.AddSubscriptionData(sub)
+	// Only rebalance subscriptions are advertised. An assign-mode expression names
+	// the filter for the queues this instance was handed, not a topic-wide
+	// subscription, so announcing it would make the broker treat the group as a
+	// subscriber of the whole topic.
+	for topic := range c.subscription {
+		if sub, ok := c.subscriptionData[topic]; ok {
+			cd.AddSubscriptionData(sub)
+		}
 	}
 	hb.AddConsumerData(cd)
 	addrs := c.instance.GetAllBrokerAddrs()
@@ -1690,7 +1788,7 @@ func (c *DefaultLitePullConsumer) pullServiceLoop(stop chan struct{}) {
 		}
 
 		c.mu.Lock()
-		assignMode := c.assignMode
+		assignMode := c.mode == liteModeAssign
 		lastTs := c.lastRebalanceTs
 		c.mu.Unlock()
 		now := common.CurrentTimeMillis()
@@ -2057,17 +2155,25 @@ func retireRounds(rounds []int, n int) []int {
 	return out
 }
 
-// dropQueueCache retires a queue this consumer no longer owns: its accounting
-// and its pending pull pause go away together. What its messages still occupy in
-// the buffer stays there for the application, but the pull rounds it leaves behind
-// stop weighing on the whole-buffer budget — that budget counts the rounds whose
-// messages are still waiting to be polled by a queue this client still holds — and
-// no leftover count can refuse a pull for a queue nobody owns.
+// dropQueueCache retires a queue this consumer no longer owns: its accounting,
+// its paused flag, its pending pull pause and any messages it already cached.
+// The cached rows go with the queue rather than waiting for the application:
+// nothing will replace them, no later round can cover them, and delivering from
+// a queue this consumer has already handed back would serve messages the group
+// no longer owns.
 func (c *DefaultLitePullConsumer) dropQueueCache(mq common.MessageQueue) {
 	c.mu.Lock()
 	delete(c.pullPause, mq)
+	delete(c.paused, mq)
 	c.mu.Unlock()
 	c.bufMu.Lock()
+	kept := c.buffer[:0:0]
+	for _, m := range c.buffer {
+		if liteQueueKey(m) != mq {
+			kept = append(kept, m)
+		}
+	}
+	c.buffer = kept
 	delete(c.cacheStats, mq)
 	c.bufMu.Unlock()
 }

@@ -174,6 +174,29 @@ final class FcInstance extends MQClientInstance
         return count($this->pulls);
     }
 
+    public function getMinOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
+    {
+        return 0;
+    }
+
+    public function getMaxOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
+    {
+        // Matches the maxOffset a pull result carries here, so a seek inside the seeded range is legal
+        // and no offset RPC ever leaves this process.
+        return 100;
+    }
+
+    public function queryConsumerOffset(
+        string $consumerGroup,
+        MessageQueue $mq,
+        int $timeoutMillis = 5000,
+        ?string $addr = null,
+        bool $setZeroIfNotFound = false,
+    ): ?int {
+        // Nothing was ever committed: the fixture answers the question instead of dialling out.
+        return null;
+    }
+
     public function popCount(): int
     {
         return count($this->pops);
@@ -2075,19 +2098,27 @@ final class RunClientFlowControl
         $this->checkSame(0, $c->cachedByteSizeOf($mq), 'and its accumulator is dropped rather than left at zero');
         $this->checkSame(0, $c->cachedMessageCount(), 'the aggregate and the buffer emptied together');
 
-        // Revoking the queue drops its record, its messages and its armed pause in one step.
-        $this->liteSeed($c, $mq, [20, 21]);
-        $this->liteSetPause($c, $this->liteKey($mq), microtime(true) + 5.0);
-        $next = (array) $this->liteProp($c, 'nextOffset');
-        $other = new MessageQueue('LiteTrack', 'b-fc', 1);
-        $next[$this->liteKey($other)] = 100;
-        $this->setLiteProp($c, 'nextOffset', $next);
-        $c->assign([$other]);
-        $this->checkSame(0, $c->cachedMessageCountOf($mq), 'a revoked queue keeps no accumulator');
-        $this->checkSame(0, $c->cachedMessageCount(), 'and its cached messages left the buffer with it');
-        $this->check($this->litePauseUntil($c, $this->liteKey($mq)) === null,
+        // Revoking the queue drops its record, its messages and its armed pause in one step. The
+        // shrink is the public assign path: a consumer that subscribed cannot also assign, and a
+        // revocation in subscribe mode is driven by the rebalance round, not by the caller.
+        $revokeInst = new FcInstance('lite-revoke-' . uniqid(), []);
+        $rc = new DefaultLitePullConsumer('GID-LITE-REVOKE');
+        $rc->setSubExpressionForAssign('LiteRevoke', '*');
+        $rc->setAutoCommit(false);
+        $this->setLiteProp($rc, 'started', true);
+        $this->setLiteProp($rc, 'running', true);
+        $rc->mqClient = $revokeInst;
+        $rmq = new MessageQueue('LiteRevoke', 'b-fc', 0);
+        $kept = new MessageQueue('LiteRevoke', 'b-fc', 1);
+        $rc->assign([$rmq, $kept]);
+        $this->liteSeed($rc, $rmq, [20, 21]);
+        $this->liteSetPause($rc, $this->liteKey($rmq), microtime(true) + 5.0);
+        $rc->assign([$kept]);
+        $this->checkSame(0, $rc->cachedMessageCountOf($rmq), 'a revoked queue keeps no accumulator');
+        $this->checkSame(0, $rc->cachedMessageCount(), 'and its cached messages left the buffer with it');
+        $this->check($this->litePauseUntil($rc, $this->liteKey($rmq)) === null,
             'a revoked queue keeps no armed pause either');
-        $this->checkSame([], $this->litePauseMap($c), 'no stale deadline survives the revocation');
+        $this->checkSame([], $this->litePauseMap($rc), 'no stale deadline survives the revocation');
     }
 
     /** The queue's lowest cached offset as the accumulator holds it (0 while nothing is cached). */

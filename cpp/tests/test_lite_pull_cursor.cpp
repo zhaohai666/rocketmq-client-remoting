@@ -12,10 +12,10 @@
 // of every PULL_MESSAGE read off the socket -- "the cursor really moved to 5" is judged by the next request starting at 5, not by an in-memory table.
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -99,7 +99,8 @@ bool writeAll(socket_t s, const Bytes& data) {
     return true;
 }
 
-bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
+bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out,
+               const std::function<void()>& onIdle = nullptr) {
     for (;;) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -109,7 +110,10 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
         tv.tv_usec = 100 * 1000;
         int ready = ::select(netcompat::selectNfds(s), &rfds, nullptr, nullptr, &tv);
         if (!alive.load()) return false;
-        if (ready == 0) continue;
+        if (ready == 0) {
+            if (onIdle != nullptr) onIdle();
+            continue;
+        }
         if (ready < 0) return false;
         break;
     }
@@ -142,6 +146,8 @@ public:
     // GET_MAX_OFFSET, one at 200 from SEARCH_OFFSET_BY_TIMESTAMP, one at 0 from the retry/FIRST rule.
     static constexpr int64_t kTailOffset = 100;
     static constexpr int64_t kSearchedOffset = 200;
+    // The floor answered by GET_MIN_OFFSET: a seek must land inside [kFloorOffset, kTailOffset].
+    static constexpr int64_t kFloorOffset = 0;
 
     MockEndpoint() {
         netcompat::ensureInitialized();
@@ -165,10 +171,9 @@ public:
     ~MockEndpoint() {
         running_.store(false);
         {
-            // if the gate was never released, open it first so a worker thread stuck in wait cannot hold up the destructor.
+            // open the gate too, so a pending deferred reply is flushed before the loop exits.
             std::lock_guard<std::mutex> lk(gateMutex_);
             gateOpen_ = true;
-            gateCv_.notify_all();
         }
         if (acceptor_.joinable()) acceptor_.join();
         for (;;) {
@@ -216,7 +221,6 @@ public:
     void releasePullGate() {
         std::lock_guard<std::mutex> lk(gateMutex_);
         gateOpen_ = true;
-        gateCv_.notify_all();
     }
 
     size_t pullCount() {
@@ -315,7 +319,22 @@ private:
 
     void serveConn(socket_t sock) {
         Bytes frame;
-        while (running_.load() && readFrame(sock, running_, frame)) {
+        // A gated pull is parked here instead of waiting inside the connection: the consumer's seek
+        // issues its boundary RPCs on this same socket, and a blocked worker would leave them
+        // unanswered until the client times out. The read loop flushes the reply once the gate opens.
+        std::deque<RemotingCommand> deferred;
+        auto flushDeferred = [&]() {
+            while (!deferred.empty() && gateIsOpen()) {
+                RemotingCommand resp;
+                resp.opaque = deferred.front().opaque;
+                resp.markResponseType();
+                fillPullReply(deferred.front().extFields, resp);
+                deferred.pop_front();
+                if (!writeAll(sock, resp.encode())) return;
+            }
+        };
+        while (running_.load() &&
+               readFrame(sock, running_, frame, [&]() { flushDeferred(); })) {
             RemotingCommand req;
             if (!RemotingCommand::tryDecode(frame, req, nullptr)) break;
             RemotingCommand resp;
@@ -336,13 +355,23 @@ private:
                 }
             } else if (req.code == RequestCode::PULL_MESSAGE ||
                        req.code == RequestCode::LITE_PULL_MESSAGE) {
-                answerPull(req, resp);
+                recordPull(req);
+                if (takePullGate()) {
+                    deferred.push_back(req);
+                    continue;
+                }
+                fillPullReply(req.extFields, resp);
             } else if (req.code == RequestCode::QUERY_CONSUMER_OFFSET) {
                 // the group never committed an offset: a real broker answers QUERY_NOT_FOUND (the 22 of
                 // 21/22), which is how the client falls into the consumeFromWhere branch to compute the start.
                 std::lock_guard<std::mutex> lk(state_);
                 codes_.push_back(req.code);
                 resp.code = ResponseCode::QUERY_NOT_FOUND;
+            } else if (req.code == RequestCode::GET_MIN_OFFSET) {
+                std::lock_guard<std::mutex> lk(state_);
+                codes_.push_back(req.code);
+                resp.code = ResponseCode::SUCCESS;
+                resp.extFields["offset"] = std::to_string(kFloorOffset);
             } else if (req.code == RequestCode::GET_MAX_OFFSET) {
                 // A tail distinct from every other start, so "the pull began at 100" identifies this RPC.
                 std::lock_guard<std::mutex> lk(state_);
@@ -369,26 +398,28 @@ private:
 
     /// The request is recorded **before** the gate: when the gate stretches the "reply still in flight"
     /// window, pullCount() must already be visible, else the "wait for the first pull" case idles at the gate. pullCodes_ records the **reply** codes.
-    void answerPull(const RemotingCommand& req, RemotingCommand& resp) {
-        {
-            std::lock_guard<std::mutex> lk(state_);
-            codes_.push_back(req.code);
-            pullReqCodes_.push_back(req.code);
-            pulls_.push_back(req.extFields);
-        }
-        bool gated = false;
-        {
-            std::lock_guard<std::mutex> lk(gateMutex_);
-            if (gateArmed_) {
-                gateArmed_ = false;
-                gated = true;
-            }
-        }
-        if (gated) {
-            std::unique_lock<std::mutex> lk(gateMutex_);
-            // 5s fallback: even a failing case must not wedge the worker thread forever (the destructor joins it).
-            gateCv_.wait_for(lk, std::chrono::seconds(5), [this] { return gateOpen_; });
-        }
+    void recordPull(const RemotingCommand& req) {
+        std::lock_guard<std::mutex> lk(state_);
+        codes_.push_back(req.code);
+        pullReqCodes_.push_back(req.code);
+        pulls_.push_back(req.extFields);
+    }
+
+    /// Consumes the armed gate for the pull that just arrived. Arm-then-wait is split from the reply
+    /// itself so the connection keeps serving other requests while the reply is held back.
+    bool takePullGate() {
+        std::lock_guard<std::mutex> lk(gateMutex_);
+        if (!gateArmed_) return false;
+        gateArmed_ = false;
+        return true;
+    }
+
+    bool gateIsOpen() {
+        std::lock_guard<std::mutex> lk(gateMutex_);
+        return gateOpen_;
+    }
+
+    void fillPullReply(const PropertyMap& reqExt, RemotingCommand& resp) {
         PullReply reply;
         bool hasScript = false;
         {
@@ -402,7 +433,7 @@ private:
         if (!hasScript) {
             reply.code = ResponseCode::PULL_NOT_FOUND;
             reply.ext["nextBeginOffset"] =
-                std::to_string(extInt(req.extFields, "queueOffset", 0));
+                std::to_string(extInt(reqExt, "queueOffset", 0));
             reply.ext["minOffset"] = "0";
             reply.ext["maxOffset"] = "0";
         }
@@ -430,7 +461,6 @@ private:
     std::vector<int64_t> searchTimestamps_;
     std::deque<PullReply> pullScripts_;
     std::mutex gateMutex_;
-    std::condition_variable gateCv_;
     bool gateArmed_ = false;
     bool gateOpen_ = false;
     std::mutex workersM_;

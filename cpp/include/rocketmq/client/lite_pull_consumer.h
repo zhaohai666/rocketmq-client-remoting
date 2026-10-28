@@ -183,6 +183,10 @@ public:
     void setSubExpressionForAssign(const std::string& topic, const MessageSelector& selector);
     // Assign mode: queues are given explicitly, no rebalance involved.
     void assign(const std::vector<MessageQueue>& messageQueues);
+    // Drops a topic's subscription AND its assigned queues at once, without waiting
+    // for the next rebalance: the queues leave with the topic and so does their
+    // per-queue state (cursors, paused flag, buffered rows, seek offset).
+    void unsubscribe(const std::string& topic);
 
     // ---------------- Lifecycle ----------------
     void start();
@@ -263,6 +267,10 @@ private:
 
     void rebalance();
     void metadataLoop();
+    // Claims one of the two mutually exclusive modes: the first subscribe()/assign()/
+    // setSubExpressionForAssign() decides, and a later call that claims the other
+    // mode is refused.
+    void claimMode(bool assign);
     bool pullOne(const MessageQueue& mq);
     std::string subscriptionFor(const std::string& topic) const;
     // The registered SubscriptionData that describes this topic's subscription (expression type and
@@ -345,6 +353,10 @@ private:
     // Assign and subscribe modes are mutually exclusive; the pull thread reads this every round while the
     // setter runs on the caller thread, so it is atomic rather than a plain bool under stateMutex_ (many read sites, not worth locking).
     std::atomic<bool> assignMode_{false};
+    // Which mode was claimed first: 0 = neither, 1 = subscribe, 2 = assign. Kept next to
+    // assignMode_ so the pull thread keeps its cheap bool while the facade can still tell a
+    // conflicting claim from a repeated one.
+    std::atomic<int> mode_{0};
     // All mutable assignment and offset state (assigned_ / the three cursor tables / the auto-commit
     // deadline / the paused set) is guarded by this single stateMutex_: the pull thread advances the
     // pull cursor, rebalance rewrites the assignment and poll/commit caller threads read at the same

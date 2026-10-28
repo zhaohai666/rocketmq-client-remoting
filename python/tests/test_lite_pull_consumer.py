@@ -62,6 +62,9 @@ class MockClient:
         # broker only evaluates SQL92 when the **pull request** carries that type.
         self.pull_expression_types: List[str] = []
         self.pull_subscriptions: List[str] = []
+        # The subVersion of every pull: a TAG subscription carries none, a broker-evaluated
+        # expression carries the version its subscription data was registered with.
+        self.pull_sub_versions: List[int] = []
 
     def start(self) -> None:
         pass
@@ -125,6 +128,7 @@ class MockClient:
         self.pull_sys_flags.append(sys_flag)
         self.pull_expression_types.append(expression_type)
         self.pull_subscriptions.append(subscription)
+        self.pull_sub_versions.append(sub_version)
         if self.scripted:
             entry = self.scripted.pop(0)
             # The callable runs "in the middle of a request": it simulates a concurrent seek / queue withdrawal
@@ -721,7 +725,9 @@ class TestPullCursorFollowsNextBeginOffset:
         c, q0 = self._paused_consumer()
         try:
             def seek_mid_flight():
-                c.seek(q0, 99)
+                # Offset 5 is this queue's max: Seek holds the offset to the queue's own
+                # [min, max] range, and this test is about the in-flight window, not a range refusal.
+                c.seek(q0, 5)
                 return PullResult(PullStatus.FOUND, 2, 0, 5, [
                     _make_msg("T", "broker-a", 0, 0, "A0"),
                     _make_msg("T", "broker-a", 0, 1, "B1"),
@@ -729,7 +735,7 @@ class TestPullCursorFollowsNextBeginOffset:
 
             c._mock.scripted.append(seek_mid_flight)
             assert c._pull_one(q0) is False, "the seek invalidated the window, nothing may be handed out"
-            assert c.pull_cursor_of(q0) == 99, "the cursor stays on the value the seek pinned"
+            assert c.pull_cursor_of(q0) == 5, "the cursor stays on the value the seek pinned"
             assert c.poll(timeout=100) == [], "the buffer must not hold messages from before the seek window"
         finally:
             c.shutdown()
@@ -860,6 +866,10 @@ class TestLitePullSelectorExpressionType:
             assert c._pull_one(q0) is True
             assert c._mock.pull_expression_types[-1] == ExpressionType.SQL92
             assert c._mock.pull_subscriptions[-1] == "a > 1"
+            # A broker-evaluated expression is compiled once per version, so the pull repeats
+            # the version the subscription data was registered with -- not 0.
+            assert c._mock.pull_sub_versions[-1] == c.subscription_data["T"].sub_version
+            assert c._mock.pull_sub_versions[-1] != 0
             got = c.poll(timeout=500)
             assert [m.body.decode() for m in got] == ["B1"], \
                 "SQL92 matches are filtered by the broker; the client must deliver them"
@@ -884,6 +894,8 @@ class TestLitePullSelectorExpressionType:
                                                [_make_msg("T", "broker-a", 0, 0, "B1")]))
             assert c._pull_one(q0) is False, "TagB must still be dropped by the client tag pass"
             assert c._mock.pull_expression_types[-1] == ExpressionType.TAG
+            assert c._mock.pull_sub_versions[-1] == 0, \
+                "a TAG subscription carries no version on the wire: the tag string is the whole filter"
         finally:
             c.shutdown()
 
@@ -920,7 +932,7 @@ def test_lite_surface_refuses_misuse():
     with pytest.raises(ValueError, match="can not be null or empty"):
         c.assign(None)
     assert c.assignment() == []                 # a refused assign changed nothing
-    assert c._assign_mode is False
+    assert c.is_assign_mode() is False
 
     with pytest.raises(ValueError, match="Topic can not be null or empty"):
         c.subscribe("   ")
@@ -938,3 +950,170 @@ def test_lite_surface_refuses_misuse():
         c.poll(timeout=-1)                      # the state check comes first
     with pytest.raises(MQClientException, match="not running"):
         c.committed(mq)
+
+
+def test_lite_mode_is_mutually_exclusive():
+    """A lite consumer is subscribed or assigning, never both: the two modes build different
+    subscription tables, pull targets and heartbeats, so a mid-flight switch would leave the
+    running halves describing two different consumers."""
+    mq = MessageQueue("T", "broker-a", 0)
+
+    subscribed = DefaultLitePullConsumer("G_lite_mode_sub")
+    subscribed.subscribe("T", "*")
+    with pytest.raises(MQClientException, match="Subscribe and assign are mutually exclusive"):
+        subscribed.assign([mq])
+    with pytest.raises(MQClientException, match="Subscribe and assign are mutually exclusive"):
+        subscribed.set_sub_expression_for_assign("T", "TagA")
+    assert subscribed.assignment() == [] and subscribed.is_assign_mode() is False
+
+    assigned = DefaultLitePullConsumer("G_lite_mode_assign")
+    assigned.assign([mq])
+    with pytest.raises(MQClientException, match="Subscribe and assign are mutually exclusive"):
+        assigned.subscribe("T", "*")
+    assert assigned.subscription == {} and assigned.is_assign_mode() is True
+    # Same mode stays open: an assign-mode consumer may take more topics or queues.
+    assigned.set_sub_expression_for_assign("T", "TagA")
+    assigned.assign([mq, MessageQueue("T", "broker-a", 1)])
+
+
+def test_seek_refuses_what_it_cannot_honour():
+    """Seek only moves a cursor the consumer can honour: a queue it does not hold is
+    refused before anything is written, and the offset is held to the queue's own
+    [minOffset, maxOffset] range."""
+    c = _Lite("LitePG_UT", _store=STORE)
+    c.set_namesrv_addr("127.0.0.1:9876")
+    c.set_auto_commit(False)
+    q0 = MessageQueue("T", "broker-a", 0)
+    stranger = MessageQueue("T", "broker-a", 7)
+    c.assign([q0])
+    # Before start the queue is held, so it is the running-state check that refuses.
+    with pytest.raises(MQClientException, match="not running"):
+        c.seek(q0, 1)
+    c.start()
+    try:
+        c.pause([q0])
+        # Assign mode: a queue that was never assigned never will be.
+        with pytest.raises(MQClientException, match="not in assigned list, message queue") as assign_err:
+            c.seek(stranger, 0)
+        assert "may be rebalancing" not in str(assign_err.value)
+
+        # The store holds 5 messages: offsets 0..5 are legal, both outside points are refused.
+        for legal in (0, 5):
+            c.seek(q0, legal)
+        for illegal in (-1, 6):
+            with pytest.raises(MQClientException, match="Seek offset illegal") as range_err:
+                c.seek(q0, illegal)
+            assert "min offset = 0, max offset = 5" in str(range_err.value)
+        assert c.pull_cursor_of(q0) == 5, "a refused Seek must not have moved the cursor"
+    finally:
+        c.shutdown()
+
+    # Subscribe mode names the same situation differently: there the queue may merely
+    # be waiting for the rebalance that would hand it over.
+    s = _Lite("LitePG_UT", _store=STORE)
+    s.set_namesrv_addr("127.0.0.1:9876")
+    s.subscribe("T", "*")
+    s.start()
+    try:
+        with pytest.raises(MQClientException, match="may be rebalancing"):
+            s.seek(stranger, 0)
+    finally:
+        s.shutdown()
+
+
+def test_assign_revoke_drops_buffered_rows_park_and_pause():
+    """A revoked queue leaves nothing behind. Poll must never hand out messages from a
+    queue the consumer has given up, and its parking window and paused flag go with the
+    assignment they described."""
+    store = {("broker-a", 0): ["A0", "B1"], ("broker-a", 1): ["C0"]}
+    c = _Lite("LitePG_UT", _store=store)
+    c.set_namesrv_addr("127.0.0.1:9876")
+    c.set_auto_commit(False)
+    q0 = MessageQueue("T", "broker-a", 0)
+    q1 = MessageQueue("T", "broker-a", 1)
+    c.assign([q0, q1])
+    c.pause([q0, q1])
+    c.start()
+    try:
+        assert c._pull_one(q0) is True, "the staged batch should reach the buffer"
+        assert len(c._local_buffer) == 2
+        c._pull_not_before[q0] = time.monotonic() + 60
+
+        c.assign([q1])          # shrink: q0 is revoked
+        assert list(c._local_buffer) == [], "rows from a revoked queue must not stay pollable"
+        assert q0 not in c._paused, "the revoked queue's paused flag goes with it"
+        assert q0 not in c._pull_not_before, "the revoked queue's parking time goes with it"
+        assert q0 not in c._queue_cache, "the revoked queue's accumulator goes with it"
+        assert c.poll(timeout=100) == []
+    finally:
+        c.shutdown()
+
+
+def test_assign_mode_heartbeat_announces_no_subscription():
+    """An assign expression filters the queues this instance was handed; it is not a
+    broker-side subscription. Announcing it would make the broker treat the group as a
+    subscriber of the whole topic, so the heartbeat carries no subscription entry at all
+    while the local registration still drives the pull request."""
+    c = DefaultLitePullConsumer("G_lite_hb_assign")
+    c.set_sub_expression_for_assign("T", "TagA")
+    c.assign([MessageQueue("T", "broker-a", 0)])
+    cd = list(c._build_heartbeat().consumer_data_set)[0]
+    assert list(cd.subscription_data_set) == [], \
+        "an assign-mode heartbeat advertises no subscription"
+    assert c.subscription_data["T"].sub_string == "TagA", \
+        "the local registration is untouched: it is what the pull request repeats"
+
+    # The control: subscribe mode still announces its subscription.
+    s = DefaultLitePullConsumer("G_lite_hb_sub")
+    s.subscribe("T", "TagA")
+    subs = list(list(s._build_heartbeat().consumer_data_set)[0].subscription_data_set)
+    assert [sub.topic for sub in subs] == ["T"]
+    assert subs[0].sub_string == "TagA"
+
+
+def test_unsubscribe_revokes_the_topics_queues_and_state():
+    """Unsubscribe does not wait for the next rebalance: the topic's queues leave at once,
+    with their cursors, seek pin, paused flag and buffered rows, and the next rebalance
+    cannot hand them back."""
+    c = _Lite("LitePG_UT", _store=STORE)
+    c.set_namesrv_addr("127.0.0.1:9876")
+    c.set_auto_commit(False)
+    c.subscribe("T", "*")
+    c.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not c.assignment() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert c.assignment(), "the rebalance assigned the topic's queue"
+        mq = c.assignment()[0]
+        c.pause([mq])
+        c.seek(mq, 3)
+        assert c.pull_cursor_of(mq) == 3
+
+        c.unsubscribe("T")
+
+        assert c.assignment() == [], "the topic's queues leave with the subscription"
+        assert c.pull_cursor_of(mq) == -1, "the pull cursor went with the revoked queue"
+        assert c.consume_cursor_of(mq) == -1, "and the consume cursor too"
+        assert mq not in c._paused, "and so did the paused flag"
+        assert mq not in c._queue_cache, "and its cache accumulator"
+        assert c.subscription == {}
+
+        # The subscription table is gone, so the running rebalance (about once a second)
+        # cannot hand the topic back.
+        time.sleep(1.5)
+        assert c.assignment() == [], "the rebalance did not re-add the unsubscribed topic"
+    finally:
+        c.shutdown()
+
+    # The assign expression table is not a rebalance subscription: unsubscribe revokes
+    # the topic's queues but leaves the caller's assign filter table alone.
+    g = DefaultLitePullConsumer("G_lite_unsub_assign")
+    g.set_sub_expression_for_assign("T", "TagA")
+    g.assign([MessageQueue("T", "broker-a", 0)])
+    g.unsubscribe("T")
+    assert g.assignment() == []
+    assert g._assign_sub_expr == {"T": "TagA"}
+    # A blank topic is a no-op, not a namespace-wrapped key.
+    g.unsubscribe("   ")
+    assert g._assign_sub_expr == {"T": "TagA"}

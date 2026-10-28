@@ -624,7 +624,11 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
         &format!("n={} got={:?}", got.len(), bodies(&got)),
     );
     // Seek to a concrete offset: queue 0 replays its remaining 2 messages from offset=1.
-    c.seek(&mqs[0], 1);
+    if let Err(e) = c.seek(&mqs[0], 1).await {
+        ck.abort("L4 seek(concrete offset)", &e.to_string());
+        c.shutdown();
+        return;
+    }
     let replay = poll_bounded(ck, &c, per_queue - 1, 20).await;
     let from_q0: BTreeSet<String> = replay
         .iter()
@@ -1196,7 +1200,12 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     o.pause(std::slice::from_ref(&q0));
     // Wait for the in-flight pull's response to land (it writes the pull cursor); only then can the seek pin at 60.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    o.seek(&q0, 60);
+    if let Err(e) = o.seek(&q0, 60).await {
+        ck.abort("L11f seek", &e.to_string());
+        o.shutdown();
+        probe.shutdown();
+        return;
+    }
     ck.check(
         "L11f seek changes the pull cursor",
         o.pull_cursor_of(&q0) == 60,

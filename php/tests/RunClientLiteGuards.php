@@ -23,6 +23,11 @@ declare(strict_types=1);
  *    start() stays hidden forever. Once running, a negative poll timeout is refused too -- and the
  *    state check comes first, so an unstarted consumer is reported as that rather than as a
  *    timeout problem.
+ * 5. subscribe() and assign() are mutually exclusive: whichever the consumer claimed first holds,
+ *    and the other is refused without changing the mode or the assignment.
+ * 6. seek() refuses a queue the consumer does not hold (with the rebalancing wording in subscribe
+ *    mode and the plain wording in assign mode), refuses a consumer that never started, and refuses
+ *    an offset outside the queue's [minOffset, maxOffset] -- leaving the cursors where they were.
  *
  * The started flag is set through reflection where a case needs "already running": starting for
  * real would need a cluster, and none of these guards reads the wire.
@@ -35,9 +40,24 @@ putenv('ROCKETMQ_NAMESRV_DOMAIN');
 putenv('ROCKETMQ_NAMESRV_ADDR');
 
 use RocketMQ\Client\DefaultLitePullConsumer;
+use RocketMQ\Client\MQClientInstance;
 use RocketMQ\Client\MessageSelector;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Client\Exceptions\MQClientException;
+
+/** Answers the two offset reads seek performs and dials nothing, so a range case stays offline. */
+final class LiteGuardInstance extends MQClientInstance
+{
+    public function getMinOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
+    {
+        return 10;
+    }
+
+    public function getMaxOffset(MessageQueue $mq, int $timeoutMillis = 5000, ?string $addr = null): int
+    {
+        return 20;
+    }
+}
 
 final class RunClientLiteGuards
 {
@@ -176,6 +196,100 @@ final class RunClientLiteGuards
             fn () => $c->poll(-1), 'a running consumer still refuses a negative timeout');
     }
 
+    // ================================================================ 5. mode exclusivity
+
+    private function testModesAreMutuallyExclusive(): void
+    {
+        $mq = new MessageQueue('T', 'broker-0', 0);
+
+        $sub = $this->consumer();
+        $sub->subscribe('T');
+        $sub->subscribe('T2');
+        $this->checkSame(2, count($sub->subscription),
+            'the first claim on the consumer is subscribe, and it stays open to more topics');
+        $this->checkThrows(MQClientException::class, 'Subscribe and assign are mutually exclusive',
+            fn () => $sub->assign([$mq]), 'assign after subscribe is refused');
+        $this->checkThrows(MQClientException::class, 'Subscribe and assign are mutually exclusive',
+            fn () => $sub->setSubExpressionForAssign('T', '*'),
+            'an assign expression after subscribe is refused too');
+        $this->checkSame(false, $sub->isAssignMode(), 'the refused calls left the consumer in subscribe mode');
+        $this->checkSame([], $sub->assignment(), 'a refused assign adds no queue');
+
+        $assign = $this->consumer();
+        $assign->setSubExpressionForAssign('T', '*');
+        $this->checkThrows(MQClientException::class, 'Subscribe and assign are mutually exclusive',
+            fn () => $assign->subscribe('T'), 'subscribe after assign is refused');
+        $this->checkSame(true, $assign->isAssignMode(), 'the refused subscribe left the consumer in assign mode');
+        $this->checkSame([], $assign->subscription, 'a refused subscribe registers no subscription');
+    }
+
+    // ================================================================ 6. seek
+
+    /** Put one queue into the assigned set without a rebalance round. */
+    private function holdQueue(DefaultLitePullConsumer $c, MessageQueue $mq): void
+    {
+        $prop = new \ReflectionProperty(DefaultLitePullConsumer::class, 'assigned');
+        $prop->setAccessible(true);
+        $prop->setValue($c, [$mq->topic . $mq->brokerName . (string) $mq->queueId => $mq]);
+    }
+
+    private function testSeekRefusesWhatItCannotHonour(): void
+    {
+        $mq = new MessageQueue('T', 'broker-0', 0);
+        $stranger = new MessageQueue('T', 'broker-0', 1);
+
+        // Subscribe mode: a queue this consumer does not hold names the rebalance explicitly.
+        $sub = $this->consumer();
+        $sub->subscribe('T');
+        $this->checkThrows(MQClientException::class, 'not in assigned list, may be rebalancing, message queue',
+            fn () => $sub->seek($stranger, 15), 'subscribe mode names the rebalance that may own the queue');
+
+        // Assign mode: the same refusal, without blaming a rebalance this mode never runs.
+        $assign = $this->consumer();
+        $assign->setSubExpressionForAssign('T', '*');
+        $assign->assign([$mq]);
+        $this->checkThrows(
+            MQClientException::class,
+            "not in assigned list, message queue: MessageQueue(topic='T', broker='broker-0', qid=1)",
+            fn () => $assign->seek($stranger, 15),
+            'assign mode does not claim a rebalance is in progress',
+        );
+        $this->checkSame(-1, $assign->pullCursorOf($mq), 'a refused seek leaves the held queue\'s cursor alone');
+
+        // Membership is answered before the running state...
+        $this->checkThrows(MQClientException::class, 'not in assigned list',
+            fn () => $assign->seek(new MessageQueue('T', 'broker-0', 2), 15),
+            'an unheld queue is reported as unheld even on a consumer that never started');
+
+        // ...and the running state before the range, which needs the broker's own bounds.
+        $this->holdQueue($assign, $mq);
+        $this->checkThrows(MQClientException::class, 'not running',
+            fn () => $assign->seek($mq, 15), 'a consumer that never started cannot seek');
+
+        $assign->mqClient = new LiteGuardInstance('lite-guard-' . uniqid(), []);
+        $this->markStarted($assign, true);
+
+        $this->checkThrows(
+            MQClientException::class,
+            'Seek offset illegal, seek offset = 9, min offset = 10, max offset = 20',
+            fn () => $assign->seek($mq, 9),
+            'an offset below the queue\'s min is refused with all three numbers',
+        );
+        $this->checkThrows(
+            MQClientException::class,
+            'Seek offset illegal, seek offset = 21, min offset = 10, max offset = 20',
+            fn () => $assign->seek($mq, 21),
+            'an offset past the queue\'s max is refused with all three numbers',
+        );
+        $this->checkSame(-1, $assign->pullCursorOf($mq), 'neither refused seek moved the cursor');
+
+        $assign->seek($mq, 10);
+        $this->checkSame(10, $assign->pullCursorOf($mq), 'the min offset itself is legal');
+        $assign->seek($mq, 20);
+        $this->checkSame(20, $assign->pullCursorOf($mq), 'the max offset itself is legal');
+        $this->checkSame(20, $assign->consumeCursorOf($mq), 'a legal seek dials the consume cursor too');
+    }
+
     // ================================================================ entry
 
     public function run(): int
@@ -184,6 +298,8 @@ final class RunClientLiteGuards
         $this->testSubscribeRefusesABlankTopic();
         $this->testAssignExpressionIsRefusedOutLoud();
         $this->testPollAndCommittedRefuseAnUnstartedConsumer();
+        $this->testModesAreMutuallyExclusive();
+        $this->testSeekRefusesWhatItCannotHonour();
         return $this->summary();
     }
 

@@ -976,17 +976,30 @@ def _lite_msg(body_size, queue_offset, store_size=1, queue_id=0, topic=LITE_TOPI
     return m
 
 
+class _BoundsClient:
+    """The two boundary reads Seek makes. The buffer under test is local, so the range
+    only has to be wide enough for the offsets those tests pin."""
+
+    def get_min_offset(self, mq):
+        return 0
+
+    def get_max_offset(self, mq):
+        return 10 ** 9
+
+
 def _lite_consumer(group, *mqs):
     """A running-but-threadless LitePull consumer: no thread and no socket, and the gates read exactly
     what the shared local buffer holds. ``assign()`` is what makes the queues owned, which is what the gates
-    judge -- the same path a live consumer takes. The started flag is set by hand because ``poll()`` refuses
-    a consumer that never started, and these tests hand the buffer to the application.
+    judge -- the same path a live consumer takes. The started flag and the boundary client are set by hand
+    because ``poll()`` and ``seek()`` refuse a consumer that never started, and these tests hand the buffer
+    to the application.
     """
     c = DefaultLitePullConsumer(group)
     c.set_auto_commit(False)
     if mqs:
         c.assign(list(mqs))
     c._started = True
+    c._mq_client = _BoundsClient()
     return c
 
 

@@ -304,6 +304,70 @@ func TestLitePullConsumerSeekDropsBufferedMessages(t *testing.T) {
 	}
 }
 
+// Seek only moves a cursor the consumer can actually honour. A queue it does not
+// hold is refused before anything is written — in subscribe mode the queue may
+// simply be waiting for a rebalance, in assign mode it never will be — and the
+// offset is held to the queue's own bounds, so a typo cannot pin a cursor the
+// pull path would reject round after round.
+func TestLitePullConsumerSeekRefusesWhatItCannotHonour(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"T": 1})
+	mq := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 0}
+	unheld := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 7}
+
+	c := newLiteConsumer(t, f, "GID_lite_seek_guards")
+	c.SetConsumeFromWhere(ConsumeFromWhereFirstOffset)
+	c.SetAutoCommit(false)
+	c.Assign([]common.MessageQueue{mq})
+	c.Pause([]common.MessageQueue{mq})
+	f.broker.add("T", 0, "a0", "a1", "a2")
+
+	// Before Start the membership check passes (the queue is held) and the
+	// running-state check refuses.
+	if err := c.Seek(mq, 1); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Errorf("Seek before Start error = %v, want the not-running refusal", err)
+	}
+
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	// Assign mode: a queue that was never assigned never will be.
+	if err := c.Seek(unheld, 0); err == nil ||
+		!strings.Contains(err.Error(), "The message queue is not in assigned list, message queue: ") ||
+		strings.Contains(err.Error(), "may be rebalancing") {
+		t.Errorf("Seek on an unheld queue in assign mode error = %v, want the plain membership refusal", err)
+	}
+
+	// The broker reports offsets 0..3; both ends are legal and both outside
+	// points are refused with the range read back.
+	for _, legal := range []int64{0, 3} {
+		if err := c.Seek(mq, legal); err != nil {
+			t.Errorf("Seek(%d) at the legal bound error = %v, want it accepted", legal, err)
+		}
+	}
+	for _, illegal := range []int64{-1, 4} {
+		err := c.Seek(mq, illegal)
+		if err == nil || !strings.Contains(err.Error(), "Seek offset illegal") ||
+			!strings.Contains(err.Error(), "min offset = 0, max offset = 3") {
+			t.Errorf("Seek(%d) error = %v, want the range refusal read back", illegal, err)
+		}
+	}
+	// A refused Seek must not have moved the cursor.
+	if got := c.PullCursorOf(mq); got != 3 {
+		t.Errorf("a refused Seek left the pull cursor at %d, want the last accepted 3", got)
+	}
+
+	// Subscribe mode names the same situation differently: there the queue may
+	// merely be waiting for the rebalance that would hand it over.
+	s := newLiteConsumer(t, f, "GID_lite_seek_guards_sub")
+	requireNoError(t, "subscribe", s.Subscribe("T", "*"))
+	requireNoError(t, "start", s.Start())
+	t.Cleanup(s.Shutdown)
+	if err := s.Seek(unheld, 0); err == nil ||
+		!strings.Contains(err.Error(), "may be rebalancing") {
+		t.Errorf("Seek on an unheld queue in subscribe mode error = %v, want the rebalancing refusal", err)
+	}
+}
+
 // ResolveOrder: broker-committed offsets win (restart continuity), otherwise
 // CONSUME_FROM_LAST_OFFSET starts at max offset — skipping everything the
 // queue already holds.
@@ -420,12 +484,21 @@ func TestLitePullConsumerCommitPaths(t *testing.T) {
 }
 
 func TestLitePullConsumerAssignDropsRevokedCursors(t *testing.T) {
-	c := MustNewDefaultLitePullConsumer("GID_lite_drop")
+	f := newClusterFixture(t, map[string]int{"T": 2})
+	c := newLiteConsumer(t, f, "GID_lite_drop")
+	c.SetConsumeFromWhere(ConsumeFromWhereFirstOffset)
+	c.SetAutoCommit(false)
 	mq0 := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 0}
 	mq1 := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 1}
 	c.Assign([]common.MessageQueue{mq0, mq1})
-	c.Seek(mq0, 5)
-	c.Seek(mq1, 7)
+	// Paused so the background loop leaves the cursors Seek sets alone.
+	c.Pause([]common.MessageQueue{mq0, mq1})
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+	f.broker.add("T", 0, "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7")
+	f.broker.add("T", 1, "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7")
+	requireNoError(t, "Seek(mq0)", c.Seek(mq0, 5))
+	requireNoError(t, "Seek(mq1)", c.Seek(mq1, 7))
 
 	c.Assign([]common.MessageQueue{mq0})
 	if !c.IsAssignMode() {
@@ -850,6 +923,17 @@ func TestLiteSurfaceRefusesMisuse(t *testing.T) {
 	if _, err := c.Committed(mq); err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Errorf("Committed before Start error = %v, want the not-running refusal", err)
 	}
+	// A table entry does not make a stopped consumer's offset real: the running
+	// check comes first, so a caller cannot read a session that is not open.
+	c.mu.Lock()
+	c.offsetTable[mq] = 42
+	c.mu.Unlock()
+	if _, err := c.Committed(mq); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Errorf("Committed on a stopped consumer holding an offset error = %v, want the not-running refusal", err)
+	}
+	c.mu.Lock()
+	delete(c.offsetTable, mq)
+	c.mu.Unlock()
 
 	requireNoError(t, "subscribe", c.Subscribe("T", "*"))
 	requireNoError(t, "start", c.Start())
@@ -862,7 +946,126 @@ func TestLiteSurfaceRefusesMisuse(t *testing.T) {
 		!strings.Contains(err.Error(), "only can be called before start") {
 		t.Errorf("assign expression after Start error = %v, want the pre-start refusal", err)
 	}
-	if err := c.Assign([]common.MessageQueue{mq}); err != nil {
-		t.Errorf("a non-empty Assign must be accepted, got %v", err)
+
+	// A consumer subscribed once stays in subscribe mode: assigning a queue now
+	// would leave the running halves describing two different consumers.
+	if err := c.Assign([]common.MessageQueue{mq}); err == nil ||
+		!strings.Contains(err.Error(), "Subscribe and assign are mutually exclusive") {
+		t.Errorf("Assign on a subscribed consumer error = %v, want the mode-conflict refusal", err)
 	}
+
+	// The mirror image is just as fixed, and the assign-mode call itself is
+	// accepted on a consumer that took that mode first.
+	assigned := newLiteConsumer(t, f, "GID_lite_guards_assign")
+	if err := assigned.Assign([]common.MessageQueue{mq}); err != nil {
+		t.Fatalf("a non-empty Assign must be accepted, got %v", err)
+	}
+	if err := assigned.Subscribe("T", "*"); err == nil ||
+		!strings.Contains(err.Error(), "Subscribe and assign are mutually exclusive") {
+		t.Errorf("Subscribe on an assigned consumer error = %v, want the mode-conflict refusal", err)
+	}
+	if err := assigned.SetSubExpressionForAssign("T", "TagA"); err != nil {
+		t.Errorf("an assign-mode consumer must accept its expression, got %v", err)
+	}
+}
+
+// Unsubscribing a topic drops the queues this instance holds for it right away.
+// In subscribe mode a rebalance would eventually hand them away; in assign mode
+// nothing ever would, so the consumer would keep pulling a topic the caller has
+// left. The sibling topic and its cursor stay untouched.
+func TestLitePullConsumerUnsubscribeDropsTheTopicsQueues(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"A": 1, "B": 1})
+	c := newLiteConsumer(t, f, "GID_lite_unsubscribe")
+	c.SetConsumeFromWhere(ConsumeFromWhereFirstOffset)
+	c.SetAutoCommit(false)
+	mqA := common.MessageQueue{Topic: "A", BrokerName: "b1", QueueID: 0}
+	mqB := common.MessageQueue{Topic: "B", BrokerName: "b1", QueueID: 0}
+	requireNoError(t, "assign", c.Assign([]common.MessageQueue{mqA, mqB}))
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	if got := len(c.Assignment()); got != 2 {
+		t.Fatalf("Assignment after Assign = %d queues, want 2", got)
+	}
+	if got := c.PullCursorOf(mqA); got != 0 {
+		t.Fatalf("A pull cursor = %d, want 0", got)
+	}
+
+	c.Unsubscribe("A")
+
+	if got := c.Assignment(); len(got) != 1 || got[0] != mqB {
+		t.Errorf("Assignment after Unsubscribe(A) = %v, want only B", got)
+	}
+	if got := c.PullCursorOf(mqA); got != -1 {
+		t.Errorf("A pull cursor after Unsubscribe = %d, want the queue to be gone", got)
+	}
+	if got := c.PullCursorOf(mqB); got != 0 {
+		t.Errorf("B pull cursor = %d, want the sibling untouched at 0", got)
+	}
+	// A blank topic matches nothing and must not revoke anything.
+	c.Unsubscribe("   ")
+	if got := len(c.Assignment()); got != 1 {
+		t.Errorf("a blank Unsubscribe left %d queues, want the held one untouched", got)
+	}
+
+	// Subscribe mode: the rebalance subscription goes with it, and the queues it
+	// had been handed leave immediately instead of at the next rebalance.
+	f.broker.setClientIDs(liteClientID(f))
+	s := newLiteConsumer(t, f, "GID_lite_unsubscribe_sub")
+	requireNoError(t, "subscribe A", s.Subscribe("A", "*"))
+	requireNoError(t, "subscribe B", s.Subscribe("B", "*"))
+	requireNoError(t, "start", s.Start())
+	t.Cleanup(s.Shutdown)
+	waitFor(t, "the rebalance to hand out both queues", func() bool {
+		return len(s.Assignment()) == 2
+	})
+	s.Unsubscribe("A")
+	if _, ok := s.SubscriptionExpressions()["A"]; ok {
+		t.Error("Unsubscribe(A) left the rebalance subscription behind")
+	}
+	if _, ok := s.SubscriptionExpressions()["B"]; !ok {
+		t.Error("Unsubscribe(A) dropped the sibling subscription too")
+	}
+	for _, mq := range s.Assignment() {
+		if mq.Topic == "A" {
+			t.Errorf("Unsubscribe(A) left %v assigned", mq)
+		}
+	}
+}
+
+// The self-heartbeat advertises rebalance subscriptions only. An assign-mode
+// expression filters the queues this instance was handed; announcing it would
+// make the broker treat the group as a subscriber of the whole topic.
+func TestLitePullHeartbeatAdvertisesOnlyRebalanceSubscriptions(t *testing.T) {
+	assigned := newClusterFixture(t, map[string]int{"T": 1})
+	a := newLiteConsumer(t, assigned, "GID_lite_beat_assign")
+	mq := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 0}
+	requireNoError(t, "assign", a.Assign([]common.MessageQueue{mq}))
+	requireNoError(t, "express", a.SetSubExpressionForAssign("T", "TagA"))
+	requireNoError(t, "start", a.Start())
+	t.Cleanup(a.Shutdown)
+	waitFor(t, "the assign-mode start to beat", func() bool {
+		return len(assigned.broker.beatSubVersions("T")) > 0
+	})
+	for _, v := range assigned.broker.beatSubVersions("T") {
+		if v != -1 {
+			t.Fatalf("an assign-mode beat announced a subscription for T (subVersion %d)", v)
+		}
+	}
+
+	// Paired control: a rebalance subscription is advertised, so the assertion
+	// above is about assign mode and not about a heartbeat that never carries any.
+	subscribed := newClusterFixture(t, map[string]int{"T": 1})
+	s := newLiteConsumer(t, subscribed, "GID_lite_beat_subscribe")
+	requireNoError(t, "subscribe", s.Subscribe("T", "TagA"))
+	requireNoError(t, "start", s.Start())
+	t.Cleanup(s.Shutdown)
+	waitFor(t, "the subscribe-mode beat to carry the subscription", func() bool {
+		for _, v := range subscribed.broker.beatSubVersions("T") {
+			if v >= 0 {
+				return true
+			}
+		}
+		return false
+	})
 }

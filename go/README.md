@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 861 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 864 个单测
 
 ## 先决条件
 
@@ -297,7 +297,7 @@ stored, _ := pullConsumer.FetchConsumeOffset(mq, true)
 
 ### LitePullConsumer
 
-这一表面的误用一律在本地先报错：空白 topic 的 `Subscribe`、空队列列表的 `Assign`（那等于撤销全部持有队列）、已经在跑之后再调 `SetSubExpressionForAssign`、没启动就 `Poll` / `Committed`。`Poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `Start()` 只有这样才不会一直被藏下去。
+这一表面的误用一律在本地先报错：空白 topic 的 `Subscribe`、空队列列表的 `Assign`（那等于撤销全部持有队列）、已经在跑之后再调 `SetSubExpressionForAssign`、没启动就 `Poll` / `Committed`。`Poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `Start()` 只有这样才不会一直被藏下去。`subscribe` / `assign` 互斥，先调用者定形；`seek` 依次判「队列是否持有」→「是否已启动」→ 位点落在 `[minOffset, maxOffset]` 内；`assign` 收窄与 `unsubscribe` 立刻撤销不再持有队列的光标、seek 定位、暂停位、park 与本地缓冲。
 
 内部跑后台短轮询填缓冲，由调用方 `Poll` 取；拉取游标与消费游标分开。
 
@@ -593,7 +593,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   77 个测试文件，861 个测试函数
+│   └── *_test.go                   77 个测试文件，864 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 

@@ -87,6 +87,24 @@ DefaultLitePullConsumer::allocateMessageQueueStrategy() const {
 }
 
 // ---------------------------------------------------------------- Subscribe / assign
+void DefaultLitePullConsumer::claimMode(bool assign) {
+    const int target = assign ? 2 : 1;
+    int current = mode_.load();
+    for (;;) {
+        if (current == 0) {
+            if (mode_.compare_exchange_weak(current, target)) break;
+            continue;
+        }
+        if (current != target) {
+            // The first caller decided how this consumer's queues are chosen; the other
+            // path would silently override an assignment the application already holds.
+            throw MQClientException("Subscribe and assign are mutually exclusive.");
+        }
+        break;
+    }
+    assignMode_.store(assign);
+}
+
 void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::string& subExpression) {
     subscribe(topic, MessageSelector::byTag(subExpression));
 }
@@ -95,7 +113,7 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic, const MessageS
     if (UtilAll::isBlank(topic)) {
         throw MQClientException("Topic can not be null or empty.");
     }
-    assignMode_ = false;
+    claimMode(false);
     std::string ns = withNamespace(topic);
     subscription_[ns] = selector.expression;
     try {
@@ -217,6 +235,7 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
     if (UtilAll::isBlank(topic)) {
         throw MQClientException("Topic can not be null or empty.");
     }
+    claimMode(true);
     std::string ns = withNamespace(topic);
     assignSubExpr_[ns] = selector.expression;
     try {
@@ -234,15 +253,17 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
         throw MQClientException("Message queues can not be null or empty.");
     }
     std::set<MessageQueue> queues(messageQueues.begin(), messageQueues.end());
+    claimMode(true);
     std::vector<MessageQueue> toResolve;
     std::vector<MessageQueue> revokedQueues;
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
-        assignMode_ = true;
         for (const MessageQueue& mq : assigned_) {
             if (queues.find(mq) == queues.end()) {
                 nextOffset_.erase(mq);
                 consumeOffset_.erase(mq);
+                seekOffset_.erase(mq);
+                paused_.erase(mq);
                 revokedQueues.push_back(mq);
             }
         }
@@ -269,6 +290,40 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
             nextOffset_[mq] = offset;
         }
     }
+}
+
+// unsubscribe drops a topic without waiting for the next rebalance: the topic's
+// assigned queues leave with it, and so does every piece of per-queue state they
+// held (cursors, seek offset, commit cell, paused flag, buffered rows).
+void DefaultLitePullConsumer::unsubscribe(const std::string& topic) {
+    if (UtilAll::isBlank(topic)) {
+        throw MQClientException("Topic can not be null or empty.");
+    }
+    const std::string ns = withNamespace(topic);
+    subscription_.erase(ns);
+    // An assign expression is not a subscription and stays: only a topic with no
+    // assign entry loses its built SubscriptionData with the subscription.
+    if (assignSubExpr_.find(ns) == assignSubExpr_.end()) {
+        subscriptionData_.erase(ns);
+    }
+    std::vector<MessageQueue> revoked;
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
+        for (auto it = assigned_.begin(); it != assigned_.end();) {
+            if (it->topic != ns) {
+                ++it;
+                continue;
+            }
+            nextOffset_.erase(*it);
+            consumeOffset_.erase(*it);
+            seekOffset_.erase(*it);
+            offsetTable_.erase(*it);
+            paused_.erase(*it);
+            revoked.push_back(*it);
+            it = assigned_.erase(it);
+        }
+    }
+    dropQueueCache(revoked);
 }
 
 // ---------------------------------------------------------------- Lifecycle
@@ -847,6 +902,9 @@ void DefaultLitePullConsumer::rebalance() {
                     consumeOffset_.erase(mq);
                     offsetTable_.erase(mq);
                     seekOffset_.erase(mq);
+                    // A revoked queue is also no longer paused by this consumer: the flag would
+                    // outlive the assignment and silence the queue if it is ever re-assigned.
+                    paused_.erase(mq);
                 }
             }
         }
@@ -997,6 +1055,31 @@ void DefaultLitePullConsumer::advanceConsumeOffset(const std::vector<MessageExt>
 void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
+        if (assigned_.find(mq) == assigned_.end()) {
+            // Writing a cursor for a queue this consumer does not hold would leave an
+            // entry nothing pulls, so the caller would watch an offset change that no
+            // round ever honours.
+            if (assignMode_.load()) {
+                throw MQClientException(
+                    "The message queue is not in assigned list, message queue: " + mq.toString());
+            }
+            throw MQClientException(
+                "The message queue is not in assigned list, may be rebalancing, message queue: "
+                + mq.toString());
+        }
+    }
+    if (mqClient_ == nullptr) {
+        throw MQClientException("The consumer not running, please start it first.");
+    }
+    const int64_t minOffset = mqClient_->getMinOffset(mq);
+    const int64_t maxOffset = mqClient_->getMaxOffset(mq);
+    if (offset < minOffset || offset > maxOffset) {
+        throw MQClientException("Seek offset illegal, seek offset = " + std::to_string(offset)
+                                + ", min offset = " + std::to_string(minOffset)
+                                + ", max offset = " + std::to_string(maxOffset));
+    }
+    {
+        std::lock_guard<std::mutex> lk(stateMutex_);
         seekOffset_[mq] = offset;
         nextOffset_[mq] = offset;
         consumeOffset_[mq] = offset;
@@ -1068,6 +1151,10 @@ int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
             return off;
         }
     } catch (...) {
+        // A failed broker read is not "nobody has committed": answering -1 would make a
+        // broken read look exactly like a fresh consumer, and the caller would restart
+        // at the top of the queue without noticing.
+        throw MQClientException("Fetch consume offset from broker exception");
     }
     return -1;
 }
@@ -1232,8 +1319,12 @@ HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
                     consumeFromWhere_);
     cd.unitMode = unitMode_;
-    for (const auto& kv : subscriptionData_) {
-        cd.subscriptionDataSet.push_back(kv.second);
+    // Only subscribe-mode topics are registered at the broker. Assign mode picks its
+    // queues locally, so advertising those topics as subscriptions would tell the
+    // broker the group reads them for delivery when nothing does.
+    for (const auto& kv : subscription_) {
+        auto it = subscriptionData_.find(kv.first);
+        if (it != subscriptionData_.end()) cd.subscriptionDataSet.push_back(it->second);
     }
     hb.consumerDataSet.push_back(cd);
     return hb;
