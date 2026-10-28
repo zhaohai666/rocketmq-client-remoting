@@ -54,13 +54,13 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 73
-Total Test time (real) = 148.02 sec   # ctest --output-on-failure, serial
+Total Test time (real) = 182.63 sec   # ctest --output-on-failure, serial
 ```
 
 The 73 cases are the 72 test binaries plus 1 codec-interop case. Assertions are summed from
 each binary's self-reported `N checks, M failures` (one summary line per binary): running all 72
-serially gives **8,367 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
-**8,440 assertions in total**.
+serially gives **8,373 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
+**8,446 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 

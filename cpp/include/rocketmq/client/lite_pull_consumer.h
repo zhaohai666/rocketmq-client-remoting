@@ -41,6 +41,9 @@ public:
                            const std::vector<MessageQueue>& messageQueues) = 0;
 };
 
+// Shortest auto-commit interval setAutoCommitIntervalMillis accepts; below it a setting is ignored.
+constexpr int32_t kMinAutoCommitIntervalMillis = 1000;
+
 class DefaultLitePullConsumer {
 public:
     explicit DefaultLitePullConsumer(
@@ -107,7 +110,13 @@ public:
     int32_t pullBatchSize() const { return pullBatchSize_; }
     void setPollTimeoutMillis(int32_t ms) { pollTimeoutMillis_ = std::max(0, ms); }
     void setAutoCommit(bool b) { autoCommit_ = b; }
-    void setAutoCommitIntervalMillis(int32_t ms) { autoCommitIntervalMillis_ = std::max(0, ms); }
+    // Auto-commit interval in milliseconds. 1000 is the floor, and the floor is an acceptance rule
+    // rather than a clamp: a shorter value is ignored outright, so the interval that was already
+    // running keeps running instead of being pulled down to the floor.
+    void setAutoCommitIntervalMillis(int32_t ms) {
+        if (ms >= kMinAutoCommitIntervalMillis) autoCommitIntervalMillis_ = ms;
+    }
+    int32_t autoCommitIntervalMillis() const { return autoCommitIntervalMillis_; }
     void setConsumerTimeoutMillisWhenSuspend(int32_t ms) {
         consumerTimeoutMillisWhenSuspend_ = ms;
     }

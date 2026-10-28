@@ -194,6 +194,22 @@ class TestLifecycle:
         assert len(c.consume_timestamp) == 14
         assert c.consume_timestamp.isdigit()
 
+    def test_auto_commit_interval_refuses_a_setting_below_the_floor(self):
+        # 1000ms is the shortest interval the knob accepts; a shorter one is ignored outright, so
+        # the previously accepted value keeps running instead of a clamped floor.
+        c = DefaultLitePullConsumer("LitePG_UT")
+        assert c.auto_commit_interval_millis == 5000
+        c.set_auto_commit_interval_millis(999)
+        assert c.auto_commit_interval_millis == 5000
+        c.set_auto_commit_interval_millis(-1)
+        assert c.auto_commit_interval_millis == 5000
+        c.set_auto_commit_interval_millis(1000)
+        assert c.auto_commit_interval_millis == 1000
+        c.set_auto_commit_interval_millis(2000)
+        assert c.auto_commit_interval_millis == 2000
+        c.set_auto_commit_interval_millis(500)
+        assert c.auto_commit_interval_millis == 2000
+
     def test_consume_timestamp_must_be_wall_clock(self):
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
@@ -465,7 +481,7 @@ class TestCommitOffsetTable:
         c = self._consumer({("broker-a", 0): ["A0", "B1", "A2", "B3", "A4"]})
         c.set_pull_batch_size(2)
         c.set_auto_commit(True)
-        c.set_auto_commit_interval_millis(0)
+        c.set_auto_commit_interval_millis(1000)
         q0 = MessageQueue("T", "broker-a", 0)
         c.assign([q0])
         c.start()

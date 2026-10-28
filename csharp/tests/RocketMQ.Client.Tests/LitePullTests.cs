@@ -214,4 +214,26 @@ public class LitePullTests
         Assert.Equal("std::exception: boom", back.Remark);
         Assert.Equal(33, back.SpentTimeMills);
     }
+
+    // The auto-commit interval has a floor, and a floor here is an acceptance rule rather than a
+    // clamp: a shorter setting is ignored, so the interval already running keeps running.
+    [Fact]
+    public void AutoCommitInterval_FloorIsAnAcceptanceRuleNotAClamp()
+    {
+        var c = new DefaultLitePullConsumer();
+        Eq(5000, c.AutoCommitIntervalMillis, "the interval starts at its default");
+
+        foreach (var rejected in new[] { 999, 0, -1 })
+        {
+            c.SetAutoCommitIntervalMillis(rejected);
+            Eq(5000, c.AutoCommitIntervalMillis, $"a {rejected} ms setting is ignored, not clamped to the floor");
+        }
+
+        c.SetAutoCommitIntervalMillis(DefaultLitePullConsumer.MinAutoCommitIntervalMillis);
+        Eq(1000, c.AutoCommitIntervalMillis, "the floor itself is accepted");
+
+        c.SetAutoCommitIntervalMillis(2500);
+        c.SetAutoCommitIntervalMillis(500);
+        Eq(2500, c.AutoCommitIntervalMillis, "a rejected setting leaves the accepted interval running");
+    }
 }

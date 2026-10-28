@@ -778,3 +778,28 @@ func TestLitePullDefaultTimestampIsThirtyMinutesBack(t *testing.T) {
 		t.Errorf("default instant %d is not aligned to a second; yyyyMMddHHmmss has no sub-second part", got[0])
 	}
 }
+
+// The auto-commit interval has a floor rather than a clamp: a setting below it is
+// ignored outright, so whatever interval was already running keeps running instead of
+// being pulled down to the floor or switched off.
+func TestLiteAutoCommitIntervalRefusesSettingsBelowTheFloor(t *testing.T) {
+	c := MustNewDefaultLitePullConsumer("GID_lite_autocommit_floor")
+	if got := c.autoCommitIntervalMillis; got != DefaultLiteAutoCommitIntervalMillis {
+		t.Fatalf("default interval = %d, want %d", got, DefaultLiteAutoCommitIntervalMillis)
+	}
+	for _, rejected := range []int64{999, 0, -1} {
+		c.SetAutoCommitIntervalMillis(rejected)
+		if got := c.autoCommitIntervalMillis; got != DefaultLiteAutoCommitIntervalMillis {
+			t.Errorf("after setting %d the interval is %d, want the previous %d left alone", rejected, got, DefaultLiteAutoCommitIntervalMillis)
+		}
+	}
+	c.SetAutoCommitIntervalMillis(MinLiteAutoCommitIntervalMillis)
+	if got := c.autoCommitIntervalMillis; got != MinLiteAutoCommitIntervalMillis {
+		t.Fatalf("the floor itself must be accepted, got %d", got)
+	}
+	c.SetAutoCommitIntervalMillis(2500)
+	c.SetAutoCommitIntervalMillis(500)
+	if got := c.autoCommitIntervalMillis; got != 2500 {
+		t.Errorf("after rejecting 500 the interval is %d, want the accepted 2500", got)
+	}
+}

@@ -67,6 +67,8 @@ public sealed class DefaultLitePullConsumer
     // multiplier of that budget and not just a request size.
     private int _pullBatchSize = 10;
     private bool _autoCommit = true;
+    // Shortest auto-commit interval SetAutoCommitIntervalMillis accepts; below it a setting is ignored.
+    public const int MinAutoCommitIntervalMillis = 1000;
     private int _autoCommitIntervalMillis = 5000;
     private int _pullIntervalMillis = 50;
 
@@ -294,7 +296,17 @@ public sealed class DefaultLitePullConsumer
 
     public void SetAutoCommit(bool b) => _autoCommit = b;
 
-    public void SetAutoCommitIntervalMillis(int ms) => _autoCommitIntervalMillis = Math.Max(0, ms);
+    // The floor is an acceptance rule, not a clamp: a value below it is ignored outright, so the
+    // interval that was already running keeps running instead of being pulled down to the floor.
+    public void SetAutoCommitIntervalMillis(int ms)
+    {
+        if (ms >= MinAutoCommitIntervalMillis)
+        {
+            _autoCommitIntervalMillis = ms;
+        }
+    }
+
+    public int AutoCommitIntervalMillis => _autoCommitIntervalMillis;
 
     public void SetConsumerTimeoutMillisWhenSuspend(int ms) => _consumerTimeoutMillisWhenSuspend = ms;
 

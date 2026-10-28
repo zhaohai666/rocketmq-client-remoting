@@ -944,6 +944,7 @@ final class DefaultLitePullConsumer
     public int $pollTimeoutMillis = 5000;
     public int $pollNameServerInterval = 30000;
     public bool $autoCommit = true;
+    /** Period of the auto-commit sweep; only a value of at least 1000 ms can be set, shorter ones are ignored. */
     public int $autoCommitIntervalMillis = 5000;
     public int $consumerTimeoutMillisWhenSuspend = 30000;
     public int $brokerSuspendMaxTimeMillis = 20000;
@@ -1093,6 +1094,22 @@ final class DefaultLitePullConsumer
     public function setAutoCommit(bool $auto): void
     {
         $this->autoCommit = $auto;
+    }
+
+    /**
+     * Auto-commit interval in milliseconds. A value below 1000 is ignored outright: whatever
+     * interval was already running keeps running, rather than being pulled down to the floor.
+     */
+    public function setAutoCommitIntervalMillis(int $ms): void
+    {
+        if ($ms >= 1000) {
+            $this->autoCommitIntervalMillis = $ms;
+        }
+    }
+
+    public function getAutoCommitIntervalMillis(): int
+    {
+        return $this->autoCommitIntervalMillis;
     }
 
     /**

@@ -8,7 +8,8 @@ declare(strict_types=1);
  * Run: php tests/RunClientConfigKnobs.php (or via tests/run_all.php)
  * On success prints "ALL TESTS PASSED (N checks)"; any failure lists details and exits non-zero.
  *
- * Covers the three knobs whose effects only show up on the wire:
+ * Covers the knobs the consumer exposes, each pinned by what it does to the wire or to the
+ * setting itself:
  *
  * 1. decodeReadBody -- the pull response is decoded body by body; the switch off leaves each
  *    message a header-only shell (queue offsets and properties survive, bodies do not) while
@@ -17,6 +18,9 @@ declare(strict_types=1);
  *    a configured value, and an explicit argument that wins over both.
  * 3. enableConcurrentHeartbeat -- one round with the switch on dispatches through the worker
  *    pool, the serial control runs the same round without ever creating it.
+ * 4. autoCommitIntervalMillis -- the lite pull auto-commit interval has a floor, and a floor is an
+ *    acceptance rule rather than a clamp: a shorter setting is ignored and the interval that was
+ *    already running keeps running.
  *
  * Every RPC here is answered by a subclass override of the instance's single synchronous exit
  * point, which also records each request's address, code and timeout -- the timeout assertions
@@ -29,6 +33,7 @@ require_once __DIR__ . '/../bootstrap.php';
 putenv('ROCKETMQ_NAMESRV_DOMAIN');
 putenv('ROCKETMQ_NAMESRV_ADDR');
 
+use RocketMQ\Client\DefaultLitePullConsumer;
 use RocketMQ\Client\MQClientInstance;
 use RocketMQ\Client\PullStatus;
 use RocketMQ\Common\MessageDecoder;
@@ -220,6 +225,25 @@ final class RunClientConfigKnobs
             'the concurrent round sent exactly one beat');
     }
 
+    // ================================================================ 4. autoCommitIntervalMillis
+
+    private function testLiteAutoCommitIntervalFloor(): void
+    {
+        $lite = new DefaultLitePullConsumer('GID-knob-autocommit-' . uniqid());
+        $this->checkSame(5000, $lite->getAutoCommitIntervalMillis(), 'the interval starts at its default');
+        foreach ([999, 0, -1] as $rejected) {
+            $lite->setAutoCommitIntervalMillis($rejected);
+            $this->checkSame(5000, $lite->getAutoCommitIntervalMillis(),
+                "a {$rejected} ms setting is ignored, not clamped to the floor");
+        }
+        $lite->setAutoCommitIntervalMillis(1000);
+        $this->checkSame(1000, $lite->getAutoCommitIntervalMillis(), 'the floor itself is accepted');
+        $lite->setAutoCommitIntervalMillis(2500);
+        $lite->setAutoCommitIntervalMillis(500);
+        $this->checkSame(2500, $lite->getAutoCommitIntervalMillis(),
+            'a rejected setting leaves the accepted interval running');
+    }
+
     // ================================================================ entry
 
     public function run(): int
@@ -227,6 +251,7 @@ final class RunClientConfigKnobs
         $this->testDecodeReadBody();
         $this->testMqClientApiTimeout();
         $this->testEnableConcurrentHeartbeat();
+        $this->testLiteAutoCommitIntervalFloor();
         return $this->summary();
     }
 }

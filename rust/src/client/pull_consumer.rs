@@ -90,6 +90,9 @@ pub const DEFAULT_LITE_CONSUME_MAX_SPAN: i64 = 2_000;
 /// this knob is separate because the aggregate gate reserves **one batch per pending round**, so
 /// the round shape of the lite loop is what the budget is divided by.
 pub const DEFAULT_LITE_PULL_BATCH_SIZE: i32 = 10;
+/// The shortest auto-commit interval that is accepted. A shorter setting is ignored outright: the
+/// interval that was already running keeps running, instead of being pulled down to this number.
+pub const MIN_LITE_AUTO_COMMIT_INTERVAL_MILLIS: i64 = 1_000;
 
 /// The polling shape of one pull request, bundled so the shared pull kernel stays under the
 /// argument-count limit. Short polling never suspends but still sends the historic fixed
@@ -1306,7 +1309,8 @@ pub struct LitePullConsumerConfig {
     pub poll_timeout_millis: i64,
     /// `auto_commit` = true: **commit as soon as pulled**, not after poll().
     pub auto_commit: bool,
-    /// `auto_commit_interval_millis` = 5000 (`max(0, ms)`).
+    /// `auto_commit_interval_millis` = 5000; a setting below the 1000 ms floor is ignored, so the
+    /// interval that was already running keeps running.
     pub auto_commit_interval_millis: i64,
     /// `consumer_timeout_millis_when_suspend` = 30000: lite always short-polls,
     /// the field is kept only for the config shape; the pull path never reads it.
@@ -1969,10 +1973,15 @@ impl DefaultLitePullConsumer {
     pub fn update_config(&self, f: impl FnOnce(&mut LitePullConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
+            let interval_before = w.auto_commit_interval_millis;
             f(&mut w);
             w.pull_batch_size = w.pull_batch_size.max(1);
             w.poll_timeout_millis = w.poll_timeout_millis.max(0);
-            w.auto_commit_interval_millis = w.auto_commit_interval_millis.max(0);
+            // The auto-commit floor is an acceptance rule, not a clamp: a value below it is dropped
+            // and the interval that was already running keeps running.
+            if w.auto_commit_interval_millis < MIN_LITE_AUTO_COMMIT_INTERVAL_MILLIS {
+                w.auto_commit_interval_millis = interval_before;
+            }
             w.pull_interval_millis = w.pull_interval_millis.max(0);
         }
     }
@@ -1994,7 +2003,9 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.auto_commit = auto);
     }
 
-    /// `max(0, ms)`.
+    /// Accepts a new auto-commit interval. A value below
+    /// [`MIN_LITE_AUTO_COMMIT_INTERVAL_MILLIS`] is ignored outright, so the interval that was
+    /// already running keeps running rather than being pulled down to the floor.
     pub fn set_auto_commit_interval_millis(&self, ms: i64) {
         self.update_config(|c| c.auto_commit_interval_millis = ms);
     }
@@ -3818,12 +3829,31 @@ mod tests {
         assert_eq!(c.config().pull_batch_size, 1);
         c.set_poll_timeout_millis(-1);
         assert_eq!(c.config().poll_timeout_millis, 0);
-        c.set_auto_commit_interval_millis(-1);
-        assert_eq!(c.config().auto_commit_interval_millis, 0);
         c.set_pull_interval_millis(-1);
         assert_eq!(c.config().pull_interval_millis, 0);
         c.set_auto_commit(false);
         assert!(!c.config().auto_commit);
+    }
+
+    /// The auto-commit floor is an acceptance rule rather than a clamp: a shorter setting leaves the
+    /// interval that was already running in place.
+    #[test]
+    fn auto_commit_interval_refuses_settings_below_the_floor() {
+        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        assert_eq!(c.config().auto_commit_interval_millis, 5_000);
+        for rejected in [999, 0, -1] {
+            c.set_auto_commit_interval_millis(rejected);
+            assert_eq!(
+                c.config().auto_commit_interval_millis,
+                5_000,
+                "a {rejected} ms setting must be ignored, not clamped to the floor"
+            );
+        }
+        c.set_auto_commit_interval_millis(MIN_LITE_AUTO_COMMIT_INTERVAL_MILLIS);
+        assert_eq!(c.config().auto_commit_interval_millis, 1_000);
+        c.set_auto_commit_interval_millis(2_500);
+        c.set_auto_commit_interval_millis(500);
+        assert_eq!(c.config().auto_commit_interval_millis, 2_500);
     }
 
     #[test]

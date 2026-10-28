@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **47** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-28, **1480** individually counted checks across 42 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **47** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-28, **1486** individually counted checks across 42 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -52,7 +52,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/namespace_rpc_smoke.ts` | 7 check groups passed |
 | `test/ns_failover_smoke.ts` | 12 checks passed |
-| `test/offset_persist_timer_smoke.ts` | 21 passed / 0 failed |
+| `test/offset_persist_timer_smoke.ts` | 27 passed / 0 failed |
 | `test/pop_batch_ack_smoke.ts` (the 200151 request shape) | 9 passed / 0 failed |
 | `test/pop_init_mode_smoke.ts` (start policy translated to POP initMode) | 14 checks passed |
 | `test/pop_pre_deliver_filter_smoke.ts` (pre-delivery filter on the POP round; section 8 asks the pull path the same question) | 27 checks passed |

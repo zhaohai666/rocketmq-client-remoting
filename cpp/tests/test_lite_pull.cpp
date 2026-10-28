@@ -190,6 +190,24 @@ static void testLitePullConsumeTimestamp() {
     ok.shutdown();
 }
 
+// The auto-commit interval has a floor, and the floor is an acceptance rule rather than a clamp: a
+// shorter setting is ignored outright, so the interval that was already running keeps running.
+static void testLitePullAutoCommitIntervalFloor() {
+    DefaultLitePullConsumer c;
+    CHECK_EQ(c.autoCommitIntervalMillis(), 5000, "auto-commit interval starts at its default");
+    for (int32_t rejected : {999, 0, -1}) {
+        c.setAutoCommitIntervalMillis(rejected);
+        CHECK_EQ(c.autoCommitIntervalMillis(), 5000,
+                 "a setting below the floor is ignored, not clamped to it");
+    }
+    c.setAutoCommitIntervalMillis(kMinAutoCommitIntervalMillis);
+    CHECK_EQ(c.autoCommitIntervalMillis(), 1000, "the floor itself is accepted");
+    c.setAutoCommitIntervalMillis(2500);
+    c.setAutoCommitIntervalMillis(500);
+    CHECK_EQ(c.autoCommitIntervalMillis(), 2500,
+             "a rejected setting leaves the accepted interval running");
+}
+
 // ---------------------------------------------------------------- 221 GetConsumerStatusBody
 static void testGetConsumerStatusBodyWireShape() {
     GetConsumerStatusBody b;
@@ -248,6 +266,7 @@ int main() {
     testLitePullPreStartBehavior();
     testLitePullOffsetTable();
     testLitePullConsumeTimestamp();
+    testLitePullAutoCommitIntervalFloor();
     testGetConsumerStatusBodyWireShape();
     testConsumeMessageDirectlyResult();
     std::cout << "lite_pull: " << g_pass << " passed, " << g_fail << " failed\n";

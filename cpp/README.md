@@ -51,12 +51,12 @@ cd build && ctest --output-on-failure
 
 ```
 100% tests passed out of 73
-Total Test time (real) = 148.02 sec   # ctest --output-on-failure（串行）
+Total Test time (real) = 182.63 sec   # ctest --output-on-failure（串行）
 ```
 
 73 个用例 = 72 个测试二进制 + 1 个编解码互调用例。断言数按二进制自报的
 `N checks, M failures` 汇总：逐个串行跑 `build/tests/` 下 72 个测试二进制，各取自己那行汇总，checks 合计
-**8,367 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,440 项**。
+**8,373 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,446 项**。
 
 不依赖集群的协议层自检：
 

@@ -35,6 +35,10 @@ const (
 	DefaultLitePollTimeoutMillis = int64(5000)
 	// DefaultLiteAutoCommitIntervalMillis is autoCommitIntervalMillis.
 	DefaultLiteAutoCommitIntervalMillis = int64(5000)
+	// MinLiteAutoCommitIntervalMillis is the shortest auto-commit interval the
+	// knob accepts: a setting below it is ignored, and the interval already in
+	// place keeps running.
+	MinLiteAutoCommitIntervalMillis = int64(1000)
 	// DefaultLitePullIntervalMillis is pullIntervalMillis — the idle backoff
 	// between pull rounds when nothing came in.
 	DefaultLitePullIntervalMillis = int64(50)
@@ -450,11 +454,14 @@ func (c *DefaultLitePullConsumer) SetAutoCommit(auto bool) {
 	c.autoCommit = auto
 }
 
+// SetAutoCommitIntervalMillis sets the auto-commit interval. A value below
+// MinLiteAutoCommitIntervalMillis is ignored outright — the previous interval
+// keeps running rather than being clamped to the floor.
 func (c *DefaultLitePullConsumer) SetAutoCommitIntervalMillis(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if ms < 0 {
-		ms = 0
+	if ms < MinLiteAutoCommitIntervalMillis {
+		return
 	}
 	c.autoCommitIntervalMillis = ms
 }

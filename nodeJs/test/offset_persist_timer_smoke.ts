@@ -298,6 +298,21 @@ async function main() {
     cluster.close();
   }
 
+  // --------- 6. the lite auto-commit interval has a floor, and a floor means ignoring
+  {
+    const lite = new DefaultLitePullConsumer('GID_persist_autocommit_floor');
+    check('the auto-commit interval starts at the default', lite.autoCommitIntervalMillis === 5000, String(lite.autoCommitIntervalMillis));
+    for (const rejected of [999, 0, -1]) {
+      lite.setAutoCommitIntervalMillis(rejected);
+      check(`a ${rejected}ms setting is ignored rather than clamped`, lite.autoCommitIntervalMillis === 5000, String(lite.autoCommitIntervalMillis));
+    }
+    lite.setAutoCommitIntervalMillis(1000);
+    check('the floor itself is accepted', lite.autoCommitIntervalMillis === 1000, String(lite.autoCommitIntervalMillis));
+    lite.setAutoCommitIntervalMillis(2500);
+    lite.setAutoCommitIntervalMillis(500);
+    check('a rejected setting leaves the accepted interval running', lite.autoCommitIntervalMillis === 2500, String(lite.autoCommitIntervalMillis));
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

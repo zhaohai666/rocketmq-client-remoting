@@ -66,6 +66,9 @@ MAX_POP_INVISIBLE_TIME = 300000
 CONSUME_INIT_MODE_MIN = 0
 CONSUME_INIT_MODE_MAX = 1
 
+# Smallest auto-commit interval the lite pull consumer accepts: a shorter setting is ignored.
+MIN_AUTO_COMMIT_INTERVAL_MILLIS = 1000
+
 # Upper bound of a 32-bit signed int: the default value for the orderly-consumption "retry count exhausted" criterion
 # (config -1 is read as this on this path, meaning "no upper limit").
 _INT32_MAX = 0x7FFFFFFF
@@ -5144,7 +5147,10 @@ class DefaultLitePullConsumer:
         self.auto_commit = bool(auto)
 
     def set_auto_commit_interval_millis(self, ms: int) -> None:
-        self.auto_commit_interval_millis = max(0, int(ms))
+        """Set the auto-commit interval; a value below 1000ms is ignored and the current one stays."""
+        interval = int(ms)
+        if interval >= MIN_AUTO_COMMIT_INTERVAL_MILLIS:
+            self.auto_commit_interval_millis = interval
 
     def set_consumer_timeout_millis_when_suspend(self, ms: int) -> None:
         self.consumer_timeout_millis_when_suspend = int(ms)

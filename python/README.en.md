@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1751 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1752 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 

@@ -33,6 +33,8 @@ const logger = getLogger('client.lite_pull_consumer');
 
 const DEFAULT_PULL_BATCH_SIZE = 10;
 const DEFAULT_POLL_TIMEOUT_MILLIS = 5000;
+// Shortest auto-commit interval setAutoCommitIntervalMillis accepts; below it a setting is ignored.
+const MIN_AUTO_COMMIT_INTERVAL_MILLIS = 1000;
 // Single queue, nothing found: the wait between two rounds of the same poll()
 // call, so an idle queue does not hot-loop against the broker.
 const IDLE_POLL_RETRY_DELAY_MILLIS = 200;
@@ -175,7 +177,12 @@ export class DefaultLitePullConsumer {
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPollTimeoutMillis(ms: number): this { this.pollTimeoutMillis = ms; return this; }
   setAutoCommit(enable: boolean): this { this.autoCommit = enable; return this; }
-  setAutoCommitIntervalMillis(ms: number): this { this.autoCommitIntervalMillis = ms; return this; }
+  // Set the auto-commit interval. A value below the floor is ignored outright, so the
+  // interval that was already running keeps running instead of being pulled down to the floor.
+  setAutoCommitIntervalMillis(ms: number): this {
+    if (Number.isFinite(ms) && ms >= MIN_AUTO_COMMIT_INTERVAL_MILLIS) this.autoCommitIntervalMillis = ms;
+    return this;
+  }
   // Flush period for consumed offsets, in milliseconds; must be greater than 0.
   // When already started the change is pushed through to the shared instance's
   // sweep timer immediately.
