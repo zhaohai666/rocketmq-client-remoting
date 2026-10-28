@@ -54,13 +54,15 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 73
-Total Test time (real) = 182.63 sec   # ctest --output-on-failure, serial
+Total Test time (real) = 149.89 sec   # ctest --output-on-failure, serial
 ```
 
 The 73 cases are the 72 test binaries plus 1 codec-interop case. Assertions are summed from
-each binary's self-reported `N checks, M failures` (one summary line per binary): running all 72
-serially gives **8,373 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
-**8,446 assertions in total**.
+each binary's own summary line (the wording differs per binary — `N checks, M failures`,
+`N passed, M failed`, `PASS=n FAIL=m`, `[PASS] n checks, [FAIL] m`, `checks=n fails=m`,
+`ALL PASS (n checks)` and a few more variants): running all 72
+serially gives **8,384 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
+**8,457 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -360,6 +362,8 @@ pull.startHeartbeatLoop();   // turn on when the group must be visible on the br
 strategy.
 
 ### LitePull Consumer
+
+Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), calling `setSubExpressionForAssign` once the consumer is running, and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
 
 ```cpp
 #include "rocketmq/client/lite_pull_consumer.h"

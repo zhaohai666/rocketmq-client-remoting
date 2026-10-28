@@ -341,6 +341,8 @@ Pull-mode consumers send consumer heartbeats by default: `HeartbeatEnabled`, `He
 
 ### LitePullConsumer (poll and commit yourself, incl. topic queue-set change listener)
 
+Misuse of this surface fails locally, before anything else: a blank topic in `Subscribe`, an empty queue list in `Assign` (that would revoke every held queue), calling `SetSubExpressionForAssign` once the consumer is running, and `Poll` / `Committed` on a consumer that never started. A negative `Poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `Start()` stays hidden until something refuses it.
+
 ```csharp
 var lite = new DefaultLitePullConsumer("GID_LITE");
 lite.SetNamesrvAddr("127.0.0.1:9876");

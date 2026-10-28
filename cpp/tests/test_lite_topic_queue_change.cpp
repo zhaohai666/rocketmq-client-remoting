@@ -526,7 +526,7 @@ void testFetchQueuesRequiresStartedConsumer() {
     try {
         c.fetchMessageQueues(kTopic);
     } catch (const MQClientException& e) {
-        threw = std::string(e.what()).find("not started") != std::string::npos;
+        threw = std::string(e.what()).find("not running") != std::string::npos;
     }
     expect(threw, "fetching queues before start throws (an empty list would read as 'no queues')");
 }

@@ -141,8 +141,8 @@ function nearbyMQs(): MessageQueue[] {
 
   // seek() itself gates on started (validating the service state), and so do both
   // wrappers — nothing moves before start.
-  await assert.rejects(() => c.seekToBegin(mq), /not started/);
-  await assert.rejects(() => c.seekToEnd(mq), /not started/);
+  await assert.rejects(() => c.seekToBegin(mq), /not running/);
+  await assert.rejects(() => c.seekToEnd(mq), /not running/);
   assert.strictEqual(c.pullCursor.get(mqKey(mq)), undefined);
 
   c.started = true;

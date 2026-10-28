@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 32 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 33 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -61,7 +61,7 @@ repository-wide **duplicate-class-name static guard** (PHP has no module isolati
 when the same FQCN is declared in two files the one autoloaded first silently wins and
 the other dies — this guard cannot be skipped), then chains **32** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 5,016 assertions across the 32 suites pass**; any failure exits with a
+**guard CLEAN, all 5,033 assertions across the 33 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -267,6 +267,8 @@ foreach ($mine as $mq) {
 ```
 
 ### LitePullConsumer (DefaultLitePullConsumer)
+
+Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), calling `setSubExpressionForAssign` once the consumer is running, and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
 
 `subscribe()` (automatic rebalance) or `assign()` (explicit queues); `poll()` drains the
 local buffer and `commit()` submits offsets; `seek()` rewinds the cursor. **The main loop
@@ -504,7 +506,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 32 suites with 5,016 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 33 suites with 5,033 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

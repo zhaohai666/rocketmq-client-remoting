@@ -393,7 +393,7 @@ $GROUP = 'GID_lite_qc_unit';
     }
     // An empty list would be read by callers as "no queues available" and stop;
     // before start the error must be explicit.
-    liteCheck(str_contains($threw, 'not started'), 'fetching queues before start fails outright', $threw);
+    liteCheck(str_contains($threw, 'not running'), 'fetching queues before start fails outright', $threw);
 }
 
 // ---------------------------------------------------------------- 3. Registered before start

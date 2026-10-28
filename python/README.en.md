@@ -28,11 +28,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1752 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1753 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` collects 1742 cases and all of them run offline — no cluster needed. The 4 skips all come
+- `pytest` collects 1757 cases and all of them run offline — no cluster needed. The 4 skips all come
   from `tests/test_protocol_alignment.py` (an optional protocol-constant cross-check, off by default).
 - `selfcheck.py` runs 7 encode/decode round-trips of the protocol itself (JSON header / binary header /
   V2 short-field header / 17-segment storage format / long-topic V2 magic / 6-segment batch format /
@@ -233,6 +233,8 @@ consumer.shutdown()
 `fetch_message_queues_in_balance(topic)` returns only the share this instance should own.
 
 ### Lite Pull Consumer
+
+Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), calling `set_sub_expression_for_assign` once the consumer is running, and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
 
 ```python
 from client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
@@ -534,7 +536,7 @@ python/
 ├── rocketmq_logging.py     logging bridge
 ├── selfcheck.py            cluster-free protocol round trips (7 checks)
 ├── __main__.py             command entry (python -m selfcheck)
-├── tests/                  1742 offline cases (conftest.py puts python/ on sys.path)
+├── tests/                  1757 offline cases (conftest.py puts python/ on sys.path)
 ├── verify_*_live.py        live-cluster scripts (see Live Cluster Verification)
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  helper scripts
 ├── pyproject.toml          no runtime dependencies; requires-python >= 3.8

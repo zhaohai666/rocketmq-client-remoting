@@ -216,7 +216,10 @@ async fn run(namesrv: &str) -> Checker {
         consumer.topic_metadata_check_interval_millis() == CHECK_INTERVAL_MILLIS,
         &consumer.topic_metadata_check_interval_millis().to_string(),
     );
-    consumer.subscribe(&topic, "*");
+    if let Err(e) = consumer.subscribe(&topic, "*") {
+        ck.check("lite subscribe", false, &e.to_string());
+        return ck;
+    }
     if let Err(e) = consumer.start().await {
         ck.check("consumer start", false, &e.to_string());
         return ck;

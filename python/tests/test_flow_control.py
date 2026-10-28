@@ -977,13 +977,16 @@ def _lite_msg(body_size, queue_offset, store_size=1, queue_id=0, topic=LITE_TOPI
 
 
 def _lite_consumer(group, *mqs):
-    """An assigned-but-never-started LitePull consumer: no thread and no socket, and the gates read exactly
+    """A running-but-threadless LitePull consumer: no thread and no socket, and the gates read exactly
     what the shared local buffer holds. ``assign()`` is what makes the queues owned, which is what the gates
-    judge -- the same path a live consumer takes."""
+    judge -- the same path a live consumer takes. The started flag is set by hand because ``poll()`` refuses
+    a consumer that never started, and these tests hand the buffer to the application.
+    """
     c = DefaultLitePullConsumer(group)
     c.set_auto_commit(False)
     if mqs:
         c.assign(list(mqs))
+    c._started = True
     return c
 
 

@@ -32,7 +32,11 @@ func pollAll(t *testing.T, c *DefaultLitePullConsumer, want int, within time.Dur
 	deadline := time.Now().Add(within)
 	var bodies []string
 	for len(bodies) < want && time.Now().Before(deadline) {
-		for _, m := range c.PollWithTimeout(200) {
+		messages, err := c.PollWithTimeout(200)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range messages {
 			bodies = append(bodies, string(m.Body))
 		}
 	}
@@ -273,7 +277,10 @@ func TestLitePullConsumerSeekDropsBufferedMessages(t *testing.T) {
 	if got := c.PullCursorOf(mq); got != 2 || c.ConsumeCursorOf(mq) != 2 {
 		t.Fatalf("cursors after Seek = %d/%d, want 2/2", c.PullCursorOf(mq), c.ConsumeCursorOf(mq))
 	}
-	msgs := c.PollWithTimeout(2000)
+	msgs, pollErr := c.PollWithTimeout(2000)
+	if pollErr != nil {
+		t.Fatal(pollErr)
+	}
 	if len(msgs) != 1 || string(msgs[0].Body) != "m2" || msgs[0].QueueOffset != 2 {
 		t.Fatalf("delivered %+v, want exactly m2@2", msgs)
 	}
@@ -801,5 +808,61 @@ func TestLiteAutoCommitIntervalRefusesSettingsBelowTheFloor(t *testing.T) {
 	c.SetAutoCommitIntervalMillis(500)
 	if got := c.autoCommitIntervalMillis; got != 2500 {
 		t.Errorf("after rejecting 500 the interval is %d, want the accepted 2500", got)
+	}
+}
+
+// The lite surface refuses to be used wrongly, and refuses out loud: an empty
+// assignment would revoke every queue the consumer holds, a blank assign-mode
+// expression would quietly mean "everything", and a poll or a committed-offset
+// read on a consumer that was never started looks identical to "nothing to see
+// here" -- which is how a missing Start() stays hidden forever.
+func TestLiteSurfaceRefusesMisuse(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"T": 1})
+	c := newLiteConsumer(t, f, "GID_lite_guards")
+	mq := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 0}
+
+	if err := c.Assign(nil); err == nil || !strings.Contains(err.Error(), "can not be null or empty") {
+		t.Errorf("Assign(nil) error = %v, want the empty-list refusal", err)
+	}
+	if err := c.Assign([]common.MessageQueue{}); err == nil {
+		t.Error("Assign([]) must refuse: the empty list would revoke every held queue")
+	}
+	if c.IsAssignMode() {
+		t.Error("a refused Assign must leave the mode alone")
+	}
+	if err := c.Subscribe("", "TagA"); err == nil || !strings.Contains(err.Error(), "Topic can not be null or empty") {
+		t.Errorf("Subscribe(\"\") error = %v, want the empty-topic refusal", err)
+	}
+	if err := c.SetSubExpressionForAssign("T", "  "); err == nil ||
+		!strings.Contains(err.Error(), "subExpression can not be null or empty") {
+		t.Errorf("blank assign expression error = %v, want the blank-expression refusal", err)
+	}
+	if err := c.SetSubExpressionForAssign("  ", "TagA"); err == nil ||
+		!strings.Contains(err.Error(), "Topic can not be null or empty") {
+		t.Errorf("blank assign-expression topic error = %v, want the blank-topic refusal", err)
+	}
+	if _, err := c.Poll(); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Errorf("Poll before Start error = %v, want the not-running refusal", err)
+	}
+	if _, err := c.PollWithTimeout(-1); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Errorf("PollWithTimeout(-1) before Start error = %v, want the not-running refusal first", err)
+	}
+	if _, err := c.Committed(mq); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Errorf("Committed before Start error = %v, want the not-running refusal", err)
+	}
+
+	requireNoError(t, "subscribe", c.Subscribe("T", "*"))
+	requireNoError(t, "start", c.Start())
+	defer c.Shutdown()
+
+	if _, err := c.PollWithTimeout(-1); err == nil || !strings.Contains(err.Error(), "Timeout must not be negative") {
+		t.Errorf("PollWithTimeout(-1) error = %v, want the negative-timeout refusal", err)
+	}
+	if err := c.SetSubExpressionForAssign("T", "TagA"); err == nil ||
+		!strings.Contains(err.Error(), "only can be called before start") {
+		t.Errorf("assign expression after Start error = %v, want the pre-start refusal", err)
+	}
+	if err := c.Assign([]common.MessageQueue{mq}); err != nil {
+		t.Errorf("a non-empty Assign must be accepted, got %v", err)
 	}
 }

@@ -253,7 +253,8 @@ impl Fixture {
         };
         let c = DefaultLitePullConsumer::with_config(cfg)
             .map_err(|e| format!("lite build failed: {e}"))?;
-        c.assign(std::slice::from_ref(queue));
+        c.assign(std::slice::from_ref(queue))
+            .map_err(|e| format!("lite assign failed: {e}"))?;
         Ok(c)
     }
 
@@ -264,18 +265,23 @@ impl Fixture {
 }
 
 /// Polls repeatedly within the given window and returns the received bodies.
-async fn poll_for(c: &DefaultLitePullConsumer, window: Duration) -> Vec<String> {
+///
+/// `Err` means a poll refused to answer (the consumer is not running): that is not "received nothing",
+/// so the caller must not read an empty list out of it.
+async fn poll_for(c: &DefaultLitePullConsumer, window: Duration) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
-        out.extend(
-            c.poll(Some(300))
-                .await
-                .iter()
-                .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
-        );
+        match c.poll(Some(300)).await {
+            Ok(batch) => out.extend(
+                batch
+                    .iter()
+                    .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
+            ),
+            Err(e) => return Err(format!("lite poll refused: {e}")),
+        }
     }
-    out
+    Ok(out)
 }
 
 fn join(v: &[String]) -> String {
@@ -352,12 +358,17 @@ async fn run(namesrv: &str) -> Checker {
                     let deadline = Instant::now() + Duration::from_secs(20);
                     let mut got = Vec::new();
                     while got.is_empty() && Instant::now() < deadline {
-                        got.extend(
-                            c.poll(Some(500))
-                                .await
-                                .iter()
-                                .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
-                        );
+                        match c.poll(Some(500)).await {
+                            Ok(batch) => got.extend(
+                                batch
+                                    .iter()
+                                    .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
+                            ),
+                            Err(e) => {
+                                ck.check("S1 lite poll during the drain window", false, &e.to_string());
+                                break;
+                            }
+                        }
                     }
                     got
                 };
@@ -486,12 +497,20 @@ async fn run(namesrv: &str) -> Checker {
             if let Err(e) = c.start().await {
                 ck.check("S2c lite start", false, &e.to_string());
             } else {
-                let starved = poll_for(&c, Duration::from_secs(8)).await;
-                ck.check(
-                    "S2c while the switch is off the lite consumer receives nothing",
-                    starved.is_empty(),
-                    &format!("got={}", join(&starved)),
-                );
+                let starved = match poll_for(&c, Duration::from_secs(8)).await {
+                    Ok(bodies) => Some(bodies),
+                    Err(e) => {
+                        ck.check("S2c lite poll window", false, &e);
+                        None
+                    }
+                };
+                if let Some(starved) = &starved {
+                    ck.check(
+                        "S2c while the switch is off the lite consumer receives nothing",
+                        starved.is_empty(),
+                        &format!("got={}", join(starved)),
+                    );
+                }
                 ck.check(
                     "S2c the pull cursor does not move at all",
                     c.pull_cursor_of(&q0) == 0,
@@ -555,12 +574,17 @@ async fn run(namesrv: &str) -> Checker {
                     let deadline = Instant::now() + Duration::from_secs(20);
                     let mut got = Vec::new();
                     while got.is_empty() && Instant::now() < deadline {
-                        got.extend(
-                            c.poll(Some(500))
-                                .await
-                                .iter()
-                                .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
-                        );
+                        match c.poll(Some(500)).await {
+                            Ok(batch) => got.extend(
+                                batch
+                                    .iter()
+                                    .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
+                            ),
+                            Err(e) => {
+                                ck.check("S3 lite poll during the drain window", false, &e.to_string());
+                                break;
+                            }
+                        }
                     }
                     got
                 };

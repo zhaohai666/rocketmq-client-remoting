@@ -828,8 +828,10 @@ class TestLitePullSelectorExpressionType:
         c.set_namesrv_addr("127.0.0.1:9876")
         c.set_auto_commit(False)
         c.subscribe_with_selector("T", MessageSelector.by_sql("a > 1"))
-        # Wire the in-memory client directly (no start -> no background pull racing the script)
+        # Wire the in-memory client directly (no start -> no background pull racing the script).
+        # The started flag is set by hand: poll() refuses a consumer that never started.
         c._mq_client = c._mock
+        c._started = True
         return c
 
     def test_sql92_selector_builds_selector_typed_subscription_data(self):
@@ -901,3 +903,38 @@ class TestLitePullSelectorExpressionType:
         c.shutdown()
 
 
+
+
+def test_lite_surface_refuses_misuse():
+    """The lite surface answers misuse with an error, not with a plausible-looking result.
+
+    An empty ``assign()`` would revoke every held queue, a blank assign expression would quietly
+    mean "everything", and a poll or a committed-offset read on a consumer that never started looks
+    exactly like a queue at its tail -- which is how a missing ``start()`` stays hidden forever.
+    """
+    c = DefaultLitePullConsumer("G_lite_guards")
+    mq = MessageQueue("T", "broker-a", 0)
+
+    with pytest.raises(ValueError, match="can not be null or empty"):
+        c.assign([])
+    with pytest.raises(ValueError, match="can not be null or empty"):
+        c.assign(None)
+    assert c.assignment() == []                 # a refused assign changed nothing
+    assert c._assign_mode is False
+
+    with pytest.raises(ValueError, match="Topic can not be null or empty"):
+        c.subscribe("   ")
+
+    with pytest.raises(ValueError, match="subExpression can not be null or empty"):
+        c.set_sub_expression_for_assign("T", "  ")
+
+    with pytest.raises(ValueError, match="Topic can not be null or empty"):
+        c.set_sub_expression_for_assign("   ", "TagA")
+    assert c.subscription == {}                  # a refused assign expression registers nothing
+
+    with pytest.raises(MQClientException, match="not running"):
+        c.poll()
+    with pytest.raises(MQClientException, match="not running"):
+        c.poll(timeout=-1)                      # the state check comes first
+    with pytest.raises(MQClientException, match="not running"):
+        c.committed(mq)

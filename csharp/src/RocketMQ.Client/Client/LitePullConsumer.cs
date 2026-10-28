@@ -502,6 +502,11 @@ public sealed class DefaultLitePullConsumer
     /// broker.</summary>
     public void AppendToLocalBufferForTest(IReadOnlyList<MessageExt> msgs) => Enqueue(msgs);
 
+    /// <summary>Answer as though Start() had completed. The running flag is all the
+    /// offset surface reads; the client stays null, so a call that would ask a broker
+    /// still refuses.</summary>
+    public void MarkRunningForTest() => _running = true;
+
     /// <summary>Nothing parked: the queue's next round runs on the loop's own cadence.</summary>
     public const int NoPullPause = -1;
 
@@ -515,6 +520,11 @@ public sealed class DefaultLitePullConsumer
     // ---------------- subscription / allocation ----------------
     public void Subscribe(string topic, string subExpression = "*")
     {
+        if (string.IsNullOrWhiteSpace(topic))
+        {
+            throw new ArgumentException("Topic can not be null or empty.");
+        }
+
         _assignMode = false;
         string ns = WithNamespace(topic);
         lock (_lock)
@@ -538,6 +548,11 @@ public sealed class DefaultLitePullConsumer
     /// (or class-filter) expression is kept verbatim, never hashed as a tag list.</summary>
     public void Subscribe(string topic, MessageSelector selector)
     {
+        if (string.IsNullOrWhiteSpace(topic))
+        {
+            throw new ArgumentException("Topic can not be null or empty.");
+        }
+
         ArgumentNullException.ThrowIfNull(selector);
         _assignMode = false;
         string ns = WithNamespace(topic);
@@ -569,6 +584,21 @@ public sealed class DefaultLitePullConsumer
 
     public void SetSubExpressionForAssign(string topic, string subExpression)
     {
+        if (string.IsNullOrWhiteSpace(subExpression))
+        {
+            throw new ArgumentException("subExpression can not be null or empty.");
+        }
+
+        if (_running)
+        {
+            throw new MQClientException("setSubExpressionForAssign only can be called before start.");
+        }
+
+        if (string.IsNullOrWhiteSpace(topic))
+        {
+            throw new ArgumentException("Topic can not be null or empty.");
+        }
+
         string ns = WithNamespace(topic);
         lock (_lock)
         {
@@ -589,6 +619,11 @@ public sealed class DefaultLitePullConsumer
 
     public void Assign(IReadOnlyList<MessageQueue> messageQueues)
     {
+        if (messageQueues is null || messageQueues.Count == 0)
+        {
+            throw new ArgumentException("Message queues can not be null or empty.");
+        }
+
         _assignMode = true;
         var set = new HashSet<MessageQueue>(messageQueues);
         var dropped = new List<MessageQueue>();
@@ -1505,10 +1540,25 @@ public sealed class DefaultLitePullConsumer
     }
 
     // ---------------- Poll / offsets ----------------
-    public List<MessageExt> Poll(int timeoutMillis = -1)
+    /// <summary>Hand back the buffered messages, waiting at most timeoutMillis.
+    /// A consumer that never started refuses: an empty poll is exactly what a queue
+    /// sitting at its tail looks like, which is how a missing Start() stays hidden.
+    /// The state check comes before the argument check, so an unstarted consumer is
+    /// reported as that rather than as a timeout problem.</summary>
+    public List<MessageExt> Poll(int? timeoutMillis = null)
     {
+        if (!_running)
+        {
+            throw new MQClientException("The consumer not running, please start it first.");
+        }
+
+        if (timeoutMillis < 0)
+        {
+            throw new ArgumentException("Timeout must not be negative");
+        }
+
         if (_autoCommit) MaybeAutoCommit();
-        int timeout = timeoutMillis > 0 ? timeoutMillis : _pollTimeoutMillis;
+        int timeout = timeoutMillis > 0 ? timeoutMillis.Value : _pollTimeoutMillis;
         long deadline = UtilAll.CurrentTimeMillis() + timeout;
         List<MessageExt> outMsgs;
         lock (_bufferLock)
@@ -1578,6 +1628,11 @@ public sealed class DefaultLitePullConsumer
 
     public long Committed(MessageQueue mq)
     {
+        if (!_running)
+        {
+            throw new MQClientException("The consumer not running, please start it first.");
+        }
+
         lock (_lock)
         {
             if (_offsetTable.TryGetValue(mq, out long cached)) return cached;
@@ -2030,7 +2085,7 @@ public sealed class DefaultLitePullConsumer
         MQClientInstance? c = _mqClient;
         if (!_started || c is null)
         {
-            throw new MQClientException("consumer not started, call Start() first");
+            throw new MQClientException("The consumer not running, please start it first.");
         }
 
         return c;

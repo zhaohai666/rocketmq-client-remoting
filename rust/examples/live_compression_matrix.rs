@@ -177,7 +177,10 @@ async fn collect(namesrv: &str, topic: &str, group: &str, want: usize) -> Option
             return None;
         }
     };
-    consumer.subscribe(topic, "*");
+    if let Err(e) = consumer.subscribe(topic, "*") {
+        eprintln!("RECV_FAIL subscribe failed: {e}");
+        return None;
+    }
     if let Err(e) = consumer.start().await {
         eprintln!("RECV_FAIL start failed: {e}");
         return None;
@@ -185,9 +188,17 @@ async fn collect(namesrv: &str, topic: &str, group: &str, want: usize) -> Option
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut got = Vec::new();
     while Instant::now() < deadline && got.len() < want {
-        for m in consumer.poll(Some(1000)).await {
-            if m.topic == *topic {
-                got.push(m);
+        match consumer.poll(Some(1000)).await {
+            Ok(batch) => {
+                for m in batch {
+                    if m.topic == *topic {
+                        got.push(m);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("RECV_FAIL poll failed: {e}");
+                break;
             }
         }
     }

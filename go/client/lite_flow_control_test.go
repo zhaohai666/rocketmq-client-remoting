@@ -1073,7 +1073,7 @@ func TestLitePullCacheGateRecoversOnceTheApplicationPolls(t *testing.T) {
 	}
 
 	for c.BufferedMessageCount() > 0 {
-		if c.PollWithTimeout(0) == nil {
+		if drained, err := c.PollWithTimeout(0); err != nil || drained == nil {
 			t.Fatal("Poll found nothing although the buffer held messages")
 		}
 	}

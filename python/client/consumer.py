@@ -5221,6 +5221,8 @@ class DefaultLitePullConsumer:
 
     # ---------------- Subscription / allocation ----------------
     def subscribe(self, topic: str, sub_expression: str = "*") -> None:
+        if not topic or not topic.strip():
+            raise ValueError("Topic can not be null or empty.")
         self._assign_mode = False
         ns = self._with_namespace(topic)
         self.subscription[ns] = sub_expression
@@ -5263,7 +5265,15 @@ class DefaultLitePullConsumer:
         """Specify a tag filter expression for a topic's queues in assign mode (setSubExpressionForAssign).
 
         Also builds the SubscriptionData registered with the heartbeat, so the broker filters by that tag (assign mode also needs the broker to know the subscription).
+        A blank expression is refused: it would quietly mean "everything", and the caller would never learn that its filter did not apply.
+        It is a pre-start setting, because a running consumer already told the broker which expression this topic has.
         """
+        if sub_expression is None or not sub_expression.strip():
+            raise ValueError("subExpression can not be null or empty.")
+        if self._started:
+            raise MQClientException("set_sub_expression_for_assign only can be called before start.")
+        if not topic or not topic.strip():
+            raise ValueError("Topic can not be null or empty.")
         ns = self._with_namespace(topic)
         self._assign_sub_expr[ns] = sub_expression
         try:
@@ -5272,6 +5282,10 @@ class DefaultLitePullConsumer:
             self.subscription_data.pop(ns, None)
 
     def assign(self, message_queues) -> None:
+        # An empty list is refused rather than taken: it would revoke every queue this
+        # consumer holds, which is exactly what a route lookup that returned nothing does by accident.
+        if not message_queues:
+            raise ValueError("Message queues can not be null or empty.")
         self._assign_mode = True
         queues = set(message_queues)
         # Reassigning drops the revoked queues along with their whole per-queue state
@@ -5897,8 +5911,14 @@ class DefaultLitePullConsumer:
 
     # ---------------- poll / offsets ----------------
     def poll(self, timeout: Optional[int] = None) -> List[MessageExt]:
+        # A consumer that never started has no background round running, so it would answer
+        # with an empty list forever -- exactly what a queue at its tail looks like.
+        if not self._started:
+            raise MQClientException("The consumer not running, please start it first.")
         if timeout is None:
             timeout = self.poll_timeout_millis
+        if timeout < 0:
+            raise ValueError("Timeout must not be negative")
         if self.auto_commit:
             self._maybe_auto_commit()
         deadline = time.time() + (timeout / 1000.0)
@@ -5965,7 +5985,13 @@ class DefaultLitePullConsumer:
     def committed(self, mq: MessageQueue) -> Optional[int]:
         """Read the committed offset memory-first, store-second:
         look at the in-memory offset table first (values just committed with ``persist=False`` but not yet sent to the broker also count),
-        then ask the broker, and backfill the broker's value into the table."""
+        then ask the broker, and backfill the broker's value into the table.
+
+        Asking the broker needs a running consumer; without one this refuses rather than
+        answering ``None``, which is exactly what "nobody has committed yet" looks like.
+        """
+        if not self._started:
+            raise MQClientException("The consumer not running, please start it first.")
         cached = self._offset_table.get(mq)
         if cached is not None:
             return cached
@@ -6062,7 +6088,7 @@ class DefaultLitePullConsumer:
     def _fetch_message_queues_by_full_name(self, full_topic: str) -> List[MessageQueue]:
         pass
         if self._mq_client is None:
-            raise MQClientException("consumer not started, call start() first")
+            raise MQClientException("The consumer not running, please start it first.")
         try:
             self._mq_client.update_topic_route_info_from_name_server(full_topic)
         except Exception as e:  # noqa: BLE001

@@ -1527,7 +1527,8 @@ async fn m8_shared_factory(
         ..Default::default()
     })
     .map_err(|e| format!("lite build failed: {e}"))?;
-    lite.subscribe(topic, "*");
+    lite.subscribe(topic, "*")
+        .map_err(|e| format!("lite subscribe failed: {e}"))?;
     lite.start().await.map_err(|e| format!("lite start failed: {e}"))?;
     ck.check(
         "M8 a pull-mode consumer is a tenant of the factory too",

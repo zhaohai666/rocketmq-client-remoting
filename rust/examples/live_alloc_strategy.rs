@@ -111,11 +111,20 @@ fn bodies_on(msgs: &[MessageExt], on_queues: &BTreeSet<String>) -> BTreeSet<Stri
 }
 
 /// Drains the buffer by **time**: when a strategy owns only part of the queues the received count is unknown, so waiting by count is impossible.
-async fn drain_for(c: &DefaultLitePullConsumer, secs: u64) -> Vec<MessageExt> {
+///
+/// A refused poll means this consumer is not pulling at all, so record it and stop draining -- the
+/// strategy checks below then fail instead of reporting an empty hand as a legitimate split.
+async fn drain_for(ck: &mut Checker, c: &DefaultLitePullConsumer, secs: u64) -> Vec<MessageExt> {
     let mut got = Vec::new();
     let deadline = now_ms() + (secs as i64) * 1000;
     while now_ms() < deadline {
-        got.extend(c.poll(Some(1000)).await);
+        match c.poll(Some(1000)).await {
+            Ok(batch) => got.extend(batch),
+            Err(e) => {
+                ck.abort("poll during the drain loop", &e.to_string());
+                break;
+            }
+        }
     }
     got
 }
@@ -336,7 +345,7 @@ fn pair_with_strategy(
         // The pre-existing messages were all sent during A0; a new group defaulting to LAST would skip them → nothing received.
         // What is verified here is "the strategy really drives send/receive", so consumption starts from the queue head.
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.subscribe(topic, "*");
+        c.subscribe(topic, "*").map_err(|e| e.to_string())?;
     }
     Ok((ca, cb))
 }
@@ -468,7 +477,10 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         // The pre-existing messages were all sent during A0; a new group defaulting to LAST would skip them → nothing received.
         // What is verified here is "the circle split really drives send/receive", so consumption starts from the queue head.
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.subscribe(topic, "*");
+        if let Err(e) = c.subscribe(topic, "*") {
+            ck.abort("A2 subscribe", &e.to_string());
+            return;
+        }
     }
     if let Err(e) = ca.start().await {
         ck.abort("A2 ca start", &e.to_string());
@@ -512,8 +524,8 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         &format!("posA={pos_a:?}"),
     );
     // After the circle split each side receives its own half; together they cover all 12 messages.
-    let ga = drain_for(&ca, 8).await;
-    let gb = drain_for(&cb, 8).await;
+    let ga = drain_for(ck, &ca, 8).await;
+    let gb = drain_for(ck, &cb, 8).await;
     let ba = bodies(&ga);
     let bb = bodies(&gb);
     let joined: BTreeSet<String> = ba.union(&bb).cloned().collect();
@@ -553,7 +565,10 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
     cb.set_allocate_message_queue_strategy(std::sync::Arc::new(AllocateMessageQueueByConfig::new(half_b.clone())));
     for c in [&ca, &cb] {
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.subscribe(topic, "*");
+        if let Err(e) = c.subscribe(topic, "*") {
+            ck.abort("A3 subscribe", &e.to_string());
+            return;
+        }
     }
     if let Err(e) = ca.start().await {
         ck.abort("A3 ca start", &e.to_string());
@@ -576,8 +591,8 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
             key_set_text(&queue_keys(&b_assigned))
         ),
     );
-    let ga = drain_for(&ca, 8).await;
-    let gb = drain_for(&cb, 8).await;
+    let ga = drain_for(ck, &ca, 8).await;
+    let gb = drain_for(ck, &cb, 8).await;
     let keys_a = queue_keys(&half_a);
     let keys_b = queue_keys(&half_b);
     let all_a = bodies(&ga);
@@ -662,8 +677,8 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
         &format!("a={} b={}", ka.len(), kb.len()),
     );
     // End to end: no matter how the ring skews, the two sides together must receive all 12 messages.
-    let ga = drain_for(&ca, 8).await;
-    let gb = drain_for(&cb, 8).await;
+    let ga = drain_for(ck, &ca, 8).await;
+    let gb = drain_for(ck, &cb, 8).await;
     let joined: BTreeSet<String> = bodies(&ga).union(&bodies(&gb)).cloned().collect();
     ck.check(
         &format!("A4 the two instances together receive all {N_MSG} messages (the ring really drives send/receive)"),
@@ -796,7 +811,7 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
     )
     .await;
     ck.check("A6 both sides' live allocations each converge to their own strategy's offline prediction", matched, &detail);
-    let ga = drain_for(&ca, 5).await;
+    let ga = drain_for(ck, &ca, 5).await;
     ck.check(
         "A6 the starved side polls no messages and raises no error",
         bodies(&ga).is_empty(),

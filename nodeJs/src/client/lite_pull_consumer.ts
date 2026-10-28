@@ -256,7 +256,7 @@ export class DefaultLitePullConsumer {
   getTopicMetadataCheckIntervalMillis(): number { return this.topicMetadataCheckIntervalMillis; }
 
   subscribe(topic: string, subExpression = '*'): this {
-    if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
+    if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
     const expr = subExpression || '*';
     this.subscription.set(topic, FilterAPI.buildSubscriptionData(topic, expr));
     this.assignedManual = null;
@@ -268,7 +268,12 @@ export class DefaultLitePullConsumer {
   }
 
   // assign switches to MANUAL mode: the given queues are polled directly.
+  // An empty list is refused: taken literally it would drop every queue held so far,
+  // which is exactly what a route lookup that came back empty does by accident.
   assign(mqs: MessageQueue[]): this {
+    if (!mqs || mqs.length === 0) {
+      throw new Error('Message queues can not be null or empty.');
+    }
     this.assignedManual = [...mqs];
     for (const mq of mqs) {
       if (!this.subscription.has(mq.getTopic())) {
@@ -435,7 +440,7 @@ export class DefaultLitePullConsumer {
   // "this topic has zero queues", so a nameserver blip would look like a
   // scale-in and the queue-change listener would happily report it as one.
   async fetchMessageQueues(topic: string): Promise<MessageQueue[]> {
-    if (!this.mqClient) throw new Error('consumer not started');
+    if (!this.mqClient) throw new Error('The consumer not running, please start it first.');
     await this.mqClient.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     const route = this.mqClient.getTopicRouteData(topic);
     if (!route) throw new Error(`Can not find MessageQueue for topic: ${topic}`);
@@ -527,7 +532,8 @@ export class DefaultLitePullConsumer {
   // NOTHING is pullable waits out the shortest remaining park rather than burning
   // the caller's deadline on a spin.
   async poll(timeoutMillis = this.pollTimeoutMillis): Promise<MessageExt[]> {
-    if (!this.started || !this.pullAPI) throw new Error('consumer not started');
+    if (!this.started || !this.pullAPI) throw new Error('The consumer not running, please start it first.');
+    if (timeoutMillis < 0) throw new Error('Timeout must not be negative');
     const deadline = Date.now() + Math.max(1, timeoutMillis);
     const queues = this._activeQueues();
     if (queues.length === 0) return [];
@@ -631,7 +637,7 @@ export class DefaultLitePullConsumer {
 
   // seek moves the pull cursor for one queue (the next poll starts there).
   seek(mq: MessageQueue, offset: number): void {
-    if (!this.started) throw new Error('consumer not started');
+    if (!this.started) throw new Error('The consumer not running, please start it first.');
     if (offset < 0) throw new Error(`offset must be >= 0, got ${offset}`);
     this.pullCursor.set(mqKey(mq), offset);
     if (this.offsetStore) this.offsetStore.updateOffset(mq, offset, false);
@@ -685,14 +691,14 @@ export class DefaultLitePullConsumer {
   // to -1: a negative cursor would come back as OFFSET_ILLEGAL on the next poll,
   // which amounts to a silent error.
   async seekToBegin(mq: MessageQueue): Promise<void> {
-    if (!this.started) throw new Error('consumer not started');
+    if (!this.started) throw new Error('The consumer not running, please start it first.');
     const begin = await this._boundaryOffset(mq, 'min');
     if (begin < 0) throw new Error(`seekToBegin: minOffset unavailable for ${mqKey(mq)}`);
     this.seek(mq, begin);
   }
 
   async seekToEnd(mq: MessageQueue): Promise<void> {
-    if (!this.started) throw new Error('consumer not started');
+    if (!this.started) throw new Error('The consumer not running, please start it first.');
     const end = await this._boundaryOffset(mq, 'max');
     if (end < 0) throw new Error(`seekToEnd: maxOffset unavailable for ${mqKey(mq)}`);
     this.seek(mq, end);
@@ -701,6 +707,7 @@ export class DefaultLitePullConsumer {
   // committed(mq): the offset last committed for this queue (-1 if never
   // committed).
   committed(mq: MessageQueue): number {
+    if (!this.started) throw new Error('The consumer not running, please start it first.');
     if (!this.offsetStore) return -1;
     const snap = (this.offsetStore as any).tableSnapshot?.() as Map<string, number> | undefined;
     const v = snap?.get(mqKey(mq));

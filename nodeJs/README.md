@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **47** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 42 套逐条计出 **1486** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **48** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 43 套逐条计出 **1500** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -48,6 +48,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 40 通过 / 0 失败 |
+| `test/lite_surface_guards_smoke.ts`（lite 表面的误用闸门：空白 topic、空队列列表的 assign、已经在跑之后再设指派表达式、没启动就 poll / committed / 取队列，负超时排在状态检查之后） | 14 通过 / 0 失败 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
@@ -222,6 +223,8 @@ await puller.shutdown();
 ```
 
 ### LitePullConsumer（含 topic 队列变更监听）
+
+这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。
 
 ```ts
 import { DefaultLitePullConsumer } from './src/client/lite_pull_consumer.ts';
@@ -406,7 +409,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 37 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 48 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

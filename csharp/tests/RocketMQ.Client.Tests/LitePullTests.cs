@@ -67,33 +67,55 @@ public class LitePullTests
     }
 
     [Fact]
-    public void Subscribe_Assign_Seek_Poll_BeforeStart_DoesNotCrash()
+    public void LiteSurface_RefusesMisuse()
     {
         var c = new DefaultLitePullConsumer();
-
-        c.Subscribe("MyTopic", "TagA || TagB");
-
-        // assign (resolving the initial offset while not started will fail but must be swallowed, it must not crash)
         var mq = new MessageQueue("MyTopic", "broker-a", 3);
+
+        // An empty assign would revoke every queue held so far, which is what an empty
+        // route lookup does by accident: it is refused and leaves the state alone.
+        Assert.Throws<ArgumentException>(() => c.Assign(Array.Empty<MessageQueue>()));
+        Assert.Throws<ArgumentException>(() => c.Assign(null!));
+        Assert.Empty(c.Assignment());
+
+        // A topic named "" would be registered and looked up on the wire as-is.
+        Assert.Throws<ArgumentException>(() => c.Subscribe("", "TagA"));
+        Assert.Throws<ArgumentException>(() => c.Subscribe("   ", "TagA"));
+
+        // A blank assign expression would quietly mean "everything": the caller would
+        // never learn its filter did not apply.
+        Assert.Throws<ArgumentException>(() => c.SetSubExpressionForAssign("MyTopic", "  "));
+        // A topic named "" would key that expression on "" instead.
+        Assert.Throws<ArgumentException>(() => c.SetSubExpressionForAssign("   ", "TagA"));
+
+        // An empty poll and an unknown committed offset look exactly like a queue at its
+        // tail, so a consumer that never started refuses instead of answering.
+        Assert.Throws<MQClientException>(() => c.Committed(mq));
+        Assert.Throws<MQClientException>(() => c.Poll(20));
+        // The state check comes first: an unstarted consumer is reported as that, not as
+        // a timeout problem.
+        Assert.Throws<MQClientException>(() => c.Poll(-1));
+
+        // Assigning for real and then starting is still the supported path; seek, pause
+        // and resume move local state only and stay allowed before start.
+        c.Subscribe("MyTopic", "TagA || TagB");
         c.Assign(new[] { mq });
         Assert.Single(c.Assignment());
         Assert.Equal(3, c.Assignment()[0].QueueId);
-
-        // committed must return -1 while not started (there is no client to query)
-        Assert.Equal(-1, c.Committed(mq));
-
-        // poll with an empty buffer: a short timeout returns an empty list (no blocking, no crash)
-        Assert.Empty(c.Poll(20));
-
-        // seek must be able to register an offset while not started too (it does not query the broker)
         c.Seek(mq, 42);
-        Assert.Single(c.Assignment());
-
-        // pause / resume must not crash while not started
         c.Pause(new[] { mq });
         c.Resume(new[] { mq });
-
         c.Subscribe("MyTopic", "TagC");
+
+        // Running: the timeout is the caller's to get right, and the assign expression
+        // is a pre-start setting -- the broker already knows the old one.
+        c.SetAutoCommit(false);
+        c.MarkRunningForTest();
+        Assert.Throws<ArgumentException>(() => c.Poll(-1));
+        Assert.Throws<MQClientException>(() => c.SetSubExpressionForAssign("MyTopic", "TagA"));
+        Assert.Throws<MQClientException>(() => c.SetSubExpressionForAssign("MyTopic", "*"));
+        Assert.Empty(c.Poll(20));
+        Eq(-1L, c.Committed(mq), "a running consumer with no client answers -1, not an error");
     }
 
     // ---------------------------------------------- The three offset tables (read/write, overwrite and guards)
@@ -114,6 +136,10 @@ public class LitePullTests
         var q1 = new MessageQueue("MyTopic", "broker-a", 1);
         var stranger = new MessageQueue("MyTopic", "broker-a", 7);
         c.Assign(new[] { q0, q1 });
+        // The offset surface only answers for a running consumer; nothing below reaches
+        // the wire, the tables are all local.
+        c.SetAutoCommit(false);
+        c.MarkRunningForTest();
 
         Assert.Equal(-1L, c.PullCursorOf(q0));
         Assert.Equal(-1L, c.ConsumeCursorOf(q0));

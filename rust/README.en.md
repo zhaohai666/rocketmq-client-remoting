@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1162 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1163 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -156,15 +156,17 @@ for mq in &mqs {
 
 ### LitePullConsumer (poll model + queue-change listener + three offset tables)
 
+Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), calling `set_sub_expression_for_assign` once the consumer is running, and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
+
 ```rust
 use rocketmq_client_remoting::client::pull_consumer::DefaultLitePullConsumer;
 use std::sync::Arc;
 
 let consumer = DefaultLitePullConsumer::new("GID_test")?;
 consumer.set_namesrv_addr("127.0.0.1:9876");
-consumer.subscribe("TopicTest", "*");        // or assign(&[mq]) manually
+consumer.subscribe("TopicTest", "*")?;        // or assign(&[mq]) manually
 consumer.start().await?;
-let msgs = consumer.poll(Some(3000)).await;  // empty Vec == timeout, not an error
+let msgs = consumer.poll(Some(3000)).await?;  // empty Vec == timeout, not an error; a consumer that never started refuses
 consumer.commit().await?;                    // manual commit when auto_commit is off
 ```
 

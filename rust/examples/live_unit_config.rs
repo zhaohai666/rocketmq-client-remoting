@@ -554,7 +554,10 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
             return;
         }
     };
-    lite.subscribe(&topic, "*");
+    if let Err(e) = lite.subscribe(&topic, "*") {
+        ck.abort("U5 lite subscribe", &e.to_string());
+        return;
+    }
     if let Err(e) = lite.start().await {
         ck.abort("U5 lite start", &e.to_string());
         return;
@@ -569,9 +572,16 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
     let mut bodies: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(WAIT_SECONDS);
     while bodies.len() < 3 && Instant::now() < deadline {
-        let got = lite.poll(Some(1000)).await;
-        for m in got {
-            bodies.push(String::from_utf8_lossy(m.get_body()).into_owned());
+        match lite.poll(Some(1000)).await {
+            Ok(got) => {
+                for m in got {
+                    bodies.push(String::from_utf8_lossy(m.get_body()).into_owned());
+                }
+            }
+            Err(e) => {
+                ck.abort("U5 lite poll during the drain loop", &e.to_string());
+                break;
+            }
         }
     }
     let ok = (0..3).all(|i| bodies.iter().any(|b| b == &format!("u5-{i}")));

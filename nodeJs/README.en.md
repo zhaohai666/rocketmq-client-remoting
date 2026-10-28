@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **65** modules under `src/` and then runs the **47** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-28, **1486** individually counted checks across 42 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **65** modules under `src/` and then runs the **48** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-28, **1500** individually counted checks across 43 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -48,6 +48,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 | `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
 | `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 40 passed / 0 failed |
+| `test/lite_surface_guards_smoke.ts` (misuse guards on the lite surface: a blank topic, an empty queue list, setting the assign expression once running, poll / committed / queue lookup on a consumer that never started, and a negative timeout behind the state check) | 14 passed / 0 failed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/namespace_rpc_smoke.ts` | 7 check groups passed |
@@ -226,6 +227,8 @@ await puller.shutdown();
 ```
 
 ### LitePullConsumer (with the topic queue-change listener)
+
+Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
 
 ```ts
 import { DefaultLitePullConsumer } from './src/client/lite_pull_consumer.ts';

@@ -120,11 +120,25 @@ async fn wait_assignment(c: &DefaultLitePullConsumer, want: usize, secs: u64) ->
 }
 
 /// Repeatedly `poll` until `want` messages accumulate or timeout (the background loop fills the buffer; never gamble on a sleep).
-async fn poll_bounded(c: &DefaultLitePullConsumer, want: usize, secs: u64) -> Vec<MessageExt> {
+///
+/// A refused poll is a broken scene, not a short drain: without a running consumer nothing is ever
+/// delivered, so record the refusal and stop here -- the count checks of the caller then also fail.
+async fn poll_bounded(
+    ck: &mut Checker,
+    c: &DefaultLitePullConsumer,
+    want: usize,
+    secs: u64,
+) -> Vec<MessageExt> {
     let mut got: Vec<MessageExt> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
     while got.len() < want && Instant::now() < deadline {
-        got.extend(c.poll(Some(1000)).await);
+        match c.poll(Some(1000)).await {
+            Ok(batch) => got.extend(batch),
+            Err(e) => {
+                ck.abort("poll during the drain loop", &e.to_string());
+                break;
+            }
+        }
     }
     got
 }
@@ -244,7 +258,10 @@ impl Fixture {
                 return None;
             }
         };
-        c.subscribe(topic, expression);
+        if let Err(e) = c.subscribe(topic, expression) {
+            ck.abort(&format!("{kind} subscribe"), &e.to_string());
+            return None;
+        }
         if let Some(where_) = from {
             c.set_consume_from_where(where_);
         }
@@ -318,15 +335,18 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
     ck.check("L1 no started state left behind after failure", !c.is_started(), "");
     ck.check(
-        "L1 poll returns empty before start",
-        c.poll(Some(100)).await.is_empty(),
+        "L1 poll refuses before start",
+        c.poll(Some(100)).await.is_err(),
         "",
     );
     ck.check("L1 is_running is false before start", !c.is_running(), "");
 
     // consumeTimestamp only accepts 14-digit wall clock: epoch millis must be rejected (otherwise parsed
     // as an epoch, the start point jumps decades ahead -- silently degrading to "consume from max offset").
-    c.subscribe(&fx.topic_name("Ts"), "*");
+    if let Err(e) = c.subscribe(&fx.topic_name("Ts"), "*") {
+        ck.abort("L1 subscribe for the timestamp check", &e.to_string());
+        return;
+    }
     c.set_consume_timestamp("1789000000000");
     match c.start().await {
         Ok(()) => ck.check("L1 invalid consumeTimestamp is rejected", false, "start unexpectedly succeeded"),
@@ -346,11 +366,14 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
             return;
         }
     };
-    c2.assign(&[MessageQueue::new(
+    if let Err(e) = c2.assign(&[MessageQueue::new(
         &fx.topic_name("Main"),
         &fx.broker_name,
         0,
-    )]);
+    )]) {
+        ck.abort("L1 assign in assign mode", &e.to_string());
+        return;
+    }
     ck.check("L1 is_assign_mode after assign", c2.is_assign_mode(), "");
     if let Err(e) = c2.start().await {
         ck.abort("L1 assign-mode start", &e.to_string());
@@ -396,7 +419,7 @@ async fn l2_subscribe_poll(ck: &mut Checker, fx: &Fixture, topic: &str) {
         assigned.len() == QUEUE_NUMS as usize,
         &format!("assigned={assigned:?}"),
     );
-    let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, N_MSG, WAIT_SECONDS).await;
     ck.check(
         &format!("L2 poll received all {N_MSG} (no dup, no gap)"),
         bodies(&got) == expected_bodies(topic),
@@ -437,7 +460,7 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
         Some(c) => c,
         None => return,
     };
-    let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, N_MSG, WAIT_SECONDS).await;
     ck.check(
         &format!("L3 auto-commit group received all {N_MSG}"),
         got.len() == N_MSG,
@@ -483,19 +506,30 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
         }
     };
     manual.set_auto_commit(false);
-    manual.subscribe(topic, "*");
+    if let Err(e) = manual.subscribe(topic, "*") {
+        ck.abort("L3 manual subscribe", &e.to_string());
+        return;
+    }
     manual.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
     if let Err(e) = manual.start().await {
         ck.abort("L3 manual start", &e.to_string());
         return;
     }
-    let got = poll_bounded(&manual, N_MSG, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &manual, N_MSG, WAIT_SECONDS).await;
     ck.check(
         "L3 auto_commit=false still delivers normally",
         got.len() == N_MSG,
         &format!("n={}", got.len()),
     );
-    let before = manual.committed(&mqs[0]).await.unwrap_or(None);
+    // A refused read must not look like "nobody has committed": record the failure and stop the scene.
+    let before = match manual.committed(&mqs[0]).await {
+        Ok(offset) => offset,
+        Err(e) => {
+            ck.abort("L3 committed read before commit()", &e.to_string());
+            manual.shutdown();
+            return;
+        }
+    };
     ck.check(
         "L3 with auto_commit=false the offset does not land on the broker",
         before.is_none(),
@@ -505,7 +539,14 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
         Ok(()) => {}
         Err(e) => ck.abort("L3 commit()", &e.to_string()),
     }
-    let after = manual.committed(&mqs[0]).await.unwrap_or(None);
+    let after = match manual.committed(&mqs[0]).await {
+        Ok(offset) => offset,
+        Err(e) => {
+            ck.abort("L3 committed read after commit()", &e.to_string());
+            manual.shutdown();
+            return;
+        }
+    };
     ck.check(
         "L3 the offset lands on the broker only after commit()",
         after.unwrap_or(0) > 0,
@@ -524,7 +565,10 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
             return;
         }
     };
-    c.assign(mqs);
+    if let Err(e) = c.assign(mqs) {
+        ck.abort("L4 assign", &e.to_string());
+        return;
+    }
     ck.check("L4 is_assign_mode after assign", c.is_assign_mode(), "");
     if let Err(e) = c.start().await {
         ck.abort("L4 start", &e.to_string());
@@ -538,7 +582,7 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
     // Assign mode defaults to LAST (a new group has no committed offset) -> not one backlog message is received.
     ck.check(
         "L4 poll finds no backlog when the start point is the queue tail",
-        c.poll(Some(500)).await.is_empty(),
+        c.poll(Some(500)).await.is_ok_and(|msgs| msgs.is_empty()),
         "",
     );
     if let Err(e) = c.seek_to_begin(&mqs[0]).await {
@@ -547,7 +591,7 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
         return;
     }
     let per_queue = N_MSG / QUEUE_NUMS as usize;
-    let got = poll_bounded(&c, per_queue, 20).await;
+    let got = poll_bounded(ck, &c, per_queue, 20).await;
     let got_bodies = bodies(&got);
     ck.check(
         &format!("L4 after seek_to_begin replays that queue's {per_queue} messages"),
@@ -573,7 +617,7 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
             return;
         }
     }
-    let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, N_MSG, WAIT_SECONDS).await;
     ck.check(
         &format!("L4 received all {N_MSG} after seek_to_begin on all queues"),
         bodies(&got) == expected_bodies(topic),
@@ -581,7 +625,7 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
     );
     // Seek to a concrete offset: queue 0 replays its remaining 2 messages from offset=1.
     c.seek(&mqs[0], 1);
-    let replay = poll_bounded(&c, per_queue - 1, 20).await;
+    let replay = poll_bounded(ck, &c, per_queue - 1, 20).await;
     let from_q0: BTreeSet<String> = replay
         .iter()
         .filter(|m| m.queue_id == mqs[0].queue_id)
@@ -616,7 +660,7 @@ async fn l5_tag_filter(ck: &mut Checker, fx: &Fixture, topic: &str) {
         .step_by(2)
         .map(|i| format!("{topic}-{i:02}"))
         .collect();
-    let got = poll_bounded(&c, N_MSG / 2, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, N_MSG / 2, WAIT_SECONDS).await;
     let got_bodies = bodies(&got);
     ck.check(
         &format!("L5 subscribe(\"TagA\") receives only {} messages", N_MSG / 2),
@@ -674,7 +718,7 @@ async fn l6_consume_from_timestamp(
         Some(c) => c,
         None => return,
     };
-    let got = poll_bounded(&c, N_MSG, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, N_MSG, WAIT_SECONDS).await;
     ck.check(
         &format!("L6a wall-clock start={past} (30 minutes ago) -> received all {N_MSG}"),
         bodies(&got) == expected_bodies(topic),
@@ -777,7 +821,13 @@ async fn l7_pause_resume(ck: &mut Checker, fx: &Fixture) {
         sent == N_MSG,
         &format!("sent={sent}"),
     );
-    let during_pause = c.poll(Some(1500)).await;
+    let during_pause = match c.poll(Some(1500)).await {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            ck.abort("L7 poll after pause", &e.to_string());
+            Vec::new()
+        }
+    };
     ck.check(
         "L7 poll gets no messages after pause",
         during_pause.is_empty(),
@@ -792,7 +842,7 @@ async fn l7_pause_resume(ck: &mut Checker, fx: &Fixture) {
     // The few messages that slipped in during the pause count as consumed too; do not drop them and wait all over again.
     let mut got = during_pause;
     let need = N_MSG.saturating_sub(got.len());
-    got.extend(poll_bounded(&c, need, WAIT_SECONDS).await);
+    got.extend(poll_bounded(ck, &c, need, WAIT_SECONDS).await);
     ck.check(
         &format!("L7 received all {N_MSG} new messages after resume"),
         bodies(&got) == expected_bodies(&topic),
@@ -830,7 +880,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         ok >= 1,
         &format!("ok={ok}"),
     );
-    let got = poll_bounded(&c, 1, WAIT_SECONDS).await;
+    let got = poll_bounded(ck, &c, 1, WAIT_SECONDS).await;
     ck.check(
         "L9 the buffer is readable after poll receives a message (buffered_message_count)",
         !got.is_empty(),
@@ -911,7 +961,10 @@ async fn lite_off_consumer(
             return None;
         }
     };
-    o.assign(mqs);
+    if let Err(e) = o.assign(mqs) {
+        ck.abort(&format!("L11 {instance} assign"), &e.to_string());
+        return None;
+    }
     if let Err(e) = o.start().await {
         ck.abort(&format!("L11 {instance} start"), &e.to_string());
         return None;
@@ -1030,7 +1083,13 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     );
 
     // ---- L11b a single poll caps at 1024 < 1200 buffered => the tail 176 do not count as consumed
-    let first = o.poll(Some(3000)).await;
+    let first = match o.poll(Some(3000)).await {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            ck.abort("L11b poll", &e.to_string());
+            Vec::new()
+        }
+    };
     ck.check(
         &format!("L11b one poll hands out {cap} messages (single-delivery cap)"),
         first.len() as i64 == cap,
@@ -1081,7 +1140,13 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         &format!("consumeCursor={}", o.consume_cursor_of(&q0)),
     );
     // After rewinding to 5, the tail 176 are still delivered (the local buffer is independent of the broker offset)
-    let tail = o.poll(Some(3000)).await;
+    let tail = match o.poll(Some(3000)).await {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            ck.abort("L11c poll of the buffer tail", &e.to_string());
+            Vec::new()
+        }
+    };
     ck.check(
         &format!("L11c the {} messages left in the buffer are still delivered after rewinding to 5", N_BIG - cap),
         tail.len() as i64 == N_BIG - cap,
@@ -1159,7 +1224,12 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         probe.shutdown();
         return;
     };
-    o.assign(&[q0.clone(), foreign.clone()]);
+    if let Err(e) = o.assign(&[q0.clone(), foreign.clone()]) {
+        ck.abort("L11g assign the foreign queue alongside q0", &e.to_string());
+        o.shutdown();
+        probe.shutdown();
+        return;
+    }
     let mut memory_only2: BTreeMap<String, i64> = BTreeMap::new();
     memory_only2.insert(key0.clone(), 300);
     if let Err(e) = o.commit_offsets(&memory_only2, false).await {
@@ -1260,7 +1330,10 @@ async fn gate_consumer(
             return None;
         }
     };
-    o.assign(std::slice::from_ref(q0));
+    if let Err(e) = o.assign(std::slice::from_ref(q0)) {
+        ck.abort(&format!("L12 {instance} assign"), &e.to_string());
+        return None;
+    }
     if let Err(e) = o.start().await {
         ck.abort(&format!("L12 start {instance}"), &e.to_string());
         return None;
@@ -1391,7 +1464,13 @@ async fn l12_cache_gate(ck: &mut Checker, fx: &Fixture) {
     let mut got: Vec<MessageExt> = Vec::new();
     let drain_deadline = Instant::now() + Duration::from_secs(60);
     while (got.len() as i64) < N_GATE && Instant::now() < drain_deadline {
-        got.extend(gated.poll(Some(1000)).await);
+        match gated.poll(Some(1000)).await {
+            Ok(batch) => got.extend(batch),
+            Err(e) => {
+                ck.abort("L12 poll during the drain loop", &e.to_string());
+                break;
+            }
+        }
     }
     let distinct: BTreeSet<String> = got
         .iter()

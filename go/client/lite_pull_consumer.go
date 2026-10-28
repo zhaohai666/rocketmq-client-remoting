@@ -682,7 +682,7 @@ func (c *DefaultLitePullConsumer) IsStarted() bool {
 // still recorded), matching the push consumer's Subscribe.
 func (c *DefaultLitePullConsumer) Subscribe(topic, subExpression string) error {
 	if strings.TrimSpace(topic) == "" {
-		return common.ClientError("subscription topic is empty")
+		return common.ClientError("Topic can not be null or empty.")
 	}
 	if subExpression == "" {
 		subExpression = "*"
@@ -708,24 +708,42 @@ func (c *DefaultLitePullConsumer) Unsubscribe(topic string) {
 }
 
 // SetSubExpressionForAssign gives one topic its TAG expression in assign mode
-// (the broker-side filter and the heartbeat still need it).
-func (c *DefaultLitePullConsumer) SetSubExpressionForAssign(topic, subExpression string) {
-	if subExpression == "" {
-		subExpression = "*"
+// (the pull request needs it, and the raw table entry is what a diagnostics read
+// returns). Only a real expression is accepted: a blank one would silently mean
+// "everything", and the caller would never learn that its filter did not apply.
+// It is also a pre-start setting, because the running consumer already told the
+// broker which expression this topic has.
+func (c *DefaultLitePullConsumer) SetSubExpressionForAssign(topic, subExpression string) error {
+	if strings.TrimSpace(subExpression) == "" {
+		return common.ClientError("subExpression can not be null or empty.")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.started {
+		return common.ClientError("setSubExpressionForAssign only can be called before start.")
+	}
+	if strings.TrimSpace(topic) == "" {
+		return common.ClientError("Topic can not be null or empty.")
+	}
 	c.assignSubExpr[topic] = subExpression
 	sub, err := remoting.FilterAPI{}.BuildSubscriptionData(topic, subExpression)
-	if err == nil {
-		c.subscriptionData[topic] = sub
-	} else {
+	if err != nil {
 		common.LogDebugf("lite assign expr: build subscription data failed: %v", err)
 		delete(c.subscriptionData, topic)
+		return err
 	}
+	c.subscriptionData[topic] = sub
+	return nil
 }
 
-func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) {
+// Assign names the queues this instance consumes, explicitly (no rebalance). An
+// empty list is refused rather than taken: it would revoke every queue the
+// consumer holds, which is what a caller with a route lookup that returned
+// nothing does by accident.
+func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) error {
+	if len(mqs) == 0 {
+		return common.ClientError("Message queues can not be null or empty.")
+	}
 	c.mu.Lock()
 	c.assignMode = true
 	keep := make(map[common.MessageQueue]struct{}, len(mqs))
@@ -750,6 +768,7 @@ func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) {
 	for _, mq := range revoked {
 		c.dropQueueCache(mq)
 	}
+	return nil
 }
 
 // Assignment snapshots the assigned queues (sorted for stable callers).
@@ -972,34 +991,43 @@ func (c *DefaultLitePullConsumer) notifyBufferLocked() {
 
 // Poll waits up to pollTimeoutMillis for messages and returns up to
 // maxPollBatchSize of them (nil when the timeout elapsed with nothing).
-func (c *DefaultLitePullConsumer) Poll() []*common.MessageExt {
+// A consumer that is not running answers with an error instead of an empty
+// round: an empty round is exactly what a queue at its tail looks like, so the
+// caller would wait forever on a Start() it never called.
+func (c *DefaultLitePullConsumer) Poll() ([]*common.MessageExt, error) {
 	c.mu.Lock()
 	timeout := c.pollTimeoutMillis
 	c.mu.Unlock()
 	return c.PollWithTimeout(timeout)
 }
 
-func (c *DefaultLitePullConsumer) PollWithTimeout(timeoutMillis int64) []*common.MessageExt {
+func (c *DefaultLitePullConsumer) PollWithTimeout(timeoutMillis int64) ([]*common.MessageExt, error) {
+	if !c.IsStarted() {
+		return nil, common.ClientError("The consumer not running, please start it first.")
+	}
+	if timeoutMillis < 0 {
+		return nil, common.ClientError("Timeout must not be negative")
+	}
 	if c.autoCommitOn() {
 		c.maybeAutoCommit()
 	}
-	deadline := time.Now().Add(time.Duration(maxInt64(timeoutMillis, 0)) * time.Millisecond)
+	deadline := time.Now().Add(time.Duration(timeoutMillis) * time.Millisecond)
 	for {
 		if msgs := c.tryDrain(); len(msgs) > 0 {
 			// Delivery is what advances the CONSUME cursor (rule 1).
 			c.advanceConsumeOffset(msgs)
-			return msgs
+			return msgs, nil
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil
+			return nil, nil
 		}
 		timer := time.NewTimer(remaining)
 		select {
 		case <-c.bufNotify:
 			timer.Stop()
 		case <-timer.C:
-			return nil
+			return nil, nil
 		}
 	}
 }
@@ -1175,7 +1203,7 @@ func (c *DefaultLitePullConsumer) Committed(mq common.MessageQueue) (int64, erro
 	group := c.consumerGroup
 	c.mu.Unlock()
 	if instance == nil {
-		return -1, common.ClientError("consumer not started, call Start() first")
+		return -1, common.ClientError("The consumer not running, please start it first.")
 	}
 	offset, found, err := instance.QueryConsumerOffset(group, mq, litePullRPCTimeoutMillis, "", false)
 	if err != nil || !found {
@@ -1223,7 +1251,7 @@ func (c *DefaultLitePullConsumer) requireInstance() (*Instance, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.started || c.instance == nil {
-		return nil, common.ClientError("consumer not started, call Start() first")
+		return nil, common.ClientError("The consumer not running, please start it first.")
 	}
 	return c.instance, nil
 }

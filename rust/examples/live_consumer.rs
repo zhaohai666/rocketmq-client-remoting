@@ -1428,7 +1428,8 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
     })
     .map_err(|e| format!("build lite pull failed: {e}"))?;
     // assign must happen before start: the rebalance right after start only honors subscriptions and would compute an empty assignment
-    lite.assign(&mqs);
+    lite.assign(&mqs)
+        .map_err(|e| format!("lite assign of the DLQ queues failed: {e}"))?;
     lite.start()
         .await
         .map_err(|e| format!("lite start failed: {e}"))?;
@@ -1445,7 +1446,11 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
     let mut seen_at: BTreeSet<(i32, i64)> = BTreeSet::new();
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     while Instant::now() < deadline {
-        for m in lite.poll(Some(1000)).await {
+        let batch = lite
+            .poll(Some(1000))
+            .await
+            .map_err(|e| format!("lite poll of the DLQ failed: {e}"))?;
+        for m in batch {
             let d = Delivered::from(&m);
             if seen_at.insert((d.queue_id, d.queue_offset)) {
                 msgs.push(d);
@@ -1458,7 +1463,11 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         // seeing what comes after, but the total window must stay bounded or every positive case waits out wait_secs for nothing.
         let drain_to = Instant::now() + Duration::from_secs(3);
         while Instant::now() < drain_to {
-            for m in lite.poll(Some(500)).await {
+            let batch = lite
+                .poll(Some(500))
+                .await
+                .map_err(|e| format!("lite poll during the DLQ drain failed: {e}"))?;
+            for m in batch {
                 let d = Delivered::from(&m);
                 if seen_at.insert((d.queue_id, d.queue_offset)) {
                     msgs.push(d);

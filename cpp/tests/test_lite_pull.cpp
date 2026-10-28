@@ -36,7 +36,23 @@ static int g_fail = 0;
         }                                                                      \
     } while (0)
 
-// ---------------------------------------------------------------- pure state behavior before start
+// Runs the call and hands back what it threw ("none" when nothing did): a guard that
+// stays silent is not a guard, so every refusal below also names the message.
+template <typename Fn>
+static std::string threwMessage(Fn fn) {
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        return std::string(e.what());
+    }
+    return "none";
+}
+
+static bool refusedWith(const std::string& threw, const std::string& needle) {
+    return threw.find(needle) != std::string::npos;
+}
+
+// ---------------------------------------------------------------- the surface refuses misuse
 static void testLitePullPreStartBehavior() {
     DefaultLitePullConsumer c;
     CHECK_EQ(c.consumerGroup(), std::string(MixAll::DEFAULT_CONSUMER_GROUP),
@@ -54,6 +70,23 @@ static void testLitePullPreStartBehavior() {
     }
     CHECK(threw, "start() throws without a subscription and without a namesrv");
 
+    // An empty assign would revoke every queue held so far, which is what an empty route
+    // lookup does by accident; a blank topic would be queried on the wire as a topic
+    // literally named ""; a blank assign expression would quietly mean "everything".
+    CHECK(refusedWith(threwMessage([&] { c.assign({}); }), "can not be null or empty"),
+          "assign({}) is refused instead of revoking every held queue");
+    CHECK(c.assignment().empty(), "a refused assign leaves the assignment alone");
+    CHECK(refusedWith(threwMessage([&] { c.subscribe("", "TagA"); }), "Topic can not be null or empty"),
+          "subscribe(\"\") is refused");
+    CHECK(refusedWith(threwMessage([&] { c.subscribe("   ", "TagA"); }), "Topic can not be null or empty"),
+          "a blank topic is refused whatever the padding");
+    CHECK(refusedWith(threwMessage([&] { c.setSubExpressionForAssign("MyTopic", "  "); }),
+                    "subExpression can not be null or empty"),
+          "a blank assign expression is refused instead of meaning \"everything\"");
+    CHECK(refusedWith(threwMessage([&] { c.setSubExpressionForAssign("  ", "TagA"); }),
+                    "Topic can not be null or empty"),
+          "a blank topic is refused as an assignment key too");
+
     c.subscribe("MyTopic", "TagA || TagB");
 
     // assign (resolveInitialOffset fails while not started but must be swallowed, no crash)
@@ -62,12 +95,17 @@ static void testLitePullPreStartBehavior() {
     CHECK_EQ(c.assignment().size(), static_cast<size_t>(1), "assignment holds 1 queue after assign");
     CHECK_EQ(c.assignment()[0].queueId, 3, "assignment queue id matches");
 
-    // committed must return -1 while not started (there is no client to query)
-    CHECK_EQ(c.committed(mq), static_cast<int64_t>(-1), "committed = -1 while not started");
-
-    // poll with an empty buffer: a short timeout returns an empty list (no blocking, no crash)
-    std::vector<MessageExt> got = c.poll(20);
-    CHECK(got.empty(), "poll on an empty buffer returns empty");
+    // An empty poll and "no offset yet" are exactly what a queue at its tail looks like,
+    // so a consumer that never started refuses instead of answering: this is how a missing
+    // start() stays hidden forever.
+    CHECK(refusedWith(threwMessage([&] { c.committed(mq); }), "not running"),
+          "committed() on a consumer that never started refuses");
+    CHECK(refusedWith(threwMessage([&] { c.poll(20); }), "not running"),
+          "poll() on a consumer that never started refuses");
+    // The state check comes first: an unstarted consumer is reported as that, not as a
+    // timeout problem.
+    CHECK(refusedWith(threwMessage([&] { c.poll(-1); }), "not running"),
+          "the running check precedes the timeout check");
 
     // seek must still record the offset while not started (no broker query)
     c.seek(mq, 42);
@@ -78,6 +116,21 @@ static void testLitePullPreStartBehavior() {
     c.resume({mq});
 
     c.subscribe("MyTopic", "TagC");
+
+    // Running (the flag only: none of what follows reads the wire): the timeout is the
+    // caller's to get right, and the assign expression is a pre-start setting because the
+    // broker was told the old one at start.
+    c.setAutoCommit(false);
+    c.markRunningForTest();
+    CHECK(refusedWith(threwMessage([&] { c.poll(-1); }), "Timeout must not be negative"),
+          "a running consumer still refuses a negative timeout");
+    CHECK(refusedWith(threwMessage([&] { c.setSubExpressionForAssign("MyTopic", "TagA"); }),
+                    "only can be called before start"),
+          "even a real expression is refused once the consumer runs");
+    CHECK(threwMessage([&] { c.poll(20); }) == "none",
+          "a running consumer with an empty buffer answers with an empty batch");
+    CHECK_EQ(c.committed(mq), static_cast<int64_t>(-1),
+             "a running consumer with no client says -1, not an error");
     // passing means no crash (the expressions live in private tables, covered by real-cluster verification)
     ++g_pass;
 }
@@ -88,6 +141,9 @@ static void testLitePullOffsetTable() {
     const MessageQueue q1("MyTopic", "broker-a", 1);
     const MessageQueue stranger("MyTopic", "broker-a", 7);
     c.assign({q0, q1});
+    // committed() only answers for a consumer that runs; the tables themselves are local,
+    // so the running flag is set without a cluster.
+    c.markRunningForTest();
 
     CHECK_EQ(c.pullCursorOf(q0), -1, "pull cursor = -1 before the start offset is resolved");
     CHECK_EQ(c.consumeCursorOf(q0), -1, "consume cursor = -1 when nothing was delivered");

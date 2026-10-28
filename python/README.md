@@ -24,11 +24,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1752 passed, 4 skipped（141.2s）
+.venv/bin/python -m pytest tests/ -q           # 1753 passed, 4 skipped（146.8s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` 收集 1742 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
+- `pytest` 收集 1757 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
   `tests/test_protocol_alignment.py`（可选的协议常量比对守卫，默认不启用）。
 - `selfcheck.py` 是 7 项协议编解码回环自检（JSON 头 / 二进制头 / V2 短字段头 /
   17 段存储格式 / 长 topic V2 magic / 6 段批量格式 / ACL 签名注入），无需集群；
@@ -227,6 +227,8 @@ consumer.shutdown()
 只给本实例按 rebalance 应得的那一份。
 
 ### Lite Pull Consumer
+
+这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `set_sub_expression_for_assign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。
 
 ```python
 from client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
@@ -515,7 +517,7 @@ python/
 ├── rocketmq_logging.py     日志桥接
 ├── selfcheck.py            无集群的协议编解码回环自检（7 项）
 ├── __main__.py             命令行入口（python -m selfcheck）
-├── tests/                  1742 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
+├── tests/                  1757 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
 ├── verify_*_live.py        真机联调脚本（见「真实集群联调」）
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  联调辅助脚本
 ├── pyproject.toml          零运行时依赖；requires-python >= 3.8

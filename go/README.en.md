@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 860 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 861 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 529 | 51.7s |
+| `client` | 530 | 51.7s |
 | `common` | 135 | 2.4s |
 | `remoting` | 196 | 4.5s |
-| **Total** | **860** (77 `*_test.go` files) | ~59s |
+| **Total** | **861** (77 `*_test.go` files) | ~59s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -310,18 +310,26 @@ stored, _ := pullConsumer.FetchConsumeOffset(mq, true)
 
 ### LitePullConsumer
 
+Misuse of this surface fails locally, before anything else: a blank topic in `Subscribe`, an empty queue list in `Assign` (that would revoke every held queue), calling `SetSubExpressionForAssign` once the consumer is running, and `Poll` / `Committed` on a consumer that never started. A negative `Poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `Start()` stays hidden until something refuses it.
+
 A background short-pull loop fills a buffer and the caller drains it with `Poll`; the pull
 cursor and the consume cursor are separate.
 
 ```go
 lite, _ := client.NewDefaultLitePullConsumer("GID_demo_lite")
 lite.SetNameServerAddr("127.0.0.1:9876")
-lite.Subscribe("TopicTest", "*")
+if err := lite.Subscribe("TopicTest", "*"); err != nil {
+    panic(err)
+}
 lite.Start()
 defer lite.Shutdown()
 
 for {
-    for _, m := range lite.Poll() { // only actual delivery advances the consume cursor
+    msgs, err := lite.Poll() // a consumer that never started refuses; only actual delivery advances the consume cursor
+    if err != nil {
+        panic(err)
+    }
+    for _, m := range msgs {
         fmt.Println(m.MsgID)
     }
     if err := lite.Commit(); err != nil { // commits the consume cursor
@@ -335,7 +343,9 @@ Explicit queues (`Assign`) + replay + offset by timestamp:
 
 ```go
 mqs, _ := lite.FetchMessageQueues("TopicTest")
-lite.Assign(mqs)
+if err := lite.Assign(mqs); err != nil { // an empty list is refused: that would revoke every held queue
+    panic(err)
+}
 lite.SeekToBegin() // or lite.Seek(mq, offset) to replay one exact queue
 ts, _ := lite.OffsetForTimestamp(mqs[0], deliverTimestamp)
 ```
@@ -636,7 +646,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   77 test files, 860 test functions
+│   └── *_test.go                   77 test files, 861 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 860 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 861 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 529 | 51.7s |
+| `client` | 530 | 51.7s |
 | `common` | 135 | 2.4s |
 | `remoting` | 196 | 4.5s |
-| **合计** | **860**（77 个 `*_test.go`） | ~59s |
+| **合计** | **861**（77 个 `*_test.go`） | ~59s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -297,17 +297,25 @@ stored, _ := pullConsumer.FetchConsumeOffset(mq, true)
 
 ### LitePullConsumer
 
+这一表面的误用一律在本地先报错：空白 topic 的 `Subscribe`、空队列列表的 `Assign`（那等于撤销全部持有队列）、已经在跑之后再调 `SetSubExpressionForAssign`、没启动就 `Poll` / `Committed`。`Poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `Start()` 只有这样才不会一直被藏下去。
+
 内部跑后台短轮询填缓冲，由调用方 `Poll` 取；拉取游标与消费游标分开。
 
 ```go
 lite, _ := client.NewDefaultLitePullConsumer("GID_demo_lite")
 lite.SetNameServerAddr("127.0.0.1:9876")
-lite.Subscribe("TopicTest", "*")
+if err := lite.Subscribe("TopicTest", "*"); err != nil {
+    panic(err)
+}
 lite.Start()
 defer lite.Shutdown()
 
 for {
-    for _, m := range lite.Poll() { // 只有真交付才推进消费游标
+    msgs, err := lite.Poll() // 未启动直接报错；只有真交付才推进消费游标
+    if err != nil {
+        fmt.Println("poll:", err)
+    }
+    for _, m := range msgs {
         fmt.Println(m.MsgID)
     }
     if err := lite.Commit(); err != nil { // 提交的是消费游标
@@ -321,7 +329,9 @@ for {
 
 ```go
 mqs, _ := lite.FetchMessageQueues("TopicTest")
-lite.Assign(mqs)
+if err := lite.Assign(mqs); err != nil { // 空列表会被拒绝：那等于撤销全部队列
+    panic(err)
+}
 lite.SeekToBegin() // 或者 lite.Seek(mq, offset) 精确重放某个队列
 ts, _ := lite.OffsetForTimestamp(mqs[0], deliverTimestamp)
 ```
@@ -583,7 +593,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   77 个测试文件，860 个测试函数
+│   └── *_test.go                   77 个测试文件，861 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 

@@ -329,7 +329,14 @@ async fn v4_group_negatives(ck: &mut Checker, namesrv: &str) {
         }
         if let Ok(lite) = DefaultLitePullConsumer::new(group) {
             lite.set_namesrv_addr(namesrv);
-            lite.subscribe("V4LiteTopic", "*");
+            if let Err(e) = lite.subscribe("V4LiteTopic", "*") {
+                ck.check(
+                    &format!("V4d lite subscribe for group {group:?}"),
+                    false,
+                    &e.to_string(),
+                );
+                continue;
+            }
             let began = Instant::now();
             let err = lite.start().await.err();
             expect_start_reject(
@@ -402,7 +409,10 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
     };
     lite.set_namesrv_addr(namesrv);
     lite.set_instance_name(&format!("lite-{stamp}"));
-    lite.subscribe(&topic, "*");
+    if let Err(e) = lite.subscribe(&topic, "*") {
+        ck.check("V6b lite subscribe", false, &e.to_string());
+        return;
+    }
     if let Err(e) = lite.start().await {
         ck.check("V6b lite start", false, &e.to_string());
     }
@@ -438,13 +448,20 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
     let mut got: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     while got.len() < N_MSG && Instant::now() < deadline {
-        got.extend(
-            lite.poll(Some(2000))
-                .await
-                .iter()
-                .filter_map(|m: &MessageExt| m.get_keys())
-                .map(str::to_string),
-        );
+        match lite.poll(Some(2000)).await {
+            Ok(batch) => {
+                got.extend(
+                    batch
+                        .iter()
+                        .filter_map(|m: &MessageExt| m.get_keys())
+                        .map(str::to_string),
+                );
+            }
+            Err(e) => {
+                ck.check("V6d lite poll during the drain loop", false, &e.to_string());
+                break;
+            }
+        }
     }
     let missing: Vec<&String> = keys.iter().filter(|k| !got.contains(k)).collect();
     ck.check(

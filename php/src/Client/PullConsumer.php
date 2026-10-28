@@ -1308,6 +1308,9 @@ final class DefaultLitePullConsumer
 
     public function subscribe(string $topic, string $subExpression = '*'): void
     {
+        if (trim($topic) === '') {
+            throw new \InvalidArgumentException('Topic can not be null or empty.');
+        }
         $this->assignMode = false;
         $ns = $this->withNamespace($topic);
         $this->subscription[$ns] = $subExpression;
@@ -1327,6 +1330,15 @@ final class DefaultLitePullConsumer
 
     public function setSubExpressionForAssign(string $topic, string $subExpression): void
     {
+        if (trim($subExpression) === '') {
+            throw new \InvalidArgumentException('subExpression can not be null or empty.');
+        }
+        if ($this->started) {
+            throw new MQClientException('setSubExpressionForAssign only can be called before start.');
+        }
+        if (trim($topic) === '') {
+            throw new \InvalidArgumentException('Topic can not be null or empty.');
+        }
         $ns = $this->withNamespace($topic);
         $this->assignSubExpr[$ns] = $subExpression;
         try {
@@ -1353,6 +1365,12 @@ final class DefaultLitePullConsumer
     /** Selector flavour of {@see setSubExpressionForAssign()} (same expression-type rule). */
     public function setSubExpressionForAssignWithSelector(string $topic, MessageSelector $selector): void
     {
+        if ($this->started) {
+            throw new MQClientException('setSubExpressionForAssign only can be called before start.');
+        }
+        if (trim($topic) === '') {
+            throw new \InvalidArgumentException('Topic can not be null or empty.');
+        }
         $ns = $this->withNamespace($topic);
         $sub = build_selector_subscription_data($ns, $selector);
         $this->assignSubExpr[$ns] = $sub->subString ?? '*';
@@ -1366,6 +1384,9 @@ final class DefaultLitePullConsumer
      */
     public function assign(array $messageQueues): void
     {
+        if ($messageQueues === []) {
+            throw new \InvalidArgumentException('Message queues can not be null or empty.');
+        }
         $this->assignMode = true;
         $queues = [];
         foreach ($messageQueues as $mq) {
@@ -1474,7 +1495,7 @@ final class DefaultLitePullConsumer
         // used here (deadlock).
         $client = $this->mqClient;
         if ($client === null) {
-            throw new MQClientException('consumer not started, call start() first');
+            throw new MQClientException('The consumer not running, please start it first.');
         }
         $topics = array_keys($this->subscription);
         foreach ($this->assigned as $mq) {
@@ -1521,7 +1542,7 @@ final class DefaultLitePullConsumer
     private function requireClient(): MQClientInstance
     {
         if (!$this->started || $this->mqClient === null) {
-            throw new MQClientException('consumer not started, call start() first');
+            throw new MQClientException('The consumer not running, please start it first.');
         }
         return $this->mqClient;
     }
@@ -2160,7 +2181,13 @@ final class DefaultLitePullConsumer
 
     public function poll(?int $timeout = null): array
     {
+        if (!$this->started) {
+            throw new MQClientException('The consumer not running, please start it first.');
+        }
         $timeout = $timeout ?? $this->pollTimeoutMillis;
+        if ($timeout < 0) {
+            throw new \InvalidArgumentException('Timeout must not be negative');
+        }
         if ($this->autoCommit) {
             $this->maybeAutoCommit();
         }

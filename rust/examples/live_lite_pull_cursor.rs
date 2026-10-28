@@ -76,33 +76,69 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
 }
 
 /// Polls repeatedly until `expect` messages are collected (or timeout), returning the received bodies.
-async fn drain(c: &DefaultLitePullConsumer, expect: usize, secs: u64) -> Vec<String> {
+///
+/// `Err` means a poll refused to answer (the consumer is not running) -- that is not "not yet delivered".
+async fn drain(c: &DefaultLitePullConsumer, expect: usize, secs: u64) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
     while out.len() < expect && Instant::now() < deadline {
-        out.extend(
-            c.poll(Some(500))
-                .await
-                .iter()
-                .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
-        );
+        match c.poll(Some(500)).await {
+            Ok(batch) => out.extend(
+                batch
+                    .iter()
+                    .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
+            ),
+            Err(e) => return Err(format!("lite poll refused during the drain: {e}")),
+        }
     }
-    out
+    Ok(out)
 }
 
 /// Watches the buffer over a given window (used when asserting "no delivery should happen").
-async fn poll_quiet(c: &DefaultLitePullConsumer, secs: u64) -> Vec<String> {
+/// An `Ok(vec![])` is the answer that proves silence; a refusal must not be read as one.
+async fn poll_quiet(c: &DefaultLitePullConsumer, secs: u64) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        out.extend(
-            c.poll(Some(200))
-                .await
-                .iter()
-                .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
-        );
+        match c.poll(Some(200)).await {
+            Ok(batch) => out.extend(
+                batch
+                    .iter()
+                    .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
+            ),
+            Err(e) => return Err(format!("lite poll refused during the quiet window: {e}")),
+        }
     }
-    out
+    Ok(out)
+}
+
+/// The assign-mode expression is a pre-start setting: a running consumer has already told the broker
+/// which expression this topic has, so a leg that needs another expression stops the consumer,
+/// sets it, and starts again. Returns false (recorded in `ck`) when either step fails.
+async fn set_expr_and_restart(
+    ck: &mut Checker,
+    c: &DefaultLitePullConsumer,
+    topic: &str,
+    expression: &str,
+) -> bool {
+    c.shutdown();
+    if let Err(e) = c.set_sub_expression_for_assign(topic, expression) {
+        ck.check(
+            &format!("expression {expression:?} accepted before start"),
+            false,
+            &e.to_string(),
+        );
+        return false;
+    }
+    if let Err(e) = c.start().await {
+        ck.check(
+            &format!("consumer restarted with expression {expression:?}"),
+            false,
+            &e.to_string(),
+        );
+        return false;
+    }
+    true
 }
 
 fn cursor_row(c: &DefaultLitePullConsumer, mqs: &[MessageQueue]) -> String {
@@ -224,7 +260,12 @@ async fn run(namesrv: &str) -> Checker {
             return ck;
         }
     };
-    c.assign(&mqs);
+    if let Err(e) = c.assign(&mqs) {
+        ck.check("lite assign", false, &e.to_string());
+        producer.shutdown();
+        admin.shutdown();
+        return ck;
+    }
     if let Err(e) = c.start().await {
         ck.check("lite start", false, &e.to_string());
         return ck;
@@ -234,7 +275,16 @@ async fn run(namesrv: &str) -> Checker {
         c.seek(mq, 0);
     }
 
-    let got1 = drain(&c, QUEUES as usize, 30).await;
+    let got1 = match drain(&c, QUEUES as usize, 30).await {
+        Ok(bodies) => bodies,
+        Err(e) => {
+            ck.check("S1 drain window", false, &e);
+            c.shutdown();
+            producer.shutdown();
+            admin.shutdown();
+            return ck;
+        }
+    };
     ck.check(
         "S1-control group: all 4 pinned messages received under the * subscription",
         got1.len() == QUEUES as usize,
@@ -259,7 +309,26 @@ async fn run(namesrv: &str) -> Checker {
     }
 
     // ---------- S2 NO_MATCHED_MSG: the whole span is filtered out by the expression, the cursor must follow past it ----------
-    c.set_sub_expression_for_assign(&topic, NEVER_MATCH);
+    // While the consumer runs, this expression is something it already reported to the broker, so the
+    // change is refused there: the refusal itself is the first thing this leg checks.
+    let mid_run = c
+        .set_sub_expression_for_assign(&topic, NEVER_MATCH)
+        .err()
+        .map(|e| e.to_string());
+    ck.check(
+        "S2 the assign expression is pre-start: changing it while running is refused",
+        mid_run
+            .as_deref()
+            .is_some_and(|m| m.contains("only can be called before start")),
+        &mid_run.unwrap_or_else(|| "the call was accepted".to_string()),
+    );
+    // Then apply it the supported way (stopped, before start), so the leg still measures the span skip.
+    if !set_expr_and_restart(&mut ck, &c, &topic, NEVER_MATCH).await {
+        c.shutdown();
+        producer.shutdown();
+        admin.shutdown();
+        return ck;
+    }
     for mq in &mqs {
         c.seek(mq, 0);
     }
@@ -269,8 +338,14 @@ async fn run(namesrv: &str) -> Checker {
         ok2,
         &cursor_row(&c, &mqs),
     );
-    let quiet = poll_quiet(&c, 1).await;
-    ck.check("S2-zero deliveries during the empty replies", quiet.is_empty(), &format!("{quiet:?}"));
+    match poll_quiet(&c, 1).await {
+        Ok(quiet) => ck.check(
+            "S2-zero deliveries during the empty replies",
+            quiet.is_empty(),
+            &format!("{quiet:?}"),
+        ),
+        Err(e) => ck.check("S2 quiet window", false, &e),
+    }
 
     // ---------- S3 OFFSET_ILLEGAL: the out-of-range offset is corrected by the broker + messages really come back ----------
     let mut ahead = Vec::new();
@@ -290,7 +365,13 @@ async fn run(namesrv: &str) -> Checker {
     );
 
     // The never-matching expression set in S2 must be switched back, otherwise the 4 TagA messages below are filtered out by the broker as-is.
-    c.set_sub_expression_for_assign(&topic, "*");
+    // Again a pre-start change: stop, set, start.
+    if !set_expr_and_restart(&mut ck, &c, &topic, "*").await {
+        c.shutdown();
+        producer.shutdown();
+        admin.shutdown();
+        return ck;
+    }
     for (i, mq) in mqs.iter().enumerate() {
         let mut msg = Message::new(&topic, Some(format!("lc-s3-{i}").as_bytes()));
         msg.set_tags("TagA");
@@ -299,7 +380,16 @@ async fn run(namesrv: &str) -> Checker {
         }
     }
 
-    let got3 = drain(&c, QUEUES as usize, 40).await;
+    let got3 = match drain(&c, QUEUES as usize, 40).await {
+        Ok(bodies) => bodies,
+        Err(e) => {
+            ck.check("S3 drain window", false, &e);
+            c.shutdown();
+            producer.shutdown();
+            admin.shutdown();
+            return ck;
+        }
+    };
     ck.check(
         "S3-after self-healing all new messages arrive (previous implementation: cursor stuck at +1000, none seen)",
         got3.len() == QUEUES as usize,

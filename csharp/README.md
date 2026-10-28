@@ -322,6 +322,8 @@ pull.Shutdown();
 
 ### LitePullConsumer（自己拉、自己提交，含队列集合变更监听）
 
+这一表面的误用一律在本地先报错：空白 topic 的 `Subscribe`、空队列列表的 `Assign`（那等于撤销全部持有队列）、已经在跑之后再调 `SetSubExpressionForAssign`、没启动就 `Poll` / `Committed`。`Poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `Start()` 只有这样才不会一直被藏下去。
+
 ```csharp
 var lite = new DefaultLitePullConsumer("GID_LITE");
 lite.SetNamesrvAddr("127.0.0.1:9876");

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -160,6 +161,7 @@ public:
 
     // ---------------- Subscription / assignment ----------------
     // Subscribe mode: registers a topic subscription (tag expressions supported), rebalance assigns queues automatically.
+    // A blank topic is refused: it would be registered and queried on the wire as a topic literally named "".
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
     void subscribe(const std::string& topic, const std::string& subExpression,
                    std::shared_ptr<LiteMessageQueueListener> messageQueueListener);
@@ -188,11 +190,18 @@ public:
 
     // ---------------- Pull / poll ----------------
     // Batch-read from the local buffer, blocking at most timeoutMillis ms; returns what was taken (may be empty).
-    std::vector<MessageExt> poll(int32_t timeoutMillis = -1);
+    // Leaving the argument out uses the configured poll timeout. A consumer that never started refuses: an
+    // empty poll is exactly what a queue sitting at its tail looks like, which is how a missing start() stays
+    // hidden forever. The running check comes first, so an unstarted consumer is reported as that rather than
+    // as a timeout problem.
+    std::vector<MessageExt> poll(std::optional<int32_t> timeoutMillis = std::nullopt);
 
     void seek(const MessageQueue& mq, int64_t offset);
     void seekToBegin(const MessageQueue& mq);
     void seekToEnd(const MessageQueue& mq);
+    // The offset last committed for this queue (-1 when nothing is committed yet). A consumer
+    // that never started refuses: "no offset yet" is a real answer the caller must not mistake
+    // for the silence of a consumer that was never started.
     int64_t committed(const MessageQueue& mq);
     void commit();
     void commit(const std::map<MessageQueue, int64_t>& offsets, bool persist = true);
@@ -229,6 +238,9 @@ public:
     // Stage a backlog directly into the local buffer (and its accumulators) without a pull, so a test
     // controls the cached count / storeSize sum / offset span exactly.
     void injectCachedForTest(const std::vector<MessageExt>& msgs);
+    // Answer as though start() had completed. The running flag is all the offset surface reads; the
+    // client stays null, so a call that would ask a broker still refuses.
+    void markRunningForTest() { running_ = true; }
 
     // ---------------- Queue query / control ----------------
     // All consumable queues of the topic (taken from the broker route, namespace already applied).

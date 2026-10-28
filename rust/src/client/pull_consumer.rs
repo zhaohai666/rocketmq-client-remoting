@@ -1894,6 +1894,13 @@ pub trait TopicMessageQueueChangeListener: Send + Sync {
     fn on_changed(&self, topic: &str, message_queues: &[MessageQueue]);
 }
 
+/// True between a successful `start()` and `shutdown()`: either flag alone means the consumer
+/// has a live instance behind it, because `start()` rolls `started` back when it fails and
+/// `shutdown()` clears both.
+fn lite_is_live(inner: &LiteInner) -> bool {
+    inner.running.load(Ordering::Acquire) || inner.started.load(Ordering::Acquire)
+}
+
 /// Two modes:
 /// * **subscribe**: `subscribe(topic, expr)` → background rebalance per [`AllocateMessageQueueStrategy`]
 ///   → background pull;
@@ -2209,7 +2216,13 @@ impl DefaultLitePullConsumer {
     ///
     /// When the expression is invalid (`FilterAPI` errors), only that entry is dropped from the subscription table
     /// ; `subscription` still records it -- consistent with the online baseline.
-    pub fn subscribe(&self, topic: &str, sub_expression: &str) {
+    ///
+    /// A blank topic is refused: it would park a subscription the heartbeat then reports to the
+    /// broker under an empty name, and every later read of the table would trip over it.
+    pub fn subscribe(&self, topic: &str, sub_expression: &str) -> Result<()> {
+        if topic.trim().is_empty() {
+            return Err(Error::client("Topic can not be null or empty."));
+        }
         let topic = with_namespace(&self.config().namespace, topic);
         {
             let mut state = lock(&self.inner.state);
@@ -2227,6 +2240,7 @@ impl DefaultLitePullConsumer {
                 }
             }
         }
+        Ok(())
     }
 
     /// Subscribe using a [`MessageSelector`]: the selector's expression type is kept
@@ -2238,7 +2252,10 @@ impl DefaultLitePullConsumer {
     ///
     /// An expression the filter API rejects follows the same stance as [`subscribe`](Self::subscribe):
     /// the `subscription` entry is kept and the `subscription_data` entry is dropped.
-    pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) {
+    pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) -> Result<()> {
+        if topic.trim().is_empty() {
+            return Err(Error::client("Topic can not be null or empty."));
+        }
         let topic = with_namespace(&self.config().namespace, topic);
         {
             let mut state = lock(&self.inner.state);
@@ -2256,6 +2273,7 @@ impl DefaultLitePullConsumer {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn unsubscribe(&self, topic: &str) {
@@ -2267,7 +2285,22 @@ impl DefaultLitePullConsumer {
 
     /// In assign mode, set the tag
     /// expression for a topic and register the `SubscriptionData` too (the broker needs subscription info in assign mode as well).
-    pub fn set_sub_expression_for_assign(&self, topic: &str, sub_expression: &str) {
+    ///
+    /// A blank expression is refused: it would quietly mean "everything" and the caller would never
+    /// learn that its filter did not apply. It is also a pre-start setting, because a running
+    /// consumer already told the broker which expression this topic has.
+    pub fn set_sub_expression_for_assign(&self, topic: &str, sub_expression: &str) -> Result<()> {
+        if sub_expression.trim().is_empty() {
+            return Err(Error::client("subExpression can not be null or empty."));
+        }
+        if self.ensure_running().is_ok() {
+            return Err(Error::client(
+                "set_sub_expression_for_assign only can be called before start.",
+            ));
+        }
+        if topic.trim().is_empty() {
+            return Err(Error::client("Topic can not be null or empty."));
+        }
         let topic = with_namespace(&self.config().namespace, topic);
         let mut state = lock(&self.inner.state);
         state
@@ -2282,6 +2315,7 @@ impl DefaultLitePullConsumer {
                 state.subscription_data.remove(&topic);
             }
         }
+        Ok(())
     }
 
     /// Switch to assign mode (no rebalance).
@@ -2289,7 +2323,13 @@ impl DefaultLitePullConsumer {
     /// Initial offset resolution needs RPCs, so this only registers the queues and leaves offsets to
     /// [`start`](Self::start) (synchronous resolution has the same semantics, just later timing,
     /// because `assign()` is not async). Queues already in `next_offset` are not overwritten.
-    pub fn assign(&self, message_queues: &[MessageQueue]) {
+    ///
+    /// An empty list is refused rather than taken: it would revoke every queue this consumer
+    /// holds, which is exactly what a route lookup that returned nothing does by accident.
+    pub fn assign(&self, message_queues: &[MessageQueue]) -> Result<()> {
+        if message_queues.is_empty() {
+            return Err(Error::client("Message queues can not be null or empty."));
+        }
         let revoked: Vec<String> = {
             let mut state = lock(&self.inner.state);
             state.assign_mode = true;
@@ -2320,6 +2360,7 @@ impl DefaultLitePullConsumer {
                 buffer.revoke_queue(key);
             }
         }
+        Ok(())
     }
 
     /// Current subscription table (topic -> expression).
@@ -2549,13 +2590,28 @@ impl DefaultLitePullConsumer {
         Some(handle)
     }
 
+    /// One state predicate for the whole RPC and offset surface: a consumer that never
+    /// started, or one already shut down, answers with this error instead of pretending the
+    /// round simply had nothing in it.
+    fn is_live(&self) -> bool {
+        lite_is_live(&self.inner)
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.is_live() {
+            Ok(())
+        } else {
+            Err(Error::client("The consumer not running, please start it first."))
+        }
+    }
+
     fn require_client(inner: &LiteInner) -> Result<MQClientInstance> {
-        if !inner.running.load(Ordering::Acquire) && !inner.started.load(Ordering::Acquire) {
-            return Err(Error::client("consumer not started, call start() first"));
+        if !lite_is_live(inner) {
+            return Err(Error::client("The consumer not running, please start it first."));
         }
         lock(&inner.client)
             .clone()
-            .ok_or_else(|| Error::client("consumer not started, call start() first"))
+            .ok_or_else(|| Error::client("The consumer not running, please start it first."))
     }
 
     // ---------------- Heartbeat ----------------
@@ -2632,11 +2688,19 @@ impl DefaultLitePullConsumer {
 
     /// Wait for the buffer to become non-empty (at most `poll_timeout_millis`),
     /// taking at most [`MAX_POLL_BATCH_SIZE`] messages per call.
-    pub async fn poll(&self, timeout_millis: Option<i64>) -> Vec<MessageExt> {
+    ///
+    /// A consumer that never started has no background round running, so it would answer with an
+    /// empty list forever -- exactly what a queue at its tail looks like. A negative timeout is the
+    /// caller's own arithmetic error and is refused the same way, after the state check.
+    pub async fn poll(&self, timeout_millis: Option<i64>) -> Result<Vec<MessageExt>> {
+        self.ensure_running()?;
+        let timeout = timeout_millis.unwrap_or_else(|| self.config().poll_timeout_millis);
+        if timeout < 0 {
+            return Err(Error::client("Timeout must not be negative"));
+        }
         if self.config().auto_commit {
             self.maybe_auto_commit().await;
         }
-        let timeout = timeout_millis.unwrap_or_else(|| self.config().poll_timeout_millis);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout.max(0) as u64);
         loop {
             // Arm the wakeup before checking the buffer (equivalent to "wait only after the check"):
@@ -2646,11 +2710,11 @@ impl DefaultLitePullConsumer {
             notified.as_mut().enable();
             if let Some(drained) = self.try_drain() {
                 self.advance_consume_offset(&drained);
-                return drained;
+                return Ok(drained);
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             // Equivalent of a timed condition wait: when woken, recheck the buffer once,
             // and keep waiting while the deadline has not passed (spurious wakeups are harmless).
@@ -2731,12 +2795,19 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
+    /// Read the queue's committed offset: the in-memory commit table first (a value just committed
+    /// with `persist = false` counts too), then the broker, whose answer is backfilled into the
+    /// table. `None` means nobody has committed.
+    ///
+    /// Asking the broker needs a running consumer, so the state is checked before the local cache:
+    /// `None` is exactly what "nobody has committed yet" looks like, and answering that way for a
+    /// consumer that was never started hides the missing `start()`.
     pub async fn committed(&self, mq: &MessageQueue) -> Result<Option<i64>> {
+        let client = Self::require_client(&self.inner)?;
         let key = mq_key(mq);
         if let Some(cached) = lock(&self.inner.state).offset_table.get(&key).copied() {
             return Ok(Some(cached));
         }
-        let client = Self::require_client(&self.inner)?;
         let group = self.consumer_group();
         let broker_offset = client
             .query_consumer_offset(&group, mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None, false)
@@ -3674,6 +3745,12 @@ mod tests {
         m
     }
 
+    /// Set the running flag with no name server behind the consumer. The poll/offset surface
+    /// reads that flag, so a buffer case can drive it without starting anything.
+    fn mark_lite_running(c: &DefaultLitePullConsumer) {
+        c.inner.running.store(true, Ordering::Release);
+    }
+
     // ---------------------------------------------------------- Lifecycle guards
 
     #[test]
@@ -3708,7 +3785,7 @@ mod tests {
 
             let lite = DefaultLitePullConsumer::new(group).expect("construction must not reject early");
             lite.set_namesrv_addr("127.0.0.1:1");
-            lite.subscribe("T", "TagA");
+            lite.subscribe("T", "TagA").unwrap();
             let err = lite.start().await.expect_err("lite: an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "lite {group}: {err}");
             assert!(
@@ -3776,7 +3853,7 @@ mod tests {
         );
         // The missing name server check comes first, and the order is fixed
         let c2 = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c2.subscribe("T", "*");
+        c2.subscribe("T", "*").unwrap();
         let e2 = c2
             .start()
             .await
@@ -3896,13 +3973,13 @@ mod tests {
     fn subscriptions_are_namespaced_and_overwritable() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.set_namespace("NS1");
-        c.subscribe("Topic", "TagA");
+        c.subscribe("Topic", "TagA").unwrap();
         let subs = c.subscription();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].0, "NS1%Topic");
         assert_eq!(c.subscriptions()[0].tags_set, vec!["TagA".to_string()]);
         // Subscribing the same topic again overwrites, it does not append
-        c.subscribe("Topic", "TagB");
+        c.subscribe("Topic", "TagB").unwrap();
         assert_eq!(c.subscription().len(), 1);
         assert_eq!(c.subscription()[0].1, "TagB");
         c.unsubscribe("Topic");
@@ -3915,7 +3992,7 @@ mod tests {
         // `"||"` makes FilterAPI throw `subString split error`: keep the
         // `subscription` entry and drop the `subscription_data`
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.subscribe("T", "||");
+        c.subscribe("T", "||").unwrap();
         assert_eq!(c.subscription().len(), 1);
         assert!(c.subscriptions().is_empty());
     }
@@ -3923,7 +4000,7 @@ mod tests {
     #[test]
     fn subscribe_with_selector_keeps_the_expression_type() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.subscribe_with_selector("SQL", &MessageSelector::by_sql("a > 1"));
+        c.subscribe_with_selector("SQL", &MessageSelector::by_sql("a > 1")).unwrap();
         let sd = &c.subscriptions()[0];
         assert_eq!(sd.expression_type, ExpressionType::SQL92);
         assert_eq!(sd.sub_string, "a > 1");
@@ -3938,7 +4015,7 @@ mod tests {
         );
 
         // A TAG selector keeps exactly the tag shape `subscribe` produces.
-        c.subscribe_with_selector("TAG", &MessageSelector::by_tag("TagB || TagA"));
+        c.subscribe_with_selector("TAG", &MessageSelector::by_tag("TagB || TagA")).unwrap();
         let sd = c
             .subscriptions()
             .into_iter()
@@ -3951,7 +4028,7 @@ mod tests {
         assert_eq!(sd.sub_string, built.sub_string);
 
         // An empty selector type falls back to the TAG path.
-        c.subscribe_with_selector("PLAIN", &MessageSelector::new("", "TagA"));
+        c.subscribe_with_selector("PLAIN", &MessageSelector::new("", "TagA")).unwrap();
         let sd = c
             .subscriptions()
             .into_iter()
@@ -3962,7 +4039,7 @@ mod tests {
 
         // A non-tag selector without an expression is rejected by the filter API: same stance as
         // a bad tag expression (keep the `subscription` entry, drop the `subscription_data`).
-        c.subscribe_with_selector("BAD", &MessageSelector::by_sql(""));
+        c.subscribe_with_selector("BAD", &MessageSelector::by_sql("")).unwrap();
         assert!(c.subscription().iter().any(|(t, _)| t == "BAD"));
         assert!(!c.subscriptions().iter().any(|s| s.topic == "BAD"));
     }
@@ -3971,7 +4048,7 @@ mod tests {
     fn lite_heartbeat_carries_selector_expression_type() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.update_config(|cfg| cfg.client_id = Some("cid-sel".to_string()));
-        c.subscribe_with_selector("T", &MessageSelector::by_sql("color = 'blue'"));
+        c.subscribe_with_selector("T", &MessageSelector::by_sql("color = 'blue'")).unwrap();
         let hb = build_lite_heartbeat(&c.inner);
         let set = &hb.consumer_data_set[0].subscription_data_set;
         assert_eq!(set.len(), 1);
@@ -3987,9 +4064,9 @@ mod tests {
     #[test]
     fn assign_switches_mode_and_keeps_subscription_expr_for_heartbeat() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.set_sub_expression_for_assign("T", "TagA");
+        c.set_sub_expression_for_assign("T", "TagA").unwrap();
         assert!(!c.is_assign_mode());
-        c.assign(&[queue("T", "broker-a", 1), queue("T", "broker-a", 0)]);
+        c.assign(&[queue("T", "broker-a", 1), queue("T", "broker-a", 0)]).unwrap();
         assert!(c.is_assign_mode());
         // The assignment snapshot is ordered by key (deterministic iteration order)
         assert_eq!(
@@ -3999,6 +4076,121 @@ mod tests {
         assert_eq!(c.subscription_for("T"), "TagA");
         assert_eq!(c.subscription_for("other"), "*");
         assert_eq!(c.subscriptions().len(), 1);
+    }
+
+    /// The lite surface refuses the misuses that would otherwise answer with a value the caller
+    /// cannot tell apart from a real one: an empty round, "no offset yet", or a silently narrowed
+    /// queue set.
+    #[tokio::test]
+    async fn lite_surface_refuses_misuse() {
+        let c = DefaultLitePullConsumer::new("LitePG_Guard").unwrap();
+        let q = queue("T", "broker-a", 0);
+        c.assign(std::slice::from_ref(&q)).unwrap();
+        let err = c
+            .assign(&[])
+            .expect_err("an empty queue list is not a request to drop everything held");
+        assert!(
+            err.to_string()
+                .contains("Message queues can not be null or empty"),
+            "{err}"
+        );
+        assert_eq!(
+            c.assignment(),
+            vec![q.clone()],
+            "a refused assign leaves the queue set as it was"
+        );
+
+        let err = c
+            .subscribe("   ", "TagA")
+            .expect_err("a blank topic is not a subscription");
+        assert!(
+            err.to_string().contains("Topic can not be null or empty"),
+            "{err}"
+        );
+        let err = c
+            .subscribe_with_selector("", &MessageSelector::by_sql("a > 1"))
+            .expect_err("a blank topic is not a subscription");
+        assert!(
+            err.to_string().contains("Topic can not be null or empty"),
+            "{err}"
+        );
+        assert!(
+            c.subscription().is_empty(),
+            "a refused subscribe records nothing in the table"
+        );
+
+        let err = c
+            .set_sub_expression_for_assign("T", "  ")
+            .expect_err("a blank expression would quietly mean everything");
+        assert!(
+            err.to_string()
+                .contains("subExpression can not be null or empty"),
+            "{err}"
+        );
+        let err = c
+            .set_sub_expression_for_assign("   ", "TagA")
+            .expect_err("a blank topic is not an assignment key either");
+        assert!(
+            err.to_string().contains("Topic can not be null or empty"),
+            "{err}"
+        );
+
+        // The same call once the consumer is running: the broker already has this topic's
+        // expression, so a late change would leave the local table and the wire out of step.
+        mark_lite_running(&c);
+        let err = c
+            .set_sub_expression_for_assign("T", "TagA")
+            .expect_err("the assign expression is a pre-start setting");
+        assert!(
+            err.to_string()
+                .contains("set_sub_expression_for_assign only can be called before start"),
+            "{err}"
+        );
+
+        // A running consumer still rejects a negative timeout -- but the state gate is read
+        // first, so a cold one reports the missing start even when the timeout is also wrong.
+        let err = c
+            .poll(Some(-1))
+            .await
+            .expect_err("a negative timeout is the caller's own arithmetic error");
+        assert!(
+            err.to_string().contains("Timeout must not be negative"),
+            "{err}"
+        );
+        assert!(
+            c.poll(Some(10)).await.unwrap().is_empty(),
+            "a running consumer with an empty buffer still answers with an empty round"
+        );
+
+        let cold = DefaultLitePullConsumer::new("LitePG_GuardCold").unwrap();
+        cold.subscribe("T", "TagA").unwrap();
+        let err = cold
+            .poll(Some(10))
+            .await
+            .expect_err("an unstarted consumer has no background round, so an empty list would lie");
+        assert!(
+            err.to_string()
+                .contains("The consumer not running, please start it first"),
+            "{err}"
+        );
+        let err = cold
+            .poll(Some(-1))
+            .await
+            .expect_err("the state gate is checked before the timeout");
+        assert!(
+            err.to_string()
+                .contains("The consumer not running, please start it first"),
+            "state first, then the timeout: {err}"
+        );
+        let err = cold
+            .committed(&q)
+            .await
+            .expect_err("-1 for a consumer that never started hides the missing start");
+        assert!(
+            err.to_string()
+                .contains("The consumer not running, please start it first"),
+            "{err}"
+        );
     }
 
     // ---------------------------------------------------- The three offset tables (#68)
@@ -4026,7 +4218,8 @@ mod tests {
                 .collect(),
         );
         assert_eq!(c.consume_cursor_of(&q), -1, "not polled yet, so not consumed");
-        let got = c.poll(Some(10)).await;
+        mark_lite_running(&c);
+        let got = c.poll(Some(10)).await.unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(c.consume_cursor_of(&q), 3, "the slot handed out is what counts as consumed");
         assert_eq!(c.pull_cursor_of(&q), 5, "poll must never change the pull cursor");
@@ -4036,7 +4229,8 @@ mod tests {
     async fn poll_ignores_queues_this_instance_does_not_hold() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.enqueue(vec![msg("T", "broker-a", 9, 0, "m")]);
-        assert_eq!(c.poll(Some(10)).await.len(), 1);
+        mark_lite_running(&c);
+        assert_eq!(c.poll(Some(10)).await.unwrap().len(), 1);
         assert_eq!(c.consume_cursor_of(&queue("T", "broker-a", 9)), -1);
     }
 
@@ -4045,7 +4239,7 @@ mod tests {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         let q0 = queue("T", "broker-a", 0);
         let q1 = queue("T", "broker-a", 1);
-        c.assign(&[q0.clone(), q1.clone()]);
+        c.assign(&[q0.clone(), q1.clone()]).unwrap();
         // commitAll works off the consumed cursor: nothing delivered ⇒ not a single slot is written
         c.commit().await.unwrap();
         assert_eq!(
@@ -4094,7 +4288,7 @@ mod tests {
             "commit(Set) writes no -1 when there is no delivery record"
         );
 
-        c.assign(std::slice::from_ref(&q0));
+        c.assign(std::slice::from_ref(&q0)).unwrap();
         assert_eq!(c.pull_cursor_of(&q1), -1, "the pull cursor disappears after assign revokes the queue");
         assert_eq!(
             c.consume_cursor_of(&q1),
@@ -4122,7 +4316,7 @@ mod tests {
     fn seek_moves_both_cursors() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         let q = queue("T", "broker-a", 0);
-        c.assign(std::slice::from_ref(&q));
+        c.assign(std::slice::from_ref(&q)).unwrap();
         c.seek(&q, 2);
         assert_eq!(c.pull_cursor_of(&q), 2, "seek moves the pull cursor");
         assert_eq!(c.consume_cursor_of(&q), 2, "seek must move the consumed cursor too");
@@ -4171,7 +4365,8 @@ mod tests {
                 .map(|i| msg("T", "broker-a", 0, i, &format!("m{i}")))
                 .collect(),
         );
-        let got = c.poll(Some(10)).await;
+        mark_lite_running(&c);
+        let got = c.poll(Some(10)).await.unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(
             got[0]
@@ -4181,7 +4376,7 @@ mod tests {
             Some("m0".to_string())
         );
         let started = std::time::Instant::now();
-        assert!(c.poll(Some(30)).await.is_empty());
+        assert!(c.poll(Some(30)).await.unwrap().is_empty());
         assert!(started.elapsed() >= Duration::from_millis(30));
         assert_eq!(c.buffered_message_count(), 0);
     }
@@ -4194,14 +4389,15 @@ mod tests {
                 .map(|i| msg("T", "broker-a", 0, i as i64, "b"))
                 .collect(),
         );
-        assert_eq!(c.poll(Some(10)).await.len(), MAX_POLL_BATCH_SIZE);
-        assert_eq!(c.poll(Some(10)).await.len(), 10);
+        mark_lite_running(&c);
+        assert_eq!(c.poll(Some(10)).await.unwrap().len(), MAX_POLL_BATCH_SIZE);
+        assert_eq!(c.poll(Some(10)).await.unwrap().len(), 10);
     }
 
     #[test]
     fn seek_pins_offset_and_drops_earlier_buffered_messages() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.assign(&[queue("T", "broker-a", 0)]);
+        c.assign(&[queue("T", "broker-a", 0)]).unwrap();
         c.enqueue((0..5).map(|i| msg("T", "broker-a", 0, i, "b")).collect());
         c.seek(&queue("T", "broker-a", 0), 3);
         assert_eq!(c.buffered_message_count(), 2);
@@ -4285,7 +4481,7 @@ mod tests {
             cfg.name_server_addrs = vec!["127.0.0.1:9876".to_string()];
             cfg.consume_timestamp = "1700000000000".to_string();
         });
-        c.assign(&[queue("T", "broker-a", 0)]);
+        c.assign(&[queue("T", "broker-a", 0)]).unwrap();
         let err = c.start().await.unwrap_err().to_string();
         assert!(err.contains("consumeTimestamp is invalid"), "{err}");
         // A valid wall clock must not be killed by this guard by mistake
@@ -4341,7 +4537,7 @@ mod tests {
         c.set_rpc_hook(Some(Arc::new(AclClientRPCHook::new(
             SessionCredentials::new("AK", "SK"),
         ))));
-        c.assign(&[queue("T", "broker-a", 0)]);
+        c.assign(&[queue("T", "broker-a", 0)]).unwrap();
         // Unreachable namesrv: start still succeeds (route refresh fails softly, same as `lite_start_rejects_epoch_millis_timestamp`)
         c.start().await.expect("start should succeed");
         let client = DefaultLitePullConsumer::require_client(&c.inner).unwrap();
@@ -4382,7 +4578,7 @@ mod tests {
     fn heartbeat_carries_only_own_consumer_data() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.update_config(|cfg| cfg.client_id = Some("cid-1".to_string()));
-        c.subscribe("T", "TagA");
+        c.subscribe("T", "TagA").unwrap();
         let hb = build_lite_heartbeat(&c.inner);
         assert_eq!(hb.client_id, "cid-1");
         assert_eq!(hb.consumer_data_set.len(), 1);
@@ -5176,7 +5372,7 @@ mod tests {
         first.set_instance_name("lite_first_offset");
         first.set_namesrv_addr(&cluster.namesrv_addr);
         first.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        first.assign(&[queue("T", "broker-a", 0)]);
+        first.assign(&[queue("T", "broker-a", 0)]).unwrap();
         first.start().await.expect("start should succeed against the fake cluster");
         wait_until(
             || !cluster.master.pull_offsets().is_empty(),
@@ -5193,7 +5389,7 @@ mod tests {
         let last = DefaultLitePullConsumer::new("LitePG_Last").unwrap();
         last.set_instance_name("lite_last_offset");
         last.set_namesrv_addr(&cluster.namesrv_addr);
-        last.assign(&[queue("T", "broker-a", 0)]);
+        last.assign(&[queue("T", "broker-a", 0)]).unwrap();
         last.start().await.expect("start should succeed against the fake cluster");
         wait_until(
             || {
@@ -5367,7 +5563,7 @@ mod tests {
         c.set_instance_name("lite_sql92_pull");
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.subscribe_with_selector("T", &MessageSelector::by_sql("a > 1"));
+        c.subscribe_with_selector("T", &MessageSelector::by_sql("a > 1")).unwrap();
         c.start().await.expect("start must succeed");
         cluster.set_cid_list(&[c.client_id().as_str()]);
 
@@ -5414,7 +5610,7 @@ mod tests {
         plain.set_instance_name("lite_tag_control");
         plain.set_namesrv_addr(&cluster.namesrv_addr);
         plain.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        plain.subscribe("T", "TagA");
+        plain.subscribe("T", "TagA").unwrap();
         plain.start().await.expect("start must succeed");
         cluster.set_cid_list(&[c.client_id().as_str(), plain.client_id().as_str()]);
         wait_until(
@@ -5448,7 +5644,7 @@ mod tests {
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.assign(std::slice::from_ref(mq));
+        c.assign(std::slice::from_ref(mq)).unwrap();
         c.start().await.expect("start should succeed against the fake cluster");
         c
     }
@@ -5465,7 +5661,7 @@ mod tests {
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        c.assign(mqs);
+        c.assign(mqs).unwrap();
         c.start().await.expect("start should succeed against the fake cluster");
         c
     }
@@ -5748,7 +5944,7 @@ mod tests {
         let c = DefaultLitePullConsumer::new(group).expect("the group name is legal");
         c.set_instance_name(instance);
         c.set_namesrv_addr(&cluster.namesrv_addr);
-        c.subscribe(topic, "*");
+        c.subscribe(topic, "*").unwrap();
         c.start().await.expect("start should succeed against the fake cluster");
         c
     }
@@ -5830,7 +6026,7 @@ mod tests {
         let c = DefaultLitePullConsumer::new("LiteQC_Pre").expect("the group name is legal");
         c.set_instance_name("lite_qc_pre");
         c.set_namesrv_addr(&cluster.namesrv_addr);
-        c.subscribe("T", "*");
+        c.subscribe("T", "*").unwrap();
         let (listener, events) = RecordingQueueListener::new();
         c.register_topic_message_queue_change_listener("T", listener)
             .await
@@ -6772,7 +6968,7 @@ mod tests {
             .await;
 
         // Recovery leg: drain the hot backlog through poll(); the gate opens and the queue pulls again.
-        let drained = c.poll(Some(50)).await;
+        let drained = c.poll(Some(50)).await.unwrap();
         assert!(!drained.is_empty(), "the application drains the refused queue's backlog");
         wait_until(|| pulls_of(0) > hot_before, "the drained hot queue resumes pulling").await;
         assert_eq!(c.buffered_message_count(), 0, "nothing of the refused batch is left buffered");

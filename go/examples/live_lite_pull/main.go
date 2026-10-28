@@ -42,6 +42,17 @@ func check(name string, ok bool, detail string) {
 	fmt.Printf("FAIL  %s%s\n", name, detail)
 }
 
+// exitOn stops the run when the client refuses a call the leg depends on: a
+// refused assign would otherwise let the following checks report PASS for
+// rounds that never happened.
+func exitOn(label string, err error) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s: %v\n", label, err)
+	os.Exit(1)
+}
+
 func bump(n int) {
 	mu.Lock()
 	total += n
@@ -82,7 +93,11 @@ func pollBodies(c *client.DefaultLitePullConsumer, want int, within time.Duratio
 	deadline := time.Now().Add(within)
 	var bodies []string
 	for len(bodies) < want && time.Now().Before(deadline) {
-		for _, m := range c.PollWithTimeout(300) {
+		messages, err := c.PollWithTimeout(300)
+		if err != nil {
+			panic(err)
+		}
+		for _, m := range messages {
 			bodies = append(bodies, string(m.Body))
 		}
 	}
@@ -180,8 +195,8 @@ func main() {
 	l1.SetInstanceName("lite-assign-1")
 	l1.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	l1.SetAutoCommit(false)
-	l1.Assign([]common.MessageQueue{q0})
-	l1.SetSubExpressionForAssign(topicName, "*")
+	exitOn("l1 assign", l1.Assign([]common.MessageQueue{q0}))
+	exitOn("l1 setSubExpressionForAssign", l1.SetSubExpressionForAssign(topicName, "*"))
 	if err := l1.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "lite consumer start: %v\n", err)
 		os.Exit(1)
@@ -220,7 +235,7 @@ func main() {
 	l2.SetInstanceName("lite-assign-2")
 	l2.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	l2.SetAutoCommit(false)
-	l2.Assign([]common.MessageQueue{q0})
+	exitOn("l2 assign", l2.Assign([]common.MessageQueue{q0}))
 	if err := l2.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "lite consumer 2 start: %v\n", err)
 		os.Exit(1)
@@ -300,7 +315,8 @@ func main() {
 	// ---- 6. auto-commit: the interval commit reaches the broker without a manual
 	// Commit. A fourth consumer of the SAME group reads the broker's offset table.
 	time.Sleep(1500 * time.Millisecond)
-	l3.PollWithTimeout(300) // triggers maybeAutoCommit (deadline < now) → commit
+	_, pollErr := l3.PollWithTimeout(300) // triggers maybeAutoCommit (deadline < now) → commit
+	exitOn("l3 poll", pollErr)
 	time.Sleep(500 * time.Millisecond)
 
 	l4 := client.MustNewDefaultLitePullConsumer(subGroup)
@@ -309,7 +325,7 @@ func main() {
 	l4.SetConsumeFromWhere(client.ConsumeFromWhereFirstOffset)
 	// assign mode keeps l4 out of the rebalance: it exists only to read the
 	// broker's offset table for the group.
-	l4.Assign([]common.MessageQueue{q0})
+	exitOn("l4 assign", l4.Assign([]common.MessageQueue{q0}))
 	if err := l4.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "lite consumer 4 start: %v\n", err)
 		os.Exit(1)

@@ -705,15 +705,18 @@ void liteGates(DefaultLitePullConsumer& c, int32_t queue, int32_t size, int64_t 
     c.setPullThresholdForAll(all);
 }
 
-// Fresh consumer with a real queue assignment so the accumulator survives the pull-thread prune; not
-// started. Callers then injectCachedForTest() to stage the backlog and use the gate directly, or
-// start() to drive the wire.
+// Fresh consumer with a real queue assignment so the accumulator survives the pull-thread prune; never
+// started for real. Callers then injectCachedForTest() to stage the backlog and use the gate directly, or
+// start() to drive the wire. The running flag is set because poll() and committed() refuse a consumer
+// that never started -- these cases are about the buffer, not about that guard.
 std::unique_ptr<DefaultLitePullConsumer> stagedLite(const std::string& group, MockEndpoint& cluster,
                                                     const std::vector<MessageQueue>& queues) {
     auto c = std::make_unique<DefaultLitePullConsumer>(group);
     c->setNamesrvAddr(cluster.address());
     c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c->setAutoCommit(false);
     c->assign(queues);
+    c->markRunningForTest();
     return c;
 }
 

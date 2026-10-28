@@ -92,6 +92,9 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::str
 }
 
 void DefaultLitePullConsumer::subscribe(const std::string& topic, const MessageSelector& selector) {
+    if (UtilAll::isBlank(topic)) {
+        throw MQClientException("Topic can not be null or empty.");
+    }
     assignMode_ = false;
     std::string ns = withNamespace(topic);
     subscription_[ns] = selector.expression;
@@ -201,6 +204,19 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
 
 void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic,
                                                         const MessageSelector& selector) {
+    if (UtilAll::isBlank(selector.expression)) {
+        // A blank expression would quietly mean "everything": the caller would never
+        // learn that its filter did not apply.
+        throw MQClientException("subExpression can not be null or empty.");
+    }
+    if (running_.load()) {
+        // The broker was told this topic's expression at start; changing it now would
+        // leave its copy and the local filter disagreeing about every later pull.
+        throw MQClientException("setSubExpressionForAssign only can be called before start.");
+    }
+    if (UtilAll::isBlank(topic)) {
+        throw MQClientException("Topic can not be null or empty.");
+    }
     std::string ns = withNamespace(topic);
     assignSubExpr_[ns] = selector.expression;
     try {
@@ -212,6 +228,11 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
 }
 
 void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQueues) {
+    if (messageQueues.empty()) {
+        // Taken literally an empty list revokes every queue this consumer holds, which is
+        // exactly what a route lookup that came back empty does by accident.
+        throw MQClientException("Message queues can not be null or empty.");
+    }
     std::set<MessageQueue> queues(messageQueues.begin(), messageQueues.end());
     std::vector<MessageQueue> toResolve;
     std::vector<MessageQueue> revokedQueues;
@@ -747,7 +768,7 @@ void DefaultLitePullConsumer::maybeAutoCommit() {
 
 int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
-        throw MQClientException("consumer not started, call start() first");
+        throw MQClientException("The consumer not running, please start it first.");
     }
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
@@ -911,8 +932,15 @@ std::vector<MessageQueue> DefaultLitePullConsumer::newSetAsVector(const std::set
 }
 
 // ---------------------------------------------------------------- poll / consumer offset
-std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
-    int32_t timeout = timeoutMillis > 0 ? timeoutMillis : pollTimeoutMillis_;
+std::vector<MessageExt> DefaultLitePullConsumer::poll(std::optional<int32_t> timeoutMillis) {
+    if (!running_.load()) {
+        throw MQClientException("The consumer not running, please start it first.");
+    }
+    if (timeoutMillis.has_value() && *timeoutMillis < 0) {
+        throw MQClientException("Timeout must not be negative");
+    }
+    int32_t timeout = (timeoutMillis.has_value() && *timeoutMillis > 0) ? *timeoutMillis
+                                                                        : pollTimeoutMillis_;
     if (autoCommit_) maybeAutoCommit();
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
     std::vector<MessageExt> out;
@@ -1008,19 +1036,24 @@ void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
 
 void DefaultLitePullConsumer::seekToBegin(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
-        throw MQClientException("consumer not started, call start() first");
+        throw MQClientException("The consumer not running, please start it first.");
     }
     seek(mq, mqClient_->getMinOffset(mq));
 }
 
 void DefaultLitePullConsumer::seekToEnd(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
-        throw MQClientException("consumer not started, call start() first");
+        throw MQClientException("The consumer not running, please start it first.");
     }
     seek(mq, mqClient_->getMaxOffset(mq));
 }
 
 int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
+    if (!running_.load()) {
+        // "no offset yet" is a real answer the caller must not mistake for the silence of
+        // a consumer that was never started.
+        throw MQClientException("The consumer not running, please start it first.");
+    }
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         auto it = offsetTable_.find(mq);
@@ -1139,7 +1172,7 @@ void DefaultLitePullConsumer::commitOffsets(const std::map<MessageQueue, int64_t
 
 int64_t DefaultLitePullConsumer::offsetForTimestamp(const MessageQueue& mq, int64_t timestamp) {
     if (mqClient_ == nullptr) {
-        throw MQClientException("consumer not started, call start() first");
+        throw MQClientException("The consumer not running, please start it first.");
     }
     return mqClient_->searchOffsetByTimestamp(mq, timestamp);
 }
@@ -1159,7 +1192,7 @@ int64_t DefaultLitePullConsumer::consumeCursorOf(const MessageQueue& mq) {
 // ---------------------------------------------------------------- Queue lookup / control
 std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std::string& topic) {
     if (mqClient_ == nullptr) {
-        throw MQClientException("consumer not started, call start() first");
+        throw MQClientException("The consumer not running, please start it first.");
     }
     std::string fullTopic = withNamespace(topic);
     try {

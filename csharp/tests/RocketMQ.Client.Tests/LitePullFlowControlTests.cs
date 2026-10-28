@@ -72,12 +72,16 @@ public class LitePullFlowControlTests
             .Select(i => Cached(mq, firstOffset + i, bodySize, storeSize))
             .ToList();
 
-    /// <summary>An assigned, never started consumer: the gates are judged with nothing on the
-    /// wire, the way the push path's flow-control cases pin their verdict.</summary>
+    /// <summary>An assigned consumer that never went through Start(): the gates are judged
+    /// with nothing on the wire, the way the push path's flow-control cases pin their
+    /// verdict. It answers as running, because poll() and committed() refuse a consumer
+    /// that never started -- and those cases are about the buffer, not about that guard.</summary>
     private static DefaultLitePullConsumer Offline(string name, params MessageQueue[] queues)
     {
         var c = new DefaultLitePullConsumer(GroupPrefix + "_" + name);
         c.Assign(queues);
+        c.SetAutoCommit(false);
+        c.MarkRunningForTest();
         // Start every gate out of reach; each case opens only the one it judges, so an
         // earlier gate can never mask the branch under test.
         c.PullThresholdForAll = int.MaxValue;
