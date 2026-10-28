@@ -188,6 +188,30 @@ func rotateLocked() {
 	logSize = 0
 }
 
+// SetLogSink routes every log line to w and returns the function restoring the
+// previous sink. Formatting and the write stay under logMu, so a caller
+// capturing into a buffer always sees whole lines. Size-based rotation is
+// suspended while a foreign sink is installed: the cap belongs to the log file,
+// not to the capture. A nil writer is ignored (returns a no-op restore).
+func SetLogSink(w io.Writer) func() {
+	InitLogging()
+	logMu.Lock()
+	previous, previousPath := logWriter, logFilePath
+	if w != nil {
+		logWriter = w
+		logFilePath = ""
+	}
+	logMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			logMu.Lock()
+			logWriter, logFilePath = previous, previousPath
+			logMu.Unlock()
+		})
+	}
+}
+
 // LogFilePath returns the file the client logs to, or "" when the file sink is
 // off. Exposed for diagnostics and the live scripts' "did it write a file" check.
 func LogFilePath() string {

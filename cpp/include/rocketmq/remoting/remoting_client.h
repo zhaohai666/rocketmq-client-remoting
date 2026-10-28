@@ -66,6 +66,11 @@ public:
 
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
+    // A connection that has carried neither a read nor a write for this long is closed by the
+    // transport's own sweep. A configured value that is not positive falls back to this default:
+    // the sweep cannot be switched off.
+    static constexpr int64_t DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS = 120 * 1000;
+
     // Defaults: 3s connect timeout, 15s invoke timeout
     explicit RemotingClient(int32_t connectTimeoutMillis = 3000,
                             int32_t invokeTimeoutMillis = 15000);
@@ -115,6 +120,22 @@ public:
     // ---- connection management ----
     bool isChannelWritable(const std::string& addr) const;
     void closeChannel(const std::string& addr);
+
+    // ---- idle connection close ----
+    // The limit for one connection; a value <= 0 restores DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS
+    // because the sweep is always installed once a connection exists.
+    void setChannelIdleTimeoutMillis(int64_t millis);
+    int64_t channelIdleTimeoutMillis() const;
+    // Close every connection idle strictly past the limit and return how many were closed. The
+    // transport's own sweep calls it on each tick; it is public so tests and diagnostics can
+    // drive one pass deterministically.
+    int sweepIdleConnections();
+
+    // ---- sync timeout and the socket it timed out on ----
+    // Whether a synchronous invoke that runs out of time also closes the connection it went out
+    // on (true by default). Send failures always close the connection regardless of this switch.
+    void setCloseSocketOnSyncTimeout(bool close);
+    bool closeSocketOnSyncTimeout() const;
 
     // Reserved: the name server address list is maintained by the upper layer (MQClientInstance)
     void updateNameServerAddressList(const std::vector<std::string>& addrs);

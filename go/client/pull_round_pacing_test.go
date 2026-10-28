@@ -101,6 +101,29 @@ func assertNoRoundWait(t *testing.T, arrivals []int64, want int, pullIntervalMs,
 	}
 }
 
+// waitPullRoundsCounted parks until the pull loop's own PULL_TPS counter has
+// recorded `want` rounds. It has to exist because the loop hands the batch to the
+// consume side BEFORE it ticks the counter, so the arrival of the last round can
+// be observed while that round is still uncounted; comparing a count with an
+// arrival timeline without this would race its own subject. The counter is read
+// raw here — the sampling helper would add minute-window samples that are not
+// what this is waiting on.
+func waitPullRoundsCounted(t *testing.T, c *DefaultMQPushConsumer, topic string, want int64) {
+	t.Helper()
+	m := consumerStatsManagerOf(t, c)
+	if m == nil {
+		t.Fatal("the started consumer has no statistics manager to read from")
+	}
+	key := statsKey(topic, c.consumerGroup)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if it := m.topicAndGroupPullTPS.getItem(key); it != nil && it.times.Load() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // ------------------------------------------- FOUND that delivered rows: paced
 
 // A delivered round waits pullInterval, and only when pullInterval is positive:
@@ -146,7 +169,9 @@ func TestPullFoundWithRowsWaitsPullIntervalOnlyWhenPositive(t *testing.T) {
 			// The rounds are provably delivered ones: every one of them handed the
 			// same row to the queue, so PULL_TPS counted each of them. The counter is
 			// the pull loop's own record, so it needs no dispatch round trip to land
-			// before the gap above is attributed.
+			// — but it is ticked after the batch is handed over, so the count is
+			// waited out rather than read at whatever instant the last arrival came.
+			waitPullRoundsCounted(t, c, topic, int64(tc.rounds))
 			stats := readPullRoundStats(t, c, topic)
 			if stats.tpsTimes < int64(tc.rounds) {
 				t.Fatalf("PULL_TPS ticked %d time(s) over %d rounds (%s):"+

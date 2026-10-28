@@ -145,6 +145,9 @@ struct RemotingClient::Impl {
         std::atomic<socket_t> sock{kInvalidSocket};
         std::mutex writeMutex;
         std::atomic<bool> readerDone{false};
+        // Monotonic millis of the last byte actually read or written on this connection; the
+        // idle sweep closes a connection whose stamp is older than the configured limit.
+        std::atomic<int64_t> lastActivityMs{0};
         // TLS session (non-null when tlsEnable; read/write go through SSL_*)
         std::unique_ptr<TlsSession> tls;
     };
@@ -177,6 +180,12 @@ struct RemotingClient::Impl {
     bool tlsEnable = false;
     std::shared_ptr<void> tlsCtx;
     TlsOptions tlsOptions;
+
+    // Idle limit for one connection; a non-positive configured value is normalised to the
+    // default at the setter, so the sweep always has a real deadline to measure against.
+    std::atomic<int64_t> channelIdleTimeoutMs{RemotingClient::DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS};
+    // Whether a sync invoke that times out also closes the connection it went out on.
+    std::atomic<bool> closeSocketOnSyncTimeout{true};
 
     SocksProxyConfig socksProxy;
 
@@ -293,8 +302,12 @@ struct RemotingClient::Impl {
                 closeSocket(sock);
                 return it->second;
             }
+            conn->lastActivityMs.store(Future::monoNowMs());
             conns[addr] = conn;
         }
+        // The idle sweep runs on the sweeper thread, so a client that only ever uses
+        // invokeSync / invokeOneway still gets its quiet connections reaped.
+        ensureSweeper();
 
         const std::string connAddr = conn->addr;
         std::thread reader([this, conn, connAddr]() {
@@ -366,17 +379,25 @@ struct RemotingClient::Impl {
                 break;
             }
             buf.append(chunk, static_cast<size_t>(n));
+            // Bytes actually came off the socket: the connection just did real work, so its idle
+            // clock restarts here.
+            conn->lastActivityMs.store(Future::monoNowMs());
             // Split frames on the totalLength prefix; partial / coalesced frames are handled here
+            bool streamUntrustworthy = false;
             while (true) {
                 if (buf.size() < 4) {
                     break;
                 }
                 int32_t totalLen = ByteReader::getInt32At(buf, 0);
                 if (totalLen <= 0 || totalLen > RemotingClient::MAX_FRAME_LENGTH) {
-                    logger_warn("remoting reader: illegal frame length " + std::to_string(totalLen) +
-                                " from " + conn->addr + ", dropping " +
-                                std::to_string(buf.size()) + " buffered bytes");
+                    // An untrustworthy length field means the byte stream is corrupt: length-prefixed
+                    // framing cannot realign itself, so every byte after this header is misframed.
+                    // Report it and take the connection down the same way a peer disconnect does
+                    // (exit the loop -> close the socket -> failFast); the other connections stay.
+                    logger_error("remoting reader: illegal frame length " + std::to_string(totalLen)
+                                 + " from " + conn->addr + ", closing the connection");
                     buf.clear();
+                    streamUntrustworthy = true;
                     break;
                 }
                 if (buf.size() < static_cast<size_t>(4 + totalLen)) {
@@ -384,7 +405,13 @@ struct RemotingClient::Impl {
                 }
                 Bytes frame = buf.substr(0, static_cast<size_t>(4 + totalLen));
                 buf.erase(0, static_cast<size_t>(4 + totalLen));
-                dispatch(frame, conn->addr);
+                if (!dispatch(frame, conn->addr)) {
+                    streamUntrustworthy = true;
+                    break;
+                }
+            }
+            if (streamUntrustworthy) {
+                break;
             }
         }
         {
@@ -460,12 +487,18 @@ struct RemotingClient::Impl {
         return static_cast<int>(doomed.size());
     }
 
-    void dispatch(const Bytes& frame, const std::string& from) {
+    // Returns true while the connection is still usable, false when this frame took the
+    // connection down and the reader must stop reading from it.
+    bool dispatch(const Bytes& frame, const std::string& from) {
         RemotingCommand cmd;
         if (!RemotingCommand::tryDecode(frame, cmd, nullptr)) {
-            logger_warn("remoting reader: drop undecodable frame (" + std::to_string(frame.size()) +
-                        " bytes) from " + from);
-            return;  // drop an undecodable frame; other requests are unaffected
+            // The bytes no longer line up with the frame boundaries, so nothing that arrives
+            // after this frame on this stream can be trusted for any later request: report the
+            // peer and take the connection down through the same route a peer disconnect takes
+            // (the reader exits, closes the socket and failFasts the in-flight requests).
+            logger_error("remoting reader: cannot decode frame from " + from + " ("
+                         + std::to_string(frame.size()) + " bytes), closing the connection");
+            return false;
         }
         std::shared_ptr<Future> future;
         {
@@ -477,45 +510,54 @@ struct RemotingClient::Impl {
             }
         }
         if (future == nullptr) {
-            // Missing from the in-flight table: either a late response or a **broker-initiated request**.
-            // The latter is taken over by a registered processor (typically transaction check-back CHECK_TRANSACTION_STATE=39).
-            if (!cmd.isResponseType()) {
-                RequestProcessor proc;
-                {
-                    std::lock_guard<std::mutex> plk(procMutex);
-                    auto pit = processors.find(cmd.code);
-                    if (pit != processors.end()) {
-                        proc = pit->second;
-                    }
-                }
-                if (proc) {
-                    // The processor runs on the reader thread: exceptions must be caught, otherwise the reader dies
-                    // and every remaining response on this connection is lost (far worse than losing one check-back).
-                    std::optional<RemotingCommand> resp;
-                    try {
-                        resp = proc(cmd, from);
-                    } catch (const std::exception& e) {
-                        logger_warn("remoting: processor for request code " +
-                                    std::to_string(cmd.code) + " threw: " + e.what());
-                        resp = RemotingCommand::createResponseCommand(
-                            ResponseCode::SYSTEM_ERROR, "process request fail");
-                    } catch (...) {
-                        logger_warn("remoting: processor for request code " +
-                                    std::to_string(cmd.code) + " threw unknown exception");
-                        resp = RemotingCommand::createResponseCommand(
-                            ResponseCode::SYSTEM_ERROR, "process request fail");
-                    }
-                    if (resp.has_value() && !cmd.isOnewayRpc()) {
-                        resp->opaque = cmd.opaque;
-                        sendResponseByAddr(from, *resp);
-                    }
-                } else {
-                    // Having no registered processor is expected (the broker does not send this when transactions are off), so do not warn
-                    logger_debug("remoting: no processor for broker request code " +
-                                 std::to_string(cmd.code) + " from " + from);
+            // A response whose opaque is no longer in the in-flight table: the request was
+            // already answered, timed out or failed fast. Dropping it is right, saying so is
+            // what makes a double-answering peer or a stale request visible; the frame itself
+            // was well-formed, so the connection stays up for the requests still on it.
+            if (cmd.isResponseType()) {
+                logger_warn("remoting reader: response from " + from + " does not match any "
+                            "in-flight request (opaque=" + std::to_string(cmd.opaque)
+                            + "), dropped");
+                return true;
+            }
+            // A command that is not a response, and that no in-flight request owns, is a
+            // **broker-initiated request**: a registered processor takes it over (typically
+            // transaction check-back CHECK_TRANSACTION_STATE=39).
+            RequestProcessor proc;
+            {
+                std::lock_guard<std::mutex> plk(procMutex);
+                auto pit = processors.find(cmd.code);
+                if (pit != processors.end()) {
+                    proc = pit->second;
                 }
             }
-            return;  // late response / already-handled broker request
+            if (proc) {
+                // The processor runs on the reader thread: exceptions must be caught, otherwise the reader dies
+                // and every remaining response on this connection is lost (far worse than losing one check-back).
+                std::optional<RemotingCommand> resp;
+                try {
+                    resp = proc(cmd, from);
+                } catch (const std::exception& e) {
+                    logger_warn("remoting: processor for request code " +
+                                std::to_string(cmd.code) + " threw: " + e.what());
+                    resp = RemotingCommand::createResponseCommand(
+                        ResponseCode::SYSTEM_ERROR, "process request fail");
+                } catch (...) {
+                    logger_warn("remoting: processor for request code " +
+                                std::to_string(cmd.code) + " threw unknown exception");
+                    resp = RemotingCommand::createResponseCommand(
+                        ResponseCode::SYSTEM_ERROR, "process request fail");
+                }
+                if (resp.has_value() && !cmd.isOnewayRpc()) {
+                    resp->opaque = cmd.opaque;
+                    sendResponseByAddr(from, *resp);
+                }
+            } else {
+                // Having no registered processor is expected (the broker does not send this when transactions are off), so do not warn
+                logger_debug("remoting: no processor for broker request code " +
+                             std::to_string(cmd.code) + " from " + from);
+            }
+            return true;
         }
         InvokeCallback cb;
         {
@@ -532,6 +574,7 @@ struct RemotingClient::Impl {
         if (cb) {
             cb(cmd, InvokeError());
         }
+        return true;
     }
 
     // Acquire an opaque **unique among in-flight requests** and register the future under the same lock.
@@ -580,6 +623,23 @@ struct RemotingClient::Impl {
         if (!ok) {
             lk.unlock();
             unregisterFuture(opaque);
+            // A sync wait that ran out with the response still missing has no evidence the peer
+            // is readable at all: the frame may be lost on the way, and nothing else will ever
+            // deliver it. Both floors below measure the budget the wait was handed when it
+            // began -- this port does not subtract the connect and write cost, so that budget IS
+            // the timeout and the second floor is out of reach for any positive value. A
+            // positive timeout therefore always closes; zero is the one shape that keeps the
+            // socket, and such a request was never going to be answered anyway.
+            const int64_t leftMillis = timeoutMillis;
+            if (closeSocketOnSyncTimeout.load()
+                && (leftMillis > 100 || leftMillis > timeoutMillis / 4)) {
+                logger_warn("remoting: sync wait to " + addr + " timed out (opaque="
+                            + std::to_string(opaque) + ", timeout=" + std::to_string(timeoutMillis)
+                            + " ms), closing the connection");
+                closeConnection(addr);
+            }
+            logger_warn("remoting: wait response from " + addr + " timeout, opaque="
+                        + std::to_string(opaque) + ", " + std::to_string(timeoutMillis) + " ms");
             throw RemotingTimeoutException(addr + " wait response timeout "
                                            + std::to_string(timeoutMillis) + " ms, opaque="
                                            + std::to_string(opaque));
@@ -718,6 +778,7 @@ struct RemotingClient::Impl {
                 lk.unlock();
                 if (!running.load()) return;
                 sweepExpired();
+                sweepIdleConnections();
                 drainGoAwayRetries();
             }
         });
@@ -754,6 +815,11 @@ struct RemotingClient::Impl {
         // calling back under the lock both contends with shutdown for the same mutex and can self-deadlock.
         for (auto& kv : expired) {
             const std::shared_ptr<Future>& f = kv.first;
+            // One event, one log line: without this a swept request is invisible, because the
+            // business callback deciding to log anything is out of the transport's hands.
+            logger_warn("remoting: in-flight request to " + f->addr + " expired (opaque="
+                        + std::to_string(kv.second) + ", timeout=" + std::to_string(f->timeoutMs)
+                        + " ms), failed with a timeout");
             bool mine = false;
             {
                 std::lock_guard<std::mutex> flk(f->m);
@@ -773,6 +839,43 @@ struct RemotingClient::Impl {
                                             + std::to_string(kv.second)));
             }
         }
+    }
+
+    // Close every connection idle strictly longer than the configured limit and WARN each one.
+    // The close goes through the same route a peer disconnect does (drop the table entry, close
+    // the socket, and let that connection's reader failFast its in-flight requests), so a
+    // connection that stopped carrying traffic takes those requests down with it while the other
+    // connections are untouched.
+    int sweepIdleConnections() {
+        const int64_t limit = channelIdleTimeoutMs.load();
+        const int64_t now = Future::monoNowMs();
+        struct Reaped {
+            std::string addr;
+            std::shared_ptr<Connection> conn;
+            int64_t idleMs;
+        };
+        std::vector<Reaped> idle;
+        {
+            std::lock_guard<std::mutex> lk(connMutex);
+            for (auto it = conns.begin(); it != conns.end();) {
+                // Unstamped entries belong to a connection still being established; a connection
+                // whose idle time merely reaches the limit is not past it.
+                const int64_t last = it->second->lastActivityMs.load();
+                if (last != 0 && now - last > limit) {
+                    idle.push_back(Reaped{it->first, it->second, now - last});
+                    it = conns.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& r : idle) {
+            logger_warn("remoting: connection to " + r.addr + " idle for "
+                        + std::to_string(r.idleMs) + " ms (limit " + std::to_string(limit)
+                        + " ms), closing it");
+            closeConnectionSocket(r.conn);
+        }
+        return static_cast<int>(idle.size());
     }
 
     // Write the response back to an **existing** connection (never create one).
@@ -808,6 +911,8 @@ struct RemotingClient::Impl {
                                   : sendAll(sock, data);
         if (!ok) {
             logger_warn("remoting: failed to write response to " + addr);
+        } else {
+            conn->lastActivityMs.store(Future::monoNowMs());
         }
     }
 
@@ -846,6 +951,8 @@ struct RemotingClient::Impl {
             }
             throw RemotingSendRequestException(formatAddr(addr));
         }
+        // The bytes went out: the connection just did real work, so its idle clock restarts here.
+        conn->lastActivityMs.store(Future::monoNowMs());
         return conn;
     }
 
@@ -1056,7 +1163,52 @@ bool RemotingClient::socksProxyEnabled() const { return !impl_->socksProxy.empty
 bool RemotingClient::isChannelWritable(const std::string& addr) const {
     std::lock_guard<std::mutex> lk(impl_->connMutex);
     auto it = impl_->conns.find(addr);
-    return it != impl_->conns.end() && it->second->sock != kInvalidSocket;
+    if (it == impl_->conns.end() || it->second->sock == kInvalidSocket) {
+        // "Nothing is open yet" is not "this cannot take data": this transport connects on
+        // demand, so the next send simply creates the connection. Same for a table entry whose
+        // socket is already gone -- the next send replaces it.
+        return true;
+    }
+    // A live socket: ask the kernel whether it would take a write right now. This is a snapshot
+    // of the send buffer, not a queue-depth watermark, so a live connection that is merely slow
+    // but currently drained still reports writable -- as does one whose peer just died (the
+    // read path is what notices that and takes the channel down). On a TLS connection the probe
+    // sees the underlying socket only, not the crypto layer's own buffers.
+    const socket_t sock = it->second->sock;
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    struct timeval tv {
+        0, 0
+    };
+    const int ready = ::select(static_cast<int>(sock) + 1, nullptr, &wfds, nullptr, &tv);
+    if (ready < 0) {
+        // The probe itself failed: report writable and let the write path
+        // (send failure -> close the connection) decide, rather than refusing the send.
+        return true;
+    }
+    return FD_ISSET(sock, &wfds);
+}
+
+void RemotingClient::setChannelIdleTimeoutMillis(int64_t millis) {
+    // A non-positive value never disables the sweep: the sweep is always installed, so an
+    // unsettable deadline would mean "reap immediately". Restore the default instead.
+    impl_->channelIdleTimeoutMs.store(millis > 0 ? millis
+                                                 : DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS);
+}
+
+int64_t RemotingClient::channelIdleTimeoutMillis() const {
+    return impl_->channelIdleTimeoutMs.load();
+}
+
+int RemotingClient::sweepIdleConnections() { return impl_->sweepIdleConnections(); }
+
+void RemotingClient::setCloseSocketOnSyncTimeout(bool close) {
+    impl_->closeSocketOnSyncTimeout.store(close);
+}
+
+bool RemotingClient::closeSocketOnSyncTimeout() const {
+    return impl_->closeSocketOnSyncTimeout.load();
 }
 
 void RemotingClient::closeChannel(const std::string& addr) { impl_->closeConnection(addr); }

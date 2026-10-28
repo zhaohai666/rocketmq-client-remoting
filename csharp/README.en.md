@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1130 unit tests.
+  offline behaviour is pinned by 1140 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1130, Skipped:     0, Total:  1130, Duration: 4 m 53 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1140, Skipped:     0, Total:  1140, Duration: 4 m 44 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -529,6 +529,22 @@ connection.
 - ✅ Transport: lazy TCP long connections over sockets, one reader thread per connection, framing,
   opaque→future dispatch; sync / async / oneway; partial-frame reassembly; timeouts and reconnects;
   in-flight requests failed immediately when the connection dies
+- ✅ Connection lifecycle: a frame that does not decode logs one ERROR naming the peer and takes
+  that connection down (an out-of-range length prefix is the same event one level earlier, logged
+  once at the level that caught it and never also as a decode failure); a response no in-flight
+  request waits on logs one WARN naming its opaque and address and the connection stays up;
+  `IsChannelWritable()` reports the socket's send buffer, not whether a connection exists — a
+  closed or never-opened address is writable because the next send connects, a live but drained
+  connection is writable, only a send parked for lack of buffer room answers false, and a probe
+  that throws itself answers writable and leaves the decision to the write path; the transport's
+  own sweeper closes every connection idle strictly longer than `ChannelIdleTimeoutMillis`
+  (default 120000; a non-positive value restores the default rather than switching the sweep off)
+  and writes one WARN per address, while a connection written to every 100ms is never idle; each
+  expired in-flight entry gets its own WARN and is not a connection event; and a synchronous wait
+  that runs out takes the connection down while `CloseSocketOnSyncTimeout` is on (default true) —
+  it keeps it only when the budget left at the deadline is neither above 100ms nor above a quarter
+  of that timeout — while a send that fails outright closes the connection whatever the switch
+  says
 - ✅ Sending: sync / pinned / selector / batch (320) / auto-batching / one-way / async (sender pool +
   fair semaphores) / transactions (two-phase + broker check-back) / delayed and timed /
   recall (`recallMessage`) / request-reply
@@ -570,7 +586,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1130 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1140 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -730,7 +746,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1130 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1140 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

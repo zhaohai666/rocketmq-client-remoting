@@ -11,7 +11,7 @@ NameServer（取路由、动态取址）与 Broker（收发消息、心跳、位
   zlib 走内置 `ZLibStream`，LZ4 / ZSTD 通过 P/Invoke 调系统库。
 - 一个库覆盖生产者、Push / Pull / LitePull 三种消费者、管理端、消息轨迹、ACL、TLS。
 - 能力在真实 RocketMQ 5.5.1 集群（namesrv 9876 + broker 10911）上逐条联调，
-  离线行为由 1130 项单元测试锁死。
+  离线行为由 1140 项单元测试锁死。
 
 ## 先决条件
 
@@ -33,7 +33,7 @@ dotnet test tests/RocketMQ.Client.Tests
 | 命令 | 结果 |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 个警告` / `0 个错误`，用时 `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1130，已跳过:     0，总计:  1130，持续时间: 4 m 53 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `已通过! - 失败:     0，通过:  1140，已跳过:     0，总计:  1140，持续时间: 4 m 44 s` |
 
 `Directory.Build.props` 里 `TreatWarningsAsErrors=true` 全局生效，所以「构建通过」等价于「零 warning」。
 测试输出跟随系统区域设置，中文 locale 下汇总行是中文，检索时按 `总计:` 匹配。
@@ -502,6 +502,7 @@ producer.TlsOptions = new TlsOptions
   非法 JSON 输出容错解析；17 段 + 6 段消息编解码
 - ✅ 传输层：Socket TCP 长连接惰性建连、每连接读线程、分帧、opaque→future 分发；
   同步 / 异步 / oneway；半包重组；超时与重连；连接断开时在途请求立即判死
+- ✅ 连接生命周期：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 与地址的 WARN，连接留着；`IsChannelWritable()` 报的是 socket 发送缓冲，不是有没有连接——已关闭或从没开过的地址可写（下一次发送自己建连），活着但已排空的连接也可写，只有因缓冲区塞不下而卡住的写才报 false，探测自己抛异常时报可写、把判断交给写路径；传输层自己的清扫线程关掉静默严格超过 `ChannelIdleTimeoutMillis`（默认 120000；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN，每 100ms 还被写的连接永远不算空闲；每个过期的在途请求各一条 WARN，而且回收请求不是连接事件；同步等待超时后，`CloseSocketOnSyncTimeout` 开着（默认 true）就把连接拆掉——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；发送本身失败则无论开关一律关闭
 - ✅ 发送：同步 / 定点 / 队列选择器 / 批量（320）/ 自动攒批 / 单向 / 异步（发送池 + 公平背压信号量）/
   事务（两阶段 + broker 回查）/ 定时与延迟 / 撤回（recallMessage）/ Request-Reply
 - ✅ 消费：Push（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 拉取前每队列三条缓存闸门
@@ -530,7 +531,7 @@ producer.TlsOptions = new TlsOptions
   发送 / 消费 / 事务 / Forbidden / FilterMessage 钩子、ACL 签名、动态 NameServer 取址、故障规避选队列
 - ✅ 压缩：zlib / LZ4 / ZSTD；TLS：`SslStream`，test-mode 与严格校验 / mTLS
 - ✅ 客户端日志：按大小轮转、双写 stderr 与文件
-- ✅ 单元测试 1130 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
+- ✅ 单元测试 1140 项；`rmq` 真机联调工具 40 条子命令（含主从、故障注入、压缩互通矩阵）
 
 ## 客户端日志
 
@@ -683,7 +684,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs  Schedules（定时任务锚定）
 │       ├── TopAddressing.cs        # 动态 NameServer 取址
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit，1130 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
+├── tests/RocketMQ.Client.Tests/    # xunit，1140 项（编解码/路由/日志/传输/轨迹/异步/流控/位点…）
 └── examples/RocketMQ.Examples/     # rmq 真机联调工具（见上）
 ```
 

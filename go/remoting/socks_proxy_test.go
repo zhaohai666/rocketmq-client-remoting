@@ -470,10 +470,11 @@ func TestRemotingInvokeSyncThroughSocks5Proxy(t *testing.T) {
 	addr := echoServer(t)
 	proxy := newFakeSocks5Server(t, false, "", "")
 	client := NewRemotingClientWithConfig(ClientConfig{
-		SocksProxy:               NewSocksProxyConfig(proxy.addr()),
-		ConnectTimeoutMillis:     3000,
-		InvokeTimeoutMillis:      3000,
-		EnableReconnectForGoAway: true,
+		SocksProxy:                NewSocksProxyConfig(proxy.addr()),
+		ConnectTimeoutMillis:      3000,
+		InvokeTimeoutMillis:       3000,
+		EnableReconnectForGoAway:  true,
+		CloseChannelOnSyncTimeout: true,
 	})
 	defer client.Shutdown()
 	response, err := client.InvokeSync(addr, request(ReqSendMessageV2, "via-proxy"), 3000)

@@ -5,6 +5,10 @@
 // connection dies, every request written onto it fails fast ("connection
 // closed") instead of waiting out its timeout. GO_AWAY(1500) responses trigger
 // one reconnect-and-retry with a fresh opaque and the remaining time budget.
+// A connection that served neither a read nor a write for the configured idle
+// limit (120 s by default) is closed by the sweep goroutine, and a sync invoke
+// whose own wait expired closes the connection it was carried on unless the
+// caller opted out of that knob.
 package remoting
 
 import (
@@ -27,6 +31,23 @@ import (
 
 // MaxFrameLength caps one inbound frame (16 MiB, the protocol limit).
 const MaxFrameLength = int32(16 * 1024 * 1024)
+
+// DefaultChannelIdleTimeoutSeconds is the idle limit a connection is allowed to
+// sit unused for before the sweep closes it (120 s). A non-positive configured
+// value falls back to it — there is no "idle close disabled" setting.
+const DefaultChannelIdleTimeoutSeconds int64 = 120
+
+// writeParkedAfter is how long a write may stay inside the kernel before the
+// connection counts as not writable. A healthy write returns immediately; one
+// that has been parked this long means the socket send buffer is full and the
+// peer is not draining, so the connection genuinely cannot take more data.
+const writeParkedAfter = 100 * time.Millisecond
+
+// closeOnSyncTimeoutFloorMillis is the budget boundary of the
+// CloseChannelOnSyncTimeout rule: a wait that began with no more than this many
+// milliseconds left (and no more than a quarter of its timeout) is not punished
+// with a reconnect, because the caller never had a real chance to be answered.
+const closeOnSyncTimeoutFloorMillis int64 = 100
 
 // RPCHook is a request/response interceptor. DoBeforeRequest must
 // run before encode so the signed bytes are the ones that hit the wire.
@@ -80,16 +101,36 @@ type ClientConfig struct {
 	// SendRequest error surfaces directly (enableReconnectForGoAway = false).
 	EnableReconnectForGoAway bool
 	SocksProxy               *SocksProxyConfig
+	// ChannelIdleTimeoutSeconds: the sweep closes any connection that served
+	// neither a read nor a write for this long (default 120; a non-positive
+	// value falls back to the default).
+	ChannelIdleTimeoutSeconds int64
+	// CloseChannelOnSyncTimeout (default true): a sync invoke whose own wait
+	// expired drops the connection instead of reusing it, because the request
+	// it carried may still be answered on that socket later.
+	CloseChannelOnSyncTimeout bool
 }
 
 func NewClientConfig() ClientConfig {
 	return ClientConfig{
-		ConnectTimeoutMillis:     3000,
-		InvokeTimeoutMillis:      3000,
-		TLSEnable:                envBool("ROCKETMQ_TLS_ENABLE", false),
-		TLSTestMode:              envBool("ROCKETMQ_TLS_TEST_MODE", true),
-		EnableReconnectForGoAway: true,
+		ConnectTimeoutMillis:      3000,
+		InvokeTimeoutMillis:       3000,
+		TLSEnable:                 envBool("ROCKETMQ_TLS_ENABLE", false),
+		TLSTestMode:               envBool("ROCKETMQ_TLS_TEST_MODE", true),
+		EnableReconnectForGoAway:  true,
+		ChannelIdleTimeoutSeconds: DefaultChannelIdleTimeoutSeconds,
+		CloseChannelOnSyncTimeout: true,
 	}
+}
+
+// channelIdleTimeout resolves the idle limit, falling back to the default for a
+// non-positive configured value.
+func (c *RemotingClient) channelIdleTimeout() time.Duration {
+	seconds := c.config.ChannelIdleTimeoutSeconds
+	if seconds <= 0 {
+		seconds = DefaultChannelIdleTimeoutSeconds
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func envBool(key string, def bool) bool {
@@ -122,6 +163,43 @@ type connection struct {
 	conn    net.Conn
 	writeMu sync.Mutex
 	alive   atomic.Bool
+	// lastActivityNano (unix nanos) is refreshed on every successful read and
+	// every completed write; the idle sweep compares it against the configured
+	// idle limit.
+	lastActivityNano atomic.Int64
+	// parkedWriteNano is the unix-ns instant a write began and 0 once it
+	// returned; a value older than writeParkedAfter means the socket buffer is
+	// full and this connection cannot take more data.
+	parkedWriteNano atomic.Int64
+}
+
+// touch stamps the connection with "activity just now"; reads and writes both
+// call it, so a connection serving either direction is never seen as idle.
+func (c *connection) touch() {
+	c.lastActivityNano.Store(time.Now().UnixNano())
+}
+
+// idleFor reports how long the connection has served no read and no write.
+func (c *connection) idleFor(now time.Time) time.Duration {
+	last := c.lastActivityNano.Load()
+	if last == 0 {
+		// Never stamped: treat the connection as just created so it gets a full
+		// idle window instead of being closed by the first sweep that sees it.
+		c.touch()
+		return 0
+	}
+	return now.Sub(time.Unix(0, last))
+}
+
+// writeParked reports whether a write is stuck in the kernel (peer not
+// draining, send buffer full) — the only observable "cannot take more data"
+// signal a Go socket offers.
+func (c *connection) writeParked(now time.Time) bool {
+	started := c.parkedWriteNano.Load()
+	if started == 0 {
+		return false
+	}
+	return now.Sub(time.Unix(0, started)) >= writeParkedAfter
 }
 
 func (c *connection) writeAll(data []byte) error {
@@ -130,9 +208,13 @@ func (c *connection) writeAll(data []byte) error {
 	if !c.alive.Load() {
 		return net.ErrClosed
 	}
-	if _, err := c.conn.Write(data); err != nil {
+	c.parkedWriteNano.Store(time.Now().UnixNano())
+	_, err := c.conn.Write(data)
+	c.parkedWriteNano.Store(0)
+	if err != nil {
 		return err
 	}
+	c.touch()
 	return nil
 }
 
@@ -157,6 +239,13 @@ type RemotingClient struct {
 	hooks      []RPCHook
 	procMu     sync.RWMutex
 	processors map[int32]ProcessorFunc
+
+	// Idle sweep: one goroutine per running client, started with the client and
+	// stopped by Shutdown, so no connection outlives the configured idle limit
+	// and no ticker outlives the client.
+	sweepMu   sync.Mutex
+	sweeping  bool
+	sweepStop chan struct{}
 }
 
 func NewRemotingClient() *RemotingClient {
@@ -172,6 +261,7 @@ func NewRemotingClientWithConfig(config ClientConfig) *RemotingClient {
 		processors: make(map[int32]ProcessorFunc),
 	}
 	c.running.Store(true)
+	c.startIdleSweep()
 	return c
 }
 
@@ -295,8 +385,19 @@ func (c *RemotingClient) InvokeOneway(addr string, request *RemotingCommand) err
 
 // ---------------- connection state ----------------
 
+// IsChannelWritable reports whether a write to addr could proceed now.
+//
+// A missing connection is not a saturated one: nothing is queued against that
+// address, and the next call simply dials, so the answer is true. Only a live
+// connection whose write has been parked in the kernel because the peer stopped
+// draining answers false. No production path in this client calls it — it is a
+// diagnostic for the host application.
 func (c *RemotingClient) IsChannelWritable(addr string) bool {
-	return c.existingConn(addr) != nil
+	conn := c.existingConn(addr)
+	if conn == nil {
+		return true
+	}
+	return !conn.writeParked(time.Now())
 }
 
 // CloseChannel drops the current connection to addr and fails fast only the
@@ -304,11 +405,23 @@ func (c *RemotingClient) IsChannelWritable(addr string) bool {
 func (c *RemotingClient) CloseChannel(addr string) {
 	c.mu.Lock()
 	conn := c.conns[addr]
-	delete(c.conns, addr)
 	c.mu.Unlock()
 	if conn == nil {
 		return
 	}
+	c.closeConn(conn)
+}
+
+// closeConn tears down one specific connection: the socket is closed, the table
+// entry is dropped only while it still points at this connection (a same-address
+// reconnect that already happened must survive), and the requests written onto
+// it fail fast.
+func (c *RemotingClient) closeConn(conn *connection) {
+	c.mu.Lock()
+	if cur, ok := c.conns[conn.addr]; ok && cur.id == conn.id {
+		delete(c.conns, conn.addr)
+	}
+	c.mu.Unlock()
 	conn.close()
 	c.failPendingFor(conn.id)
 }
@@ -331,13 +444,17 @@ func (c *RemotingClient) InFlightCount() int {
 }
 
 // Start re-opens a transport closed by Shutdown; connections are built lazily
-// anyway.
-func (c *RemotingClient) Start() { c.running.Store(true) }
+// anyway, and the idle sweep runs from here on.
+func (c *RemotingClient) Start() {
+	c.running.Store(true)
+	c.startIdleSweep()
+}
 
 func (c *RemotingClient) Shutdown() {
 	if !c.running.CompareAndSwap(true, false) {
 		return
 	}
+	c.stopIdleSweep()
 	for _, addr := range c.ConnectionAddrs() {
 		c.CloseChannel(addr)
 	}
@@ -358,7 +475,78 @@ func (c *RemotingClient) Shutdown() {
 	}
 }
 
-// ---------------- invoke internals ----------------
+// ---------------- idle connection sweep ----------------
+
+// startIdleSweep launches the sweep goroutine unless one is already running. It
+// is called with the client (and from Start), and stopIdleSweep shuts it down,
+// so the ticker never outlives the transport.
+func (c *RemotingClient) startIdleSweep() {
+	c.sweepMu.Lock()
+	if c.sweeping {
+		c.sweepMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	c.sweepStop = stop
+	c.sweeping = true
+	c.sweepMu.Unlock()
+	go c.idleSweep(stop)
+}
+
+func (c *RemotingClient) stopIdleSweep() {
+	c.sweepMu.Lock()
+	stop := c.sweepStop
+	c.sweepStop = nil
+	c.sweeping = false
+	c.sweepMu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+// idleSweep ticks at a quarter of the idle limit (never faster than 250 ms) and
+// closes everything idle past the limit. An idle limit of 120 s is therefore
+// acted on within at most 150 s of the last activity.
+func (c *RemotingClient) idleSweep(stop <-chan struct{}) {
+	interval := c.channelIdleTimeout() / 4
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			c.closeIdleChannels()
+		}
+	}
+}
+
+// closeIdleChannels closes every connection whose last read/write stamp is
+// strictly older than the configured idle limit, warning per connection with the
+// address it timed out on. Other connections are untouched.
+func (c *RemotingClient) closeIdleChannels() {
+	if !c.running.Load() {
+		return
+	}
+	limit := c.channelIdleTimeout()
+	now := time.Now()
+	c.mu.Lock()
+	var idle []*connection
+	for _, conn := range c.conns {
+		if conn.idleFor(now) > limit {
+			idle = append(idle, conn)
+		}
+	}
+	c.mu.Unlock()
+	for _, conn := range idle {
+		common.LogWarnf("remoting: connection to %s (id=%d) idle for %s (limit %s), closing",
+			conn.addr, conn.id, conn.idleFor(now), limit)
+		c.closeConn(conn)
+	}
+}
 
 func (c *RemotingClient) runBeforeRequestHooks(addr string, request *RemotingCommand) {
 	c.hooksMu.RLock()
@@ -389,12 +577,21 @@ func (c *RemotingClient) invokeWithTimeout(addr string, request *RemotingCommand
 	c.mu.Lock()
 	c.pending[request.Opaque] = call
 	c.mu.Unlock()
+	// Timing starts here, so the write cost is counted and `left` below is the
+	// budget still available when the wait itself begins.
+	waitBegins := time.Now()
 	if err := c.writeConn(conn, request); err != nil {
 		return nil, err
 	}
 	d := time.Duration(timeoutMillis) * time.Millisecond
 	if d <= 0 {
 		d = time.Millisecond
+	}
+	// left is the budget still available when the wait begins (the write above
+	// already spent part of it); the close-on-timeout rule keys off it.
+	left := timeoutMillis - time.Since(waitBegins).Milliseconds()
+	if left < 0 {
+		left = 0
 	}
 	timer := time.NewTimer(d)
 	defer timer.Stop()
@@ -405,9 +602,33 @@ func (c *RemotingClient) invokeWithTimeout(addr string, request *RemotingCommand
 		}
 		return response, nil
 	case <-timer.C:
-		c.cancelPending(request.Opaque)
+		closeChannel := c.shouldCloseOnSyncTimeout(left, timeoutMillis)
+		if closeChannel {
+			common.LogWarnf("remoting: sync invoke to %s spent %d ms without a response, closing the connection",
+				addr, timeoutMillis)
+		}
+		// The expired entry is dropped before the connection teardown, which
+		// would otherwise purge it without the per-request expiry warning.
+		c.cancelPending(addr, request.Opaque, timeoutMillis)
+		if closeChannel {
+			c.closeConn(conn)
+		}
 		return nil, common.TimeoutError(addr, timeoutMillis)
 	}
+}
+
+// shouldCloseOnSyncTimeout applies the close-on-timeout rule: the connection
+// goes unless the wait began with almost nothing left — 100 ms or less AND a
+// quarter of the timeout or less, i.e. a request that never had a real chance to
+// be answered.
+func (c *RemotingClient) shouldCloseOnSyncTimeout(leftMillis, timeoutMillis int64) bool {
+	if !c.config.CloseChannelOnSyncTimeout {
+		return false
+	}
+	if leftMillis <= closeOnSyncTimeoutFloorMillis && leftMillis <= timeoutMillis/4 {
+		return false
+	}
+	return true
 }
 
 // writeConn encodes and writes one frame. Write failure closes the channel:
@@ -431,10 +652,19 @@ func (c *RemotingClient) respondFrame(addr string, response *RemotingCommand) er
 	return c.writeConn(conn, response)
 }
 
-func (c *RemotingClient) cancelPending(opaque int32) {
+// cancelPending drops one expired in-flight request at its removal site and
+// warns there, so an expired entry always produces exactly one line naming the
+// address, the opaque and the timeout that ran out. Removing an entry that is
+// already gone (the answer arrived first) logs nothing.
+func (c *RemotingClient) cancelPending(addr string, opaque int32, timeoutMillis int64) {
 	c.mu.Lock()
+	_, found := c.pending[opaque]
 	delete(c.pending, opaque)
 	c.mu.Unlock()
+	if found {
+		common.LogWarnf("remoting: pending request to %s (opaque %d) expired after %d ms",
+			addr, opaque, timeoutMillis)
+	}
 }
 
 // failPendingFor fails
@@ -566,6 +796,7 @@ func (c *RemotingClient) connect(addr string) (*connection, error) {
 	}
 	conn := &connection{id: c.connSeq.Add(1), addr: addr, conn: raw}
 	conn.alive.Store(true)
+	conn.touch()
 	return conn, nil
 }
 
@@ -590,8 +821,9 @@ func (c *RemotingClient) wrapTLS(raw net.Conn, host, addr string) (net.Conn, err
 
 // readLoop reassembles frames (totalLength prefix + headerLength-marked
 // header + body) and hands each to dispatch. It unwinds on running=false,
-// peer EOF, a bad frame length or any read error; the defer always runs the
-// connection-lost bookkeeping with its own connID.
+// peer EOF, a bad frame length, a frame dispatch cannot decode, or any read
+// error; the defer always runs the connection-lost bookkeeping with its own
+// connID. Every successful read refreshes the connection's activity stamp.
 func (c *RemotingClient) readLoop(conn *connection) {
 	defer func() {
 		conn.alive.Store(false)
@@ -606,6 +838,7 @@ func (c *RemotingClient) readLoop(conn *connection) {
 		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
 			return
 		}
+		conn.touch()
 		total := int32(binary.BigEndian.Uint32(lenBuf[:]))
 		if total <= 0 || total > MaxFrameLength {
 			common.LogWarnf("remoting: bad frame length %d from %s", total, conn.addr)
@@ -616,18 +849,28 @@ func (c *RemotingClient) readLoop(conn *connection) {
 		if _, err := io.ReadFull(reader, frame[4:]); err != nil {
 			return
 		}
-		c.dispatch(conn.addr, frame)
+		conn.touch()
+		// A frame the client cannot decode means the length-prefixed stream is no
+		// longer aligned, so every later frame would be read from the wrong offset:
+		// the connection goes, the same way a peer EOF takes it (its in-flight
+		// requests fail fast, other connections are untouched).
+		if err := c.dispatch(conn.addr, frame); err != nil {
+			common.LogErrorf("remoting: undecodable frame from %s, closing the connection: %v",
+				conn.addr, err)
+			return
+		}
 	}
 }
 
 // dispatch routes one decoded frame: responses pop the pending table by
 // opaque, requests go to the processor table. A processor panic must not kill
-// the read loop — answer SYSTEM_ERROR, the protocol's exception guard.
-func (c *RemotingClient) dispatch(addr string, frame []byte) {
+// the read loop — answer SYSTEM_ERROR, the protocol's exception guard. A header
+// that cannot be decoded is returned to the read loop, which closes the
+// connection.
+func (c *RemotingClient) dispatch(addr string, frame []byte) error {
 	cmd, err := Decode(frame)
 	if err != nil {
-		common.LogWarnf("remoting: failed to decode frame from %s: %v", addr, err)
-		return
+		return err
 	}
 	opaque := cmd.Opaque
 	c.mu.Lock()
@@ -644,21 +887,22 @@ func (c *RemotingClient) dispatch(addr string, frame []byte) {
 		case call.ch <- cmd:
 		default:
 		}
-		return
+		return nil
 	}
 	if cmd.IsResponseType() {
 		common.LogWarnf("remoting: response for unknown opaque %d from %s", opaque, addr)
-		return
+		return nil
 	}
 	c.procMu.RLock()
 	proc := c.processors[cmd.Code]
 	c.procMu.RUnlock()
 	if proc == nil {
 		common.LogWarnf("remoting: no processor for request code %d (opaque %d) from %s", cmd.Code, opaque, addr)
-		return
+		return nil
 	}
 	sink := &ResponseSink{client: c, addr: addr, opaque: opaque, wantsReply: !cmd.IsOnewayRPC()}
 	c.safeProcess(proc, cmd, addr, sink)
+	return nil
 }
 
 func (c *RemotingClient) safeProcess(proc ProcessorFunc, request *RemotingCommand, addr string, sink *ResponseSink) {

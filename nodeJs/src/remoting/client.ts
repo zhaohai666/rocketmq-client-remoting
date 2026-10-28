@@ -12,6 +12,10 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('remoting.client');
 const MAX_FRAME_LENGTH = 16 * 1024 * 1024;
+// Idle-connection close default: a connection that has neither read nor written
+// for this long is swept away. A configured value that is not positive falls back
+// to this default (it does not disable the sweep).
+const DEFAULT_MAX_IDLE_TIME_MILLIS = 120 * 1000;
 
 interface ResponseFuture {
   opaque: number;
@@ -44,6 +48,13 @@ export class RemotingClient {
   connectTimeoutMillis = 3000;
   invokeTimeoutMillis = 15000;
   enableReconnectForGoAway = true;
+  // Idle-connection close limit, in milliseconds (120 s by default). A value <= 0
+  // falls back to the default rather than disabling the sweep.
+  maxIdleTimeMillis = DEFAULT_MAX_IDLE_TIME_MILLIS;
+  // When a synchronous invoke's own wait times out, close the connection first.
+  // A port that does not subtract the connect cost effectively always closes for
+  // any positive timeout; the flag is the master switch for that behaviour.
+  closeSocketOnSyncTimeout = true;
   tlsEnable = false;
   tlsOptions: TlsOptions | null = null;
   socksProxyConfig: SocksProxyConfig | null = null;
@@ -54,10 +65,18 @@ export class RemotingClient {
   private processors = new Map<number, (cmd: RemotingCommand, addr: string) => RemotingCommand | null | Promise<RemotingCommand | null>>();
   private running = true;
   private connectPromises = new Map<string, Promise<any>>();
+  // Per-connection last-activity stamp (address -> epoch millis), refreshed on
+  // every successful read and every completed write; consumed by the idle sweep.
+  private lastActivity = new Map<string, number>();
+  // The idle sweep timer. It is unref()'d so it never keeps a test process alive,
+  // and cleared on shutdown.
+  private idleSweepTimer: NodeJS.Timeout | null = null;
 
-  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; tlsEnable?: boolean; tlsOptions?: TlsOptions | null; socksProxyConfig?: SocksProxyConfig | null } = {}) {
+  constructor(opts: { connectTimeoutMillis?: number; invokeTimeoutMillis?: number; maxIdleTimeMillis?: number; closeSocketOnSyncTimeout?: boolean; tlsEnable?: boolean; tlsOptions?: TlsOptions | null; socksProxyConfig?: SocksProxyConfig | null } = {}) {
     if (opts.connectTimeoutMillis != null) this.connectTimeoutMillis = opts.connectTimeoutMillis;
     if (opts.invokeTimeoutMillis != null) this.invokeTimeoutMillis = opts.invokeTimeoutMillis;
+    if (opts.maxIdleTimeMillis != null) this.maxIdleTimeMillis = opts.maxIdleTimeMillis;
+    if (opts.closeSocketOnSyncTimeout != null) this.closeSocketOnSyncTimeout = opts.closeSocketOnSyncTimeout;
     if (opts.tlsEnable != null) this.tlsEnable = opts.tlsEnable;
     else {
       const e = (process.env['ROCKETMQ_TLS_ENABLE'] || '').trim().toLowerCase();
@@ -153,6 +172,8 @@ export class RemotingClient {
       }
       this.conns.set(addr, sock);
       this.buffers.set(addr, Buffer.alloc(0));
+      this.lastActivity.set(addr, Date.now());
+      this._ensureIdleSweep();
       sock.on('data', (chunk: Buffer) => this._onData(addr, sock, chunk));
       sock.on('close', () => this._onClose(addr, sock));
       sock.on('error', (e: Error) => { logger.debug('socket error %s: %s', addr, (e as Error).message); });
@@ -164,56 +185,98 @@ export class RemotingClient {
   }
 
   isChannelWritable(addr: string): boolean {
+    // "No connection yet" is not "cannot write": an absent or already-closed
+    // socket reports writable (there is nothing to block on). Only a live socket
+    // whose outbound buffer has hit the backpressure watermark is unwritable.
     const c = this.conns.get(addr);
-    return !!c && !c.destroyed;
+    if (c == null || c.destroyed) return true;
+    return !(c.writableNeedDrain === true || c.writableLength > c.writableHighWaterMark);
   }
   closeChannel(addr: string) {
     const c = this.conns.get(addr);
     this.conns.delete(addr);
     this.buffers.delete(addr);
+    this.lastActivity.delete(addr);
     if (c && !c.destroyed) c.destroy();
+  }
+
+  // Take down exactly this socket the way a peer close does: destroying it fires
+  // 'close' -> _onClose -> _failFast, so its pending entries fail fast while other
+  // connections stay put.
+  private _closeSocketForFrameError(sock: any) {
+    try { if (sock && !sock.destroyed) sock.destroy(); } catch { /* ignore */ }
   }
 
   // ---------------- read loop ----------------
   private _onData(addr: string, sock: any, chunk: Buffer) {
+    this.lastActivity.set(addr, Date.now());
     let buf = this.buffers.get(addr) || Buffer.alloc(0);
     buf = Buffer.concat([buf, chunk]);
     for (;;) {
       if (buf.length < 4) break;
       const totalLen = buf.readInt32BE(0);
-      if (totalLen <= 0 || totalLen > MAX_FRAME_LENGTH) { buf = Buffer.alloc(0); break; }
+      if (totalLen <= 0 || totalLen > MAX_FRAME_LENGTH) {
+        // A bad length prefix desynchronises the whole stream, so it is not
+        // trustworthy: log and take the connection down like a peer close.
+        logger.error('illegal frame length %d from %s (must be 1..%d), closing connection', totalLen, addr, MAX_FRAME_LENGTH);
+        this.buffers.set(addr, Buffer.alloc(0));
+        this._closeSocketForFrameError(sock);
+        return;
+      }
       if (buf.length < 4 + totalLen) break;
       const frame = buf.subarray(0, 4 + totalLen);
       buf = buf.subarray(4 + totalLen);
-      this._dispatch(Buffer.from(frame), addr, sock);
+      if (!this._dispatch(Buffer.from(frame), addr, sock)) return;
     }
     this.buffers.set(addr, buf);
   }
 
   private _onClose(addr: string, sock: any) {
-    this.conns.delete(addr);
-    this.buffers.delete(addr);
+    // Only drop the pooled entry if it still points at the socket that closed;
+    // a reconnect to the same address must not be clobbered by the old socket's
+    // late 'close'. The socket-bound fail-fast runs regardless.
+    if (this.conns.get(addr) === sock) {
+      this.conns.delete(addr);
+      this.buffers.delete(addr);
+      this.lastActivity.delete(addr);
+    }
     this._failFast(addr, sock);
   }
 
-  private _dispatch(frame: Buffer, addr: string, sock: any) {
+  // Returns true when the connection is still usable, false when this frame tore
+  // the connection down and the read loop must stop.
+  private _dispatch(frame: Buffer, addr: string, sock: any): boolean {
     let cmd: RemotingCommand;
-    try { cmd = RemotingCommand.decode(frame); } catch (e) { return; }
+    try { cmd = RemotingCommand.decode(frame); }
+    catch (e) {
+      // The bytes no longer line up with the frame boundaries, so nothing that arrives
+      // after this frame on this stream can be trusted: report it and take the
+      // connection down the way a peer close does, leaving the other connections alone.
+      logger.error('decode response failed from %s (%s bytes): %s, closing connection',
+        addr, frame.length, (e instanceof Error ? e.message : String(e)));
+      this.buffers.set(addr, Buffer.alloc(0));
+      this._closeSocketForFrameError(sock);
+      return false;
+    }
     if (cmd.isResponseType()) {
       const fut = this.responseTable.get(cmd.opaque);
       if (fut) {
         this.responseTable.delete(cmd.opaque);
         fut.conn = sock;
         this._complete(fut, cmd);
+      } else {
+        // No pending request owns this opaque: drop it, keep the connection, but
+        // say so instead of swallowing it in silence.
+        logger.warning('receive response, but not matched any request: opaque=%s, addr=%s', cmd.opaque, addr);
       }
-      return;
+      return true;
     }
     const fut = this.responseTable.get(cmd.opaque);
     if (fut) {
       this.responseTable.delete(cmd.opaque);
       fut.conn = sock;
       this._complete(fut, cmd);
-      return;
+      return true;
     }
     const handler = this.processors.get(cmd.code);
     if (handler) {
@@ -228,6 +291,7 @@ export class RemotingClient {
     } else {
       logger.debug('no processor for request code %s (opaque=%s) from %s', cmd.code, cmd.opaque, addr);
     }
+    return true;
   }
 
   registerProcessor(requestCode: number, handler: (cmd: RemotingCommand, addr: string) => RemotingCommand | null | Promise<RemotingCommand | null>) {
@@ -262,7 +326,7 @@ export class RemotingClient {
     await new Promise<void>((resolve, reject) => {
       sock.write(data, (err?: Error) => {
         if (err) reject(err);
-        else resolve();
+        else { this.lastActivity.set(addr, Date.now()); resolve(); }
       });
     });
     return sock;
@@ -303,6 +367,17 @@ export class RemotingClient {
     return retry;
   }
 
+  // Whether a sync invoke that hits its own deadline should close the connection.
+  // Gated by the master flag and by the time still available when the wait began:
+  // close unless that budget is both <= 100 ms and <= timeout / 4. This client
+  // schedules the deadline as a plain setTimeout(timeout) and does not subtract the
+  // connect cost, so the budget when the wait began is the whole timeout.
+  private _shouldCloseOnSyncTimeout(timeoutMillis: number): boolean {
+    if (!this.closeSocketOnSyncTimeout) return false;
+    const left = timeoutMillis;
+    return !(left <= 100 && left <= timeoutMillis / 4);
+  }
+
   private _invokeOnce(addr: string, request: RemotingCommand, timeout: number): Promise<RemotingCommand> {
     return new Promise((resolve, reject) => {
       const fut: ResponseFuture = {
@@ -311,9 +386,13 @@ export class RemotingClient {
       };
       this.responseTable.set(request.opaque, fut);
       fut.timer = setTimeout(() => {
-        if (this.responseTable.delete(request.opaque)) {
-          reject(new RemotingTimeoutException(addr, timeout));
+        if (!this.responseTable.delete(request.opaque)) return;
+        if (this._shouldCloseOnSyncTimeout(timeout)) {
+          logger.warning('invokeSync timed out, closing connection to %s (opaque=%s)', addr, request.opaque);
+          this.closeChannel(addr);
         }
+        logger.warning('invokeSync request expired: addr=%s, opaque=%s, timeoutMillis=%s', addr, request.opaque, timeout);
+        reject(new RemotingTimeoutException(addr, timeout));
       }, timeout);
       this._send(addr, request).then((sock) => {
         fut.conn = sock;
@@ -321,6 +400,9 @@ export class RemotingClient {
       }).catch((e) => {
         this.responseTable.delete(request.opaque);
         if (fut.timer) clearTimeout(fut.timer);
+        logger.warning('invokeSync send to %s failed, tearing down the connection: %s',
+          addr, (e instanceof Error ? e.message : String(e)));
+        this.closeChannel(addr);
         reject(e instanceof Error ? e : new RemotingSendRequestException(addr, String(e)));
       });
     });
@@ -350,6 +432,7 @@ export class RemotingClient {
     this.responseTable.set(request.opaque, fut);
     fut.timer = setTimeout(() => {
       if (!this.responseTable.delete(request.opaque)) return;
+      logger.warning('invokeAsync request expired: addr=%s, opaque=%s, timeoutMillis=%s', addr, request.opaque, timeout);
       // This body runs on Node's timer stack: a throw from the caller's callback
       // would surface as an uncaughtException and kill the process, so it must not
       // escape here.
@@ -400,8 +483,44 @@ export class RemotingClient {
     return doomed.length;
   }
 
+  // ---------------- idle connection sweep ----------------
+  // The effective idle limit: a non-positive configured value falls back to the
+  // default (it does not disable the sweep — the sweep is always installed).
+  private _idleLimitMillis(): number {
+    return this.maxIdleTimeMillis > 0 ? this.maxIdleTimeMillis : DEFAULT_MAX_IDLE_TIME_MILLIS;
+  }
+
+  // Install the sweep once, lazily, on the first connection. The interval is a
+  // fraction of the idle limit so detection is prompt for small limits yet cheap for
+  // the 120 s default. unref() keeps a test process from hanging on this timer.
+  private _ensureIdleSweep() {
+    if (this.idleSweepTimer != null || !this.running) return;
+    const tick = Math.max(200, Math.floor(this._idleLimitMillis() / 4));
+    const timer = setInterval(() => this._sweepIdleConnections(), tick);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.idleSweepTimer = timer;
+  }
+
+  // Close any connection idle strictly past the configured limit, WARNing the
+  // address; the close goes through the peer-close route (destroy -> 'close' ->
+  // _onClose -> _failFast), so its pending entries fail fast and other connections
+  // are untouched.
+  private _sweepIdleConnections() {
+    const limit = this._idleLimitMillis();
+    const now = Date.now();
+    for (const [addr, sock] of this.conns) {
+      const last = this.lastActivity.get(addr);
+      if (last == null) { this.lastActivity.set(addr, now); continue; }
+      if (now - last > limit) {
+        logger.warning('closing idle connection to %s: no traffic for %s ms (limit %s ms)', addr, now - last, limit);
+        try { if (!sock.destroyed) sock.destroy(); } catch { /* ignore */ }
+      }
+    }
+  }
+
   shutdown() {
     this.running = false;
+    if (this.idleSweepTimer != null) { clearInterval(this.idleSweepTimer); this.idleSweepTimer = null; }
     for (const fut of this.responseTable.values()) {
       if (fut.timer) clearTimeout(fut.timer);
     }
@@ -411,6 +530,7 @@ export class RemotingClient {
     }
     this.conns.clear();
     this.buffers.clear();
+    this.lastActivity.clear();
   }
 }
 

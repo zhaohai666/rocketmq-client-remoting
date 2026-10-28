@@ -6,9 +6,17 @@ opaque-keyed callback dispatch, timeout control, connection liveness probing, GO
 reconnect-and-resend, and immediate failure of in-flight requests on a connection when that
 connection drops (fail-fast).
 
-Idle name-server connections are not periodically swept (no channelNotActiveInterval=60s-style scan):
-when the peer really disconnects the reader thread sees EOF immediately, and lazy cleanup already
-covers the real scenario.
+Each connection carries a last-activity stamp, refreshed on every successful socket read and on
+every completed write. The thread that reclaims expired in-flight requests also watches those
+stamps and closes any connection that has carried no traffic at all for strictly longer than
+channel_not_active_interval_millis (default 120 s), logging one WARN per closed connection, so an
+all-quiet connection cannot sit in the connection table indefinitely. A connection whose incoming
+bytes no longer fit the framing rules -- a length header outside the allowed range, or a frame
+whose header cannot be decoded -- is taken down the same way a peer EOF takes it down: the read
+loop ends, the socket closes, the in-flight requests still on that connection fail fast, and the
+other connections keep working. A response whose opaque is not in the in-flight table is dropped
+with a WARN naming it, and a synchronous invoke whose wait runs out closes that connection before
+the timeout is raised (unless enable_close_channel_on_sync_timeout is turned off).
 """
 from __future__ import annotations
 
@@ -32,6 +40,16 @@ logger = get_logger()
 
 MAX_FRAME_LENGTH = 16 * 1024 * 1024
 
+# Default idle limit of one connection. A connection that has had neither a successful socket
+# read nor a completed write for strictly longer than this is closed by the sweep thread.
+DEFAULT_CHANNEL_NOT_ACTIVE_INTERVAL_MILLIS = 120 * 1000
+# Tick of the sweep thread: it reclaims expired in-flight requests and idle connections.
+_SWEEP_INTERVAL_SECONDS = 0.1
+# A synchronous request that ran out of time closes its connection, unless the budget its wait
+# started with was tiny: below both floors a reconnect would not have finished in the leftover
+# time anyway, so the connection is kept.
+MIN_LEFT_MILLIS_TO_CLOSE_ON_SYNC_TIMEOUT = 100.0
+
 # Poll interval for the reader thread waiting on data. Even when a connection stays quiet, "I should close" must be noticed within this second.
 _READ_POLL_SECONDS = 1.0
 # Upper bound for waiting on the TLS close_notify: a peer that never sends close_notify must not hang the close path.
@@ -45,6 +63,19 @@ _SHUTDOWN_JOIN_SECONDS = 5.0
 # rather than the wall clock.
 def _mono_millis() -> float:
     return time.monotonic() * 1000.0
+
+
+def _interval_millis_or_default(value, default_millis: int) -> int:
+    """Normalize a configured idle interval: a finite positive number of milliseconds is kept,
+    anything else (missing, non-numeric, zero, negative) falls back to the default.
+
+    The sweep is always installed, so no configured value switches it off.
+    """
+    try:
+        millis = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return default_millis
+    return millis if millis > 0 else default_millis
 
 
 def _retry_request(request: RemotingCommand) -> RemotingCommand:
@@ -196,12 +227,21 @@ class RemotingClient:
                  tls_enable: Optional[bool] = None,
                  tls_options: Optional[Dict[str, str]] = None,
                  enable_reconnect_for_go_away: bool = True,
-                 socks_proxy_config: Optional[SocksProxyConfig] = None):
+                 socks_proxy_config: Optional[SocksProxyConfig] = None,
+                 channel_not_active_interval_millis: int = DEFAULT_CHANNEL_NOT_ACTIVE_INTERVAL_MILLIS,
+                 enable_close_channel_on_sync_timeout: bool = True):
         self.connect_timeout_millis = connect_timeout_millis
         self.invoke_timeout_millis = invoke_timeout_millis
         # Whether to switch to another connection and resend once when
         # ResponseCode.GO_AWAY(1500) arrives (default **true**).
         self.enable_reconnect_for_go_away = enable_reconnect_for_go_away
+        # How long a connection may carry no traffic at all before the sweep thread closes it
+        # (a non-positive configured value falls back to the 120 s default).
+        self.channel_not_active_interval_millis = _interval_millis_or_default(
+            channel_not_active_interval_millis, DEFAULT_CHANNEL_NOT_ACTIVE_INTERVAL_MILLIS)
+        # Whether a synchronous invoke whose wait ran out also closes the connection it was
+        # sent on (default **true**); see _close_channel_after_sync_timeout for the floors.
+        self.enable_close_channel_on_sync_timeout = bool(enable_close_channel_on_sync_timeout)
         # TLS switch. An explicit argument wins, otherwise the ROCKETMQ_TLS_ENABLE
         # environment variable is read (equivalent to the broker-side
         # tls.enable system property).
@@ -223,12 +263,14 @@ class RemotingClient:
         self._sock_locks: Dict[str, threading.Lock] = {}
         self._response_table: Dict[int, _ResponseFuture] = {}
         self._response_lock = threading.Lock()
-        # In-flight request timeout sweeping: periodically scan the in-flight table,
-        # reclaim expired requests and deliver their failure callbacks.
+        # In-flight request timeout sweeping and idle connection sweeping share one thread, which
+        # periodically scans the in-flight table, reclaims expired requests and delivers their
+        # failure callbacks, and closes connections that have carried no traffic for too long.
         # Without it an asynchronous request that never gets a response hangs forever:
-        # the entry leaks in the table and the callback never fires.
-        # The thread only starts on the first invoke_async, so purely synchronous
-        # usage leaves no thread behind.
+        # the entry leaks in the table and the callback never fires, and a connection that goes
+        # quiet stays in the connection table until the operating system reaps it.
+        # The thread starts on the first connection or the first invoke_async, so a client that
+        # never connected anywhere leaves no thread behind.
         self._sweeper_lock = threading.Lock()
         self._sweeper_stop = threading.Event()
         self._sweeper_thread: Optional[threading.Thread] = None
@@ -240,11 +282,20 @@ class RemotingClient:
         # Per-connection "should exit" flag: the reader thread uses it to wind down and
         # close the socket without blocking itself forever
         self._conn_stops: Dict[str, threading.Event] = {}
+        # Per-connection last-activity stamp (monotonic milliseconds), refreshed by the reader
+        # thread on every successful socket read and by the write path on every completed write;
+        # the sweep thread compares it against channel_not_active_interval_millis. Single-key
+        # assignment/read is atomic here, so this dict is used lock-free.
+        self._conn_last_active: Dict[str, float] = {}
         # Broker-initiated request processors: request_code -> handler(cmd, addr) -> None
         self._processors: Dict[int, Callable] = {}
 
     # ---------- connection management ----------
     def _get_or_create_conn(self, addr: str) -> socket.socket:
+        # Idle connections are reclaimed by the sweep thread, and a connection can also be
+        # created by a purely synchronous call, so the thread is started here rather than only
+        # on the first invoke_async.
+        self._ensure_sweeper()
         with self._lock:
             conn = self._conns.get(addr)
             if conn is not None and self._is_alive(conn):
@@ -252,6 +303,7 @@ class RemotingClient:
             sock = self._create_conn(addr)
             self._conns[addr] = sock
             self._sock_locks[addr] = threading.Lock()
+            self._conn_last_active[addr] = _mono_millis()
             stop = threading.Event()
             self._conn_stops[addr] = stop
             # Plaintext connections spawn the reader thread right away; TLS connections
@@ -379,6 +431,7 @@ class RemotingClient:
         self._start_reader(addr)
         with self._lock:
             self._conns.pop(addr, None)
+            self._conn_last_active.pop(addr, None)
             stop = self._conn_stops.pop(addr, None)
             thread = self._reader_threads.pop(addr, None)
         if stop is not None:
@@ -391,14 +444,26 @@ class RemotingClient:
             thread.join(timeout=2 * _READ_POLL_SECONDS + _TLS_SHUTDOWN_TIMEOUT_SECONDS)
 
     def is_channel_writable(self, addr: str) -> bool:
+        """Whether a request sent to ``addr`` right now can go out on the wire.
+
+        An address with no connection reports True: this transport connects on demand, so "not
+        connected yet" is not "cannot write" -- the next send simply creates the connection. The
+        same holds for a connection that is no longer usable (closed, or its peer gone): the next
+        send replaces it. Only an existing connection that is still live and whose outbound side
+        currently has no room for more data reports False.
+        """
         conn = self._conns.get(addr)
         if conn is None:
-            return False
+            return True
         try:
             conn.getpeername()
-            return True
         except OSError:
-            return False
+            return True
+        try:
+            _, writable, _ = select.select([], [conn], [], 0)
+        except (OSError, ValueError):
+            return True
+        return bool(writable)
 
     # ---------- read loop ----------
     @staticmethod
@@ -456,23 +521,35 @@ class RemotingClient:
                     break
                 if not chunk:
                     break
+                self._conn_last_active[addr] = _mono_millis()
                 buf += chunk
                 while True:
                     if len(buf) < 4:
                         break
                     (total_len,) = struct.unpack_from(">i", bytes(buf), 0)
                     if total_len <= 0 or total_len > MAX_FRAME_LENGTH:
-                        buf.clear()
-                        break
+                        # A length header outside the framing range does not desynchronise only
+                        # this frame: every byte after it belongs to an unknown frame boundary,
+                        # so the stream is no longer trustworthy and the connection goes.
+                        logger.error(
+                            "remoting: frame length header %d from %s is outside the accepted range "
+                            "(1..%d), closing the connection", total_len, addr, MAX_FRAME_LENGTH)
+                        return
                     if len(buf) < 4 + total_len:
                         break
                     frame = bytes(buf[:4 + total_len])
                     del buf[:4 + total_len]
-                    self._dispatch(frame, addr)
+                    if not self._dispatch(frame, addr):
+                        # _dispatch already logged why: stop serving this connection. The finally
+                        # block below runs the same teardown a peer EOF runs.
+                        return
         finally:
             with self._lock:
                 if self._conns.get(addr) is sock:
                     self._conns.pop(addr, None)
+                    # Only this connection's stamp: an address that already has a replacement
+                    # connection must keep the stamp the new one wrote.
+                    self._conn_last_active.pop(addr, None)
                 if self._reader_threads.get(addr) is threading.current_thread():
                     self._reader_threads.pop(addr, None)
                     self._conn_stops.pop(addr, None)
@@ -481,11 +558,19 @@ class RemotingClient:
             # instead of making the caller wait out the full timeout (fail-fast)
             self._fail_fast(addr, sock)
 
-    def _dispatch(self, frame: bytes, addr: str) -> None:
+    def _dispatch(self, frame: bytes, addr: str) -> bool:
+        """Handle one complete frame from ``addr``; False means this connection must be taken down.
+
+        A header that does not decode is reported rather than skipped: the frame arrived inside a
+        valid length prefix, so the peer and this client no longer agree on the protocol, and
+        keeping the socket would leave every later frame of that connection misinterpreted.
+        """
         try:
             cmd = RemotingCommand.decode(frame)
-        except Exception:
-            return
+        except Exception as e:
+            logger.error("remoting: cannot decode frame from %s (%d byte(s)): %s; "
+                         "closing the connection", addr, len(frame), e, exc_info=True)
+            return False
         if cmd.is_response_type():
             future = None
             with self._response_lock:
@@ -494,7 +579,14 @@ class RemotingClient:
                 future.put_response(cmd)
                 self._apply_after_response_hooks(addr, future.request, cmd)
                 future.execute_invoke_callback()
-            return
+            else:
+                # Nobody is waiting for this opaque: it was already reclaimed (the caller timed
+                # out, or the sweep thread removed the entry) or this client never sent such a
+                # request. Nothing to deliver, so drop it -- but log it, otherwise the frame
+                # disappears from this connection without a trace.
+                logger.warning("remoting: response from %s has no in-flight request to answer "
+                               "(opaque=%s, code=%s), dropping it", addr, cmd.opaque, cmd.code)
+            return True
         # Non-response command: a request initiated by the broker (such as
         # CHECK_TRANSACTION_STATE=39). The opaque of such a request is generated by
         # the broker and never appears in the local in-flight table, so treat it as
@@ -508,7 +600,7 @@ class RemotingClient:
             future.put_response(cmd)
             self._apply_after_response_hooks(addr, future.request, cmd)
             future.execute_invoke_callback()
-            return
+            return True
         handler = self._processors.get(cmd.code)
         if handler is not None:
             # The handler **may** return a response command. The typical case that needs one
@@ -529,6 +621,7 @@ class RemotingClient:
         else:
             logger.debug("no processor registered for request code %s (opaque=%s) from %s",
                          cmd.code, cmd.opaque, addr)
+        return True
 
     def register_processor(self, request_code: int,
                            handler: Callable[["RemotingCommand", str], Optional[RemotingCommand]]) -> None:
@@ -643,6 +736,9 @@ class RemotingClient:
                     raise RemotingSendRequestException(addr)
                 except AttributeError:
                     raise RemotingSendRequestException(addr)
+                # A completed write counts as activity on this connection: a connection that is
+                # still being written to is not an idle one, however little comes back.
+                self._conn_last_active[addr] = _mono_millis()
         finally:
             self._start_reader(addr)
 
@@ -709,8 +805,32 @@ class RemotingClient:
             # producer's failure classification).
             if future.cause is not None:
                 raise future.cause
+            self._close_channel_after_sync_timeout(addr, request, timeout)
+            logger.warning("remoting: synchronous invoke to %s timed out (opaque=%s, timeoutMillis=%s)",
+                           addr, request.opaque, timeout)
             raise RemotingTimeoutException(addr, timeout)
         return response
+
+    def _close_channel_after_sync_timeout(self, addr: str, request: RemotingCommand,
+                                          timeout_millis: int) -> None:
+        """A synchronous invoke that ran out of time also drops the connection it was sent on.
+
+        Both floors below compare against the time the wait was handed when it began. This
+        transport does not subtract the connect and write cost from the configured budget, so the
+        wait always starts with the whole of it: the leftover then equals ``timeout_millis``, the
+        second floor is out of reach for any positive budget, and a positive timeout therefore
+        always closes. A budget of zero or less is the one shape that keeps the connection, and
+        such a request was never going to be answered anyway.
+        """
+        if not self.enable_close_channel_on_sync_timeout:
+            return
+        left_millis = float(timeout_millis)
+        if (left_millis <= MIN_LEFT_MILLIS_TO_CLOSE_ON_SYNC_TIMEOUT
+                and left_millis <= timeout_millis / 4.0):
+            return
+        logger.warning("remoting: synchronous invoke to %s timed out (opaque=%s, timeoutMillis=%s), "
+                       "closing the connection", addr, request.opaque, timeout_millis)
+        self.close_channel(addr)
 
     def invoke_async(self, addr: str, request: RemotingCommand,
                      callback: Callable[[Optional[RemotingCommand], Optional[BaseException]], None],
@@ -780,7 +900,7 @@ class RemotingClient:
         except BaseException as retry_error:  # noqa: BLE001 - callback contract: errors must also go through the error argument
             callback(None, retry_error)
 
-    # ---------- in-flight request timeout sweeping ----------
+    # ---------- sweep thread: expired in-flight requests and idle connections ----------
     def _ensure_sweeper(self) -> None:
         with self._sweeper_lock:
             if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
@@ -799,12 +919,17 @@ class RemotingClient:
             thread.join(timeout=2.0)
 
     def _sweep_loop(self) -> None:
-        while not self._sweeper_stop.wait(0.1):
+        while not self._sweeper_stop.wait(_SWEEP_INTERVAL_SECONDS):
             try:
                 self._sweep_expired()
             except Exception as e:
                 logger.warning("remoting: response sweep failed: %s" % e)
+            try:
+                self._sweep_idle_connections()
+            except Exception as e:
+                logger.warning("remoting: idle connection sweep failed: %s" % e)
 
+    # ---------- in-flight request timeout sweeping ----------
     def _sweep_expired(self) -> None:
         # Decision rule: beginTimestamp + timeoutMillis + 1000 <= now. That 1s grace is the
         # margin left for "the response is already on its way" -- a response that
@@ -825,12 +950,42 @@ class RemotingClient:
                 if removed is not None:
                     expired.append((removed, opaque))
         for f, opaque in expired:
+            # One line per reclaimed entry: the caller of a request that never got an answer has
+            # to be able to find it in the log by address and opaque.
+            logger.warning("remoting: in-flight request to %s expired without a response "
+                           "(opaque=%s, timeoutMillis=%s)", f.addr, opaque, f.timeout_millis)
             error = RemotingTimeoutException(f.addr, f.timeout_millis)
             # The callback must run **outside** _response_lock: callbacks often reach
             # back into the transport or business layers, and calling them while
             # holding the lock races with shutdown for the same lock, or even
             # self-deadlocks.
             f.execute_invoke_callback(error=error)
+
+    # ---------- idle connection sweeping ----------
+    def _sweep_idle_connections(self) -> None:
+        """Close every connection that has been idle strictly longer than the configured limit.
+
+        The stamp is written by this connection's reader thread on each successful socket read and
+        by the write path on each completed write, so an old stamp means the connection carried no
+        traffic in either direction for that whole time. Closing runs through ``close_channel``,
+        which is the same teardown a peer EOF takes: the reader thread ends, the socket is closed
+        by that thread, and any request still in flight on it fails fast.
+        """
+        if self._closed:
+            return
+        limit_millis = self.channel_not_active_interval_millis
+        now = _mono_millis()
+        for addr, last_active in list(self._conn_last_active.items()):
+            idle_millis = now - last_active
+            if idle_millis <= limit_millis:
+                continue
+            if addr not in self._conns:
+                # Already gone (EOF, a write failure, a concurrent close): nothing left to sweep.
+                self._conn_last_active.pop(addr, None)
+                continue
+            logger.warning("remoting: connection to %s has been idle for %.1f s (limit %.1f s), "
+                           "closing it", addr, idle_millis / 1000.0, limit_millis / 1000.0)
+            self.close_channel(addr)
 
     # ---------- fail in-flight requests immediately when a connection breaks (fail-fast) ----------
     def _fail_fast(self, addr: str, sock: socket.socket) -> int:
@@ -908,6 +1063,7 @@ class RemotingClient:
             self._conns.clear()
             self._conn_stops.clear()
             self._reader_threads.clear()
+            self._conn_last_active.clear()
         # Each socket is closed by its own reader thread (TLS must send close_notify
         # first), so here we only wait for them to exit
         for stop in stops:

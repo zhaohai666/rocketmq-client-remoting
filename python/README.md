@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1738 passed, 4 skipped（136.5s）
+.venv/bin/python -m pytest tests/ -q           # 1751 passed, 4 skipped（141.2s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -377,6 +377,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 客户端统计（拉取 TPS/RT、消费 RT、消费成功/失败 TPS）与 `ConsumerRunningInfo`（307） | ✅ |
 | 压缩三后端：zlib（标准库）/ LZ4 / ZSTD | ✅ |
 | TLS（含 mTLS、严格 CA 校验） | ✅ |
+| 连接生命周期：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`is_channel_writable` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有发送缓冲塞满的活连接才报不可写；清扫线程关掉既没有成功读、也没有完成写、静默严格超过 `channel_not_active_interval_millis`（默认 120000；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步调用等满自己的超时后，`enable_close_channel_on_sync_timeout` 开着（默认 true）就关掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论旋钮开合一律关通道 | ✅ |
 | SOCKS 代理（SOCKS4/5、用户名密码子协商、CONNECT 隧道，TLS 可叠加） | ✅ |
 | 动态 NameServer 取址（`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`） | ✅ |
 | 发送延迟故障规避（`set_send_latency_fault_enable`）与主从切换 | ✅ |

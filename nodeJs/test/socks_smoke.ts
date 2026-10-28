@@ -361,8 +361,11 @@ async function testLive(): Promise<void> {
   check('invokeSync through SOCKS5 proxy succeeds', resp.code === ResponseCode.SUCCESS && resp.isResponseType(),
     `code=${resp.code}`);
   check('response body carried through the tunnel', resp.body != null && resp.body.toString().includes('socks-route-ok'));
-  check('proxy saw the CONNECT to the target', p5.connectAttempts === 1 && rc5.isChannelWritable(target.addr),
+  check('proxy saw the CONNECT to the target', p5.connectAttempts === 1,
     `attempts=${p5.connectAttempts}`);
+  // isChannelWritable reports writable for an absent socket too, so it is not a
+  // liveness probe here; the second invoke reusing the tunnel (no new CONNECT) is
+  // what proves the connection survived.
   check('target received exactly one request', target.requests.length === 1, `requests=${target.requests.length}`);
   // A second invoke reuses the tunnel (no new CONNECT).
   await rc5.invokeSync(target.addr, routeRequest());

@@ -26,7 +26,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 个 examples
-cargo test --quiet                              # 1152 passed; 0 failed; 0 ignored（~10s）
+cargo test --quiet                              # 1161 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets --all-features -- -D warnings  # 零 warning 是硬门槛
 ```
 
@@ -249,6 +249,7 @@ ROCKETMQ_TLS_ENABLE=1 cargo run --quiet --example live_producer -- 127.0.0.1:987
 - ✅ remoting 帧 / JSON 与 RocketMQ 二进制双序列化 / 17 段存储格式 + 6 段批量格式
 - ✅ 同步 / 异步 / oneway 传输：半包重组、opaque 匹配、超时、重连、GO_AWAY 换连接重发、
   连接判死快速失败
+- ✅ 传输层的连接生命周期六条，全部是客户端侧行为，每条都有自己的闸门用例：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；可写回答的是 socket 发送缓冲，所以没有活连接的地址是可写的（按需建连），只有活的 socket 塞不下才算不可写；清扫线程关掉既没有成功读、也没有完成写、静默严格超过 `channel_idle_timeout_millis`（默认 120000；配非正数恢复默认，而不是把清扫关掉；每次读和每次写都会重打时间戳）的连接，每个地址一条 WARN；每个过期的在途请求各自一条点名自己 opaque 的 WARN；同步发送等满自己的超时后，`close_socket_on_sync_timeout` 开着（默认 true）就关掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留连接；写本身失败则无论旋钮开合，连接一律拆掉
 - ✅ Producer：上表九种发送形态全覆盖
 - ✅ PushConsumer：长轮询 + POP（`POP_CK` / ACK / CHANGE_INVISIBLE）、顺序、广播、
   重试 / 死信、位点持久化、拉取停摆自愈、POP 的待 ack 欠账闸门（严格大于 `pop_threshold_for_queue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）

@@ -35,6 +35,9 @@ public sealed class RemotingClient : IDisposable
 
     public const int MaxFrameLength = 16 * 1024 * 1024;
 
+    /// <summary>Default idle deadline for a connection that carries no traffic at all.</summary>
+    public const long DefaultChannelIdleTimeoutMillis = 120 * 1000;
+
     private sealed class Connection
     {
         public required string Addr;
@@ -50,6 +53,10 @@ public sealed class RemotingClient : IDisposable
         // thread would push the TLS connection into undefined behavior.
         public readonly object WriteLock = new();
         public volatile bool ReaderDone;
+        // When this connection last carried bytes in either direction, on the same monotonic
+        // clock as Future.MonoNowMs. Zero until the connection is registered: an entry still
+        // being established is not an idle one.
+        public long LastActivityMs;
         // TLS session (non-null when TLS is enabled; reads/writes go through SslStream)
         public SslStream? Tls;
     }
@@ -88,6 +95,7 @@ public sealed class RemotingClient : IDisposable
 
     private readonly object _sweepLock = new();
     private Timer? _sweeper;
+    private long _channelIdleTimeoutMs = DefaultChannelIdleTimeoutMillis;
 
     // Broker-initiated request processor table: requestCode -> handler. Only used for
     // commands like transaction check-back (CHECK_TRANSACTION_STATE=39), i.e. "the server
@@ -218,6 +226,75 @@ public sealed class RemotingClient : IDisposable
     }
 
     public bool EnableReconnectForGoAway { get; set; } = true;
+
+    /// <summary>
+    /// How long a connection may carry no traffic at all before the transport closes it. A value
+    /// that is not positive restores the default rather than switching the sweep off: the sweep
+    /// is always installed, so an unsettable deadline would otherwise mean "reap immediately".
+    /// </summary>
+    public long ChannelIdleTimeoutMillis
+    {
+        get => _channelIdleTimeoutMs;
+        set => _channelIdleTimeoutMs = value > 0 ? value : DefaultChannelIdleTimeoutMillis;
+    }
+
+    /// <summary>
+    /// Whether a synchronous wait that runs out with the response still missing also takes the
+    /// connection down. On by default: nothing else will ever deliver that response, so the stream
+    /// is not trustworthy for the requests behind it.
+    /// </summary>
+    public bool CloseSocketOnSyncTimeout { get; set; } = true;
+
+    /// <summary>
+    /// Close every connection idle strictly longer than ChannelIdleTimeoutMillis and return how
+    /// many went. The transport's own sweeper calls this; the method is public so a test can drive
+    /// one pass.
+    /// </summary>
+    public int SweepIdleConnections()
+    {
+        long limit = _channelIdleTimeoutMs;
+        long now = Future.MonoNowMs();
+        List<Connection>? idle = null;
+        lock (_connMutex)
+        {
+            foreach ((string addr, Connection conn) in _conns)
+            {
+                long last = conn.LastActivityMs;
+                if (last == 0 || now - last <= limit)
+                {
+                    continue;
+                }
+
+                idle ??= new List<Connection>();
+                idle.Add(conn);
+            }
+
+            if (idle is not null)
+            {
+                foreach (Connection conn in idle)
+                {
+                    _conns.Remove(conn.Addr);
+                }
+            }
+        }
+
+        if (idle is null)
+        {
+            return 0;
+        }
+
+        foreach (Connection conn in idle)
+        {
+            ClientLog.Warn("remoting: connection to " + conn.Addr + " idle for "
+                + (now - conn.LastActivityMs).ToString(CultureInfo.InvariantCulture)
+                + " ms (limit " + limit.ToString(CultureInfo.InvariantCulture) + " ms), closing it");
+            // The same route a peer disconnect takes: the reader's Receive throws, it exits,
+            // drops the table entry and failFasts this connection's in-flight requests.
+            CloseFromOutsideWriteLane(conn);
+        }
+
+        return idle.Count;
+    }
 
     public int ConnectTimeoutMillis => _connectTimeoutMillis;
 
@@ -524,6 +601,11 @@ public sealed class RemotingClient : IDisposable
             _conns[addr] = conn;
         }
 
+        // The connection is registered: the idle clock starts here, and the sweeper that reads
+        // that clock has to be running whatever call shape created this connection.
+        conn.LastActivityMs = Future.MonoNowMs();
+        EnsureSweeper();
+
         var reader = new Thread(() =>
         {
             ClientLog.SetThreadName("RemotingClientReader-" + addr);
@@ -548,6 +630,11 @@ public sealed class RemotingClient : IDisposable
         var buf = new MemoryStream();
         byte[] chunk = new byte[65536];
         Socket sock = conn.Sock;
+        // Set when the byte stream stopped lining up with the frame boundaries. Nothing that
+        // arrives after that can be trusted for any later request, so the reader exits and the
+        // normal teardown below takes the connection down -- the same route a peer disconnect
+        // takes.
+        bool streamUntrustworthy = false;
         while (_running)
         {
             int n;
@@ -580,6 +667,8 @@ public sealed class RemotingClient : IDisposable
                 break;
             }
 
+            // Bytes arrived: the connection is not the idle one, whatever happens to them next.
+            conn.LastActivityMs = Future.MonoNowMs();
             buf.Write(chunk, 0, n);
             buf.Flush();
 
@@ -598,11 +687,14 @@ public sealed class RemotingClient : IDisposable
                 int totalLen = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(consumed, 4));
                 if (totalLen <= 0 || totalLen > MaxFrameLength)
                 {
-                    ClientLog.Warn("remoting reader: illegal frame length "
+                    // The length prefix itself is out of range, so the bytes on the stream no
+                    // longer line up with the frame boundaries. This is the same event as an
+                    // undecodable frame one level earlier, and it is reported once, here: what
+                    // follows cannot be attributed to any request, so the connection goes.
+                    ClientLog.Error("remoting reader: illegal frame length "
                         + totalLen.ToString(CultureInfo.InvariantCulture)
-                        + " from " + conn.Addr + ", dropping "
-                        + available.ToString(CultureInfo.InvariantCulture) + " buffered bytes");
-                    consumed = (int)buf.Length;
+                        + " from " + conn.Addr + ", closing the connection");
+                    streamUntrustworthy = true;
                     break;
                 }
 
@@ -614,7 +706,11 @@ public sealed class RemotingClient : IDisposable
                 byte[] frame = new byte[4 + totalLen];
                 Buffer.BlockCopy(data, consumed, frame, 0, 4 + totalLen);
                 consumed += 4 + totalLen;
-                Dispatch(frame, conn.Addr);
+                if (!Dispatch(frame, conn.Addr))
+                {
+                    streamUntrustworthy = true;
+                    break;
+                }
             }
 
             // move the consumed bytes out of the buffer
@@ -628,6 +724,11 @@ public sealed class RemotingClient : IDisposable
 
                 buf.SetLength(rest);
             }
+
+            if (streamUntrustworthy)
+            {
+                break;
+            }
         }
 
         lock (_connMutex)
@@ -638,7 +739,7 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        CloseQuietly(conn);
+        CloseFromOutsideWriteLane(conn);
         FailFast(conn);
         conn.ReaderDone = true;
     }
@@ -696,72 +797,88 @@ public sealed class RemotingClient : IDisposable
         return doomed.Count;
     }
 
-    private void Dispatch(byte[] frame, string from)
+    /// <summary>
+    /// Hand one complete frame to its owner. Returns whether the connection is still usable, i.e.
+    /// false when this frame took the connection down and the reader must stop reading from it.
+    /// </summary>
+    private bool Dispatch(byte[] frame, string from)
     {
         if (!RemotingCommand.TryDecode(frame, out RemotingCommand cmd, out _))
         {
-            ClientLog.Warn("remoting reader: drop undecodable frame ("
-                + frame.Length.ToString(CultureInfo.InvariantCulture) + " bytes) from " + from);
-            return; // undecodable frames are dropped directly, not affecting other requests
+            // The bytes no longer line up with the frame boundaries, so nothing that arrives after
+            // this frame on this stream can be trusted for any later request: report the peer and
+            // take the connection down through the same route a peer disconnect takes.
+            ClientLog.Error("remoting reader: cannot decode frame from " + from + " ("
+                + frame.Length.ToString(CultureInfo.InvariantCulture) + " bytes), closing the connection");
+            return false;
         }
 
         if (!_respTable.TryRemove(cmd.Opaque, out Future? future))
         {
-            // Not found in the in-flight table: either a late response or a **broker-initiated
-            // request**. The latter goes to the registered processor (typically the
-            // transaction check-back CHECK_TRANSACTION_STATE=39).
-            if (!cmd.IsResponseType())
+            if (cmd.IsResponseType())
             {
-                RequestProcessor? proc = null;
-                lock (_procLock)
-                {
-                    _processors.TryGetValue(cmd.Code, out proc);
-                }
-
-                if (proc is not null)
-                {
-                    // The processor runs in the reader thread: exceptions must be caught,
-                    // otherwise the reader thread dies and all other responses on that
-                    // connection are lost (far worse than losing one check-back).
-                    try
-                    {
-                        RemotingCommand? resp = proc(cmd, from);
-                        // The processor produced a response (typically 326 must reply
-                        // SUCCESS/SYSTEM_ERROR; on the broker side it is invokeSync, and it
-                        // times out if no response is sent); echo back the request's opaque
-                        // verbatim and set the response bit.
-                        if (resp is not null)
-                        {
-                            resp.Opaque = cmd.Opaque;
-                            resp.MarkResponseType();
-                            try
-                            {
-                                SendResponse(from, resp);
-                            }
-                            catch (Exception se)
-                            {
-                                ClientLog.Warn("remoting: send processor response for code "
-                                    + cmd.Code.ToString(CultureInfo.InvariantCulture) + " failed: "
-                                    + se.Message);
-                            }
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        ClientLog.Warn("remoting: processor for request code "
-                            + cmd.Code.ToString(CultureInfo.InvariantCulture) + " threw: " + e.Message);
-                    }
-                }
-                else
-                {
-                    // When transactions are not enabled the broker never sends such requests,
-                    // so this is expected; no Warn needed
-                    ClientLog.Debug("remoting: no processor for broker request code "
-                        + cmd.Code.ToString(CultureInfo.InvariantCulture) + " from " + from);
-                }
+                // A response whose opaque is no longer in the in-flight table: the request was
+                // already answered, timed out or failed fast. Dropping it is right, saying so is
+                // what makes a double-answering peer visible; the frame itself was well-formed, so
+                // the connection stays up for the requests still on it.
+                ClientLog.Warn("remoting reader: response from " + from
+                    + " does not match any in-flight request (opaque="
+                    + cmd.Opaque.ToString(CultureInfo.InvariantCulture) + "), dropped");
+                return true;
             }
 
-            return; // late response / already-handled broker request
+            // Missing from the in-flight table and not a response: a **broker-initiated request**.
+            // The latter is taken over by the registered processor (typically the
+            // transaction check-back CHECK_TRANSACTION_STATE=39).
+            RequestProcessor? proc = null;
+            lock (_procLock)
+            {
+                _processors.TryGetValue(cmd.Code, out proc);
+            }
+
+            if (proc is not null)
+            {
+                // The processor runs in the reader thread: exceptions must be caught,
+                // otherwise the reader thread dies and all other responses on that
+                // connection are lost (far worse than losing one check-back).
+                try
+                {
+                    RemotingCommand? resp = proc(cmd, from);
+                    // The processor produced a response (typically 326 must reply
+                    // SUCCESS/SYSTEM_ERROR; on the broker side it is invokeSync, and it
+                    // times out if no response is sent); echo back the request's opaque
+                    // verbatim and set the response bit.
+                    if (resp is not null)
+                    {
+                        resp.Opaque = cmd.Opaque;
+                        resp.MarkResponseType();
+                        try
+                        {
+                            SendResponse(from, resp);
+                        }
+                        catch (Exception se)
+                        {
+                            ClientLog.Warn("remoting: send processor response for code "
+                                + cmd.Code.ToString(CultureInfo.InvariantCulture) + " failed: "
+                                + se.Message);
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    ClientLog.Warn("remoting: processor for request code "
+                        + cmd.Code.ToString(CultureInfo.InvariantCulture) + " threw: " + e.Message);
+                }
+            }
+            else
+            {
+                // When transactions are not enabled the broker never sends such requests,
+                // so this is expected; no Warn needed
+                ClientLog.Debug("remoting: no processor for broker request code "
+                    + cmd.Code.ToString(CultureInfo.InvariantCulture) + " from " + from);
+            }
+
+            return true; // late response / already-handled broker request
         }
 
         InvokeCallback? cb = null;
@@ -778,6 +895,7 @@ public sealed class RemotingClient : IDisposable
 
         future.Done.Set();
         cb?.Invoke(cmd, null);
+        return true;
     }
 
     public void RegisterProcessor(int requestCode, RequestProcessor handler)
@@ -831,6 +949,8 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
+        // The bytes went out: the connection just did real work, so its idle clock restarts here.
+        conn.LastActivityMs = Future.MonoNowMs();
         return conn;
     }
 
@@ -843,7 +963,14 @@ public sealed class RemotingClient : IDisposable
             return;
         }
 
-        Socket sock = conn.Sock;
+        Socket? sock = conn.Sock;
+        if (sock is null)
+        {
+            // A closer outside the write lane unpublished this connection between the lookup and
+            // the lock: the table entry is gone, so this send has no socket to write to.
+            throw new SocketException((int)SocketError.NotConnected);
+        }
+
         int sent = 0;
         while (sent < data.Length)
         {
@@ -881,6 +1008,8 @@ public sealed class RemotingClient : IDisposable
                 throw new RemotingSendRequestException(addr);
             }
         }
+
+        conn.LastActivityMs = Future.MonoNowMs();
     }
 
     // ---------------------------------------------------------------- opaque registration
@@ -920,7 +1049,12 @@ public sealed class RemotingClient : IDisposable
 
     private void UnregisterFuture(int opaque) => _respTable.TryRemove(opaque, out _);
 
-    /// <summary>Starts the timeout sweeper thread (idempotent; only async calls need it).</summary>
+    /// <summary>
+    /// Starts the sweeper thread (idempotent). It reclaims expired in-flight requests, which only
+    /// async calls need, and sweeps idle connections, which every call shape needs -- a client
+    /// that only ever uses InvokeSync / InvokeOneway still has to see its quiet connections
+    /// closed, so the thread is installed when the first connection is registered.
+    /// </summary>
     private void EnsureSweeper()
     {
         lock (_sweepLock)
@@ -930,7 +1064,11 @@ public sealed class RemotingClient : IDisposable
                 return;
             }
 
-            _sweeper = new Timer(_ => SweepExpired(), null, 100, 100);
+            _sweeper = new Timer(_ =>
+            {
+                SweepExpired();
+                SweepIdleConnections();
+            }, null, 100, 100);
         }
     }
 
@@ -1014,6 +1152,12 @@ public sealed class RemotingClient : IDisposable
             // Callbacks must run **outside the in-flight table**: callbacks often go back to
             // the transport or business layer, and invoking while holding the table would
             // race with shutdown for the same lock and may self-deadlock.
+            //
+            // One event, one log line: without this a swept request is invisible, because whether
+            // the business callback logs anything is out of the transport's hands.
+            ClientLog.Warn("remoting: in-flight request to " + f.Addr + " expired (opaque="
+                + opaque.ToString(CultureInfo.InvariantCulture) + ", timeout="
+                + f.TimeoutMs.ToString(CultureInfo.InvariantCulture) + " ms), failed with a timeout");
             cb?.Invoke(null, new RemotingTimeoutException(f.Addr + " async invoke timeout "
                 + f.TimeoutMs.ToString(CultureInfo.InvariantCulture) + " ms, opaque="
                 + opaque.ToString(CultureInfo.InvariantCulture)));
@@ -1060,6 +1204,25 @@ public sealed class RemotingClient : IDisposable
         if (!future.Done.Wait(timeout))
         {
             UnregisterFuture(opaque);
+            // A sync wait that ran out with the response still missing has no evidence the peer is
+            // readable at all: the frame may be lost on the way, and nothing else will ever deliver
+            // it. Both floors below measure the budget the wait was handed when it began -- this
+            // port does not subtract the connect and write cost, so that budget IS the timeout and
+            // the second floor is out of reach for any positive value. A positive timeout therefore
+            // always closes; zero is the one shape that keeps the socket, and such a request was
+            // never going to be answered anyway.
+            long leftMillis = timeout;
+            if (CloseSocketOnSyncTimeout && (leftMillis > 100 || leftMillis > timeout / 4))
+            {
+                ClientLog.Warn("remoting: sync wait to " + addr + " timed out (opaque="
+                    + opaque.ToString(CultureInfo.InvariantCulture) + ", timeout="
+                    + timeout.ToString(CultureInfo.InvariantCulture) + " ms), closing the connection");
+                CloseChannel(addr);
+            }
+
+            ClientLog.Warn("remoting: wait response from " + addr + " timeout, opaque="
+                + opaque.ToString(CultureInfo.InvariantCulture) + ", "
+                + timeout.ToString(CultureInfo.InvariantCulture) + " ms");
             throw new RemotingTimeoutException(addr + " wait response timeout "
                 + timeout.ToString(CultureInfo.InvariantCulture) + " ms, opaque="
                 + opaque.ToString(CultureInfo.InvariantCulture));
@@ -1180,22 +1343,56 @@ public sealed class RemotingClient : IDisposable
         SendRequest(addr, request);
     }
 
-    /// <summary>Whether the connection is alive (liveness probe).</summary>
+    /// <summary>
+    /// Whether this address can take a write right now. The question is about the outbound side,
+    /// not about having connected: an address with no connection is writable (the transport
+    /// connects on demand), and only a live connection whose send buffer is full is not.
+    /// </summary>
     public bool IsChannelWritable(string addr)
     {
+        Socket? sock;
         lock (_connMutex)
         {
-            return _conns.TryGetValue(addr, out Connection? c) && c.Sock is { Connected: true };
+            sock = _conns.TryGetValue(addr, out Connection? c) ? c.Sock : null;
+        }
+
+        if (sock is null)
+        {
+            // "Nothing is open yet" is not "this cannot take data": the next send simply creates
+            // the connection. Same for a table entry whose socket is already gone -- the next send
+            // replaces it.
+            return true;
+        }
+
+        // A live socket: ask the kernel whether it would take a write right now. This is a snapshot
+        // of the send buffer, not a queue-depth watermark, so a live connection that is merely slow
+        // but currently drained still reports writable -- as does one whose peer just died (the
+        // read path is what notices that and takes the channel down). On a TLS connection the probe
+        // sees the underlying socket only, not the crypto layer's own buffers.
+        try
+        {
+            return sock.Poll(0, SelectMode.SelectWrite);
+        }
+        catch (SocketException)
+        {
+            // The probe itself failed: report writable and let the write path (send failure ->
+            // close the connection) decide, rather than refusing the send.
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
         }
     }
 
     private static void CloseQuietly(Connection conn)
     {
         // WriteLock is also the lock for the socket lifetime: the write path closes it under
-        // the lock on failure, and the reader thread's exit path comes through here too, so
-        // there is neither a duplicate Dispose (a second dispose of SslStream/Socket is merely
-        // pointless; closing an already-returned handle again is the truly dangerous part) nor
-        // a window where "one lane is Sending while another yanks the socket away".
+        // the lock on failure, so there is neither a duplicate Dispose (a second dispose of
+        // SslStream/Socket is merely pointless; closing an already-returned handle again is the
+        // truly dangerous part) nor a window where "one lane is Sending while another yanks the
+        // socket away". Only the write lane, which already holds the lock, comes through here --
+        // everything outside it uses CloseFromOutsideWriteLane.
         lock (conn.WriteLock)
         {
             if (conn.Sock is null)
@@ -1225,6 +1422,51 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Close a connection from a thread that does **not** own the write lane: shutdown and the idle
+    /// sweep both come from outside, where taking WriteLock would mean waiting for a thread parked
+    /// inside a blocking Send -- an unbounded hang, since the peer that stopped reading is the very
+    /// reason the send is parked. So unpublish the socket first (the write path then sees no socket
+    /// and the reader sees an invalid one), then wake whatever is blocked on it: the shutdown is
+    /// what turns a parked send or receive into an exception, and the in-flight requests on this
+    /// connection are failFasted by the reader thread's exit path as usual.
+    /// </summary>
+    private static void CloseFromOutsideWriteLane(Connection conn)
+    {
+        Socket? sock = Interlocked.Exchange(ref conn.Sock, null!);
+        if (sock is null)
+        {
+            return; // already unpublished
+        }
+
+        try
+        {
+            sock.Shutdown(SocketShutdown.Both);
+        }
+        catch
+        {
+            // already disconnected
+        }
+
+        try
+        {
+            conn.Tls?.Dispose();
+        }
+        catch
+        {
+            // dispose failure ignored
+        }
+
+        try
+        {
+            sock.Dispose();
+        }
+        catch
+        {
+            // dispose failure ignored
+        }
+    }
+
     /// <summary>Actively closes a single connection; the reader thread exits and cleans up on its own.</summary>
     public void CloseChannel(string addr)
     {
@@ -1238,7 +1480,7 @@ public sealed class RemotingClient : IDisposable
         }
 
         // Closing the socket makes the reader thread's Receive throw immediately and exit on its own
-        CloseQuietly(conn);
+        CloseFromOutsideWriteLane(conn);
     }
 
     /// <summary>Reserved: the NameServer address list is maintained by the upper layer (MQClientInstance).</summary>
@@ -1284,7 +1526,7 @@ public sealed class RemotingClient : IDisposable
         // Closing the socket makes blocked readers exit immediately
         foreach (Connection c in all)
         {
-            CloseQuietly(c);
+            CloseFromOutsideWriteLane(c);
         }
 
         lock (_threadMutex)

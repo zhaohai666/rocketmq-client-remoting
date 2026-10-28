@@ -1,7 +1,7 @@
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use crate::common::util_all::time_to_human_string;
@@ -108,6 +108,12 @@ fn sink() -> &'static Mutex<Sink> {
 
 pub fn level() -> Level {
     config().level
+}
+
+/// The file the sink appends to. It is decided with the rest of the config on the first log line of
+/// the process, so this answers "where did the lines go", it is not a knob.
+pub fn file_path() -> &'static Path {
+    &config().path
 }
 
 pub fn is_enabled(level: Level) -> bool {

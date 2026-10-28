@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1152 passed; 0 failed; 0 ignored (~10s)
+cargo test --quiet                              # 1161 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -270,11 +270,22 @@ verification); for production set it to `false` and configure the system trust c
   + 6-segment batch format
 - ✅ sync / async / oneway transport: half-packet reassembly, opaque matching, timeouts,
   reconnection, GO_AWAY re-establish-and-resend, connection-fatal fast failure
+- ✅ Connection lifecycle on the transport, all six rules client-side and each with its own gate
+  leg: a frame that cannot be decoded logs one ERROR naming the peer and takes that connection
+  down (an out-of-range length prefix is the same event one level earlier, reported once at the
+  level that caught it and never also as a decode failure); a response nobody is waiting for logs
+  one WARN naming its opaque and address and the connection stays up; the writable answer
+  describes the socket's send buffer, so an address with no live connection is writable
+  (connect-on-demand) and only a live socket with no room is not; the sweeper closes a connection
+  that carried neither a successful read nor a completed write for strictly longer than
+  `channel_idle_timeout_millis` (default 120000; a non-positive value restores the default rather
+  than switching the sweep off, and the stamp refreshes on every read and every write) with one
+  WARN per address; every expired in-flight request gets its own WARN naming its opaque; and a
+  sync send whose own wait ran out closes the socket it went out on when
+  `close_socket_on_sync_timeout` is on (default true) — it keeps the socket only when the budget
+  left at the deadline was neither above 100ms nor above a quarter of that timeout; and a write
+  that fails outright takes the connection down, knob or no knob.
 - ✅ Producer: all nine send shapes in the table above
-- ✅ PushConsumer: long polling + POP (`POP_CK` / ACK / CHANGE_INVISIBLE), ordering,
-  broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's
-  outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the
-  pull path's one client-wide flow-control total and warn cadence)
 - ✅ PushConsumer: long polling + POP (`POP_CK` / ACK / CHANGE_INVISIBLE), ordering,
   broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's
   outstanding-ACK gate (strictly above `pop_threshold_for_queue`, default 96, a trip counted on the

@@ -127,7 +127,8 @@ class MQClientInstance:
                  decode_read_body: bool = True,
                  mq_client_api_timeout: int = 3000,
                  enable_concurrent_heartbeat: bool = False,
-                 concurrent_heartbeat_thread_pool_size: Optional[int] = None):
+                 concurrent_heartbeat_thread_pool_size: Optional[int] = None,
+                 channel_not_active_interval_millis: int = 120000):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
         self.poll_name_server_interval = poll_name_server_interval
@@ -151,7 +152,8 @@ class MQClientInstance:
         self._heartbeat_v2 = HeartbeatV2Coordinator(self)
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable, tls_options=tls_options,
-                                              socks_proxy_config=socks_proxy_config)
+                                              socks_proxy_config=socks_proxy_config,
+                                              channel_not_active_interval_millis=channel_not_active_interval_millis)
         self.remoting_client.register_rpc_hook(NamespaceRpcHook(self.namespace_v2))
         if enable_stream_request_type:
             self.remoting_client.register_rpc_hook(StreamTypeRPCHook())

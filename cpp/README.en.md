@@ -50,16 +50,17 @@ cd build && ctest --output-on-failure
 ```
 
 This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq::remoting`),
-71 test binaries and 44 tools under `build/examples/`. Measured on this machine:
+72 test binaries and 44 tools under `build/examples/`. Measured on this machine:
 
 ```
-100% tests passed out of 72
-Total Test time (real) = 165.54 sec   # ctest --output-on-failure, serial
+100% tests passed out of 73
+Total Test time (real) = 148.02 sec   # ctest --output-on-failure, serial
 ```
 
-The 72 cases are the 71 test binaries plus 1 codec-interop case. Assertions are summed from
-each binary's self-reported `N checks, M failures`: running all 71 serially gives **8,299 checks,
-0 failures**; `tests/interop_check.py` adds **73 PASS** — **8,372 assertions in total**.
+The 73 cases are the 72 test binaries plus 1 codec-interop case. Assertions are summed from
+each binary's self-reported `N checks, M failures` (one summary line per binary): running all 72
+serially gives **8,367 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
+**8,440 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -523,6 +524,23 @@ reader thread and the caller's writing thread overlap on the same SSL session).
   message storage format and the 6-segment batch format
 - ✅ Transport: sync / async / oneway, partial-packet reassembly, opaque matching, reconnect,
   GO_AWAY(1500) connection switch with one resend, dead-connection detection, SIGPIPE handling
+- ✅ Connection lifecycle, one offline leg per rule: a frame that does not decode logs exactly one
+  ERROR naming the peer and takes only that connection down (an out-of-range length prefix is the
+  same event one level earlier, reported once at the level that caught it and never also as a
+  decode failure), and the peer's next valid request is served on a fresh connection; a response
+  whose opaque no in-flight request waits on is dropped with one WARNING naming the opaque and the
+  address, and the connection stays up and still serves the next request; `isChannelWritable()`
+  answers for the socket's send buffer, not for having a connection — an address with no
+  connection is writable because the next send connects (and asking creates nothing), a live
+  connection with room is writable, and only a peer that never reads so the buffers fill is the
+  unwritable case; the transport drives its own idle sweep — a connection that stopped carrying
+  traffic for strictly longer than `setChannelIdleTimeoutMillis()` (default 120000; a value <= 0
+  restores the default because the sweep is always installed once a connection exists) is closed
+  with one WARNING naming its address, while one written to every 100ms is never the idle one;
+  each reclaimed in-flight request logs one timeout warning naming its address and is not a
+  connection event; and a synchronous invoke that runs out of time closes the connection it went
+  out on unless `setCloseSocketOnSyncTimeout(false)` turns that off, while a send that fails
+  outright always closes regardless of the switch
 - ✅ TLS: test mode, strict CA verification, mTLS
 - ✅ Producer: normal / FIFO (selector and pinned) / delayed and timer / transactional / batch /
   oneway / true async / async back pressure / automatic batching / request-reply / timer recall /
@@ -679,7 +697,7 @@ cpp/
 │                               admin / mq_client / allocate_strategy / hook / trace /
 │                               request_reply / backpressure / validators / result / exception
 ├── src/                        Implementations mirroring include/ (common / remoting / client)
-├── tests/                      70 test sources + interop_check.py = 71 ctest cases
+├── tests/                      72 test sources + interop_check.py = 73 ctest cases
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 live-cluster tools
 └── tools/                      Windows header preparation and syntax-check scripts
 ```

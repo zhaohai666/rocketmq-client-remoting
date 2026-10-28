@@ -28,7 +28,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1738 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1751 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
@@ -392,6 +392,7 @@ third-party dependencies.
 | Client statistics (pull TPS and RT, consume RT, consume success/failure TPS) and `ConsumerRunningInfo` (307) | ✅ |
 | Three compression backends: zlib (standard library) / LZ4 / ZSTD | ✅ |
 | TLS (mTLS and strict CA verification) | ✅ |
+| Connection lifecycle: an undecodable frame logs one ERROR naming the peer and takes that connection down (an out-of-range length prefix is the same event one level earlier, reported once at the level that caught it); a response no request is waiting on logs one WARN naming its opaque and address and the connection stays up; every expired in-flight request logs its own WARN; `is_channel_writable` answers for the socket's send buffer, not for having a connection — an address with no live connection is writable because the next send connects, only a live socket whose send buffer is full answers false; the sweep thread closes a connection that served neither a read nor a completed write for strictly longer than `channel_not_active_interval_millis` (default 120000; a non-positive value restores the default rather than switching the sweep off) with one WARN per address; a sync wait that runs out closes the connection it went out on when `enable_close_channel_on_sync_timeout` is on (default true) — it keeps it only when the budget left at the deadline is neither above 100ms nor above a quarter of that timeout; a write that fails closes the channel whatever the knobs say | ✅ |
 | SOCKS proxy (SOCKS4/5, username-password sub-negotiation, CONNECT tunnel, TLS stackable) | ✅ |
 | Dynamic NameServer discovery (`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`) | ✅ |
 | Send-latency fault avoidance (`set_send_latency_fault_enable`) and master/slave switching | ✅ |

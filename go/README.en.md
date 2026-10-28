@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 848 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 859 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 528 | 54.3s |
-| `common` | 135 | 3.8s |
-| `remoting` | 185 | 1.6s |
-| **Total** | **848** (76 `*_test.go` files) | ~60s |
+| `client` | 528 | 51.7s |
+| `common` | 135 | 2.4s |
+| `remoting` | 196 | 4.5s |
+| **Total** | **859** (77 `*_test.go` files) | ~59s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -451,6 +451,21 @@ to get full verification.
 - ✅ Transport: connection reuse, half-packet and sticky-packet reassembly, opaque matching,
   timeouts, in-flight requests marked dead the moment the connection dies, `GO_AWAY`, sync /
   async / one-way, TLS
+- ✅ Connection lifecycle, every rule measured offline against a loopback socket this suite owns:
+  a frame that cannot be decoded logs one ERROR naming the peer and takes that connection down (a
+  length prefix outside the accepted range is the same event one level earlier, reported once at
+  the level that caught it and never also as a decode failure); a response no request is waiting
+  on logs one WARN naming its opaque and address and the connection stays up; every expired
+  in-flight request logs its own WARN; `IsChannelWritable` answers for the socket's send buffer,
+  not for having a connection — an address with no live connection is writable because the next
+  send connects, and only a live socket whose write has parked for lack of room answers false; a
+  connection that served neither a read nor a write for strictly longer than
+  `ClientConfig.ChannelIdleTimeoutSeconds` (default 120; a non-positive value restores the default
+  instead of switching the sweep off) is closed by the sweeper with one WARN per address; and a
+  sync invoke whose own wait expired drops the connection it went out on when
+  `ClientConfig.CloseChannelOnSyncTimeout` is on (default true) — it keeps it only when the budget
+  left at the deadline is neither above 100ms nor above a quarter of that timeout. A write that
+  fails outright closes the channel whatever the knobs say.
 - ✅ Security and multi-tenancy: ACL signing (`HmacSHA1`, standard library), both namespace
   schemes, unit mode (`SetUnitName` / `SetUnitMode`), `CheckForbiddenHook`
 - ✅ Compression: ZLIB, LZ4 and ZSTD all send and receive; ZSTD decoding covers the full
@@ -621,7 +636,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   76 test files, 848 test functions
+│   └── *_test.go                   77 test files, 859 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

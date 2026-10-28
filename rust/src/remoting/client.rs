@@ -4,11 +4,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -17,9 +17,28 @@ use crate::error::{Error, Result};
 use crate::remoting::protocol::codes::response_code;
 use crate::remoting::protocol::remoting_command::{next_opaque, RemotingCommand};
 use crate::remoting::rpchook::RPCHook;
-use crate::{rmq_debug, rmq_warn};
+use crate::{rmq_debug, rmq_error, rmq_warn};
 
 pub const MAX_FRAME_LENGTH: i32 = 16 * 1024 * 1024;
+
+/// A connection that carried no traffic for this long is closed by the sweeper.
+/// A configured value that is not positive restores this default instead of switching the sweep off:
+/// a transport that never reaps is not a knob anyone asked for.
+pub const DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS: i64 = 120 * 1000;
+
+/// How often the sweeper looks at the idle clock.
+const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Milliseconds on a clock that only moves forward, so a wall-clock jump cannot mass-close live connections.
+///
+/// One-based on purpose: zero is what an unstamped connection carries, so the first reading of the
+/// process must not look like one, or a connection stamped that early would never age.
+fn mono_now_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    (EPOCH.get_or_init(Instant::now).elapsed().as_millis() + 1)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 
 /// Connection identity: monotonically increasing, binds in-flight requests to "the connection that actually wrote them out".
 /// An address cannot serve as identity -- switching connections at the same address (GO_AWAY resend, reconnect after EOF) is a common shape,
@@ -90,6 +109,8 @@ pub struct RemotingClientConfig {
     pub tls_test_mode: bool,
     pub enable_reconnect_for_go_away: bool,
     pub socks_proxy: Option<crate::remoting::socks::SocksProxyConfig>,
+    pub channel_idle_timeout_millis: i64,
+    pub close_socket_on_sync_timeout: bool,
 }
 
 impl Default for RemotingClientConfig {
@@ -101,6 +122,8 @@ impl Default for RemotingClientConfig {
             tls_test_mode: env_bool("ROCKETMQ_TLS_TEST_MODE", true),
             enable_reconnect_for_go_away: true,
             socks_proxy: None,
+            channel_idle_timeout_millis: DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS,
+            close_socket_on_sync_timeout: true,
         }
     }
 }
@@ -152,17 +175,48 @@ struct Connection {
     id: u64,
     addr: String,
     writer: WriterHandle,
-    alive: AtomicBool,
+    alive: Arc<AtomicBool>,
     tasks: Mutex<Vec<TaskHandle>>,
+    /// When this connection last carried bytes in either direction, on the clock of [`mono_now_ms`].
+    /// It starts at zero while the connection is still being established: an entry that never went
+    /// up is not an idle one either.
+    last_activity_ms: Arc<AtomicU64>,
+    /// Whether the last write on this socket found room in the send buffer. It only ever describes
+    /// the socket, never how much work the write lane has queued behind it.
+    send_ready: Arc<AtomicBool>,
 }
 
 impl Connection {
+    fn new(addr: &str, writer: WriterHandle, tasks: Vec<TaskHandle>) -> Arc<Connection> {
+        Arc::new(Connection {
+            id: next_conn_id(),
+            addr: addr.to_string(),
+            writer,
+            alive: Arc::new(AtomicBool::new(true)),
+            tasks: Mutex::new(tasks),
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+            send_ready: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
 
     fn mark_dead(&self) {
         self.alive.store(false, Ordering::Release);
+    }
+
+    fn touch(&self) {
+        self.last_activity_ms.store(mono_now_ms(), Ordering::Release);
+    }
+
+    fn idle_millis(&self, now: u64) -> Option<u64> {
+        let last = self.last_activity_ms.load(Ordering::Acquire);
+        if last == 0 {
+            return None;
+        }
+        Some(now.saturating_sub(last))
     }
 
     fn abort_tasks(&self) {
@@ -187,6 +241,20 @@ struct Inner {
     /// `RemotingClient` may be constructed outside a tokio runtime,
     /// so an eager `Handle::current()` is impossible here; every spawn point is inside a runtime.
     handle: OnceLock<tokio::runtime::Handle>,
+    /// The idle limit and the close-on-timeout rule are tunable after construction, so they live in
+    /// the transport's own atomics rather than in the immutable config snapshot.
+    channel_idle_timeout_ms: AtomicI64,
+    close_socket_on_sync_timeout: AtomicBool,
+    sweeper: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// A non-positive configured value restores the default; the sweep is always installed.
+fn normalized_idle_timeout_millis(millis: i64) -> i64 {
+    if millis > 0 {
+        millis
+    } else {
+        DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS
+    }
 }
 
 /// Long-connection remoting client, clonable across tasks.
@@ -207,6 +275,8 @@ impl RemotingClient {
     }
 
     pub fn with_config(config: RemotingClientConfig) -> RemotingClient {
+        let channel_idle_timeout_ms = normalized_idle_timeout_millis(config.channel_idle_timeout_millis);
+        let close_socket_on_sync_timeout = config.close_socket_on_sync_timeout;
         RemotingClient {
             inner: Arc::new(Inner {
                 config,
@@ -216,8 +286,44 @@ impl RemotingClient {
                 processors: RwLock::new(HashMap::new()),
                 running: AtomicBool::new(true),
                 handle: OnceLock::new(),
+                channel_idle_timeout_ms: AtomicI64::new(channel_idle_timeout_ms),
+                close_socket_on_sync_timeout: AtomicBool::new(close_socket_on_sync_timeout),
+                sweeper: Mutex::new(None),
             }),
         }
+    }
+
+    /// Milliseconds a connection may carry no traffic before the sweeper closes it.
+    pub fn channel_idle_timeout_millis(&self) -> i64 {
+        self.inner
+            .channel_idle_timeout_ms
+            .load(Ordering::Acquire)
+    }
+
+    /// Setting a value that is not positive restores [`DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS`]:
+    /// this is a limit on how long a connection may sit idle, not a switch for the sweep.
+    pub fn set_channel_idle_timeout_millis(&self, millis: i64) {
+        self.inner
+            .channel_idle_timeout_ms
+            .store(normalized_idle_timeout_millis(millis), Ordering::Release);
+    }
+
+    /// Whether a synchronous call whose wait ran out closes the connection it waited on.
+    pub fn close_socket_on_sync_timeout(&self) -> bool {
+        self.inner
+            .close_socket_on_sync_timeout
+            .load(Ordering::Acquire)
+    }
+
+    pub fn set_close_socket_on_sync_timeout(&self, close: bool) {
+        self.inner
+            .close_socket_on_sync_timeout
+            .store(close, Ordering::Release);
+    }
+
+    /// Closes every connection idle strictly longer than the configured limit and returns how many went.
+    pub fn sweep_idle_connections(&self) -> usize {
+        sweep_idle_connections(&self.inner)
     }
 
     pub fn config(&self) -> &RemotingClientConfig {
@@ -314,9 +420,15 @@ impl RemotingClient {
     }
 
     // ---------------- Connection state ----------------
+    /// Answers whether a send to this address would find room on the socket -- not whether the
+    /// transport happens to have one open. An address with no live connection is writable, because
+    /// the next send simply connects; `false` is reserved for a socket whose send buffer is full.
     pub fn is_channel_writable(&self, addr: &str) -> bool {
         let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.conns.get(addr).map(|c| c.is_alive()).unwrap_or(false)
+        match state.conns.get(addr).filter(|c| c.is_alive()) {
+            None => true,
+            Some(conn) => conn.send_ready.load(Ordering::Acquire),
+        }
     }
 
     pub fn close_channel(&self, addr: &str) {
@@ -343,6 +455,7 @@ impl RemotingClient {
         if !self.inner.running.swap(false, Ordering::SeqCst) {
             return;
         }
+        stop_sweeper(&self.inner);
         let addrs: Vec<String> = {
             let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
             state.conns.keys().cloned().collect()
@@ -476,13 +589,38 @@ async fn invoke_with_timeout(
             })
         }
         Err(_) => {
+            // This call shape owns the only copy of the wait, so the entry is reclaimed exactly here:
+            // one line per expired request, naming the address and the opaque it never answered.
+            rmq_warn!(
+                "remoting: in-flight request to {addr} expired (opaque={opaque}, timeout={timeout} ms), failed with a timeout"
+            );
             inner.cancel(opaque);
+            close_socket_on_timeout(inner, addr, timeout, opaque);
             Err(Error::Timeout {
                 addr: addr.to_string(),
                 timeout_millis: timeout,
             })
         }
     }
+}
+
+/// The close-after-timeout rule, on the only budget this port can hand the wait.
+///
+/// The budget is not reduced by the connect or the encode ahead of the wait, so what remains when
+/// the wait runs out is the whole timeout: the rule then keeps the socket exactly when no wait
+/// could ever have been answered on that budget.
+fn close_socket_on_timeout(inner: &Arc<Inner>, addr: &str, timeout: i64, opaque: i32) {
+    if !inner.close_socket_on_sync_timeout.load(Ordering::Acquire) {
+        return;
+    }
+    let left_millis = timeout;
+    if !(left_millis > 100 || left_millis > timeout / 4) {
+        return;
+    }
+    rmq_warn!(
+        "remoting: request to {addr} timed out (opaque={opaque}, timeout={timeout} ms), closing the connection"
+    );
+    close_channel(inner, addr);
 }
 
 async fn send_request(
@@ -577,13 +715,94 @@ fn on_connection_lost(inner: &Arc<Inner>, addr: &str, conn_id: u64) {
     fail_pending_for(inner, conn_id);
 }
 
+/// Closes every connection idle strictly longer than the limit and returns how many went.
+///
+/// Reaping goes through the same route a peer disconnect takes: the entry leaves the table first,
+/// then the connection is marked dead and its tasks aborted, and only the requests owned by **that**
+/// connection fail fast.
+fn sweep_idle_connections(inner: &Arc<Inner>) -> usize {
+    let limit = inner
+        .channel_idle_timeout_ms
+        .load(Ordering::Acquire)
+        .max(0) as u64;
+    let now = mono_now_ms();
+    let doomed: Vec<Arc<Connection>> = {
+        let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<String> = state
+            .conns
+            .iter()
+            .filter(|(_, c)| c.idle_millis(now).map(|idle| idle > limit).unwrap_or(false))
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        stale.into_iter().filter_map(|addr| state.conns.remove(&addr)).collect()
+    };
+    if doomed.is_empty() {
+        return 0;
+    }
+    let closed = doomed.len();
+    for conn in doomed {
+        rmq_warn!(
+            "remoting: connection to {} idle for {} ms (limit {} ms), closing it",
+            conn.addr,
+            conn.idle_millis(now).unwrap_or(0),
+            limit
+        );
+        conn.mark_dead();
+        conn.abort_tasks();
+        fail_pending_for(inner, conn.id);
+    }
+    closed
+}
+
+/// Installs the sweeper on first use. It is spawned from inside the runtime that a connection was
+/// created on, so a client that only ever calls synchronously outside a runtime has no sweep task --
+/// and equally no idle connections, because establishing one needs this same path.
+fn ensure_sweeper(inner: &Arc<Inner>) {
+    let mut slot = inner.sweeper.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return;
+    }
+    let Some(handle) = inner.runtime_handle() else {
+        return;
+    };
+    // A weak reference keeps the task from owning the client it sweeps: an Arc here would be a cycle
+    // (Inner holds the JoinHandle, the task would hold Inner) and nothing would ever be freed.
+    let weak = Arc::downgrade(inner);
+    *slot = Some(handle.spawn(async move {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            let Some(inner) = weak.upgrade() else { break };
+            if !inner.is_running() {
+                break;
+            }
+            sweep_idle_connections(&inner);
+        }
+    }));
+}
+
+fn stop_sweeper(inner: &Arc<Inner>) {
+    let handle = inner.sweeper.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(handle) = handle {
+        handle.abort();
+    }
+}
+
 /// Every frame the reader decodes comes through here: responses go to the in-flight table, requests to the processor table.
-fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
+///
+/// The answer says whether the byte stream can still be trusted: `false` means the frame that came
+/// off it is not a frame at all, so everything after it sits at the wrong offset and the caller has
+/// to take the connection down instead of reading on.
+fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) -> bool {
     let cmd = match RemotingCommand::decode(&frame) {
         Ok(cmd) => cmd,
         Err(e) => {
-            rmq_warn!("remoting: failed to decode frame from {addr}: {e}");
-            return;
+            // Reported as the connection-level event it is: the bytes cannot be attributed to any
+            // request, so there is nothing to answer and the stream no longer lines up.
+            rmq_error!(
+                "remoting: cannot decode frame from {addr} ({} bytes), closing the connection: {e}",
+                frame.len()
+            );
+            return false;
         }
     };
     let opaque = cmd.opaque;
@@ -599,11 +818,15 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         } = pending;
         apply_after_response_hooks(inner, addr, request.as_ref(), Some(&cmd));
         let _ = sender.send(cmd);
-        return;
+        return true;
     }
     if cmd.is_response_type() {
-        rmq_warn!("remoting: response for unknown opaque {opaque} from {addr}");
-        return;
+        // A frame that answers nothing we are waiting for: drop it loudly, but the stream itself is
+        // still aligned, so the connection stays.
+        rmq_warn!(
+            "remoting: response from {addr} does not match any in-flight request (opaque={opaque}), dropped"
+        );
+        return true;
     }
     let processor = inner
         .processors
@@ -616,7 +839,7 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
             "remoting: no processor for request code {} (opaque {opaque}) from {addr}",
             cmd.code
         );
-        return;
+        return true;
     };
     let sink = ResponseSink {
         inner: inner.clone(),
@@ -636,6 +859,7 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         );
         panic_sink.respond(response);
     }
+    true
 }
 
 fn apply_after_response_hooks(
@@ -679,6 +903,11 @@ async fn get_or_create(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>
     }
     let inserted = conn.clone();
     state.conns.insert(addr.to_string(), conn);
+    // The connection is registered: the idle clock starts here, and the sweeper that reads that
+    // clock has to be running for whatever call shape created it.
+    inserted.touch();
+    drop(state);
+    ensure_sweeper(inner);
     Ok(inserted)
 }
 
@@ -735,53 +964,72 @@ async fn connect_plain(
     stream: TcpStream,
     addr: &str,
 ) -> Result<Arc<Connection>> {
-    let (read_half, write_half) = tokio::io::split(stream);
+    // Two handles on the same socket rather than one split stream: the write lane has to be able
+    // to ask the socket itself whether it still takes bytes, and that question is only answerable
+    // on a `TcpStream`, which a borrowed write half is not.
+    let std_stream = stream
+        .into_std()
+        .map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    let read_std = std_stream
+        .try_clone()
+        .map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    let read_stream =
+        TcpStream::from_std(read_std).map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    let stream =
+        TcpStream::from_std(std_stream).map_err(|_| Error::Connect { addr: addr.to_string() })?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let conn = Arc::new(Connection {
-        id: next_conn_id(),
-        addr: addr.to_string(),
-        writer: WriterHandle::Async(tx),
-        alive: AtomicBool::new(true),
-        tasks: Mutex::new(Vec::new()),
-    });
+    let conn = Connection::new(addr, WriterHandle::Async(tx), Vec::new());
     let conn_id = conn.id;
 
     let reader_inner = inner.clone();
     let reader_addr = addr.to_string();
+    let reader_activity = conn.last_activity_ms.clone();
     let reader = tokio::spawn(async move {
-        let mut read_half = read_half;
+        let mut read_stream = read_stream;
         let mut len_buf = [0u8; 4];
         loop {
             if !reader_inner.is_running() {
                 break;
             }
-            if read_half.read_exact(&mut len_buf).await.is_err() {
+            if read_stream.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
+            // Bytes arrived: the connection is not the idle one, whatever happens to them next.
+            reader_activity.store(mono_now_ms(), Ordering::Release);
             let total = i32::from_be_bytes(len_buf);
             if total <= 0 || total > MAX_FRAME_LENGTH {
-                rmq_warn!("remoting: bad frame length {total} from {reader_addr}");
+                // The length prefix itself is out of range, so the bytes on the stream no longer
+                // line up with the frame boundaries. This is the same event as an undecodable frame
+                // one level earlier, and it is reported once, here: what follows cannot be
+                // attributed to any request, so the connection goes.
+                rmq_error!("remoting: illegal frame length {total} from {reader_addr}, closing the connection");
                 break;
             }
             let mut frame = vec![0u8; 4 + total as usize];
             frame[..4].copy_from_slice(&len_buf);
-            if read_half.read_exact(&mut frame[4..]).await.is_err() {
+            if read_stream.read_exact(&mut frame[4..]).await.is_err() {
                 break;
             }
-            dispatch(&reader_inner, &reader_addr, frame);
+            if !dispatch(&reader_inner, &reader_addr, frame) {
+                break;
+            }
         }
         on_connection_lost(&reader_inner, &reader_addr, conn_id);
     });
 
     let writer_inner = inner.clone();
     let writer_addr = addr.to_string();
+    let writer_activity = conn.last_activity_ms.clone();
+    let writer_ready = conn.send_ready.clone();
     let writer = tokio::spawn(async move {
-        let mut write_half = write_half;
+        let stream = stream;
         while let Some(data) = rx.recv().await {
-            if write_half.write_all(&data).await.is_err() || write_half.flush().await.is_err() {
+            if write_tracked(&stream, &data, &writer_ready).await.is_err() {
                 break;
             }
+            // The bytes went out: the connection just did real work, so its idle clock restarts here.
+            writer_activity.store(mono_now_ms(), Ordering::Release);
         }
         on_connection_lost(&writer_inner, &writer_addr, conn_id);
     });
@@ -794,12 +1042,38 @@ async fn connect_plain(
     Ok(conn)
 }
 
+/// Puts one frame on the socket, saying plainly when the send buffer has no room.
+///
+/// The readiness question is asked **before** the bytes move, from the write lane itself: a peer
+/// that stopped reading shows up here as the socket refusing more, and that is the only state this
+/// transport reports as unwritable. Once the whole frame is out the socket takes bytes again, so
+/// the answer flips back.
+async fn write_tracked(stream: &TcpStream, data: &[u8], ready: &AtomicBool) -> std::io::Result<()> {
+    let mut off = 0usize;
+    while off < data.len() {
+        match stream.try_write(&data[off..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                ready.store(false, Ordering::Release);
+                // Wait for room instead of claiming the socket is fine: the peer that stopped
+                // reading is what this answer exists to report.
+                stream.writable().await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    ready.store(true, Ordering::Release);
+    Ok(())
+}
+
 /// TLS runs on dedicated threads: `native-tls` has no async interface, one [`TlsStream`] shares a single lock for both directions.
 ///
 /// ⚠  After the handshake the socket is set to **non-blocking**, reads and writes retry with a short sleep of [`TLS_POLL_INTERVAL`].
 /// The old "blocking read + read timeout" approach would sit on the lock for a whole timeout period on a partial frame and starve the writer:
 /// measured against a real TLS broker this showed up as every name server request timing out at 5s with the responses then arriving in batches
-/// (`remoting: response for unknown opaque N`). Non-blocking + short sleep presses the lock hold time down to one syscall.
+/// (each one answered by `remoting: response from ... does not match any in-flight request`).
+/// Non-blocking + short sleep presses the lock hold time down to one syscall.
 async fn connect_tls(
     inner: &Arc<Inner>,
     addr: &str,
@@ -839,32 +1113,21 @@ async fn connect_tls(
     })??;
 
     let shared = Arc::new(Mutex::new(stream));
-    let alive = Arc::new(AtomicBool::new(true));
     let (tx, rx) = std_mpsc::sync_channel::<Vec<u8>>(1024);
     let rx = Arc::new(Mutex::new(rx));
 
-    let conn = Arc::new(Connection {
-        id: next_conn_id(),
-        addr: addr.to_string(),
-        writer: WriterHandle::Blocking(Arc::new(tx)),
-        alive: AtomicBool::new(true),
-        tasks: Mutex::new(vec![TaskHandle::Blocking]),
-    });
-    let conn_id = conn.id;
+    let conn = Connection::new(
+        addr,
+        WriterHandle::Blocking(Arc::new(tx)),
+        vec![TaskHandle::Blocking],
+    );
 
     // The reader is a plain std thread with no tokio context of its own, while broker-pushed requests (transaction check-back,
     // heartbeat response) are processed synchronously on that thread and processors rely on the runtime to spawn background tasks. This function is async,
     // so it certainly runs inside a runtime: take the handle here (also caching it in Inner for other threads).
     let runtime = inner.runtime_handle();
-    spawn_tls_writer(
-        inner.clone(),
-        addr,
-        shared.clone(),
-        rx.clone(),
-        alive.clone(),
-        conn_id,
-    );
-    spawn_tls_reader(inner.clone(), addr, shared, alive, runtime, conn_id);
+    spawn_tls_writer(inner.clone(), addr, shared.clone(), rx.clone(), &conn);
+    spawn_tls_reader(inner.clone(), addr, shared, runtime, &conn);
     Ok(conn)
 }
 
@@ -872,16 +1135,18 @@ fn spawn_tls_reader(
     inner: Arc<Inner>,
     addr: &str,
     shared: SharedTls,
-    alive: Arc<AtomicBool>,
     runtime: Option<tokio::runtime::Handle>,
-    conn_id: u64,
+    conn: &Connection,
 ) {
     let addr = addr.to_string();
+    let alive = conn.alive.clone();
+    let activity = conn.last_activity_ms.clone();
+    let conn_id = conn.id;
     std::thread::spawn(move || {
         // enter() makes `Handle::try_current()` on the reader behave like the plaintext tokio read task,
         // otherwise in a pure TLS session broker check-back requests reach the processor but cannot be spawned.
         let _guard = runtime.as_ref().map(|handle| handle.enter());
-        tls_read_loop(inner, addr, shared, alive, conn_id);
+        tls_read_loop(inner, addr, shared, alive, activity, conn_id);
     });
 }
 
@@ -890,10 +1155,13 @@ fn spawn_tls_writer(
     addr: &str,
     shared: SharedTls,
     rx: Arc<Mutex<std_mpsc::Receiver<Vec<u8>>>>,
-    alive: Arc<AtomicBool>,
-    conn_id: u64,
+    conn: &Connection,
 ) {
     let addr = addr.to_string();
+    let alive = conn.alive.clone();
+    let activity = conn.last_activity_ms.clone();
+    let ready = conn.send_ready.clone();
+    let conn_id = conn.id;
     std::thread::spawn(move || {
         loop {
             let data = match rx.lock().unwrap_or_else(|e| e.into_inner()).recv() {
@@ -903,9 +1171,11 @@ fn spawn_tls_writer(
             if !alive.load(Ordering::Acquire) || !inner.is_running() {
                 break;
             }
-            if tls_write_all(&shared, &data).is_err() {
+            if tls_write_all(&shared, &data, &ready).is_err() {
                 break;
             }
+            // The bytes went out: the connection just did real work, so its idle clock restarts here.
+            activity.store(mono_now_ms(), Ordering::Release);
         }
         on_connection_lost(&inner, &addr, conn_id);
     });
@@ -916,7 +1186,7 @@ type SharedTls = Arc<Mutex<native_tls::TlsStream<std::net::TcpStream>>>;
 /// Takes and releases the lock once per chunk written, sleeping [`TLS_POLL_INTERVAL`] before resuming on `WouldBlock`.
 ///
 /// The lock must be taken once per attempt: the reader waits on the same lock, holding it for long blocks the peer's requests.
-fn tls_write_all(shared: &SharedTls, data: &[u8]) -> std::io::Result<()> {
+fn tls_write_all(shared: &SharedTls, data: &[u8], ready: &AtomicBool) -> std::io::Result<()> {
     let mut off = 0usize;
     while off < data.len() {
         let written = {
@@ -928,15 +1198,26 @@ fn tls_write_all(shared: &SharedTls, data: &[u8]) -> std::io::Result<()> {
         };
         match written {
             Ok(n) => off += n,
-            Err(e) if is_timeout(&e) => std::thread::sleep(TLS_POLL_INTERVAL),
+            Err(e) if is_timeout(&e) => {
+                // The socket refuses more right now: that is exactly the state the writability
+                // answer is about, so say so and keep the lane waiting for room.
+                ready.store(false, Ordering::Release);
+                std::thread::sleep(TLS_POLL_INTERVAL);
+            }
             Err(e) => return Err(e),
         }
     }
     loop {
         let flushed = { shared.lock().unwrap_or_else(|e| e.into_inner()).flush() };
         match flushed {
-            Ok(()) => return Ok(()),
-            Err(e) if is_timeout(&e) => std::thread::sleep(TLS_POLL_INTERVAL),
+            Ok(()) => {
+                ready.store(true, Ordering::Release);
+                return Ok(());
+            }
+            Err(e) if is_timeout(&e) => {
+                ready.store(false, Ordering::Release);
+                std::thread::sleep(TLS_POLL_INTERVAL);
+            }
             Err(e) => return Err(e),
         }
     }
@@ -947,6 +1228,7 @@ fn tls_read_loop(
     addr: String,
     shared: SharedTls,
     alive: Arc<AtomicBool>,
+    activity: Arc<AtomicU64>,
     conn_id: u64,
 ) {
     let mut len_buf = [0u8; 4];
@@ -965,9 +1247,14 @@ fn tls_read_loop(
                 Err(_) => break,
             }
         }
+        // Bytes arrived: the connection is not the idle one, whatever happens to them next.
+        activity.store(mono_now_ms(), Ordering::Release);
         let total = i32::from_be_bytes(len_buf);
         if total <= 0 || total > MAX_FRAME_LENGTH {
-            rmq_warn!("remoting: bad tls frame length {total} from {addr}");
+            // The length prefix itself is out of range, so the bytes on the stream no longer line
+            // up with the frame boundaries: the same event as an undecodable frame one level
+            // earlier, reported once here, and the connection goes.
+            rmq_error!("remoting: illegal tls frame length {total} from {addr}, closing the connection");
             break;
         }
         let mut frame = vec![0u8; 4 + total as usize];
@@ -981,7 +1268,9 @@ fn tls_read_loop(
             Err(_) => break,
         }
         header_done = false;
-        dispatch(&inner, &addr, frame);
+        if !dispatch(&inner, &addr, frame) {
+            break;
+        }
     }
     alive.store(false, Ordering::Release);
     on_connection_lost(&inner, &addr, conn_id);
@@ -1061,7 +1350,9 @@ pub(crate) async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    // `AsyncReadExt` / `AsyncWriteExt` already arrive through the module-level `use` via `use super::*`.
+    // `AsyncReadExt` arrives through the module-level `use` via `use super::*`; the fake peers
+    // here also write, which needs the matching write trait.
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     use super::*;
@@ -1318,7 +1609,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Connect { .. }), "got {err}");
-        assert!(!client.is_channel_writable(&addr));
+        // "No connection" is not "cannot write": the next send simply connects.
+        assert!(client.is_channel_writable(&addr));
     }
 
     #[tokio::test]
@@ -1342,7 +1634,9 @@ mod tests {
             .await
             .unwrap();
         client.close_channel(&addr);
-        assert!(!client.is_channel_writable(&addr));
+        assert!(client.connection_addrs().is_empty(), "the closed address leaves the connection table");
+        // "No connection" is not "cannot write": the next send simply connects.
+        assert!(client.is_channel_writable(&addr));
         let mut second = request(request_code::SEND_MESSAGE, "second");
         let response = client
             .invoke_sync(&addr, &mut second, Some(3000))
@@ -1512,7 +1806,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
-        assert!(!client.is_channel_writable(&addr), "the dead connection must be unpublished from the connection table");
+        assert!(
+            client.connection_addrs().is_empty(),
+            "the dead connection must be unpublished from the connection table"
+        );
+        // And the address is writable again: the next request builds a fresh connection.
+        assert!(client.is_channel_writable(&addr));
 
         let mut second = request(request_code::SEND_MESSAGE_V2, "ok");
         let response = client
@@ -2174,5 +2473,624 @@ mod tests {
             "a TLS handshake on a plaintext port must report Connect, got {err}"
         );
         client.shutdown();
+    }
+
+    // ------------------------------------------------------------ transport contract legs
+    //
+    // These legs watch what the transport says as well as what it does, and the log file is the only
+    // place the wording lives. The path is decided once for the process, so a leg cannot point the
+    // logger at a file of its own; instead it marks where the file ends right now and reads the tail
+    // its own traffic appended, filtered by the peer address. Every leg binds its own port, so a
+    // line from another leg running in the same process cannot be mistaken for its own.
+
+    /// The lines the transport logged after one mark.
+    struct LogTail {
+        start: u64,
+    }
+
+    impl LogTail {
+        fn mark() -> LogTail {
+            let start = std::fs::metadata(crate::common::logging::file_path())
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            LogTail { start }
+        }
+
+        /// Appended lines holding **every** needle.
+        fn lines_with(&self, needles: &[&str]) -> Vec<String> {
+            read_after(self.start)
+                .map(|text| {
+                    text.lines()
+                        .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Waits (bounded) until `count` matching lines landed, then hands them over.
+        ///
+        /// The line is written by the reader task, so it can trail the state change it describes.
+        async fn wait_for(&self, needles: &[&str], count: usize, what: &str) -> Vec<String> {
+            wait_until(|| self.lines_with(needles).len() >= count, what).await;
+            self.lines_with(needles)
+        }
+    }
+
+    fn read_after(start: u64) -> std::io::Result<String> {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::File::open(crate::common::logging::file_path())?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        Ok(text)
+    }
+
+    /// Accepts forever: drains each connection's frames without ever answering, and counts the
+    /// connections the client closed.
+    async fn quiet_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counter = closes.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    while read_frame(&mut stream).await.is_some() {}
+                    counter.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (addr, closes)
+    }
+
+    #[tokio::test]
+    async fn undecodable_frame_is_reported_and_takes_the_connection_down() {
+        // A frame whose length prefix is legal and whose header is not a command: the bytes after it
+        // no longer line up with a frame boundary, so reading on would attribute garbage to requests.
+        let (addr, conns, closes) = broken_frame_server(Broken::NotACommand, 1).await;
+        let client = RemotingClient::new();
+        let tail = LogTail::mark();
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "garbage");
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(5000))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::SendRequest { .. }),
+            "the broken frame answered nothing, so the wait must end as a send failure, got {err}"
+        );
+
+        let lines = tail
+            .wait_for(
+                &[addr.as_str(), "cannot decode frame"],
+                1,
+                "the undecodable frame is reported by name",
+            )
+            .await;
+        assert_eq!(lines.len(), 1, "one report for one broken stream");
+        assert!(lines[0].contains("[ERROR]"), "not a warning: {}", lines[0]);
+
+        wait_until(
+            || client.connection_addrs().is_empty(),
+            "the broken connection leaves the table",
+        )
+        .await;
+        wait_until(
+            || closes.load(Ordering::SeqCst) == 1,
+            "the peer sees the connection closed",
+        )
+        .await;
+        assert_eq!(client.in_flight_count(), 0, "the request it never answered is gone too");
+
+        // The next request goes over a fresh connection and is served like any other.
+        let mut next = request(request_code::SEND_MESSAGE_V2, "served");
+        let response = client
+            .invoke_sync(&addr, &mut next, Some(5000))
+            .await
+            .unwrap();
+        assert_eq!(response.code, response_code::SUCCESS);
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            2,
+            "the next request rode a new connection, not the broken stream"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn illegal_frame_length_is_reported_once_at_the_level_that_caught_it() {
+        // The length prefix itself is out of range: this is the same event one level earlier, and the
+        // bytes behind it were never parsed as a command, so there is no decode failure to report.
+        let (addr, _conns, closes) = broken_frame_server(Broken::IllegalLength, 1).await;
+        let client = RemotingClient::new();
+        let tail = LogTail::mark();
+        let mut cmd = request(request_code::SEND_MESSAGE_V2, "huge");
+        let err = client
+            .invoke_sync(&addr, &mut cmd, Some(5000))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
+
+        let lines = tail
+            .wait_for(
+                &[addr.as_str(), "illegal frame length"],
+                1,
+                "the out-of-range length is reported",
+            )
+            .await;
+        assert_eq!(lines.len(), 1, "the event is reported once");
+        assert!(lines[0].contains("[ERROR]"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("2147483647"),
+            "the length that broke the stream is in the line: {}",
+            lines[0]
+        );
+        assert!(
+            tail.lines_with(&[addr.as_str(), "cannot decode frame"])
+                .is_empty(),
+            "the same event must not also be reported as a decode failure"
+        );
+
+        wait_until(
+            || client.connection_addrs().is_empty(),
+            "the connection with the impossible length is gone",
+        )
+        .await;
+        wait_until(
+            || closes.load(Ordering::SeqCst) == 1,
+            "the peer sees the connection closed",
+        )
+        .await;
+        client.shutdown();
+    }
+
+    /// The opaque the stray response carries: real opaques count up from zero, so this one answers nothing.
+    const STRAY_OPAQUE: i32 = -987_654;
+
+    #[tokio::test]
+    async fn unmatched_response_is_named_and_the_connection_survives() {
+        let (addr, conns, closes) = stray_response_server().await;
+        let client = RemotingClient::new();
+        let tail = LogTail::mark();
+        let mut cmd = request(request_code::SEND_MESSAGE, "first");
+        let response = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+
+        let lines = tail
+            .wait_for(
+                &[addr.as_str(), "does not match any in-flight request"],
+                1,
+                "the stray response is warned about",
+            )
+            .await;
+        assert_eq!(lines.len(), 1, "one line for one stray frame");
+        assert!(lines[0].contains("[WARN]"), "{}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("opaque={STRAY_OPAQUE}")),
+            "the warning names the opaque it could not place: {}",
+            lines[0]
+        );
+        assert_eq!(
+            response.code,
+            response_code::SUCCESS,
+            "the request the stray did not answer still got its own answer"
+        );
+
+        // A frame that answers nothing is still a frame: the stream lines up, so the connection stays.
+        assert_eq!(client.connection_addrs(), vec![addr.clone()]);
+        assert_eq!(closes.load(Ordering::SeqCst), 0, "reporting a stray is not a connection event");
+        let mut second = request(request_code::SEND_MESSAGE, "second");
+        let second_response = client
+            .invoke_sync(&addr, &mut second, Some(5000))
+            .await
+            .unwrap();
+        assert_eq!(second_response.code, response_code::SUCCESS);
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "the second request rode the connection the stray arrived on"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn writable_answers_for_the_send_buffer_not_for_having_a_connection() {
+        let (addr, conns) = stalled_echo_server(Duration::from_millis(1500)).await;
+        let client = RemotingClient::new();
+        assert!(
+            client.is_channel_writable(&addr),
+            "an address with no live connection is writable: the next send simply connects"
+        );
+        assert!(client.connection_addrs().is_empty());
+
+        // 12 MB body: more than both socket buffers even at their autosetup maxima, so a peer that
+        // does not read leaves the write nowhere to go.
+        let mut cmd = request(request_code::SEND_MESSAGE, "stalled");
+        cmd.body = Some(vec![0xA5u8; 12 * 1024 * 1024]);
+        let call = {
+            let client = client.clone();
+            let addr = addr.clone();
+            tokio::spawn(async move { client.invoke_sync(&addr, &mut cmd, Some(30_000)).await })
+        };
+        wait_until(
+            || !client.is_channel_writable(&addr),
+            "a write parked on a full send buffer reports the socket as unwritable",
+        )
+        .await;
+        assert_eq!(
+            client.connection_addrs(),
+            vec![addr.clone()],
+            "the connection is up; only its send buffer has no room"
+        );
+        assert!(
+            !call.is_finished(),
+            "the request waits for room instead of failing fast"
+        );
+
+        let response = call
+            .await
+            .unwrap()
+            .expect("the request still completes once the peer reads");
+        assert_eq!(response.code, response_code::SUCCESS);
+        wait_until(
+            || client.is_channel_writable(&addr),
+            "once the frame is on the wire the socket takes bytes again",
+        )
+        .await;
+        assert_eq!(conns.load(Ordering::SeqCst), 1, "one connection carried it all");
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_default_survives_a_nonsense_setting() {
+        let client = RemotingClient::new();
+        assert_eq!(
+            client.channel_idle_timeout_millis(),
+            DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS
+        );
+        assert_eq!(DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS, 120 * 1000);
+
+        // A limit that is not positive restores the default instead of switching the sweep off.
+        client.set_channel_idle_timeout_millis(0);
+        assert_eq!(client.channel_idle_timeout_millis(), DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS);
+        client.set_channel_idle_timeout_millis(-1);
+        assert_eq!(client.channel_idle_timeout_millis(), DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS);
+        let configured = RemotingClient::with_config(RemotingClientConfig {
+            channel_idle_timeout_millis: -5000,
+            ..RemotingClientConfig::default()
+        });
+        assert_eq!(
+            configured.channel_idle_timeout_millis(),
+            DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS,
+            "the same normalization at construction time"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transport_reaps_a_quiet_connection_and_leaves_a_busy_one() {
+        let (quiet_addr, quiet_closes) = quiet_server().await;
+        let (busy_addr, busy_closes) = quiet_server().await;
+        let client = RemotingClient::with_config(RemotingClientConfig {
+            channel_idle_timeout_millis: 300,
+            ..RemotingClientConfig::default()
+        });
+        let tail = LogTail::mark();
+        for addr in [&quiet_addr, &busy_addr] {
+            let mut beat = request(request_code::HEART_BEAT, "beat");
+            beat.mark_oneway_rpc();
+            client.invoke_oneway(addr, &mut beat).await.unwrap();
+        }
+        wait_until(
+            || client.connection_addrs().len() == 2,
+            "both connections are registered",
+        )
+        .await;
+
+        // One write every 100 ms against a 300 ms limit: this connection is never the idle one.
+        let stop = Arc::new(AtomicBool::new(false));
+        let beating = {
+            let client = client.clone();
+            let addr = busy_addr.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut beat = request(request_code::HEART_BEAT, "beat");
+                    beat.mark_oneway_rpc();
+                    let _ = client.invoke_oneway(&addr, &mut beat).await;
+                }
+            })
+        };
+
+        wait_until(
+            || client.connection_addrs() == vec![busy_addr.clone()],
+            "only the quiet connection is reaped",
+        )
+        .await;
+        assert_eq!(quiet_closes.load(Ordering::SeqCst), 1, "the reap closed the socket");
+
+        // Bytes went out a moment ago, so no connection here is past the limit -- however short it is.
+        let mut fresh = request(request_code::HEART_BEAT, "fresh");
+        fresh.mark_oneway_rpc();
+        client.invoke_oneway(&busy_addr, &mut fresh).await.unwrap();
+        assert_eq!(
+            client.sweep_idle_connections(),
+            0,
+            "a connection that just carried traffic is inside the limit"
+        );
+
+        stop.store(true, Ordering::Release);
+        beating.await.unwrap();
+        wait_until(
+            || client.connection_addrs().is_empty(),
+            "the connection the beats kept alive is reaped once they stop",
+        )
+        .await;
+        assert_eq!(busy_closes.load(Ordering::SeqCst), 1);
+
+        for addr in [&quiet_addr, &busy_addr] {
+            let lines = tail
+                .wait_for(&[addr.as_str(), "idle for", "closing it"], 1, "the reap is logged")
+                .await;
+            assert_eq!(lines.len(), 1, "one warning per reaped connection for {addr}");
+            assert!(lines[0].contains("[WARN]"), "{}", lines[0]);
+            assert!(
+                lines[0].contains("limit 300 ms"),
+                "the warning states the limit it broke: {}",
+                lines[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_expired_request_gets_its_own_warning() {
+        let (addr, _frames) = silent_server().await;
+        let client = RemotingClient::new();
+        // This leg is about the in-flight table; whether the socket goes with a timed-out wait is the
+        // rule under T6, so switch it off and let both waits run on one connection.
+        client.set_close_socket_on_sync_timeout(false);
+        let tail = LogTail::mark();
+        let mut commands = vec![
+            request(request_code::PULL_MESSAGE, "slow-a"),
+            request(request_code::PULL_MESSAGE, "slow-b"),
+        ];
+        let opaques: Vec<i32> = commands.iter().map(|cmd| cmd.opaque).collect();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for cmd in commands.drain(..) {
+            let tx = tx.clone();
+            client.invoke_async(&addr, cmd, Box::new(move |result| {
+                let _ = tx.send(result);
+            }), Some(200));
+        }
+        for _ in 0..2 {
+            let result = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a callback never fired")
+                .expect("the callback channel closed");
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, Error::Timeout { .. }),
+                "the caller gets the timeout it asked for, got {err}"
+            );
+        }
+        assert_eq!(
+            client.in_flight_count(),
+            0,
+            "both expired entries were reclaimed, none left to answer a late frame"
+        );
+        assert_eq!(client.connection_addrs(), vec![addr.clone()]);
+
+        let lines = tail
+            .wait_for(&[addr.as_str(), "failed with a timeout"], 2, "one warning per expired request")
+            .await;
+        assert_eq!(lines.len(), 2, "two requests are two separate reports");
+        assert!(lines.iter().all(|line| line.contains("[WARN]")));
+        for opaque in &opaques {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!("opaque={opaque}")))
+                    .count(),
+                1,
+                "each line names the opaque it gave up on"
+            );
+        }
+        client.shutdown();
+    }
+
+    /// One synchronous call whose wait runs out, as the transport answered it.
+    struct SyncTimeoutRun {
+        timed_out: bool,
+        connection_kept: bool,
+        peer_closes: usize,
+        close_warns: usize,
+        expiry_warns: usize,
+    }
+
+    /// Brings one connection up, then waits on a request the peer never answers.
+    ///
+    /// The warm-up matters: "kept" and "closed" have to be statements about a socket that exists.
+    async fn run_sync_timeout(close_on_timeout: bool, timeout: i64) -> SyncTimeoutRun {
+        let (addr, closes) = quiet_server().await;
+        let client = RemotingClient::new();
+        client.set_close_socket_on_sync_timeout(close_on_timeout);
+        let tail = LogTail::mark();
+        let mut warm = request(request_code::HEART_BEAT, "warm");
+        warm.mark_oneway_rpc();
+        client.invoke_oneway(&addr, &mut warm).await.unwrap();
+        let registered = vec![addr.clone()];
+        wait_until(
+            || client.connection_addrs() == registered,
+            "the warm-up connection is registered",
+        )
+        .await;
+
+        let mut cmd = request(request_code::PULL_MESSAGE, "never-answered");
+        let result = client.invoke_sync(&addr, &mut cmd, Some(timeout)).await;
+        let timed_out = matches!(result, Err(Error::Timeout { .. }));
+        // Give a close the chance to reach the peer before the counters are read.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let run = SyncTimeoutRun {
+            timed_out,
+            connection_kept: !client.connection_addrs().is_empty(),
+            peer_closes: closes.load(Ordering::SeqCst),
+            close_warns: tail.lines_with(&[addr.as_str(), "closing the connection"]).len(),
+            expiry_warns: tail.lines_with(&[addr.as_str(), "failed with a timeout"]).len(),
+        };
+        client.shutdown();
+        run
+    }
+
+    #[tokio::test]
+    async fn sync_timeout_closes_the_connection_by_default() {
+        let on = run_sync_timeout(true, 400).await;
+        assert!(on.timed_out, "the caller still gets the timeout it asked for");
+        assert!(!on.connection_kept, "by default the connection the wait ran out on is closed");
+        assert_eq!(on.peer_closes, 1, "the peer sees the close");
+        assert_eq!(on.close_warns, 1);
+        assert_eq!(on.expiry_warns, 1);
+
+        let off = run_sync_timeout(false, 400).await;
+        assert!(off.timed_out, "the timeout is still reported to the caller");
+        assert!(off.connection_kept, "with the knob off the socket is kept -- the timeout is caller-side");
+        assert_eq!(off.peer_closes, 0);
+        assert_eq!(off.close_warns, 0);
+        assert_eq!(off.expiry_warns, 1);
+    }
+
+    /// The two floors of the close decision, on the only budget this port can hand the wait.
+    ///
+    /// This transport does not subtract the connect cost, so the time still available when the wait
+    /// began is the whole timeout. The floors then leave exactly one shape that keeps the socket: a
+    /// budget of zero, which no wait can ever be answered on.
+    #[tokio::test]
+    async fn sync_timeout_close_rule_has_one_floor_shape() {
+        let zero = run_sync_timeout(true, 0).await;
+        assert!(zero.timed_out, "a zero budget still reports the timeout to the caller");
+        assert!(zero.connection_kept, "a zero budget is at both floors, so the connection is kept");
+        assert_eq!(zero.close_warns, 0);
+
+        let just_above = run_sync_timeout(true, 101).await;
+        assert!(!just_above.connection_kept, "one millisecond above the floor is a close, not a keep");
+        assert_eq!(just_above.close_warns, 1);
+    }
+
+    /// How a peer breaks the frame stream on the connections marked broken.
+    #[derive(Clone, Copy)]
+    enum Broken {
+        /// A legal length prefix in front of a header that is not a command.
+        NotACommand,
+        /// A length prefix outside the legal range: the frame boundary itself is gone.
+        IllegalLength,
+    }
+
+    impl Broken {
+        fn bytes(self) -> Vec<u8> {
+            match self {
+                // totalLength 8, headerLength 4 in JSON mode: the prefix promises a frame, and the
+                // four header bytes behind it are not a header.
+                Broken::NotACommand => vec![0, 0, 0, 8, 0, 0, 0, 4, 0xFF, 0xFF, 0xFF, 0xFF],
+                Broken::IllegalLength => vec![0x7F, 0xFF, 0xFF, 0xFF],
+            }
+        }
+    }
+
+    /// The first `broken_conns` connections get a frame that is not a command; later ones echo.
+    /// Counts the connections seen and the ones the client closed.
+    async fn broken_frame_server(
+        broken: Broken,
+        broken_conns: usize,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counted = conns.clone();
+        let closed = closes.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let idx = counted.fetch_add(1, Ordering::SeqCst);
+                let broken_conn = idx < broken_conns;
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    if broken_conn {
+                        let bytes = broken.bytes();
+                        let _ = stream.write_all(&bytes).await;
+                        let _ = stream.flush().await;
+                    }
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        if broken_conn {
+                            continue;
+                        }
+                        let cmd = RemotingCommand::decode(&frame).unwrap();
+                        let mut response = response_for(&cmd, response_code::SUCCESS);
+                        if let Some(remark) = cmd.remark.clone() {
+                            response.remark = Some(format!("pong:{remark}"));
+                        }
+                        write_command(&mut stream, &mut response).await;
+                    }
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (addr, conns, closes)
+    }
+
+    /// Echoes every request, but puts one extra response with an unknown opaque on the stream first.
+    async fn stray_response_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let counted = conns.clone();
+        let closed = closes.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    let mut stray_pending = true;
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let cmd = RemotingCommand::decode(&frame).unwrap();
+                        if stray_pending {
+                            stray_pending = false;
+                            let mut stray = response_for(&cmd, response_code::SUCCESS);
+                            stray.opaque = STRAY_OPAQUE;
+                            write_command(&mut stream, &mut stray).await;
+                        }
+                        let mut response = response_for(&cmd, response_code::SUCCESS);
+                        write_command(&mut stream, &mut response).await;
+                    }
+                    closed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        (addr, conns, closes)
+    }
+
+    /// Reads nothing for `stall` after accepting, then answers like the echo broker.
+    async fn stalled_echo_server(stall: Duration) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counted = conns.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(stall).await;
+                    while let Some(frame) = read_frame(&mut stream).await {
+                        let cmd = RemotingCommand::decode(&frame).unwrap();
+                        let mut response = response_for(&cmd, response_code::SUCCESS);
+                        write_command(&mut stream, &mut response).await;
+                    }
+                });
+            }
+        });
+        (addr, conns)
     }
 }

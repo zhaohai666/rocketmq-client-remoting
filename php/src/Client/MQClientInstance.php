@@ -210,6 +210,9 @@ class MQClientInstance
     /** Default timeout of the internal client-to-broker/name-server API calls, 3000ms. */
     public const DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS = 3000;
 
+    /** Default idle limit of one transport connection: 120 seconds. */
+    public const DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS = RemotingClient::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS;
+
     public const QUERY_ASSIGNMENT_TIMEOUT_MILLIS = 3000;
 
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
@@ -277,6 +280,20 @@ class MQClientInstance
 
     /** Worker count of the concurrent heartbeat pool, default = available processors. */
     public int $concurrentHeartbeatThreadPoolSize;
+
+    /**
+     * Idle limit of one transport connection, in seconds (default 120). A connection with
+     * neither a completed read nor a completed write for longer than this limit is closed by
+     * the transport sweep. A non-positive value falls back to the default -- the sweep cannot
+     * be switched off, only widened.
+     */
+    public int $channelIdleTimeoutSeconds = self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS;
+
+    /**
+     * Whether a synchronous call that runs out of time closes the connection it went out on
+     * (default true). When false the socket is kept and only the timeout is reported.
+     */
+    public bool $closeChannelOnSyncTimeout = true;
 
     private ?ConsumeExecutor $heartbeatExecutor = null;
 
@@ -383,6 +400,8 @@ class MQClientInstance
         int $mqClientApiTimeout = self::DEFAULT_MQ_CLIENT_API_TIMEOUT_MILLIS,
         bool $enableConcurrentHeartbeat = false,
         ?int $concurrentHeartbeatThreadPoolSize = null,
+        int $channelIdleTimeoutSeconds = self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS,
+        bool $closeChannelOnSyncTimeout = true,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
@@ -402,7 +421,22 @@ class MQClientInstance
             ? $concurrentHeartbeatThreadPoolSize
             : self::availableProcessors();
         $this->namespaceV2 = $namespaceV2;
-        $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions, socksProxy: $socksProxy);
+        // The transport idle limit and the sync-timeout close decision live on the transport;
+        // this object is the configuration entry, and a non-positive idle limit falls back to
+        // the default there as well.
+        $this->channelIdleTimeoutSeconds = $channelIdleTimeoutSeconds > 0
+            ? $channelIdleTimeoutSeconds
+            : self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS;
+        $this->closeChannelOnSyncTimeout = $closeChannelOnSyncTimeout;
+        $this->remotingClient = new RemotingClient(
+            $connectTimeoutMillis,
+            $invokeTimeoutMillis,
+            $tlsEnable,
+            tlsOptions: $tlsOptions,
+            socksProxy: $socksProxy,
+            channelIdleTimeoutSeconds: $this->channelIdleTimeoutSeconds,
+            closeChannelOnSyncTimeout: $this->closeChannelOnSyncTimeout,
+        );
         $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
         // The stream hook must also be registered before the user rpcHook, so that ReqT is
         // counted in the ACL signature content ("Inject stream rpc hook first to make
@@ -503,6 +537,36 @@ class MQClientInstance
     public function isEnableConcurrentHeartbeat(): bool
     {
         return $this->enableConcurrentHeartbeat;
+    }
+
+    /**
+     * Idle limit of one transport connection, in seconds. The transport applies it to the
+     * connections it holds from the next sweep on; a non-positive value falls back to the
+     * default.
+     */
+    public function setChannelIdleTimeoutSeconds(int $seconds): void
+    {
+        $this->channelIdleTimeoutSeconds = $seconds > 0
+            ? $seconds
+            : self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS;
+        $this->remotingClient->setChannelIdleTimeoutSeconds($this->channelIdleTimeoutSeconds);
+    }
+
+    public function getChannelIdleTimeoutSeconds(): int
+    {
+        return $this->channelIdleTimeoutSeconds;
+    }
+
+    /** Whether a synchronous call that runs out of time closes its connection. */
+    public function setCloseChannelOnSyncTimeout(bool $close): void
+    {
+        $this->closeChannelOnSyncTimeout = $close;
+        $this->remotingClient->setCloseChannelOnSyncTimeout($close);
+    }
+
+    public function isCloseChannelOnSyncTimeout(): bool
+    {
+        return $this->closeChannelOnSyncTimeout;
     }
 
     /** Resize the concurrently dispatching heartbeat pool when it already exists. */
@@ -648,6 +712,19 @@ class MQClientInstance
 
         // Delayed action queue (e.g. rebalance triggered by resetOffset)
         $this->runPendingActions();
+
+        // (0) Transport connection sweep: this port has no IO thread and no transport timer, so
+        //   a connection idle past channelIdleTimeoutSeconds is reaped here (and from the
+        //   transport's own pumps, waitResponses/pumpIncoming). It runs before the started check
+        //   because the sockets belong to the transport, not to the instance lifecycle: a
+        //   connection opened by a call is reaped even while this instance is not started.
+        //   Nothing here runs when the caller does not tick -- a socket that neither pumps nor
+        //   is ticked stays open until one of the two happens.
+        try {
+            $this->remotingClient->sweepIdleConnections();
+        } catch (\Throwable $e) {
+            Logger::warning('transport idle sweep exception: ' . $e->getMessage());
+        }
 
         if (!$this->started) {
             return;

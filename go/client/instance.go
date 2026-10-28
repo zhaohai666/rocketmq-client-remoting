@@ -304,14 +304,17 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 	} else {
 		inst.maxPageSizeInGetMetadata.Store(DefaultMaxPageSizeInGetMetadata)
 	}
-	inst.remoting = remoting.NewRemotingClientWithConfig(remoting.ClientConfig{
-		ConnectTimeoutMillis:     config.ConnectTimeoutMillis,
-		InvokeTimeoutMillis:      config.InvokeTimeoutMillis,
-		TLSEnable:                config.TLSEnable,
-		TLSTestMode:              true,
-		EnableReconnectForGoAway: true,
-		SocksProxy:               config.SocksProxy,
-	})
+	// Base the transport config on this port's remoting defaults so every knob
+	// the instance does not carry itself (idle close, close-on-sync-timeout)
+	// keeps its default instead of a zero value.
+	remotingConfig := remoting.NewClientConfig()
+	remotingConfig.ConnectTimeoutMillis = config.ConnectTimeoutMillis
+	remotingConfig.InvokeTimeoutMillis = config.InvokeTimeoutMillis
+	remotingConfig.TLSEnable = config.TLSEnable
+	remotingConfig.TLSTestMode = true
+	remotingConfig.EnableReconnectForGoAway = true
+	remotingConfig.SocksProxy = config.SocksProxy
+	inst.remoting = remoting.NewRemotingClientWithConfig(remotingConfig)
 	inst.registerClientProcessors()
 	return inst
 }

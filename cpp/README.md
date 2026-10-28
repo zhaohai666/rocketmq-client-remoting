@@ -46,17 +46,17 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、71 个测试二进制与
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、72 个测试二进制与
 44 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 72
-Total Test time (real) = 165.54 sec   # ctest --output-on-failure（串行）
+100% tests passed out of 73
+Total Test time (real) = 148.02 sec   # ctest --output-on-failure（串行）
 ```
 
-72 个用例 = 71 个测试二进制 + 1 个编解码互调用例。断言数按二进制自报的
-`N checks, M failures` 汇总：逐个串行跑 `build/tests/` 下 71 个测试二进制，自报 checks 合计
-**8,299 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,372 项**。
+73 个用例 = 72 个测试二进制 + 1 个编解码互调用例。断言数按二进制自报的
+`N checks, M failures` 汇总：逐个串行跑 `build/tests/` 下 72 个测试二进制，各取自己那行汇总，checks 合计
+**8,367 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,440 项**。
 
 不依赖集群的协议层自检：
 
@@ -547,6 +547,7 @@ producer.setTlsOptions(opts);
   CommandCustomHeader 家族（含 V2 单字母短字段名）、17 段消息存储格式与 6 段批量格式
 - ✅ 传输层：同步 / 异步 / oneway、半包重组、opaque 匹配、断线重连、
   GO_AWAY(1500) 换连接重发、连接判死、SIGPIPE 处理
+- ✅ 连接生命周期，每条规则一个离线用例：解不开帧的连接只打一条点名对端的 ERROR，并且只拆掉那一条连接（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败），对端下一个合法请求在新连接上被服务；没人等的响应被丢弃并打一条点名 opaque 与地址的 WARNING，连接留着并继续服务下一个请求；`isChannelWritable()` 回答的是 socket 发送缓冲，不是有没有连接——没有连接的地址即可写（下一次发送自己建连，而且问一次不会凭空建出连接），有缓冲区的活连接可写，只有不读的把缓冲塞满才是不可写；传输层自己驱动空闲清扫——停止承载流量、静默严格超过 `setChannelIdleTimeoutMillis()`（默认 120000；配 ≤0 恢复默认，因为只要有连接清扫就一直在装）的连接被关掉并打一条点名地址的 WARNING，每 100ms 还被写的连接永远不会被当成空闲；每个被回收的在途请求一条超时 WARNING 点名地址，而且回收请求不是连接事件；同步调用等满超时后默认关掉它发出去的那条连接，`setCloseSocketOnSyncTimeout(false)` 才关不掉，而发送本身失败则无论开关一律关闭
 - ✅ TLS：test-mode 与严格 CA 校验、mTLS
 - ✅ 生产者：普通 / 顺序（selector 与定点）/ 延迟与定时 / 事务 / 批量 / 单向 / 真异步 /
   异步背压 / 自动攒批 / Request-Reply / 定时消息撤回 / 消息查询
@@ -699,7 +700,7 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      71 个测试源文件 + interop_check.py = 72 个 ctest 用例
+├── tests/                      72 个测试源文件 + interop_check.py = 73 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

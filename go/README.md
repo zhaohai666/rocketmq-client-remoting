@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 848 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 859 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 528 | 54.3s |
-| `common` | 135 | 3.8s |
-| `remoting` | 185 | 1.6s |
-| **合计** | **848**（76 个 `*_test.go`） | ~60s |
+| `client` | 528 | 51.7s |
+| `common` | 135 | 2.4s |
+| `remoting` | 196 | 4.5s |
+| **合计** | **859**（77 个 `*_test.go`） | ~59s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -427,6 +427,7 @@ producer.SetTLSEnable(true)
   6 段批量格式、V2 单字母短键 header、心跳与订阅关系、请求码 / 响应码 / 语言码常量
 - ✅ 传输：长连接复用、半包粘包重组、opaque 匹配、超时、连接断开即在途请求判死、
   `GO_AWAY`、同步 / 异步 / 单向、TLS
+- ✅ 连接生命周期，每条规则都有只跑本机回环 socket 的离线用例：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`IsChannelWritable` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有写请求因为塞不下而卡住的活连接才算不可写；清扫线程关掉既没读也没写、静默严格超过 `ClientConfig.ChannelIdleTimeoutSeconds`（默认 120；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步调用等满自己的超时后，`ClientConfig.CloseChannelOnSyncTimeout` 开着（默认 true）就丢掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留。写本身失败则无论旋钮开合，连接一律关掉
 - ✅ 安全与多租：ACL 签名（`HmacSHA1`，标准库）、两套命名空间、单元化
   （`SetUnitName` / `SetUnitMode`）、`CheckForbiddenHook`
 - ✅ 压缩：ZLIB、LZ4、ZSTD 三型可发可收；ZSTD 解码是完整格式（含 FSE + Huffman），
@@ -582,7 +583,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   76 个测试文件，848 个测试函数
+│   └── *_test.go                   77 个测试文件，859 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 

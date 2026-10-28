@@ -408,8 +408,14 @@ func TestConnectFailureMapsToConnectError(t *testing.T) {
 	if !common.IsKind(err, common.KindConnect) {
 		t.Fatalf("got %v", err)
 	}
-	if client.IsChannelWritable(addr) {
-		t.Fatal("should be no writable connection after failure")
+	// A failed dial leaves no connection behind, and "no connection" is not
+	// "saturated": the predicate reports the address as writable, and the table
+	// is what proves nothing was kept.
+	if !client.IsChannelWritable(addr) {
+		t.Fatalf("an address with no live connection must report writable: %s", addr)
+	}
+	if addrs := client.ConnectionAddrs(); len(addrs) != 0 {
+		t.Fatalf("a failed dial must leave the table empty, got %v", addrs)
 	}
 }
 
@@ -432,8 +438,13 @@ func TestCloseChannelForcesReconnect(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.CloseChannel(addr)
-	if client.IsChannelWritable(addr) {
-		t.Fatal("connection must be unwritable after close")
+	// Closed means gone, not blocked: the table lost the entry and the predicate
+	// reports the address writable again because nothing can be saturated.
+	if addrs := client.ConnectionAddrs(); len(addrs) != 0 {
+		t.Fatalf("close must drop the table entry, got %v", addrs)
+	}
+	if !client.IsChannelWritable(addr) {
+		t.Fatalf("an address with no live connection must report writable: %s", addr)
 	}
 	response, err := client.InvokeSync(addr, request(ReqSendMessage, "second"), 3000)
 	if err != nil {
@@ -534,8 +545,13 @@ func TestSameAddressWorksAfterFailFast(t *testing.T) {
 	if !common.IsKind(err, common.KindSendRequest) {
 		t.Fatalf("got %v", err)
 	}
-	if client.IsChannelWritable(addr) {
-		t.Fatal("dead connection must be removed from the connection table")
+	if addrs := client.ConnectionAddrs(); len(addrs) != 0 {
+		t.Fatalf("dead connection must be removed from the connection table, got %v", addrs)
+	}
+	// The entry is gone, so the address is writable again rather than blocked:
+	// the next call dials instead of queueing onto a dead socket.
+	if !client.IsChannelWritable(addr) {
+		t.Fatalf("an address with no live connection must report writable: %s", addr)
 	}
 	response, err := client.InvokeSync(addr, request(ReqSendMessageV2, "ok"), 5000)
 	if err != nil {

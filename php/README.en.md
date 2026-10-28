@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 31 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 32 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,9 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains **31** suites — the list is derived
+the other dies — this guard cannot be skipped), then chains **32** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 4,937 assertions across the 31 suites pass**; any failure exits with a
+**guard CLEAN, all 5,010 assertions across the 32 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -426,6 +426,22 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Protocol / transport: `RemotingCommand` dual serialization (JSON + ROCKETMQ binary),
   the 17-segment storage format and the 6-segment batch message codec, sync / async /
   oneway, opaque matching, half-packet reassembly, GO_AWAY connection-switch resend, TLS
+- ✅ Connection lifecycle, each rule gated against a socket the test itself owns: an undecodable frame logs
+  one ERROR naming the peer and the connection goes the way a peer-EOF connection goes (an
+  out-of-range length prefix is the same event one level earlier, reported once at the level that
+  caught it and never also as a decode failure), and the peer's next valid frame is served on a
+  fresh connection; a response whose opaque no request waits on is dropped with one WARNING naming
+  opaque and address and the connection stays up; `isChannelWritable()` answers for the socket's
+  send buffer, not for having a connection — no connection is writable because the next send
+  connects, a live socket whose send buffer is full is the unwritable case, and a failed probe
+  reports writable and lets the write path decide; a connection idle past
+  `setChannelIdleTimeoutSeconds()` (default 120; a non-positive value restores the default instead
+  of switching the sweep off) is reaped with one WARNING per address, reads and writes both
+  re-start its clock, and the reaping runs on the client's own pumps (`pumpIncoming()` /
+  `waitResponses()`) because a single-threaded process has no background timer to trust; a
+  synchronous wait that runs out closes the connection it went out on unless
+  `setCloseChannelOnSyncTimeout(false)` turns that off, an expired in-flight entry logs one line
+  per entry, and a write that fails closes the channel whatever the knobs say
 - ✅ Sending: normal / pinned / queue selector / batch (with `ProduceAccumulator`
   auto-accumulation and two-level fair backpressure) / oneway / async / transactional
   (two-phase + broker check-back) / timed messages and recall / Request-Reply
@@ -488,7 +504,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 31 suites with 4,937 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 32 suites with 5,010 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

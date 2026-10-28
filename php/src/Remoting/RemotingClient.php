@@ -32,12 +32,34 @@ final class RemotingClient
 {
     public const MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
+    /** Default idle limit of one transport connection, in seconds. */
+    public const DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS = 120;
+
     private int $connectTimeoutMillis;
     private int $invokeTimeoutMillis;
 
     /** Defaults to **true**: on broker ResponseCode.GO_AWAY(1500), resend once over a new
      * connection; when disabled, GO_AWAY is reported directly as a send failure. */
     private bool $enableReconnectForGoAway;
+
+    /**
+     * Idle limit of one transport connection, in seconds (default
+     * {@see self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS}). A connection whose last **completed
+     * read or write** is strictly older than this limit is closed by
+     * {@see self::sweepIdleConnections()}. A non-positive value falls back to the default:
+     * the limit cannot be switched off, only widened.
+     *
+     * The sweep is not driven by a transport timer (this port has none); see
+     * {@see self::sweepIdleConnections()} for the places that actually run it.
+     */
+    private int $channelIdleTimeoutSeconds;
+
+    /**
+     * Defaults to **true**: when a synchronous invoke times out while its response never lands,
+     * the connection it went out on is closed (and its other in-flight requests fail fast).
+     * When false the socket is kept and only the timeout is reported.
+     */
+    private bool $closeChannelOnSyncTimeout;
 
     /** Whether to connect to the broker over TLS. The explicit constructor argument wins,
      * otherwise the ROCKETMQ_TLS_ENABLE environment variable is read (this port has no runtime
@@ -67,6 +89,12 @@ final class RemotingClient
     /** @var array<string, string> addr -> receive buffer holding an incomplete frame */
     private array $inBuffers = [];
 
+    /**
+     * @var array<string, float> addr -> monotonic millisecond of the last completed read or
+     *        write on that connection (the stamp the idle sweep measures)
+     */
+    private array $lastActivityMillis = [];
+
     /** @var array<int, PendingResponse> opaque -> in-flight request */
     private array $pending = [];
 
@@ -91,10 +119,14 @@ final class RemotingClient
         ?array $nameServers = null,
         ?array $tlsOptions = null,
         ?SocksProxyConfig $socksProxy = null,
+        int $channelIdleTimeoutSeconds = self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS,
+        bool $closeChannelOnSyncTimeout = true,
     ) {
         $this->connectTimeoutMillis = $connectTimeoutMillis;
         $this->invokeTimeoutMillis = $invokeTimeoutMillis;
         $this->enableReconnectForGoAway = $enableReconnectForGoAway;
+        $this->channelIdleTimeoutSeconds = self::normalizeIdleTimeoutSeconds($channelIdleTimeoutSeconds);
+        $this->closeChannelOnSyncTimeout = $closeChannelOnSyncTimeout;
         if ($tlsEnable === null) {
             $tlsEnable = in_array(strtolower(trim((string)getenv('ROCKETMQ_TLS_ENABLE'))), ['1', 'true', 'yes'], true);
         }
@@ -128,6 +160,36 @@ final class RemotingClient
     }
 
     /**
+     * Idle limit of one transport connection, in seconds. A non-positive value falls back to
+     * {@see self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS}: the sweep cannot be switched off.
+     */
+    public function setChannelIdleTimeoutSeconds(int $seconds): void
+    {
+        $this->channelIdleTimeoutSeconds = self::normalizeIdleTimeoutSeconds($seconds);
+    }
+
+    public function getChannelIdleTimeoutSeconds(): int
+    {
+        return $this->channelIdleTimeoutSeconds;
+    }
+
+    /** Whether a synchronous invoke that times out closes the connection it went out on. */
+    public function setCloseChannelOnSyncTimeout(bool $close): void
+    {
+        $this->closeChannelOnSyncTimeout = $close;
+    }
+
+    public function isCloseChannelOnSyncTimeout(): bool
+    {
+        return $this->closeChannelOnSyncTimeout;
+    }
+
+    private static function normalizeIdleTimeoutSeconds(int $seconds): int
+    {
+        return $seconds > 0 ? $seconds : self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS;
+    }
+
+    /**
      * @return resource
      */
     private function getOrCreateConn(string $addr)
@@ -139,6 +201,7 @@ final class RemotingClient
         $conn = $this->createConn($addr);
         $this->conns[$addr] = $conn;
         $this->inBuffers[$addr] = '';
+        $this->lastActivityMillis[$addr] = self::monoMillis();
         return $conn;
     }
 
@@ -272,17 +335,46 @@ final class RemotingClient
         if ($conn === null) {
             return;
         }
-        unset($this->conns[$addr], $this->inBuffers[$addr]);
+        unset($this->conns[$addr], $this->inBuffers[$addr], $this->lastActivityMillis[$addr]);
         $this->failFast($addr, $conn);
         if (is_resource($conn)) {
             @fclose($conn);
         }
     }
 
+    /**
+     * Whether more data may be written to this address right now.
+     *
+     * No connection (or a table entry that is no longer a usable resource) => **true**: "nothing
+     * is open yet" is not "this cannot take data" -- the next send simply connects. Only an
+     * existing, live connection answers false, and only when the kernel will not currently take
+     * a write from it.
+     *
+     * What this port can and cannot determine: the check is a zero-timeout ``stream_select`` on
+     * the write set, i.e. the same question ``writeAll()`` already asks before each ``fwrite``,
+     * so "not writable" means "a write would block right now". It is a snapshot of the socket
+     * send buffer, not a queue-depth watermark -- PHP's streams layer exposes no high-water
+     * mark, so a live connection that is merely slow but currently drained reports writable, and
+     * so does a connection whose peer just died (the read path is what notices that, and it
+     * closes the channel). On a TLS connection the probe sees the underlying socket only, not
+     * the crypto layer's own buffers.
+     */
     public function isChannelWritable(string $addr): bool
     {
         $conn = $this->conns[$addr] ?? null;
-        return $conn !== null && is_resource($conn);
+        if ($conn === null || !is_resource($conn)) {
+            return true;
+        }
+        $r = [];
+        $w = [$conn];
+        $e = [];
+        $n = @stream_select($r, $w, $e, 0, 0);
+        if ($n === false) {
+            // The probe itself failed: report writable and let the write path
+            // (writeAll -> send failure -> closeChannel) decide, rather than refusing the send.
+            return true;
+        }
+        return $w !== [];
     }
 
     // ---------- RPC hooks ----------
@@ -350,6 +442,9 @@ final class RemotingClient
             $this->closeChannel($addr);
             throw new RemotingSendRequestException($addr, $e->getMessage());
         }
+        // The frame is fully on the socket: the connection just did real work, so its idle
+        // clock restarts here.
+        $this->lastActivityMillis[$addr] = self::monoMillis();
         return $conn;
     }
 
@@ -399,6 +494,7 @@ final class RemotingClient
         try {
             $conn = $this->getOrCreateConn($addr);
             $this->writeAll($conn, $cmd->encode(), $this->invokeTimeoutMillis / 1000.0);
+            $this->lastActivityMillis[$addr] = self::monoMillis();
         } catch (\Throwable $e) {
             Logger::warning(sprintf('remoting: failed to write response (code=%s) to %s: %s', $cmd->code, $addr, $e->getMessage()));
         }
@@ -486,6 +582,31 @@ final class RemotingClient
         if ($future->cause !== null) {
             throw $future->cause;
         }
+        // A sync wait that ran out with the response still missing has no evidence the peer is
+        // readable at all: the frame may be lost on the way, and nothing else will ever deliver
+        // it. The socket is therefore dropped by default -- this port does not subtract the
+        // connect cost from the budget, so the time still available when the wait began is the
+        // whole timeout (left == $timeout).
+        $leftMillis = $timeout;
+        $closeChannel = $this->closeChannelOnSyncTimeout
+            && ($leftMillis > 100 || $leftMillis > intdiv($timeout, 4));
+        if ($closeChannel) {
+            // In-flight requests of *other* callers sharing this connection are doomed by
+            // failFast and WARN about themselves there.
+            Logger::warning(sprintf(
+                'remoting: sync wait to %s timed out (opaque=%s, timeout=%dms), closing the connection',
+                $addr,
+                $request->opaque,
+                $timeout,
+            ));
+            $this->closeChannel($addr);
+        }
+        Logger::warning(sprintf(
+            'remoting: wait response from %s timeout, opaque=%s, %dms',
+            $addr,
+            $request->opaque,
+            $timeout,
+        ));
         throw new RemotingTimeoutException($addr, $timeout);
     }
 
@@ -524,12 +645,15 @@ final class RemotingClient
     public function waitResponses(int $timeoutMillis): void
     {
         $deadline = self::monoMillis() + $timeoutMillis;
+        // Idle reaping rides this pump: it is one of the few places the transport actually runs.
+        $this->sweepIdleConnections();
         while ($this->pending !== []) {
             $now = self::monoMillis();
             if ($now >= $deadline) {
                 break;
             }
             $this->sweepExpired();
+            $this->sweepIdleConnections();
             if ($this->pending === []) {
                 break;
             }
@@ -588,6 +712,9 @@ final class RemotingClient
     public function pumpIncoming(int $timeoutMillis): void
     {
         $deadline = self::monoMillis() + $timeoutMillis;
+        // Idle reaping rides this pump too, and unlike waitResponses it runs even with an empty
+        // pending table -- which is the state a long-lived idle socket is actually left in.
+        $this->sweepIdleConnections();
         while (true) {
             if (self::monoMillis() >= $deadline) {
                 break;
@@ -685,14 +812,24 @@ final class RemotingClient
             }
             return true; // no data for now on a non-blocking socket
         }
+        // Bytes actually came off the socket: the connection just did real work, so its idle
+        // clock restarts here.
+        $this->lastActivityMillis[$addr] = self::monoMillis();
         $buf = ($this->inBuffers[$addr] ?? '') . $chunk;
         while (strlen($buf) >= 4) {
             $totalLen = RocketMQSerializable::unpackSignedInt(substr($buf, 0, 4));
             if ($totalLen <= 0 || $totalLen > self::MAX_FRAME_LENGTH) {
-                // An untrustworthy length field means the stream is corrupt: drop the whole buffer,
-                // do not try to realign frame boundaries
-                $buf = '';
-                break;
+                // An untrustworthy length field means the stream is corrupt: length-prefixed
+                // framing cannot realign itself, so every byte after this header is misframed.
+                // Report it as an error and take the connection down the same way a peer EOF
+                // does (closeChannel -> failFast), leaving the other connections alone.
+                Logger::error(sprintf(
+                    'remoting: bad frame length %d from %s: the stream is not trustworthy, closing the connection',
+                    $totalLen,
+                    $addr,
+                ));
+                $this->closeChannel($addr);
+                return false;
             }
             if (strlen($buf) < 4 + $totalLen) {
                 break;
@@ -716,7 +853,18 @@ final class RemotingClient
     {
         try {
             $cmd = RemotingCommand::decode($frame);
-        } catch (\Throwable) {
+        } catch (\Throwable $e) {
+            // An undecodable frame means the byte stream no longer lines up with the frame
+            // boundaries, so the connection cannot be trusted for any later request: log the
+            // error and take it down through the same path a peer EOF takes (closeChannel ->
+            // failFast, which WARNs about the requests it dooms). Other connections are untouched.
+            Logger::error(sprintf(
+                'remoting: cannot decode frame from %s (%d bytes): %s, closing the connection',
+                $addr,
+                strlen($frame),
+                $e->getMessage(),
+            ));
+            $this->closeChannel($addr);
             return;
         }
         if ($cmd->isResponseType()) {
@@ -754,6 +902,17 @@ final class RemotingClient
     {
         $future = $this->pending[$cmd->opaque] ?? null;
         if ($future === null) {
+            // The pending table removes an entry as soon as it is answered (timeout sweep,
+            // failFast, or an earlier response), so an unmatched opaque is a response nobody is
+            // waiting for any more: drop it, but say so -- a silent drop hides both a peer that
+            // answers twice and a request this client already gave up on.
+            // Dropping does not invalidate the stream: the frame was well-formed and correctly
+            // framed, so the connection stays up for the requests still on it.
+            Logger::warning(sprintf(
+                'remoting: response from %s does not match any in-flight request (opaque=%s), dropped',
+                $addr,
+                $cmd->opaque,
+            ));
             return;
         }
         unset($this->pending[$cmd->opaque]);
@@ -808,8 +967,60 @@ final class RemotingClient
                 continue;
             }
             unset($this->pending[$opaque]);
+            // One event, one log line: without this line a swept request is invisible (the
+            // failure callback only logs when the callback itself throws).
+            Logger::warning(sprintf(
+                'remoting: in-flight request to %s expired (opaque=%s, timeout=%dms), failed with a timeout',
+                $f->addr,
+                $opaque,
+                $f->timeoutMillis,
+            ));
             $this->fireFailure($f, new RemotingTimeoutException($f->addr, $f->timeoutMillis));
         }
+    }
+
+    // ---------- Idle connection sweep ----------
+
+    /**
+     * Closes every connection idle strictly longer than the configured limit and WARNs the
+     * address each time; the close goes through {@see self::closeChannel()}, so a connection
+     * that stopped carrying traffic takes its in-flight requests down with it (failFast).
+     *
+     * When this runs: this port has no IO thread and no transport timer, so nothing reaps a
+     * socket on its own. The sweep is driven only from the places that actually execute --
+     * ``waitResponses()`` (on entry, and again in every round it pumps) and ``pumpIncoming()``
+     * (on entry), plus ``MQClientInstance::tick()``, the client-layer pump the caller drives
+     * between requests. A connection that never pumps and whose owner never ticks is therefore
+     * not reaped until one of those runs; and a caller that never calls any of them leaves the
+     * socket open for the lifetime of the process.
+     *
+     * @param int|null $nowMillis injectable monotonic clock reading (milliseconds), for tests
+     * @return int number of connections closed
+     */
+    public function sweepIdleConnections(?int $nowMillis = null): int
+    {
+        $idleLimitMillis = $this->channelIdleTimeoutSeconds * 1000;
+        $now = $nowMillis ?? (int)self::monoMillis();
+        $closed = 0;
+        foreach ($this->lastActivityMillis as $addr => $lastActivity) {
+            if (!isset($this->conns[$addr])) {
+                unset($this->lastActivityMillis[$addr]);
+                continue;
+            }
+            // Strictly past the limit: a connection whose idle time equals the limit survives.
+            if ($now - $lastActivity <= $idleLimitMillis) {
+                continue;
+            }
+            Logger::warning(sprintf(
+                'remoting: connection to %s idle for %dms (limit %ds), closing it',
+                $addr,
+                $now - $lastActivity,
+                $this->channelIdleTimeoutSeconds,
+            ));
+            $this->closeChannel($addr);
+            $closed++;
+        }
+        return $closed;
     }
 
     // ---------- Fail in-flight requests immediately on disconnect (failFast) ----------

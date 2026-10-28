@@ -23,6 +23,17 @@ add_executable(rmq_test_transport test_transport.cpp)
 target_link_libraries(rmq_test_transport PRIVATE rocketmq::remoting)
 add_test(NAME transport COMMAND rmq_test_transport)
 
+# Remoting transport connection-lifecycle contract, offline against loopback fake peers: a frame
+# that does not decode (and a length prefix outside the accepted range) is an ERROR naming the peer
+# and takes that one connection down; a stray response is a WARNING and the connection survives;
+# the writable question answers about the outbound buffer, not about having connected; a quiet
+# connection is reaped by the transport's own sweep while one still carrying traffic is not; and a
+# sync wait that runs out closes the socket it ran out on unless that is switched off -- each leg
+# reads both the connection table and the log line that has to explain it.
+add_executable(rmq_test_transport_contract test_transport_contract.cpp)
+target_link_libraries(rmq_test_transport_contract PRIVATE rocketmq::remoting)
+add_test(NAME transport_contract COMMAND rmq_test_transport_contract)
+
 # SOCKS proxy: local fake SOCKS5/SOCKS4 servers pin the handshake bytes and the CONNECT target,
 # the accept/reject paths of RFC 1929 username/password sub-negotiation, and one real remoting
 # request sent over the tunnel. Failure-path assertions get a >=30s connect budget per loopback quirks.

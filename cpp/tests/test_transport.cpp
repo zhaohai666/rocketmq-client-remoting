@@ -460,7 +460,9 @@ int main() {
         client.invokeSync(addr, req);
         CHECK(client.isChannelWritable(addr), "channel writable before close");
         client.closeChannel(addr);
-        CHECK(!client.isChannelWritable(addr), "channel not writable after close");
+        // "No connection" is not "cannot write": the next send simply connects. The table
+        // entry leaving is what closeChannel promises (checked next).
+        CHECK(client.isChannelWritable(addr), "an address with no connection is writable again");
         CHECK(client.connectionCount() == 0, "connection removed after closeChannel");
         // still able to reconnect after close
         RemotingCommand req2 = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
@@ -469,7 +471,7 @@ int main() {
         client.shutdown();
         client.shutdown();  // idempotent
         CHECK(client.connectionCount() == 0, "connectionCount 0 after shutdown");
-        CHECK(!client.isChannelWritable(addr), "not writable after shutdown");
+        CHECK(client.isChannelWritable(addr), "and after shutdown the address is writable again");
     }
 
     STEP("8.1 goaway retry");

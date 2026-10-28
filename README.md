@@ -25,7 +25,7 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 | 领域 | 内容 |
 | --- | --- |
 | 协议层 | `RemotingCommand` 帧编解码；JSON / 二进制双序列化；17 段 + 6 段消息编解码；V2 短键 header；对 broker 返回的非严格 JSON 做容错解析 |
-| 传输层 | 长连接惰性建连与复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时与重连、在途请求超时扫描、GO_AWAY 换连接重发一次、连接断开时在途请求立即判死、TLS |
+| 传输层 | 长连接惰性建连与复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时与重连、在途请求超时扫描、GO_AWAY 换连接重发一次、连接断开时在途请求立即判死、TLS。七端再各自守着一套连接生命周期规则：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 与地址的 WARN，连接留着；可写回答的是 socket 发送缓冲——没有活连接的地址可写（下一次发送自己建连），只有塞不下的活连接才不可写；既没读也没写、静默严格超过空闲上限（默认 120s，配非正数恢复默认而不是关掉清扫）的连接被关掉并每个地址一条 WARN，每次成功读写都重打时间戳；每个过期的在途请求各一条 WARN；同步等待超时后默认关掉它发出去的那条 socket，关掉本端的开关才留——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论开关一律关闭。各端旋钮名（空闲上限 / 超时关连接）：Go `ChannelIdleTimeoutSeconds` / `CloseChannelOnSyncTimeout`，Rust `channel_idle_timeout_millis` / `close_socket_on_sync_timeout`，Python `channel_not_active_interval_millis` / `enable_close_channel_on_sync_timeout`，Node.js `maxIdleTimeMillis` / `closeSocketOnSyncTimeout`，C++ `setChannelIdleTimeoutMillis()` / `setCloseSocketOnSyncTimeout()`，C# `ChannelIdleTimeoutMillis` / `CloseSocketOnSyncTimeout`，PHP `setChannelIdleTimeoutSeconds()` / `setCloseChannelOnSyncTimeout()`（PHP 由自己的泵驱动清扫，Node.js 的清扫定时器是 `unref()` 的） |
 | 发送 | 同步 / 定点 / 批量 / 单向 / 队列选择器 / 异步（真异步发送池 + 两个公平背压信号量）/ 事务消息（两阶段 + broker 回查）/ 定时消息撤回（recallMessage） |
 | 消费 | Push Consumer（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 启动位点解析（`CONSUME_FROM_FIRST` / `LAST` / `TIMESTAMP` 各自的分派，广播组 / `%RETRY%` 组 / 带 SQL92 过滤的订阅都走同一条判定链） + 拉取前流控（每队列三条缓存闸门，只判该队列「持有」的一切：未派发缓冲 + 已交给监听器但尚未结算的批次，按位点去重；条数 / 消息体字节按 1 MiB 整除 / 队列位点跨度，每条都严格大于阈值才停，阈值按字面取值——不 clamp 到 1、0 也不是「关闭」，合法区间由启动配置检查把守，字节闸门累加消息体长度而不是解码记录的 `storeSize`，跨度闸门完全不作用于顺序消费；两个 topic 级缓存预算不在拉取时累计兄弟队列，而是在重平衡改变分配后除以自有队列数、把商写回对应的每队列闸门；命中后本地缓存闸门重排 50ms、broker 的 FLOW_CONTROL(215) 只等 20ms、其余拉取失败等 500ms，告警第 1 次及其后每 1000 次一次；分配集合变动的重平衡轮按序补齐——只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向变动的 topic 回调队列监听，集合未变的轮次与停摆自愈轮什么都不欠；POP 循环没有「已拉未消费」缓冲，它的缓存闸门是本队列待 ack 的欠账数（默认 96，同样严格大于才停、只读本队列、不累加兄弟队列），命中后走同一个 50ms 重排、记进拉取路径那个全局 flowControlTimes 计数与同一套告警节奏，POP 请求被 broker 回 FLOW_CONTROL(215) 时同样只等 20ms）+ 挂起 listener 的清扫逃生口，POP 侧支持单条 ack 与 `BATCH_ACK_MESSAGE`(200151) 批量 ack：同一重试标记 + 队列 + pop 时间窗的多条 CK 合并成一个请求，位集按 `queueOffset-ckQueueOffset` 编码）、Pull Consumer（`fetchSubscribeMessageQueues` 给整个 topic，`fetchMessageQueuesInBalance` 只给本实例应得的那份，算不动时保留现有分配、绝不退化成「全要」；分配集合变动时只欠队列监听这一半）、Lite Pull Consumer（拉取 / 已消费 / 内存提交三张位点表；后台拉取在解析本队列拉取位点之前先过四道缓存闸门——在途拉取轮次 × `PullBatchSize`（默认 10）对 `PullThresholdForAll` 10000、本队列条数 1000、本队列消息体字节按 1 MiB 整除后 100、本队列位点跨度 2000，每条都严格大于阈值才停；命中只重排这一个队列 50ms、兄弟队列照旧，broker 回 `FLOW_CONTROL`(215) 只等 20ms，条数与字节共用一个 trip 计数、聚合与跨度各用自己的，被撤销的队列连缓冲、累计值和在途轮次一起消失；Node.js 的 lite `poll()` 就地拉取、没有预取缓冲，所以四道闸门在该端无对象可判，只保留 215 的按队列 20ms 停拉） |
 | 队列变更监听 | LitePull 的 `registerTopicMessageQueueChangeListener`：按 topic 注册回调，周期比对队列集合，扩容 / 缩容都能在下一趟检查里被看到（比对趟次现查路由，不吃周期刷新的路由缓存；空队列集按「查不到」处理） |
@@ -41,13 +41,13 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 
 | 语言 | 目录 | 运行形态 | 压缩 | 单元测试 |
 | --- | --- | --- | --- | --- |
-| Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1738 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：72 个用例全绿（8372 项断言） |
-| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1130 passed |
-| Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：1152 passed；`cargo clippy --all-targets` 零 warning |
-| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：848 个测试函数（client 528 / common 135 / remoting 185）；`go vet` / `gofmt` 零告警 |
-| Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 65 个模块 + 46 套冒烟共 1468 项检查全绿 |
-| PHP | [`php/`](php/README.md) | PHP 8.1+，单线程 `tick()` 驱动，零 composer 依赖 | zlib 走 `gzcompress`；LZ4 纯 PHP frame；ZSTD 优先 `zstd` CLI，退回纯 PHP Raw/RLE | `php tests/run_all.php`：31 个套件 4937 项断言 + 重复类名守卫 |
+| Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1751 passed + 4 skipped |
+| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：73 个用例全绿（8440 项断言） |
+| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1140 passed |
+| Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：1161 passed；`cargo clippy --all-targets` 零 warning |
+| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：859 个测试函数（client 528 / common 135 / remoting 196）；`go vet` / `gofmt` 零告警 |
+| Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 65 个模块 + 47 套冒烟全绿（42 套逐条计出 1480 项检查，另外 5 套按检查组报告） |
+| PHP | [`php/`](php/README.md) | PHP 8.1+，单线程 `tick()` 驱动，零 composer 依赖 | zlib 走 `gzcompress`；LZ4 纯 PHP frame；ZSTD 优先 `zstd` CLI，退回纯 PHP Raw/RLE | `php tests/run_all.php`：32 个套件 5010 项断言 + 重复类名守卫 |
 
 > Go 的 ZSTD 编码产出**合法 zstd 帧但不做熵编码**（store-only Raw/RLE 块），对端能正常解开，
 > 压缩比接近 1:1；真机矩阵里 `storeSize≈消息体大小` 就是这个取值的证据。需要真实压缩比时用
