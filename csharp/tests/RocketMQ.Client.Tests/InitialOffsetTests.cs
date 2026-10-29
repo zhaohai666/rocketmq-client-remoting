@@ -49,6 +49,19 @@ public class InitialOffsetTests
         /// it to place itself in cidAll, otherwise this consumer gets not a single queue,
         /// never pulls, and the pull leg would be testing nothing.</summary>
         private string _clientId = string.Empty;
+        /// <summary>How the committed-offset read is answered. Defaults to "never
+        /// committed"; a non-success code models a store that cannot answer.</summary>
+        private int _offsetReadCode = ResponseCode.QueryNotFound;
+        private long _offsetReadOffset;
+
+        public void SetOffsetRead(int code, long offset)
+        {
+            lock (_gate)
+            {
+                _offsetReadCode = code;
+                _offsetReadOffset = offset;
+            }
+        }
 
         public string Addr { get; }
 
@@ -228,8 +241,30 @@ public class InitialOffsetTests
 
             if (req.Code == RequestCode.QueryConsumerOffset && !req.IsOnewayRpc())
             {
-                // A new group: no committed offset on the broker -- exactly the situation the FIRST_OFFSET branch handles
-                return Echo(req, ResponseCode.QueryNotFound, "mock: no committed offset");
+                // Default: a new group, no committed offset on the broker -- exactly the
+                // situation the FIRST_OFFSET branch handles. A scripted failure models a
+                // store that cannot answer at all.
+                int code;
+                long offset;
+                lock (_gate)
+                {
+                    code = _offsetReadCode;
+                    offset = _offsetReadOffset;
+                }
+
+                if (code == ResponseCode.QueryNotFound)
+                {
+                    return Echo(req, ResponseCode.QueryNotFound, "mock: no committed offset");
+                }
+
+                if (code != ResponseCode.Success)
+                {
+                    return Echo(req, code, "mock: offset store read failed");
+                }
+
+                RemotingCommand storedResp = Echo(req, ResponseCode.Success, null);
+                storedResp.AddExtField("offset", offset.ToString(CultureInfo.InvariantCulture));
+                return storedResp;
             }
 
             if (req.Code is RequestCode.GetMaxOffset or RequestCode.GetMinOffset
@@ -560,6 +595,74 @@ public class InitialOffsetTests
             Assert.False(ep.Requests(RequestCode.GetMaxOffset)
                 .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == retryTopic),
                 "a retry topic with no stored offset must not be resolved by a max-offset query");
+        }
+        finally
+        {
+            consumer.Shutdown();
+        }
+    }
+
+    /// <summary>
+    /// A committed-offset read that FAILS (as opposed to "nothing committed") must leave the
+    /// queue assigned but without a pull loop for that round: with no cursor the loop could
+    /// only guess a start position, and the LAST_OFFSET guess is the tail, which silently skips
+    /// the backlog the group never consumed. The next rebalance round retries the read, and the
+    /// loop starts at the offset the store finally returns. The control is the recovered leg:
+    /// same consumer, same queue, only the store's answer changes.
+    /// </summary>
+    [Fact]
+    public void AnUnreadableCommittedOffsetGetsTheQueueNoPullLoopUntilTheStoreAnswers()
+    {
+        using var ep = OffsetEndpoint.Start();
+        ep.SetOffsetRead(ResponseCode.SystemError, 0);
+
+        var consumer = new DefaultMQPushConsumer("CG_InitReadFail");
+        consumer.SetNamesrvAddr(ep.Addr);
+        consumer.Subscribe(Topic, "*");
+        consumer.SetMessageListener(new NullListener());
+        consumer.Start();
+        try
+        {
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.QueryConsumerOffset)
+                    .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == Topic),
+                TimeSpan.FromSeconds(15)),
+                "the rebalance must try to read this topic's committed offset; request codes that arrived:"
+                + string.Join(",", ep.Codes()));
+
+            string key = DefaultMQPushConsumer.OffsetKeyForTest(Queue0());
+            Assert.True(WaitFor(() => consumer.AssignedQueuesForTest().Exists(q => q.Topic == Topic),
+                    TimeSpan.FromSeconds(5)),
+                "the queue keeps its assignment while its offset is unreadable");
+
+            // Never registered as pulling, and never put on the wire: watch the whole window a
+            // wrongly-started loop (or a parked one) would have shown itself in.
+            bool registered = false;
+            for (int i = 0; i < 75 && !registered; i++)
+            {
+                registered = consumer.MqMapContainsForTest(key);
+                Thread.Sleep(20);
+            }
+
+            Assert.False(registered,
+                "a queue with no cursor must not be registered as pulling this round");
+            Assert.DoesNotContain(ep.Requests(RequestCode.PullMessage),
+                r => r.Ext.TryGetValue("topic", out string? t) && t == Topic);
+            Assert.DoesNotContain(ep.Requests(RequestCode.GetMaxOffset),
+                r => r.Ext.TryGetValue("topic", out string? t) && t == Topic);
+
+            // The store recovers: the next round reads 7 and the loop starts exactly there.
+            ep.SetOffsetRead(ResponseCode.Success, 7);
+            consumer.WakeupRebalanceForTest();
+            Assert.True(WaitFor(() => ep.Requests(RequestCode.PullMessage)
+                    .Exists(r => r.Ext.TryGetValue("topic", out string? t) && t == Topic),
+                TimeSpan.FromSeconds(15)),
+                "the recovered queue must start pulling; request codes that arrived:"
+                + string.Join(",", ep.Codes()));
+            WireReq first = ep.Requests(RequestCode.PullMessage)
+                .Find(r => r.Ext.TryGetValue("topic", out string? t) && t == Topic)!;
+            Assert.Equal("7", first.Ext["queueOffset"]);
+            Assert.True(consumer.MqMapContainsForTest(key),
+                "the recovered queue is registered as pulling again");
         }
         finally
         {

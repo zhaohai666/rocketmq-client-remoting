@@ -15,6 +15,9 @@
 //   * consumeTimestamp is parsed unconditionally at start-up. A malformed value
 //     is a hard failure — falling back to "now" would silently turn the policy
 //     into "skip the backlog".
+//   * A store read that FAILS is not "nothing committed": the queue gets no
+//     pull loop for that round, the read is retried on the next rebalance, and
+//     the failed read never falls through to the tail.
 //   * The default instant is boot time minus 30 minutes.
 //
 // Each "which RPC drove the start" claim is decided by what the fake broker
@@ -56,6 +59,10 @@ class FakeCluster {
   // -1 makes QUERY_CONSUMER_OFFSET answer QUERY_NOT_FOUND: the group has
   // never committed, so the policy decides.
   storedOffset = -1;
+  // offsetReadFails makes that same read answer SYSTEM_ERROR: the store exists
+  // but cannot answer, which is NOT "nothing committed".
+  offsetReadFails = false;
+  offsetReadAttempts = 0;
   pulls: Array<{ topic: string; queueId: number; offset: number }> = [];
   searchTimestamps: number[] = [];
   minOffsetCalls = 0;
@@ -153,6 +160,8 @@ class FakeCluster {
       return resp;
     }
     if (req.code === RequestCode.QUERY_CONSUMER_OFFSET) {
+      this.offsetReadAttempts++;
+      if (this.offsetReadFails) { resp.code = ResponseCode.SYSTEM_ERROR; return resp; }
       if (this.storedOffset < 0) { resp.code = ResponseCode.QUERY_NOT_FOUND; return resp; }
       resp.extFields['offset'] = String(this.storedOffset);
       return resp;
@@ -425,6 +434,48 @@ async function main() {
     try { await c.start(); } catch (e) { msg = (e as Error).message; }
     check('push: a malformed instant stops start-up', msg.includes('consumeTimestamp is invalid'), msg);
     cluster.close();
+  }
+
+  // ------------------- 12. push: a failed store read starts nothing
+  {
+    const group = 'GID_push_read_fail';
+    const cluster = new FakeCluster();
+    await cluster.listen();
+    cluster.addTopic(TOPIC, 1);
+    cluster.addTopic(MixAll.getRetryTopic(group), 1);
+    cluster.offsetReadFails = true;
+    const c = new DefaultMQPushConsumer(group);
+    c.setNamesrvAddr(cluster.addr);
+    c.subscribe(TOPIC, '*');
+    c.registerMessageListener({ consumeMessage: () => 0 });
+    await c.start();
+    try {
+      check(`push read failure: the committed-offset read is attempted`,
+        cluster.offsetReadAttempts > 0, String(cluster.offsetReadAttempts));
+
+      // Watch the window in which a wrongly started loop would have pulled.
+      const until = Date.now() + 1500;
+      while (Date.now() < until && cluster.firstPullOffset(TOPIC) === undefined) {
+        await new Promise<void>((r) => setTimeout(r, 20));
+      }
+      check(`push read failure: no PULL goes out for the queue the round could not place`,
+        cluster.firstPullOffset(TOPIC) === undefined, String(cluster.firstPullOffset(TOPIC)));
+      check(`push read failure: the failed read never falls back to the tail`,
+        cluster.maxOffsetCalls === 0, String(cluster.maxOffsetCalls));
+
+      // The store recovers: the next round reads the committed offset and the
+      // queue starts exactly there.
+      cluster.offsetReadFails = false;
+      cluster.storedOffset = STORED;
+      await c.doRebalance();
+      const pulled = await waitFor(() => cluster.firstPullOffset(TOPIC) !== undefined);
+      check(`push read failure: once the store answers, the queue pulls at the committed offset`,
+        pulled && cluster.firstPullOffset(TOPIC) === STORED,
+        String(cluster.firstPullOffset(TOPIC)));
+    } finally {
+      await c.shutdown();
+      cluster.close();
+    }
   }
 
   console.log(`\ninitial offset policy: ${pass} checks, ${fail} failed`);

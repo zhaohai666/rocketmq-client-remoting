@@ -51,10 +51,10 @@ ports; see the table below and each language README for the details.
 | --- | --- | --- | --- | --- |
 | Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1777 passed + 4 skipped |
 | C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 74 cases green (8,585 assertions) |
-| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1171 passed |
-| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1183 passed; `cargo clippy --all-targets` warning-free |
-| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 867 test funcs (client 536 / common 135 / remoting 196); `go vet` / `gofmt` clean |
-| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 66 modules loaded + 50 smoke suites green (45 of them report 1,688 individually counted checks; the other 5 report check groups) |
+| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1172 passed |
+| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1184 passed; `cargo clippy --all-targets` warning-free |
+| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 868 test funcs (client 537 / common 135 / remoting 196); `go vet` / `gofmt` clean |
+| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 66 modules loaded + 50 smoke suites green (45 of them report 1,692 individually counted checks; the other 5 report check groups) |
 | PHP | [`php/`](php/README.en.md) | PHP 8.1+, single-threaded `tick()`-driven, zero composer deps | zlib via `gzcompress`; LZ4 as a pure-PHP frame; ZSTD prefers the `zstd` CLI and falls back to pure-PHP raw/RLE | `php tests/run_all.php`: 34 suites, 5,223 assertions + duplicate class-name guard |
 
 > Go's ZSTD encoder emits **valid frames without entropy coding** (store-only raw/RLE blocks): the

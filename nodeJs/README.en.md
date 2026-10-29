@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **66** modules under `src/` and then runs the **50** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-29, **1688** individually counted checks across 45 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **66** modules under `src/` and then runs the **50** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-29, **1692** individually counted checks across 45 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -47,7 +47,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/flow_control_smoke.ts` (three per-queue gates judging everything the queue HOLDS — the undispatched buffer plus the batches already in a listener's hands and not yet settled; strictly greater than the threshold, which is taken literally: no floor clamping 0 up to 1 and no "0 disables this gate", keeping each knob in range is the start-up config check's job, the byte gate sums whole MiB of message BODY by integer division and never the wire store size, the span gate does not run for orderly consumption; the reported reason is the first gate of the fixed count → size → span order and one judgment records one tick, the WARN fires on the 1st trip and every 1000th after; cache gate 50ms, the broker's 215 gets 20ms, every other failed pull waits the single configurable knob `pullRetryDelayMillis` (default 1000ms, `get/setPullRetryDelayMillis`, shared by the pull and POP paths and read once when a queue's loop is set up); the POP queue's outstanding-ACK gate defaults to 96 and trips strictly above it, a trip lands on the same flow-control counter and warn cadence as the pull path, and a POP request answered 215 also waits only 20ms; the lite path's `poll()` pulls inline with no prefetch buffer, so it parks a queue only on the broker's 215 for 20ms, arms nothing for every other code, never holds back a sibling, and hands the caller a typed `MQBrokerException` carrying `responseCode`) | 148 checks passed |
 | `test/heartbeat_v2_beat_smoke.ts` | 28 passed / 0 failed |
 | `test/heartbeat_v2_smoke.ts` | 30 passed / 0 failed |
-| `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 40 passed / 0 failed |
+| `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 44 passed / 0 failed |
 | `test/lite_surface_guards_smoke.ts` (misuse guards on the lite surface: a blank topic, an empty queue list, setting the assign expression once running, poll / committed / queue lookup on a consumer that never started, and a negative timeout behind the state check) | 48 passed / 0 failed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |

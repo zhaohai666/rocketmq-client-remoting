@@ -1982,7 +1982,7 @@ impl DefaultMQPushConsumer {
     /// Deliberately `async`: the finalize sends RPCs, and calling `block_on` again from a caller that is already in an async
     /// context would panic outright.
     pub async fn sync_pull_threads(&self) {
-        self.rebalance_pull_threads().await;
+        self.rebalance_pull_threads(&BTreeSet::new()).await;
     }
 
     // ---------------- Rebalance ----------------
@@ -2169,6 +2169,11 @@ impl DefaultMQPushConsumer {
                 moved.join(",")
             );
         }
+        // A queue whose store read failed gets no cursor this round, so it must get no pull loop
+        // either: without a cursor the loop could only guess a start position, and LAST_OFFSET
+        // would guess the tail -- silently skipping the backlog the group never consumed. The
+        // queue stays in `assigned`, so the next rebalance round retries the read and adds it.
+        let mut skipped: BTreeSet<String> = BTreeSet::new();
         for mq in &assigned {
             let key = mq_key(mq);
             if was.contains(&key) {
@@ -2179,10 +2184,13 @@ impl DefaultMQPushConsumer {
                     let mut state = lock(&self.inner.state);
                     state.offset_table.entry(key).or_insert(off);
                 }
-                Err(e) => rmq_debug!("resolve initial offset failed for {mq:?}: {e}"),
+                Err(e) => {
+                    rmq_debug!("resolve initial offset failed for {mq:?}, skip it this round: {e}");
+                    skipped.insert(key);
+                }
             }
         }
-        self.rebalance_pull_threads().await;
+        self.rebalance_pull_threads(&skipped).await;
         // Everything the moved set owes is paid in one place, in one order that cannot drift, and
         // only **after** the pull-state update above.
         //
@@ -2328,11 +2336,18 @@ impl DefaultMQPushConsumer {
     /// When a queue is revoked it must (1) persist the consumed offset (2) drop the buffer (in-flight messages stop being consumed)
     /// (3) for orderly consumption also UNLOCK_BATCH_MQ -- missing any step lets the old instance keep consuming the in-flight
     /// messages of the revoked queue, duplicating the new owner.
-    async fn rebalance_pull_threads(&self) {
+    ///
+    /// `skip` names queues the current round cannot place (their initial offset could not be
+    /// read): they keep their assignment but get no pull loop, and the next rebalance round
+    /// tries again. Keeping them out of `queue_owners` / `mq_map` is deliberate -- a registered
+    /// queue with no cursor would be judged stalled by the self-healing sweep on the very next
+    /// round and torn down as a `[BUG]`.
+    async fn rebalance_pull_threads(&self, skip: &BTreeSet<String>) {
         let pop = self.config().pop_mode;
         let current: BTreeMap<String, MessageQueue> = lock(&self.inner.state)
             .assigned
             .iter()
+            .filter(|mq| !skip.contains(&mq_key(mq)))
             .map(|mq| (mq_key(mq), mq.clone()))
             .collect();
         let mut revoked: Vec<(MessageQueue, Option<i64>)> = Vec::new();
@@ -6109,6 +6124,7 @@ mod tests {
     use crate::client::result::PullResult;
     use crate::common::message::Message;
     use crate::common::message_const::PROPERTY_KEYS;
+    use crate::remoting::protocol::body::GetConsumerListByGroupResponseBody;
     use crate::remoting::protocol::heartbeat::ExpressionType;
 
     fn ext(topic: &str, tags: Option<&str>) -> MessageExt {
@@ -10089,7 +10105,7 @@ mod tests {
                 .last_pull_at
                 .insert(key.clone(), before - PULL_MAX_IDLE_TIME - 1000);
         }
-        consumer.rebalance_pull_threads().await;
+        consumer.rebalance_pull_threads(&BTreeSet::new()).await;
         let state = lock(&consumer.inner.state);
         // Ownership token changed = the old loop is dead and a new loop took over
         assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
@@ -10128,7 +10144,7 @@ mod tests {
                 .last_pull_at
                 .insert(key.clone(), current_time_millis());
         }
-        consumer.rebalance_pull_threads().await;
+        consumer.rebalance_pull_threads(&BTreeSet::new()).await;
         let state = lock(&consumer.inner.state);
         assert_eq!(state.queue_owners.get(&key).copied(), Some(5));
         assert_eq!(state.pending.get(&key).map(VecDeque::len), Some(1));
@@ -10149,7 +10165,7 @@ mod tests {
             state.mq_map.insert(key.clone(), mq.clone());
         }
         stamp_at(&consumer, &key, 1); // as old as it gets
-        consumer.rebalance_pull_threads().await;
+        consumer.rebalance_pull_threads(&BTreeSet::new()).await;
         assert_eq!(
             lock(&consumer.inner.state).queue_owners.get(&key).copied(),
             Some(1)
@@ -10176,7 +10192,7 @@ mod tests {
             &key,
             current_time_millis() - PULL_MAX_IDLE_TIME - 1,
         );
-        consumer.rebalance_pull_threads().await;
+        consumer.rebalance_pull_threads(&BTreeSet::new()).await;
         let state = lock(&consumer.inner.state);
         assert!(old.is_dropped());
         let fresh = state.pop_queues.get(&key).cloned().expect("rebuilt");
@@ -11435,7 +11451,7 @@ mod tests {
         h.retire();
         // rebuild: assign the queue to self again (the build branch of `rebalance_pull_threads`)
         lock(&h.c.inner.state).assigned = vec![h.mq.clone()];
-        h.c.rebalance_pull_threads().await;
+        h.c.rebalance_pull_threads(&BTreeSet::new()).await;
         assert!(
             !h.frozen(),
             "the new ProcessQueue must unfreeze as soon as it is in place, or the queue would from then on only pull and never ack"
@@ -11810,6 +11826,12 @@ mod tests {
         /// The captured HEARTBEAT(34) request bodies, oldest first -- the only place a test can read
         /// the subscription versions exactly as they went on the wire.
         heartbeats: Mutex<Vec<Vec<u8>>>,
+        /// GET_CONSUMER_LIST_BY_GROUP answer for a classic rebalance round (empty = no classic round ran).
+        cid_list: Mutex<Vec<String>>,
+        /// QUERY_CONSUMER_OFFSET script: None answers SUCCESS/0; Some sets the code (and the offset for SUCCESS).
+        offset_read: Mutex<Option<(i32, i64)>>,
+        /// Every PULL_MESSAGE that reached the fake broker: (topic, queueId, requested offset).
+        pulls: Mutex<Vec<(String, i32, i64)>>,
     }
 
     /// 1 name server (any topic gets the same route back: broker-a with 4 read queues)
@@ -11831,6 +11853,9 @@ mod tests {
                 fixture: Mutex::new(None),
                 bodies: Mutex::new(Vec::new()),
                 heartbeats: Mutex::new(Vec::new()),
+                cid_list: Mutex::new(Vec::new()),
+                offset_read: Mutex::new(None),
+                pulls: Mutex::new(Vec::new()),
             });
             let _namesrv_task = spawn_assign_namesrv(namesrv, broker_addr);
             let _broker_task = spawn_assign_broker(broker, state.clone());
@@ -11842,6 +11867,21 @@ mod tests {
 
         fn set(&self, fixture: Option<AssignFixture>) {
             *lock(&self.state.fixture) = fixture;
+        }
+
+        /// The GET_CONSUMER_LIST_BY_GROUP answer for a classic (non-POP) rebalance round.
+        fn set_cid_list(&self, cids: &[&str]) {
+            *lock(&self.state.cid_list) = cids.iter().map(|c| c.to_string()).collect();
+        }
+
+        /// Script the QUERY_CONSUMER_OFFSET answer: a non-SUCCESS code makes the store read fail.
+        fn set_offset_read(&self, code: i32, offset: i64) {
+            *lock(&self.state.offset_read) = Some((code, offset));
+        }
+
+        /// Every PULL_MESSAGE the fake broker has seen: (topic, queueId, requested offset).
+        fn pulls(&self) -> Vec<(String, i32, i64)> {
+            lock(&self.state.pulls).clone()
         }
 
         /// All 400 request bodies the fake broker has received (decoded).
@@ -12027,10 +12067,56 @@ mod tests {
                             write_assign_frame(&mut stream, &mut response).await;
                             continue;
                         }
+                        if request.code == request_code::GET_CONSUMER_LIST_BY_GROUP {
+                            let body = GetConsumerListByGroupResponseBody {
+                                consumer_id_list: lock(&state.cid_list).clone(),
+                            };
+                            let mut response =
+                                assign_response_for(&request, response_code::SUCCESS);
+                            response.set_body(Some(
+                                serde_json::to_vec(&body.to_json_value())
+                                    .expect("cid list must be serializable"),
+                            ));
+                            write_assign_frame(&mut stream, &mut response).await;
+                            continue;
+                        }
+                        if request.code == request_code::QUERY_CONSUMER_OFFSET {
+                            // The store read this round: a scripted failure is what makes the
+                            // rebalance skip the queue instead of starting it at a guess.
+                            let (code, offset) = lock(&state.offset_read)
+                                .unwrap_or((response_code::SUCCESS, 0));
+                            let mut response = assign_response_for(&request, code);
+                            if code == response_code::SUCCESS {
+                                response.add_ext_field("offset", &offset.to_string());
+                            }
+                            write_assign_frame(&mut stream, &mut response).await;
+                            continue;
+                        }
+                        if request.code == request_code::PULL_MESSAGE {
+                            let offset = request
+                                .get_ext_field("queueOffset")
+                                .and_then(|v| v.parse::<i64>().ok())
+                                .unwrap_or(-1);
+                            lock(&state.pulls).push((
+                                request.get_ext_field("topic").unwrap_or_default().to_string(),
+                                request
+                                    .get_ext_field("queueId")
+                                    .and_then(|v| v.parse::<i32>().ok())
+                                    .unwrap_or(-1),
+                                offset,
+                            ));
+                            // An empty queue: the tail IS the cursor, exactly as a real broker
+                            // answers -- anything else would move the client's cursor.
+                            let mut response =
+                                assign_response_for(&request, response_code::PULL_NOT_FOUND);
+                            response.add_ext_field("nextBeginOffset", &offset.to_string());
+                            response.add_ext_field("minOffset", "0");
+                            response.add_ext_field("maxOffset", &offset.to_string());
+                            write_assign_frame(&mut stream, &mut response).await;
+                            continue;
+                        }
                         let mut response = assign_response_for(&request, response_code::SUCCESS);
-                        if request.code == request_code::QUERY_CONSUMER_OFFSET
-                            || request.code == request_code::GET_MAX_OFFSET
-                        {
+                        if request.code == request_code::GET_MAX_OFFSET {
                             response.add_ext_field("offset", "0");
                         }
                         write_assign_frame(&mut stream, &mut response).await;
@@ -12074,6 +12160,74 @@ mod tests {
         // are spawned only by start(), so manual pacing is not disturbed here.
         c.inner.started.store(true, Ordering::Release);
         c
+    }
+
+    /// Builds a classic (non-POP) consumer on the same fake cluster: registered in the instance and
+    /// `started` so `require_client` works, with no background loops (the rebalance is driven by hand).
+    fn classic_consumer_on_cluster(instance: &str, cluster: &AssignCluster) -> DefaultMQPushConsumer {
+        let group = "GID_classic_offset";
+        let c = DefaultMQPushConsumer::new(group).expect("legal group name");
+        c.subscribe("T", "*").expect("subscribe");
+        c.set_message_listener_concurrently(Arc::new(NoopListener));
+        let client_id = format!("cid-{instance}");
+        c.update_config(|cfg| {
+            cfg.client_id = Some(client_id.clone());
+            cfg.name_server_addrs = vec![cluster.namesrv_addr.clone()];
+        });
+        let client = MQClientInstance::new(&client_id, vec![cluster.namesrv_addr.clone()]);
+        client.register_consumer(group, Arc::new(c.clone()));
+        *lock(&c.inner.client) = Some(client);
+        c.inner.started.store(true, Ordering::Release);
+        c
+    }
+
+    /// A queue whose initial offset cannot be read is skipped for this round: no pull loop and no
+    /// PULL, because without a cursor the loop could only guess a start position -- and the default
+    /// LAST_OFFSET guess is the tail, which silently skips the backlog. The queue stays in the
+    /// assignment, so the next round retries the read and resumes at the committed offset.
+    #[tokio::test]
+    async fn a_queue_with_an_unreadable_offset_gets_no_pull_loop_this_round() {
+        let cluster = AssignCluster::start().await;
+        let c = classic_consumer_on_cluster("classic-offset-1", &cluster);
+        cluster.set_cid_list(&["cid-classic-offset-1"]);
+        cluster.set_offset_read(response_code::SYSTEM_ERROR, 0);
+
+        c.do_rebalance().await.expect("rebalance must not error");
+
+        {
+            let state = lock(&c.inner.state);
+            assert_eq!(state.assigned.len(), 4, "the assignment itself survives the failed read");
+            assert!(
+                state.queue_owners.is_empty(),
+                "a queue with no cursor must get no pull loop"
+            );
+            assert!(
+                state.mq_map.is_empty(),
+                "and must not be registered as pulling"
+            );
+            assert!(
+                state.offset_table.is_empty(),
+                "a failed read must not fall back to a guessed offset"
+            );
+        }
+        assert!(
+            cluster.pulls().is_empty(),
+            "no PULL may go out for a queue this round could not place"
+        );
+
+        // The store recovers: the next round builds the loops and they resume at the committed offset.
+        cluster.set_offset_read(response_code::SUCCESS, 7);
+        c.do_rebalance().await.expect("rebalance must not error");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while cluster.pulls().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pulls = cluster.pulls();
+        assert!(!pulls.is_empty(), "the recovered queues must start pulling");
+        assert!(
+            pulls.iter().all(|(topic, _, offset)| topic == "T" && *offset == 7),
+            "pulls resume at the committed offset, never at a guessed one: {pulls:?}"
+        );
     }
 
     /// The subscription versions the heartbeat builder reads, straight off the client's own table --

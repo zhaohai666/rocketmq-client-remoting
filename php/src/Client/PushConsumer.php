@@ -1192,10 +1192,17 @@ final class DefaultMQPushConsumer
 
     // ---------------- Rebalance ----------------
 
-    private function rebalancePullState(): void
+    private function rebalancePullState(array $skip = []): void
     {
         $current = [];
         foreach ($this->assigned as $key => $mq) {
+            // `$skip` names queues this round could not place (their initial offset could not be
+            // read): they keep their assignment but get no pull loop, and the next round tries
+            // again. Leaving them out of $mqMap is deliberate -- a registered queue with no cursor
+            // would be judged stalled by the self-healing sweep on the very next round.
+            if (isset($skip[$key])) {
+                continue;
+            }
             $current[$key] = $mq;
         }
         $retired = [];
@@ -1389,6 +1396,11 @@ final class DefaultMQPushConsumer
                 implode(',', $moved),
             ));
         }
+        // A queue whose store read failed gets no cursor this round, so it must get no pull loop
+        // either: without a cursor the loop could only guess a start position, and the default
+        // LAST_OFFSET guess is the tail, which silently skips the backlog. The queue stays in
+        // $assigned, so the next round retries the read and adds it.
+        $skipped = [];
         foreach ($newAssigned as $key => $mq) {
             if (isset($was[$key])) {
                 continue;
@@ -1403,14 +1415,15 @@ final class DefaultMQPushConsumer
             try {
                 $off = $this->resolveInitialOffset($client, $mq);
             } catch (\Throwable $e) {
-                Logger::debug("resolve initial offset for $mq failed: " . $e->getMessage());
+                Logger::debug("resolve initial offset for $mq failed, skip it this round: " . $e->getMessage());
+                $skipped[$key] = true;
                 continue;
             }
             if (!isset($this->offsetTable[$key])) {
                 $this->offsetTable[$key] = $off;
             }
         }
-        $this->rebalancePullState();
+        $this->rebalancePullState($skipped);
         $this->afterAssignmentChange($moved);
     }
 

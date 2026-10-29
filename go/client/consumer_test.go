@@ -53,6 +53,13 @@ type consumerBroker struct {
 	minOffset map[mqKey]int64
 	committed map[string]int64
 	clientIDs []string
+	// offsetReads records the (topic, queue) of every QUERY_CONSUMER_OFFSET(14)
+	// attempt, so a test can tell "the read was attempted and failed" from "the
+	// round has not run yet".
+	offsetReads []mqKey
+	// offsetReadCode, when non-zero, makes those reads answer that code instead
+	// of the committed table: the store-cannot-answer path.
+	offsetReadCode int32
 
 	pulls   []*remoting.PullMessageRequestHeader
 	pullExt []*common.StringMap
@@ -165,6 +172,14 @@ func (b *consumerBroker) failSendBack(code int32) {
 	b.sendBackCode = code
 }
 
+// failOffsetReads makes QUERY_CONSUMER_OFFSET(14) answer code instead of the
+// committed table; code 0 restores the normal answers.
+func (b *consumerBroker) failOffsetReads(code int32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.offsetReadCode = code
+}
+
 func commitKey(group, topic string, queueID int32) string {
 	return fmt.Sprintf("%s|%s|%d", group, topic, queueID)
 }
@@ -248,7 +263,9 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		header.FromExtFields(req.ExtFields())
 		key := commitKey(deref(header.ConsumerGroup), deref(header.Topic), derefI32(header.QueueID))
 		b.mu.Lock()
+		b.offsetReads = append(b.offsetReads, mqKey{deref(header.Topic), derefI32(header.QueueID)})
 		offset, ok := b.committed[key]
+		readCode := b.offsetReadCode
 		// A broker asked this way answers a FRESH group with 0/SUCCESS instead of
 		// QUERY_NOT_FOUND, so the client's "no offset yet, fall through to the
 		// policy" branch can never be exercised. Capture the flag to pin it.
@@ -256,6 +273,9 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 			b.queryOffsetZeroAnswers = append(b.queryOffsetZeroAnswers, deref(header.Topic))
 		}
 		b.mu.Unlock()
+		if readCode != 0 {
+			return remoting.CreateResponseCommand(readCode, "offset store read failed")
+		}
 		if !ok {
 			return remoting.CreateResponseCommand(remoting.RespQueryNotFound,
 				"Not found, V3_0_6_SNAPSHOT maybe this group consumer boot first")
@@ -644,6 +664,27 @@ func (b *consumerBroker) zeroIfNotFoundQueries() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]string(nil), b.queryOffsetZeroAnswers...)
+}
+
+// offsetReadsFor counts the committed-offset reads aimed at one topic: the control
+// that separates "the read was attempted and failed" from "no round has run yet".
+func (b *consumerBroker) offsetReadsFor(topic string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, k := range b.offsetReads {
+		if k.topic == topic {
+			n++
+		}
+	}
+	return n
+}
+
+// setCommitted seeds one queue's committed offset, the value a rebalance read returns.
+func (b *consumerBroker) setCommitted(group, topic string, queueID int32, offset int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.committed[commitKey(group, topic, queueID)] = offset
 }
 
 func (b *consumerBroker) searchTimestamps() []int64 {

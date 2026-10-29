@@ -139,6 +139,12 @@ function ioRespond(RemotingCommand $cmd, string $addr): RemotingCommand
                 // Nothing committed: the policy has to place the queue.
                 return RemotingCommand::createResponseCommand(ResponseCode::QUERY_NOT_FOUND);
             }
+            if ($committed[$key] === 'FAIL') {
+                // A store read failure -- NOT "nothing committed": the queue must be left
+                // unplaced rather than started from a guessed position.
+                return RemotingCommand::createResponseCommand(ResponseCode::SYSTEM_ERROR,
+                    'offset store read failed');
+            }
             $resp = RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
             $resp->extFields['offset'] = (string) (int) $committed[$key];
             return $resp;
@@ -717,6 +723,52 @@ final class RunClientInitialOffset
         $this->setCommitted([]);
     }
 
+    // ---------------- 5. a failed store read is not "nothing committed" ----------------
+
+    private function testPushUnreadableOffset(IoFakeBroker $broker): void
+    {
+        $topic = 'IoReadFailTopic';
+        $group = 'GID-IO-PUSH-READFAIL';
+        $retry = MixAll::getRetryTopic($group);
+        $this->resetLog();
+        $this->setRoutes([$topic => 1, $retry => 1]);
+        $this->setGroups([$group => [MixAll::clientIdFor('IO-PF', null, false)]]);
+        $this->setCommitted([$topic . '@0' => 'FAIL']);
+
+        $c = new DefaultMQPushConsumer($group);
+        $c->setInstanceName('IO-PF');
+        $c->setNameServerAddresses([$broker->addr]);
+        $c->setMessageListener(new IoNoopListener());
+        $c->consumeFromWhere = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
+        $c->subscribe($topic, '*');
+        $c->start();
+        // The next rebalance is 20s out once the round has produced an assignment, so the
+        // clock is advanced explicitly instead of sleeping.
+        $t0 = UtilAll::currentTimeMillis();
+        $c->tick($t0);
+        $c->tick($t0);
+        $this->loadLog();
+        $this->check($this->firstPullOffset($group, $topic) === null,
+            'push read failure: the queue is skipped for the round, never pulled from a guess',
+            $this->describe($group, $topic));
+        $this->check($this->rpcCount(RequestCode::GET_MAX_OFFSET, $topic) === 0,
+            'push read failure: and no tail query is issued for it',
+            (string) $this->rpcCount(RequestCode::GET_MAX_OFFSET, $topic));
+
+        // The store recovers: the next round places the queue and resumes at the committed offset.
+        $this->setCommitted([$topic . '@0' => IO_STORED]);
+        $c->tick($t0 + 21000);
+        $c->tick($t0 + 21000);
+        $this->loadLog();
+        $this->check($this->firstPullOffset($group, $topic) === IO_STORED,
+            'push read failure: once the store answers, the queue resumes at the committed offset',
+            $this->describe($group, $topic));
+
+        $c->shutdown();
+        MQClientInstance::removeInstance($c->clientId);
+        $this->setCommitted([]);
+    }
+
     // ---------------- run ----------------
 
     public function run(): int
@@ -746,6 +798,7 @@ final class RunClientInitialOffset
         try {
             $this->testLiteTable($broker);
             $this->testPushTable($broker);
+            $this->testPushUnreadableOffset($broker);
         } finally {
             $broker->stop();
             putenv('IO_LOG');

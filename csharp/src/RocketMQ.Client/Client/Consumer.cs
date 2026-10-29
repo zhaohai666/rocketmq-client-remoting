@@ -2405,12 +2405,22 @@ public sealed class DefaultMQPushConsumer
 
     private readonly ManualResetEventSlim _testLoopGate = new(false);
 
-    private void RebalancePullThreads()
+    /// <param name="skip">Queues the current round cannot place (their initial offset could not be
+    /// read): they keep their assignment but get no pull loop, and the next rebalance round tries
+    /// again. Keeping them out of <c>_mqMap</c> / <c>_pullThreads</c> is deliberate -- a registered
+    /// queue with no cursor would be judged stalled by the self-healing sweep on the very next
+    /// round and torn down as a <c>[BUG]</c>.</param>
+    private void RebalancePullThreads(ISet<string>? skip = null)
     {
         List<MessageQueue> queues = AssignedQueues();
         var current = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
         foreach (MessageQueue mq in queues)
         {
+            if (skip is not null && skip.Contains(OffsetKey(mq)))
+            {
+                continue;
+            }
+
             current[OffsetKey(mq)] = mq;
         }
 
@@ -6874,8 +6884,7 @@ public sealed class DefaultMQPushConsumer
             _assigned = assigned;
         }
 
-        // Revocation cleanup (updateProcessQueueTableInRebalance →
-        // removeUnnecessaryMessageQueue + removeProcessQueue): queues no
+        // Revocation cleanup: queues no
         // longer assigned to this instance this round first have their
         // consumed offsets persisted, in-flight/buffered messages discarded,
         // orderly locks released (orderly+clustering), and are marked in
@@ -6982,21 +6991,18 @@ public sealed class DefaultMQPushConsumer
             OnQueuesRevoked(healed);
         }
 
-        // Newly assigned queues resolve the initial offset into the offset
-        // table IMMEDIATELY (updateProcessQueueTableInRebalance: new queue →
-        // computePullFromWhereWithException → offsetStore.updateOffset). It
-        // cannot be left to lazy resolution at first pull -- CONSUME_FROM_LAST_OFFSET
-        // semantics are "the latest offset at assignment time", and lazy
-        // resolution skips messages produced after assignment (observable on
-        // live machines as not receiving).
+        // An assigned queue with no cursor resolves the initial offset into
+        // the offset table IMMEDIATELY. It cannot be left to lazy resolution
+        // at first pull -- CONSUME_FROM_LAST_OFFSET semantics are "the latest
+        // offset at assignment time", and lazy resolution skips messages
+        // produced after assignment (observable on live machines as not
+        // receiving). A queue whose read FAILS gets no cursor this round and
+        // is listed in `unplaced`: it keeps its assignment but gets no pull
+        // loop, and the next rebalance round retries the read.
+        var unplaced = new HashSet<string>(StringComparer.Ordinal);
         foreach (MessageQueue mq in assigned)
         {
             string key = OffsetKey(mq);
-            if (prev.ContainsKey(key))
-            {
-                continue;
-            }
-
             SubscriptionData? sub;
             lock (_lock)
             {
@@ -7020,11 +7026,13 @@ public sealed class DefaultMQPushConsumer
             }
             catch (Exception e)
             {
-                // The queue stays assigned but gets no cursor: its pull loop
-                // resolves one again before the first pull and parks until the
-                // store answers, so a guessed start offset never replays it.
+                // No cursor means no pull loop this round: without one the
+                // loop could only guess a start position, and the
+                // CONSUME_FROM_LAST_OFFSET guess is the tail, which silently
+                // skips the backlog the group never consumed.
                 ClientLog.Warn("failed to resolve the initial offset for " + mq
-                    + ", the pull loop will retry: " + e.Message);
+                    + ", skip it this round: " + e.Message);
+                unplaced.Add(key);
                 continue;
             }
 
@@ -7037,7 +7045,7 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        RebalancePullThreads();
+        RebalancePullThreads(unplaced);
 
         // The round's assignment moved the queue SET of at least one topic: pay what that change
         // owes, in the fixed order (re-stamp -> re-divide -> immediate heartbeat -> application
