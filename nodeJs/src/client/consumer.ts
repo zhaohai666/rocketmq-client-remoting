@@ -33,7 +33,7 @@ import {
   POP_DELAY_WHEN_CACHE_FLOW_CONTROL,
 } from './pop_consumer.ts';
 import {
-  LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey,
+  LocalFileOffsetStore, RemoteBrokerOffsetStore, ReadOffsetMode, mqKey, messageQueueKeyJson,
 } from './offset_store.ts';
 import type {
   OffsetStore,
@@ -68,14 +68,14 @@ import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { defaultConsumeTimestamp, parseConsumeTimestamp, currentTimeMillis } from '../common/utilAll.ts';
 import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
-import { decodeMessages } from '../common/messageDecoder.ts';
+import { decodeMessages, decodeInnerBatchMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
 import { DefaultMQProducer } from './producer.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import { AclRPCHook } from '../remoting/acl.ts';
 import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
-import { MQBrokerException, RemotingTimeoutException } from '../remoting/exception.ts';
+import { MQBrokerException, MQClientException, RemotingTimeoutException } from '../remoting/exception.ts';
 
 const logger = getLogger('client.consumer');
 
@@ -959,6 +959,37 @@ export class DefaultMQPushConsumer {
       assigned.push(...got);
     }
     assigned.sort((a, b) => a.compareTo(b));
+    // Resolve the initial offset for freshly assigned queues NOW, not lazily
+    // on the first pull: CONSUME_FROM_LAST_OFFSET means "the newest offset as
+    // of the moment the queue was assigned". A queue whose offset cannot be
+    // resolved is dropped from this round's assignment instead of starting at
+    // the tail, which would skip its backlog. POP names no offset — the start
+    // position rides initMode on the request — so a POP assignment never reads
+    // one and never loses a queue to an unreadable offset table.
+    const skipped: MessageQueue[] = [];
+    if (!this.popMode) {
+      for (const mq of assigned) {
+        if (was.has(mqKey(mq))) continue;
+        if (!this.subscription.has(mq.getTopic())) continue;
+        if (this.offsetTable.has(mqKey(mq))) continue;
+        try {
+          const next = await this.computePullFromWhere(mq);
+          if (next < 0) continue;
+          if (!this.offsetTable.has(mqKey(mq))) this.offsetTable.set(mqKey(mq), next);
+          if (this.offsetStore) this.offsetStore.updateOffset(mq, next, false);
+        } catch (e) {
+          logger.warning('doRebalance, %s, compute offset failed, skip %s this round: %s',
+            this.consumerGroup, mqKey(mq), (e as Error).message);
+          skipped.push(mq);
+        }
+      }
+    }
+    if (skipped.length > 0) {
+      const skip = new Set(skipped.map(mqKey));
+      const kept = assigned.filter((mq) => !skip.has(mqKey(mq)));
+      assigned.length = 0;
+      assigned.push(...kept);
+    }
     this.assigned = assigned;
     // The topics whose queue SET moved, so a swap that keeps the COUNT (one queue
     // lost, another gained) still counts: which buffers exist changed, the topic
@@ -968,22 +999,6 @@ export class DefaultMQPushConsumer {
     if (moved.length > 0) {
       logger.info('rebalance result changed, group=%s clientId=%s assigned=%d topics=%s',
         this.consumerGroup, this.clientID, assigned.length, moved.join(','));
-    }
-    // Resolve the initial offset for freshly assigned queues NOW, not lazily
-    // on the first pull: CONSUME_FROM_LAST_OFFSET means "the newest offset as
-    // of the moment the queue was assigned".
-    for (const mq of assigned) {
-      if (was.has(mqKey(mq))) continue;
-      if (!this.subscription.has(mq.getTopic())) continue;
-      if (this.offsetTable.has(mqKey(mq))) continue;
-      try {
-        const next = await this.computePullFromWhere(mq);
-        if (next < 0) continue;
-        if (!this.offsetTable.has(mqKey(mq))) this.offsetTable.set(mqKey(mq), next);
-        if (this.offsetStore) this.offsetStore.updateOffset(mq, next, false);
-      } catch (e) {
-        logger.debug('resolve initial offset for %s failed: %s', mqKey(mq), (e as Error).message);
-      }
     }
     this.syncPullLoops();
     // ORDER MATTERS, and the four steps are one package that only a moved
@@ -1201,11 +1216,16 @@ export class DefaultMQPushConsumer {
   private _persistRevoked(revoked: Array<{ mq: MessageQueue; offset: number; hasOffset: boolean }>): void {
     if (!this.offsetStore) return;
     if (this.messageModel === MessageModel.BROADCASTING) {
-      // Broadcast offsets live in a local file. Persist BEFORE
-      // removeOffset so the value stays on disk and a rebuilt queue can
-      // continue from it.
-      this.offsetStore.persistAll([]).catch((e) =>
-        logger.debug('persist local offsets on revoke failed: %s', (e as Error).message));
+      // Broadcast offsets live in a local file. Persist BEFORE removeOffset so
+      // the value stays on disk and a rebuilt queue can continue from it. Each
+      // revoked queue is flushed individually: an empty flush list is a no-op
+      // and would leave the last consumed offsets unsaved.
+      for (const q of revoked) {
+        if (!q.hasOffset) continue;
+        this.offsetStore.updateOffset(q.mq, q.offset, false);
+        this.offsetStore.persist(q.mq).catch((e) =>
+          logger.debug('persist local offset on revoke failed for %s: %s', mqKey(q.mq), (e as Error).message));
+      }
       return;
     }
     for (const q of revoked) {
@@ -1258,18 +1278,37 @@ export class DefaultMQPushConsumer {
     if (!store || !client) return -1;
     const last = await store.readOffset(mq, ReadOffsetMode.READ_FROM_STORE);
     if (last >= 0) return last;
-    const where = this.consumeFromWhere;
-    if (where === ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET) return 0;
-    if (where === ConsumeFromWhere.CONSUME_FROM_TIMESTAMP) {
-      if (MixAll.isRetryTopic(mq.getTopic())) {
-        return this._getMaxOffsetForMq(mq);
-      }
-      const ts = parseConsumeTimestamp(this.consumeTimestamp);
-      return this._searchOffsetForMq(mq, ts);
+    if (last !== -1) {
+      // -1 means "no committed offset". Anything else is a failed read: falling
+      // through to the tail policy would silently skip the whole backlog, so the
+      // queue is left unowned for this round instead.
+      throw new MQClientException(`Failed to query consume offset from offset store for ${mqKey(mq)}`);
     }
-    // CONSUME_FROM_LAST_OFFSET (and the two deprecated variants).
-    if (MixAll.isRetryTopic(mq.getTopic())) return 0;
-    return this._getMaxOffsetForMq(mq);
+    const where = this.consumeFromWhere;
+    let result = -1;
+    if (where === ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET) {
+      // The offset gets fixed by the OFFSET_ILLEGAL path.
+      result = 0;
+    } else if (where === ConsumeFromWhere.CONSUME_FROM_TIMESTAMP) {
+      if (MixAll.isRetryTopic(mq.getTopic())) {
+        result = await this._getMaxOffsetForMq(mq);
+      } else {
+        const ts = parseConsumeTimestamp(this.consumeTimestamp);
+        result = await this._searchOffsetForMq(mq, ts);
+      }
+    } else if (MixAll.isRetryTopic(mq.getTopic())) {
+      // CONSUME_FROM_LAST_OFFSET (and the two deprecated variants) on a retry
+      // topic: retried messages must all be retried, so start at 0.
+      result = 0;
+    } else {
+      result = await this._getMaxOffsetForMq(mq);
+    }
+    if (result < 0) {
+      // A failed min/max/search query is not "start at the tail": the caller
+      // skips the queue for this round.
+      throw new MQClientException(`Found unexpected result ${result} for ${mqKey(mq)}`);
+    }
+    return result;
   }
 
   private async _getMaxOffsetForMq(mq: MessageQueue): Promise<number> {
@@ -1323,12 +1362,19 @@ export class DefaultMQPushConsumer {
       // here — it waits for a request this loop will never re-issue.
       const sub = this.subscription.get(mq.getTopic());
       if (!sub) return;
-      if (this.orderly && !pq.isLocked()) {
-        // Orderly in CLUSTERING: do not pull before LOCK_BATCH_MQ granted
-        // this queue, or we would consume what another instance is about to
-        // lock.
-        if (await this._sleepOrStop(200, stopFlag)) return;
-        continue;
+      if (this.orderly && this.messageModel !== MessageModel.BROADCASTING) {
+        // Orderly in CLUSTERING: do not pull before LOCK_BATCH_MQ granted this
+        // queue, or we would consume what another instance is about to lock. A
+        // grant older than the live time counts as unlocked — the periodic
+        // sweep renews it. BROADCASTING owns every queue locally and never
+        // sweeps, so it must bypass this gate entirely.
+        if (!pq.isLocked() || pq.isLockExpired()) {
+          pq.incTryUnlockTimes();
+          logger.warning('orderly queue %s %s, wait for the lock sweep', key,
+            pq.isLocked() ? 'lock expired' : 'not locked');
+          if (await this._sleepOrStop(200, stopFlag)) return;
+          continue;
+        }
       }
       if (this._flowControlHit(mq, pq)) {
         if (await this._sleepOrStop(PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL, stopFlag)) return;
@@ -1567,7 +1613,10 @@ export class DefaultMQPushConsumer {
     this.pullFromWhichNode.set(mqKey(mq), brokerId);
 
     if (result.status !== PullStatus.FOUND || result.msgFoundList.length === 0) return result;
-    let msgs = clientSideTagFilter(sub, result.msgFoundList);
+    // Unwrap inner batches before filtering so the tag check and the hooks see
+    // the individual messages.
+    let msgs = decodeInnerBatchMessages(result.msgFoundList);
+    msgs = clientSideTagFilter(sub, msgs);
     if (this.filterMessageHookList.length > 0) {
       // FilterMessageHook MUST swallow exceptions and continue (rule #7): the
       // pull path silently skips filtered messages.
@@ -2059,7 +2108,7 @@ export class DefaultMQPushConsumer {
         // or the send-back failed" suspends in place; once the message has
         // been handed to the broker the offset moves on, otherwise a poison
         // message parks the queue forever.
-        if (this._checkOrderlyReconsumeTimes(batch)) {
+        if (await this._checkOrderlyReconsumeTimes(batch)) {
           const pq = this.processQueueTable.get(mqKey(mq));
           if (pq) pq.requeueBatch(batch);
           await this._sleepOrStop(this._sleepOrderlyMillis(ctx));
@@ -2084,7 +2133,7 @@ export class DefaultMQPushConsumer {
       }
       case ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT: {
         this._incConsumeFailedTPS(mq.getTopic(), batch.length);
-        if (this._checkOrderlyReconsumeTimes(batch)) {
+        if (await this._checkOrderlyReconsumeTimes(batch)) {
           const pq = this.processQueueTable.get(mqKey(mq));
           if (pq) pq.requeueBatch(batch);
           await this._sleepOrStop(this._sleepOrderlyMillis(ctx));
@@ -2126,13 +2175,13 @@ export class DefaultMQPushConsumer {
   // _checkOrderlyReconsumeTimes compares the message's reconsume count against
   // the orderly max. Returns whether the
   // batch still has to be suspended in place.
-  private _checkOrderlyReconsumeTimes(msgs: MessageExt[]): boolean {
+  private async _checkOrderlyReconsumeTimes(msgs: MessageExt[]): Promise<boolean> {
     let suspend = false;
     const maxTimes = this._orderlyMaxReconsumeTimes();
     for (const msg of msgs) {
       if (msg.getReconsumeTimes() >= maxTimes) {
         msg.putProperty(MessageConst.PROPERTY_RECONSUME_TIME, String(msg.getReconsumeTimes()));
-        if (!this._orderlySendMessageBackSync(msg)) {
+        if (!(await this._orderlySendMessageBackSync(msg))) {
           suspend = true;
           msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
         }
@@ -2144,15 +2193,13 @@ export class DefaultMQPushConsumer {
     return suspend;
   }
 
-  // _orderlySendMessageBack sends back for the orderly path — a PLAIN send to
-  // %RETRY%<group>, not a CONSUMER_SEND_MSG_BACK.
-  private _orderlySendMessageBackSync(msg: MessageExt): boolean {
+  // _orderlySendMessageBackSync sends back for the orderly path — a PLAIN send
+  // to %RETRY%<group>, not a CONSUMER_SEND_MSG_BACK. It waits for the send and
+  // returns the REAL outcome: only a confirmed send lets the offset move past
+  // the message.
+  private async _orderlySendMessageBackSync(msg: MessageExt): Promise<boolean> {
     try {
-      void this._doOrderlySendMessageBack(msg).catch(() => false);
-      // The async send is fire-and-forget here. For this port
-      // the caller treats a not-yet-confirmed send as failed (suspend)
-      // which is the safe side: the message is requeued, not lost.
-      return false;
+      return await this._doOrderlySendMessageBack(msg);
     } catch (e) {
       return false;
     }
@@ -2381,8 +2428,13 @@ export class DefaultMQPushConsumer {
     if (mqs.length === 0) return;
     const locked = await this._lockBatchMQ(mqs);
     const lockedSet = new Set(locked.map(mqKey));
+    const now = Date.now();
     for (const [key, pq] of this.processQueueTable) {
-      pq.setLocked(lockedSet.has(key));
+      const granted = lockedSet.has(key);
+      pq.setLocked(granted);
+      // Stamp every grant: an old timestamp is what the pull gate reads as
+      // "lock expired".
+      if (granted) pq.setLastLockTimestamp(now);
     }
     logger.debug('lock_batch_mq: %d/%d queues locked', lockedSet.size, mqs.length);
   }
@@ -2545,7 +2597,8 @@ export class DefaultMQPushConsumer {
       const h = new GetConsumerRunningInfoRequestHeader();
       try { h.fromExtFields(cmd.extFields || {}); } catch (e) { /* defaults */ }
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, null);
-      response.body = Buffer.from(JSON.stringify(this.buildConsumerRunningInfo(h.jstack === true)), 'utf-8');
+      response.body = Buffer.from(
+        encodeRunningInfoBody(this.buildConsumerRunningInfo(h.jstack === true)), 'utf-8');
       return response;
     });
     handlers.set(RequestCode.CONSUME_MESSAGE_DIRECTLY, (cmd: RemotingCommand) => {
@@ -2594,18 +2647,25 @@ export class DefaultMQPushConsumer {
     void jstack;
     const mqTable: Record<string, any> = {};
     for (const [key, pq] of this.processQueueTable) {
+      const [topic, brokerName, queueId] = parseMqKey(key);
+      const mq = new MessageQueue(topic, brokerName, queueId);
       const [first, last, count] = pq.bufferedOffsetSpan();
-      mqTable[key] = {
+      const [txMin, txMax, txCount] = pq.consumingStats();
+      mqTable[messageQueueKeyJson(mq)] = {
         commitOffset: this.offsetTable.get(key) ?? -1,
+        cachedMsgMinOffset: count > 0 ? first : 0,
+        cachedMsgMaxOffset: count > 0 ? last : 0,
         cachedMsgCount: count,
-        cachedMsgSizeInMiB: Math.round(pq.msgSizeMB() * 100) / 100,
-        transactionTableSize: 0,
-        firstMsgOffset: first,
-        lastMsgOffset: last,
+        cachedMsgSizeInMiB: Math.floor(pq.msgSizeMB()),
+        transactionMsgMinOffset: txCount > 0 ? txMin : 0,
+        transactionMsgMaxOffset: txCount > 0 ? txMax : 0,
+        transactionMsgCount: txCount,
         locked: pq.isLocked(),
-        tryUnlockTimes: 0,
-        queueOffsetSpan: last - first,
-        order: this.orderly,
+        tryUnlockTimes: pq.tryUnlockTimes,
+        lastLockTimestamp: pq.lastLockTimestampValue(),
+        droped: pq.isDropped(),
+        lastPullTimestamp: pq.lastPullTimestampValue(),
+        lastConsumeTimestamp: pq.lastConsumeTimestamp || 0,
       };
     }
     const statusTable = this._buildStatusTable();
@@ -2840,6 +2900,24 @@ function clientSideTagFilter(sub: SubscriptionData, msgs: MessageExt[]): Message
     if (accepted.has(tags)) out.push(msg);
   }
   return out;
+}
+
+// encodeRunningInfoBody renders the 307 payload. mqTable is keyed by inline
+// JSON MessageQueue objects, which JSON.stringify cannot produce (it would
+// quote and escape the key text), so that one table is spliced in raw exactly
+// like the local offset file's table.
+export function encodeRunningInfoBody(info: Record<string, any>): string {
+  const head: Record<string, any> = { ...info };
+  const table = head['mqTable'] || {};
+  delete head['mqTable'];
+  const entries: string[] = [];
+  for (const [key, value] of Object.entries(table)) {
+    entries.push(`${key}:${JSON.stringify(value)}`);
+  }
+  const base = JSON.stringify(head);
+  const body = base.slice(0, base.length - 1);
+  const sep = body.length > 1 ? ',' : '';
+  return `${body}${sep}"mqTable":{${entries.join(',')}}}`;
 }
 
 // parseMqKey reverses the canonical "topic@brokerName@queueId" key.

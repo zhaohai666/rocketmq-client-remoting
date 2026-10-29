@@ -345,6 +345,22 @@ std::vector<Message> decodeBatchMessages(const Bytes& raw) {
     return result;
 }
 
+bool decodeBatchMessagesStrict(const Bytes& raw, std::vector<Message>& out) {
+    std::vector<Message> result;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        if (raw.size() - pos < 4) return false;
+        const int32_t storeSize = ByteReader::getInt32At(raw, pos);
+        if (storeSize <= 0 || static_cast<size_t>(storeSize) > raw.size() - pos) return false;
+        Message msg;
+        if (!decodeBatchMessage(raw.substr(pos, static_cast<size_t>(storeSize)), msg)) return false;
+        result.push_back(std::move(msg));
+        pos += static_cast<size_t>(storeSize);
+    }
+    out = std::move(result);
+    return true;
+}
+
 int32_t countInnerMsgNum(const Bytes& raw) {
     int32_t count = 0;
     size_t pos = 0;

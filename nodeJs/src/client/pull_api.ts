@@ -32,7 +32,7 @@ import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
 import { FilterMessageContext, FilterMessageHook } from './hook.ts';
-import { decodeMessages } from '../common/messageDecoder.ts';
+import { decodeMessages, decodeInnerBatchMessages } from '../common/messageDecoder.ts';
 import { getLogger } from '../logging.ts';
 import { MQBrokerException } from '../remoting/exception.ts';
 import { mqKey } from './offset_store.ts';
@@ -213,7 +213,10 @@ export class PullAPI {
     const brokerId = result.suggestWhichBrokerId != null ? result.suggestWhichBrokerId : MixAll.MASTER_ID;
     this.updatePullFromWhichNode(mq, brokerId);
     if (result.status !== PullStatus.FOUND || result.msgFoundList.length === 0) return result;
-    let msgs = clientSideTagFilter(sub, result.msgFoundList);
+    // Unwrap inner batches before filtering so the tag check and the hooks see
+    // the individual messages.
+    let msgs = decodeInnerBatchMessages(result.msgFoundList);
+    msgs = clientSideTagFilter(sub, msgs);
     if (this.hooks.length > 0) {
       // FilterMessageHook MUST swallow exceptions and continue: the pull path
       // silently skips filtered messages.

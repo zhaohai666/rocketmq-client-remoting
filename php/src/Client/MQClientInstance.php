@@ -2176,6 +2176,36 @@ class MQClientInstance
                 $m->brokerName = $mq->brokerName;
                 $m->queueId = $mq->queueId;
             }
+            // An inner batch arrives as one envelope whose body holds several member messages.
+            // Expand it after the queue stamping so the members inherit the broker identity; on
+            // a malformed body the envelope list is kept untouched.
+            $needsUnwrap = false;
+            foreach ($found as $m) {
+                if (MessageSysFlag::check((int) $m->sysFlag, MessageSysFlag::INNER_BATCH_FLAG)
+                    && MessageSysFlag::check((int) $m->sysFlag, MessageSysFlag::NEED_UNWRAP_FLAG)) {
+                    $needsUnwrap = true;
+                    break;
+                }
+            }
+            if ($needsUnwrap) {
+                $expanded = [];
+                try {
+                    foreach ($found as $m) {
+                        if (MessageSysFlag::check((int) $m->sysFlag, MessageSysFlag::INNER_BATCH_FLAG)
+                            && MessageSysFlag::check((int) $m->sysFlag, MessageSysFlag::NEED_UNWRAP_FLAG)) {
+                            foreach (MessageDecoder::unwrapInnerBatch($m) as $inner) {
+                                $expanded[] = $inner;
+                            }
+                        } else {
+                            $expanded[] = $m;
+                        }
+                    }
+                    $found = $expanded;
+                } catch (\Throwable $e) {
+                    Logger::error(sprintf('Try to decode the inner batch failed for %s@%d: %s',
+                        $mq->topic, $mq->queueId, $e->getMessage()));
+                }
+            }
         }
         return new PullResult(
             $status,

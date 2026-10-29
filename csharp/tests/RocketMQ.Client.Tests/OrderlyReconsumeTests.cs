@@ -304,13 +304,13 @@ public class OrderlyReconsumeTests
     }
 
     [Fact]
-    public void ManualSuccessHoldsTheBatchWithoutCommitting()
+    public void ManualSuccessLeavesTheBatchWithoutCommitting()
     {
         var h = new Harness(0);
         var listener = new OrderlyListener(ConsumeOrderlyStatus.Success).ManualCommit(false);
-        Assert.False(h.RunWith(listener, OffsetBatch(0, new[] { 0 })));
+        Assert.True(h.RunWith(listener, OffsetBatch(0, new[] { 0 })));
         Assert.Null(h.Offset());
-        Assert.Equal(new[] { (0L, 0) }, h.Pending().ToArray());
+        Assert.Empty(h.Pending());
     }
 
     [Fact]

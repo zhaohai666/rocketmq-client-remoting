@@ -626,6 +626,61 @@ final class MessageDecoder
     }
 
     /**
+     * Expand one pulled message flagged as an inner batch into its member messages.
+     *
+     * The outer message body is a concatenation of 6-segment lightweight frames. Every member
+     * inherits the envelope's topic, queue, storage hosts, timestamps, flags and properties
+     * source, and takes the queue offset of the envelope plus its position in the batch.
+     * A malformed or empty body throws, so the caller can keep the original message.
+     *
+     * @return list<MessageExt>
+     */
+    public static function unwrapInnerBatch(MessageExt $outer): array
+    {
+        $raw = $outer->getBody() ?? '';
+        $total = strlen($raw);
+        $out = [];
+        $pos = 0;
+        $index = 0;
+        while ($pos < $total) {
+            if ($total - $pos < 4) {
+                throw new \RuntimeException('inner batch frame is truncated');
+            }
+            $storeSize = (int) unpack('N', substr($raw, $pos, 4))[1];
+            if ($storeSize <= 0 || $storeSize > $total - $pos) {
+                throw new \RuntimeException('inner batch frame has an illegal size');
+            }
+            $inner = self::decodeBatchMessage(substr($raw, $pos, $storeSize));
+
+            $member = new MessageExt();
+            $member->setTopic($outer->getTopic());
+            $member->queueId = $outer->queueId;
+            $member->queueOffset = $outer->queueOffset + $index;
+            $member->setFlag($inner->getFlag());
+            $member->setBody($inner->getBody());
+            $member->setProperties($inner->getProperties());
+            $member->bornHost = $outer->bornHost;
+            $member->bornHostPort = $outer->bornHostPort;
+            $member->bornTimestamp = $outer->bornTimestamp;
+            $member->storeHost = $outer->storeHost;
+            $member->storeHostPort = $outer->storeHostPort;
+            $member->storeTimestamp = $outer->storeTimestamp;
+            $member->sysFlag = $outer->sysFlag;
+            $member->commitLogOffset = $outer->commitLogOffset;
+            $member->brokerName = $outer->brokerName;
+            $member->reconsumeTimes = $outer->reconsumeTimes;
+
+            $out[] = $member;
+            $pos += $storeSize;
+            $index++;
+        }
+        if ($out === []) {
+            throw new \RuntimeException('inner batch body is empty');
+        }
+        return $out;
+    }
+
+    /**
      * Counts how many messages are embedded in a batch body (advancing by the TOTALSIZE of each
      * segment, stopping as soon as a length is illegal).
      */

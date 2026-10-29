@@ -720,6 +720,13 @@ public sealed class DefaultMQPushConsumer
     private long _startTimestamp;
     // Orderly consumption: queue key set confirmed locked by broker LOCK_BATCH_MQ
     private readonly HashSet<string> _lockOk = new(StringComparer.Ordinal);
+    // Grant timestamp (ms) per locked queue: a grant older than
+    // LockMaxLiveTime counts as expired at the pull gate even before the next
+    // sweep round replaces the set.
+    private readonly Dictionary<string, long> _lockOkAt = new(StringComparer.Ordinal);
+    /// <summary>How long a lock grant stays valid (30s), refreshed by the
+    /// 20s sweep; an older stamp is treated as unlocked.</summary>
+    private const long LockMaxLiveTime = 30000;
     private int _pullThresholdForQueue = 1000;
     // The remaining four flow-control thresholds: the byte gate counts whole
     // MiB (the held body total is divided by 1 MiB with truncating integer
@@ -2175,6 +2182,7 @@ public sealed class DefaultMQPushConsumer
         _pending.Remove(key);
         _offsetTable.Remove(key);
         _lockOk.Remove(key);
+        _lockOkAt.Remove(key);
         _mqMap.Remove(key);
         // In-flight registrations are voided too: the queue has been removed
         // from the registered assignment table (which the sweep walks), so
@@ -3444,16 +3452,29 @@ public sealed class DefaultMQPushConsumer
             }
 
             // Orderly consumption: do not pull queues the broker has not
-            // confirmed locked (LOCK_BATCH_MQ)
-            if (orderly)
+            // confirmed locked (LOCK_BATCH_MQ). Broadcasting is implicitly
+            // locked: no broker-side lock round runs for it at all. A grant
+            // older than LockMaxLiveTime counts as expired even if the last
+            // sweep still has it in the set.
+            if (orderly && _messageModel != RocketMQ.Remoting.Protocol.MessageModel.Broadcasting)
             {
                 bool locked;
+                bool expired;
                 lock (_lock)
                 {
                     locked = _lockOk.Contains(key);
+                    expired = locked
+                        && UtilAll.CurrentTimeMillis() - (_lockOkAt.TryGetValue(key, out long at) ? at : 0)
+                           > LockMaxLiveTime;
                 }
 
-                if (!locked)
+                if (locked && expired)
+                {
+                    ClientLog.Warn("the lock of the message queue is expired, wait for the next lock round. group="
+                        + ConsumerGroup + " mq=" + mq);
+                }
+
+                if (!locked || expired)
                 {
                     _stopEvent.Wait(TimeSpan.FromMilliseconds(200));
                     continue;
@@ -4957,21 +4978,12 @@ public sealed class DefaultMQPushConsumer
                 return false;
             }
 
-            // Success + AutoCommit=false: record OK TPS only, no commit.
-            // Deliberate deviation: the classic approach leaves messages in
-            // consumingMsgOrderlyTreeMap waiting for an explicit commit(),
-            // while the listener has no access to the queue buffer (no commit
-            // opening), and copying "do nothing" would let this batch be
-            // swallowed by the dispatch thread with the offset unmoved.
-            // Here it is equivalently pushed back to the queue head and waits
-            // one suspend period: the offset likewise does not advance, no
-            // messages are lost, and the consume thread does not become a busy
-            // wait (without the sleep the next round would immediately grab
-            // the same batch again).
+            // Success + AutoCommit=false: record OK TPS only. The batch leaves
+            // the queue buffer, no commit, no rollback and no re-delivery: the
+            // commit authority is in the listener's hands, so whether the
+            // offset advances is its own call.
             RecordConsumeStats(mq.Topic, batch.Count, obegin, failed: false);
-            RequeuePending(key, batch);
-            _stopEvent.Wait(TimeSpan.FromMilliseconds(OrderlySuspendMillis(ctx)));
-            return false;
+            return true;
         }
 
         // ---- Concurrent consumption (ConsumeRequest.run) ----
@@ -6134,14 +6146,16 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    private string LocalOffsetPath()
+    private string LocalOffsetPath() => BuildLocalOffsetPath(_clientId, ConsumerGroup);
+
+    /// <summary>The one on-disk offset file every message-model-aware consumer mode
+    /// shares: $HOME/.rocketmq_offsets/&lt;clientId&gt;/&lt;group&gt;/offsets.json.</summary>
+    public static string BuildLocalOffsetPath(string clientId, string group)
     {
-        // Local offset file path:
-        // $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
         string home = UtilAll.UserHome();
         if (home.Length == 0) home = ".";
-        return home + "/.rocketmq_offsets/" + (_clientId.Length == 0 ? "DEFAULT" : _clientId)
-            + "/" + ConsumerGroup + "/offsets.json";
+        return home + "/.rocketmq_offsets/" + (clientId.Length == 0 ? "DEFAULT" : clientId)
+            + "/" + group + "/offsets.json";
     }
 
     /// <param name="extra">
@@ -6189,6 +6203,23 @@ public sealed class DefaultMQPushConsumer
             Directory.CreateDirectory(dir);
         }
 
+        // persistAll semantics: read the existing table, overlay only the
+        // queues being flushed, write the union. A queue that is not part of
+        // this flush (revoked, or owned by an earlier run) keeps its entry,
+        // so a re-added queue resumes from where it stopped instead of from
+        // the tail.
+        var merged = new Dictionary<string, long>(items, StringComparer.Ordinal);
+        var mergedMap = new Dictionary<string, MessageQueue>(mqMap, StringComparer.Ordinal);
+        foreach (KeyValuePair<string, (MessageQueue Mq, long Offset)> kv
+                 in ReadLocalOffsetTable(path))
+        {
+            if (!merged.ContainsKey(kv.Key))
+            {
+                merged[kv.Key] = kv.Value.Offset;
+                mergedMap[kv.Key] = kv.Value.Mq;
+            }
+        }
+
         // string2File: the old content rolls to .bak before writing the new
         // file
         try
@@ -6206,7 +6237,7 @@ public sealed class DefaultMQPushConsumer
         }
 
         string tmp = path + ".tmp";
-        File.WriteAllText(tmp, BuildLocalOffsetsJson(items, mqMap));
+        File.WriteAllText(tmp, BuildLocalOffsetsJson(merged, mergedMap));
         File.Move(tmp, path, true);
     }
 
@@ -6279,9 +6310,45 @@ public sealed class DefaultMQPushConsumer
         return outMap;
     }
 
+    // Main file first, .bak only when the main file is missing/corrupted.
+    private static Dictionary<string, (MessageQueue Mq, long Offset)> ReadLocalOffsetTable(string path)
+    {
+        var outMap = new Dictionary<string, (MessageQueue Mq, long Offset)>(StringComparer.Ordinal);
+        foreach (string candidate in new[] { path, path + ".bak" })
+        {
+            string text;
+            try
+            {
+                text = File.ReadAllText(candidate);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            List<(MessageQueue Mq, long Offset)>? parsed = ScanOffsetEntries(text.Trim());
+            if (parsed is null)
+            {
+                continue;
+            }
+
+            foreach ((MessageQueue mq, long offset) in parsed)
+            {
+                outMap[QueueKey(mq)] = (mq, offset);
+            }
+
+            return outMap;
+        }
+
+        return outMap;
+    }
+
+    private static string QueueKey(MessageQueue mq) =>
+        mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
+
     // Strict JSON parsing first (the flat map an older version wrote);
-    // fastjson's "object as key" format necessarily fails strict parsing
-    // (including the pretty version), falling into ScanOffsetEntries.
+    // the object-as-key format necessarily fails strict parsing (including
+    // the pretty version), falling into ScanOffsetEntries.
     // The test project has no InternalsVisibleTo relationship with this
     // assembly, hence public; not for business code.
     public static Dictionary<string, long>? ParseLocalOffsetsText(string text)
@@ -6313,10 +6380,22 @@ public sealed class DefaultMQPushConsumer
             }
         }
 
-        return ScanOffsetEntries(trimmed);
+        List<(MessageQueue Mq, long Offset)>? entries = ScanOffsetEntries(trimmed);
+        if (entries is null)
+        {
+            return null;
+        }
+
+        var outMap = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach ((MessageQueue mq, long offset) in entries)
+        {
+            outMap[QueueKey(mq)] = offset;
+        }
+
+        return outMap;
     }
 
-    private static Dictionary<string, long>? ScanOffsetEntries(string text)
+    private static List<(MessageQueue Mq, long Offset)>? ScanOffsetEntries(string text)
     {
         int pos = 0;
         if (!Eat(text, ref pos, '{'))
@@ -6334,7 +6413,7 @@ public sealed class DefaultMQPushConsumer
             return null;
         }
 
-        var outMap = new Dictionary<string, long>(StringComparer.Ordinal);
+        var entries = new List<(MessageQueue Mq, long Offset)>();
         while (true)
         {
             if (Eat(text, ref pos, '}'))
@@ -6412,7 +6491,7 @@ public sealed class DefaultMQPushConsumer
                 return null;
             }
 
-            outMap[topic + broker + queueId.Value.ToString(CultureInfo.InvariantCulture)] = off;
+            entries.Add((new MessageQueue(topic, broker, (int)queueId.Value), off));
             if (Eat(text, ref pos, ','))
             {
                 continue;
@@ -6438,7 +6517,7 @@ public sealed class DefaultMQPushConsumer
             pos++;
         }
 
-        return pos == text.Length ? outMap : null;
+        return pos == text.Length ? entries : null;
     }
 
     private static bool Eat(string s, ref int pos, char c)
@@ -6584,9 +6663,12 @@ public sealed class DefaultMQPushConsumer
                         lock (_lock)
                         {
                             _lockOk.Clear();
+                            _lockOkAt.Clear();
+                            long now = UtilAll.CurrentTimeMillis();
                             foreach (string k in okKeys)
                             {
                                 _lockOk.Add(k);
+                                _lockOkAt[k] = now;
                             }
                         }
 
@@ -6609,7 +6691,11 @@ public sealed class DefaultMQPushConsumer
     }
 
 
-    private static string OffsetKey(MessageQueue mq) => mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
+    private static string OffsetKey(MessageQueue mq) => LocalOffsetKey(mq);
+
+    /// <summary>The local offset table's per-queue key, shared by every consumer mode.</summary>
+    public static string LocalOffsetKey(MessageQueue mq) =>
+        mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
     private List<MessageQueue> AssignedQueues()
     {
@@ -6965,7 +7051,11 @@ public sealed class DefaultMQPushConsumer
             }
             catch (Exception e)
             {
-                ClientLog.Debug("resolve initial offset for " + mq + " failed: " + e.Message);
+                // The queue stays assigned but gets no cursor: its pull loop
+                // resolves one again before the first pull and parks until the
+                // store answers, so a guessed start offset never replays it.
+                ClientLog.Warn("failed to resolve the initial offset for " + mq
+                    + ", the pull loop will retry: " + e.Message);
                 continue;
             }
 
@@ -7153,19 +7243,14 @@ public sealed class DefaultMQPushConsumer
         }
         else
         {
-            // Clustering mode: first query the offset committed on the broker
-            // (RemoteBrokerOffsetStore.readOffset)
-            try
+            // Clustering mode: first query the offset committed on the broker.
+            // "Not found" is the only answer that falls through to the policy;
+            // any other failure propagates so the caller skips this queue for
+            // the current round instead of guessing a start offset from it.
+            if (c.QueryConsumerOffset(ConsumerGroup, mq, out long remote, 5000, null,
+                    /*setZeroIfNotFound=*/false))
             {
-                if (c.QueryConsumerOffset(ConsumerGroup, mq, out long remote, 5000, null,
-                        /*setZeroIfNotFound=*/false))
-                {
-                    stored = remote;
-                }
-            }
-            catch (Exception e)
-            {
-                ClientLog.Debug("query consumer offset for " + mq + " not found: " + e.Message);
+                stored = remote;
             }
         }
 

@@ -61,13 +61,59 @@ public class ConsumerStatsTests
         item.AddValue(200, 2);
         item.Sample();
         StatsSnapshot minute = item.GetStatsDataInMinute();
-        Assert.Equal(200, minute.Sum);       // differenced window: only what lies between the two points
-        Assert.Equal(2, minute.Times);
+        Assert.Equal(300, minute.Sum);       // cumulative delta from the seeded zero to the last point
+        Assert.Equal(4, minute.Times);       // the seeded zero baseline contributes no times
 
         item.SampleHour();
         StatsSnapshot hour = item.GetStatsDataInHour();
-        Assert.Equal(0, hour.Sum);           // a single point in the hour chain -> 0
-        Assert.Equal(0, hour.Times);
+        Assert.Equal(300, hour.Sum);         // one cumulative point on top of the seeded zero
+        Assert.Equal(4, hour.Times);
+    }
+
+    [Fact]
+    public void StatsItem_MinuteAndHour_KeepSevenSamples()
+    {
+        StatsItem item = new StatsItemSet("PULL_RT").GetAndCreate("T@G");
+        long now = UtilAll.CurrentTimeMillis();
+        for (int i = 0; i < 30; i++)
+        {
+            item.AppendSampleForTest(now + i * 1000, i, i);
+        }
+
+        // The last seven points are 23..29; older samples and the zero baseline are evicted.
+        Assert.Equal(6, item.GetStatsDataInMinute().Sum);
+        Assert.Equal(6, item.GetStatsDataInMinute().Times);
+        Assert.Equal(6, item.GetStatsDataInHour().Sum);
+        Assert.Equal(6, item.GetStatsDataInHour().Times);
+    }
+
+    [Fact]
+    public void StatsItem_DayChain_SeedsZeroOnePeriodBack()
+    {
+        StatsItem item = new StatsItemSet("PULL_RT").GetAndCreate("T@G");
+        item.AddValue(7, 3);
+        item.SampleDay();
+
+        StatsSnapshot day = item.GetStatsDataInDay();
+        Assert.Equal(7, day.Sum);
+        Assert.Equal(3, day.Times);
+    }
+
+    [Fact]
+    public void StatsItem_DayChain_Keeps25Samples()
+    {
+        StatsItem item = new StatsItemSet("PULL_RT").GetAndCreate("T@G");
+        long now = UtilAll.CurrentTimeMillis();
+        // The first append also seeds the zero baseline one hour back, hence 31 entries
+        // before trimming: points 5..29 survive.
+        for (int i = 0; i < 30; i++)
+        {
+            item.AppendDaySampleForTest(now - 3_600_000 + i * 1000, i, i);
+        }
+
+        StatsSnapshot day = item.GetStatsDataInDay();
+        Assert.Equal(24, day.Sum);
+        Assert.Equal(24, day.Times);
     }
 
     [Fact]
@@ -80,12 +126,15 @@ public class ConsumerStatsTests
         FeedTwoPoints(m, x => x.TopicAndGroupConsumeOKTPS, 8, 1);
         FeedTwoPoints(m, x => x.TopicAndGroupConsumeFailedTPS, 3, 1);
 
+        // The minute chain is seeded one sampling period before the first injected point
+        // (now - 1000), so TPS divides by the 11 s span from that baseline.
+        const double minuteSpanMs = StatsItems.MinuteSampleIntervalMs + 1000;
         ConsumeStatus cs = m.ConsumeStatus(Group, Topic);
         Assert.Equal(50.0, cs.PullRT, 6);
-        Assert.Equal(5.0, cs.PullTPS, 6);
+        Assert.Equal(5.0 * 1000 / minuteSpanMs, cs.PullTPS, 6);
         Assert.Equal(10.0, cs.ConsumeRT, 6);
-        Assert.Equal(8.0, cs.ConsumeOKTPS, 6);
-        Assert.Equal(3.0, cs.ConsumeFailedTPS, 6);
+        Assert.Equal(8.0 * 1000 / minuteSpanMs, cs.ConsumeOKTPS, 6);
+        Assert.Equal(3.0 * 1000 / minuteSpanMs, cs.ConsumeFailedTPS, 6);
 
         // an unrecorded key returns all zeros
         ConsumeStatus zero = m.ConsumeStatus(Group, "NoTopic");

@@ -47,6 +47,13 @@ int64_t parseConsumeTimestamp(const std::string& ts) {
     return UtilAll::parseConsumeTimestamp(ts);
 }
 
+std::string localOffsetFilePath(const std::string& clientId, const std::string& group) {
+    std::string base = UtilAll::userHome();
+    if (base.empty()) base = ".";
+    return base + "/.rocketmq_offsets/" + (clientId.empty() ? "DEFAULT" : clientId) + "/"
+           + group + "/offsets.json";
+}
+
 }  // namespace
 
 DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGroup) {
@@ -121,6 +128,22 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic, const MessageS
             FilterAPI::buildSubscriptionData(ns, selector.expression, selector.type);
     } catch (...) {
         subscriptionData_.erase(ns);
+    }
+    if (running_.load() && mqClient_ != nullptr) {
+        // A subscription added after start() must reach the broker the same way start() makes the
+        // initial ones reach it: the route lookup gives the pull loop its queues, the heartbeat
+        // registers the tag expression.
+        mqClient_->registerTopicInUse(ns);
+        try {
+            mqClient_->updateTopicRouteInfoFromNameServer(ns);
+        } catch (const std::exception& e) {
+            logger_debug("lite subscribe: refresh route for " + ns + " failed: " + e.what());
+        }
+        try {
+            sendHeartbeatToAllBroker();
+        } catch (...) {
+            logger_debug("lite subscribe: heartbeat for " + ns + " failed");
+        }
     }
 }
 
@@ -327,24 +350,52 @@ void DefaultLitePullConsumer::unsubscribe(const std::string& topic) {
 }
 
 // ---------------------------------------------------------------- Lifecycle
-void DefaultLitePullConsumer::start() {
-    if (started_) return;
-    if (!namespace_.empty()) {
-        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
+std::string DefaultLitePullConsumer::serviceStateName(ServiceState state) {
+    switch (state) {
+        case ServiceState::CREATE_JUST:
+            return "CREATE_JUST";
+        case ServiceState::RUNNING:
+            return "RUNNING";
+        case ServiceState::START_FAILED:
+            return "START_FAILED";
+        case ServiceState::SHUTDOWN_ALREADY:
+            return "SHUTDOWN_ALREADY";
     }
+    return "UNKNOWN";
+}
+
+void DefaultLitePullConsumer::checkConfig() {
     Validators::checkGroup(consumerGroup_);
     if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
         throw MQClientException(
             "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
     }
-    if (nameServerAddrs_.empty()) {
-        throw MQClientException("name server address is not set");
+    if (messageModel_ != MessageModel::CLUSTERING &&
+        messageModel_ != MessageModel::BROADCASTING) {
+        throw MQClientException("messageModel is invalid: " + messageModel_);
     }
     if (allocateStrategy_ == nullptr) {
         throw MQClientException("allocateMessageQueueStrategy is null");
     }
-    if (subscription_.empty() && !assignMode_) {
-        throw MQClientException("subscription is not set, call subscribe() or assign() first");
+    if (consumerTimeoutMillisWhenSuspend_ < brokerSuspendMaxTimeMillis_) {
+        throw MQClientException(
+            "consumerTimeoutMillisWhenSuspend must be greater than or equal to "
+            "brokerSuspendMaxTimeMillis");
+    }
+}
+
+void DefaultLitePullConsumer::start() {
+    ServiceState expected = ServiceState::CREATE_JUST;
+    if (!serviceState_.compare_exchange_strong(expected, ServiceState::START_FAILED)) {
+        throw MQClientException("The PullConsumer service state not OK, maybe started once, " +
+                                serviceStateName(expected));
+    }
+    if (!namespace_.empty()) {
+        consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
+    }
+    checkConfig();
+    if (nameServerAddrs_.empty()) {
+        throw MQClientException("name server address is not set");
     }
     parseConsumeTimestamp(consumeTimestamp_);
     if (messageModel_ == MessageModel::CLUSTERING) {
@@ -407,10 +458,14 @@ void DefaultLitePullConsumer::start() {
     started_ = true;
     pullThread_ = std::thread(&DefaultLitePullConsumer::pullServiceLoop, this);
     metadataThread_ = std::thread(&DefaultLitePullConsumer::metadataLoop, this);
+    serviceState_.store(ServiceState::RUNNING);
 }
 
 void DefaultLitePullConsumer::shutdown() {
-    if (!started_) return;
+    ServiceState expected = ServiceState::RUNNING;
+    if (!serviceState_.compare_exchange_strong(expected, ServiceState::SHUTDOWN_ALREADY)) {
+        return;
+    }
     started_ = false;
     running_ = false;
     try {
@@ -831,10 +886,17 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
         if (sit != seekOffset_.end()) return sit->second;
     }
     int64_t stored = -1;
-    try {
-        int64_t off = 0;
-        if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) stored = off;
-    } catch (...) {
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        const std::map<std::string, int64_t> table = DefaultMQPushConsumer::loadLocalOffsetsAt(
+            localOffsetFilePath(clientId_, consumerGroup_));
+        auto it = table.find(DefaultMQPushConsumer::offsetKey(mq));
+        if (it != table.end()) stored = it->second;
+    } else {
+        try {
+            int64_t off = 0;
+            if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) stored = off;
+        } catch (...) {
+        }
     }
     // The same policy table the push consumer uses: the start never depends on the subscription type.
     switch (planInitialOffset(stored, consumeFromWhere_, MixAll::isRetryTopic(mq.topic))) {
@@ -913,7 +975,14 @@ void DefaultLitePullConsumer::rebalance() {
             // Flush the last commit before letting go, so the new owner does not redeliver from the previous window.
     for (const auto& kv : revoked) {
         try {
-            mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+            if (messageModel_ == MessageModel::BROADCASTING) {
+                const std::string key = DefaultMQPushConsumer::offsetKey(kv.first);
+                DefaultMQPushConsumer::saveLocalOffsetsAt(
+                    localOffsetFilePath(clientId_, consumerGroup_), {{key, kv.second}},
+                    {{key, kv.first}});
+            } else {
+                mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+            }
         } catch (...) {
             logger_debug("lite persist on revoke failed for " + kv.first.toString());
         }
@@ -1143,6 +1212,17 @@ int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
         if (it != offsetTable_.end()) return it->second;
     }
     if (mqClient_ == nullptr) return -1;
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        const std::map<std::string, int64_t> table = DefaultMQPushConsumer::loadLocalOffsetsAt(
+            localOffsetFilePath(clientId_, consumerGroup_));
+        auto it = table.find(DefaultMQPushConsumer::offsetKey(mq));
+        if (it == table.end()) return -1;
+        {
+            std::lock_guard<std::mutex> lk(stateMutex_);
+            offsetTable_[mq] = it->second;
+        }
+        return it->second;
+    }
     try {
         int64_t off = 0;
         if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) {
@@ -1169,7 +1249,13 @@ void DefaultLitePullConsumer::persistOffset(const MessageQueue& mq) {
     }
     if (mqClient_ == nullptr) return;
     try {
-        mqClient_->updateConsumerOffset(consumerGroup_, mq, offset);
+        if (messageModel_ == MessageModel::BROADCASTING) {
+            const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+            DefaultMQPushConsumer::saveLocalOffsetsAt(
+                localOffsetFilePath(clientId_, consumerGroup_), {{key, offset}}, {{key, mq}});
+        } else {
+            mqClient_->updateConsumerOffset(consumerGroup_, mq, offset);
+        }
     } catch (const std::exception& e) {
         logger_debug("lite persist failed for " + mq.toString() + ": " + e.what());
     } catch (...) {
@@ -1194,7 +1280,14 @@ void DefaultLitePullConsumer::persistOffsetTable(const std::set<MessageQueue>& m
     if (mqClient_ == nullptr) return;
     for (const auto& kv : toSend) {
         try {
-            mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+            if (messageModel_ == MessageModel::BROADCASTING) {
+                const std::string key = DefaultMQPushConsumer::offsetKey(kv.first);
+                DefaultMQPushConsumer::saveLocalOffsetsAt(
+                    localOffsetFilePath(clientId_, consumerGroup_), {{key, kv.second}},
+                    {{key, kv.first}});
+            } else {
+                mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
+            }
         } catch (...) {
             logger_debug("lite persist failed for " + kv.first.toString());
         }

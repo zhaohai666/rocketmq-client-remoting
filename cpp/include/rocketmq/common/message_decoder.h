@@ -86,6 +86,9 @@ bool decodeBatchMessage(const Bytes& raw, Message& out);
 
 std::vector<Message> decodeBatchMessages(const Bytes& raw);
 
+// All-or-nothing variant: a malformed entry fails the whole body instead of silently ending the walk.
+bool decodeBatchMessagesStrict(const Bytes& raw, std::vector<Message>& out);
+
 int32_t countInnerMsgNum(const Bytes& raw);
 
 }  // namespace rocketmq

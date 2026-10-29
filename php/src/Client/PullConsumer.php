@@ -798,12 +798,25 @@ final class DefaultMQPullConsumer
 
     public function fetchConsumeOffset(MessageQueue $mq): ?int
     {
-        return $this->requireClient()->queryConsumerOffset($this->consumerGroup, $mq);
+        $this->requireClient();
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            // Broadcasting keeps its offsets client-side; the broker is never asked.
+            $table = read_local_offset_table($this->clientId ?? '', $this->consumerGroup) ?? [];
+            $key = self::mqKey($mq);
+            return array_key_exists($key, $table) ? $table[$key] : null;
+        }
+        return $this->mqClient->queryConsumerOffset($this->consumerGroup, $mq);
     }
 
     public function updateConsumeOffset(MessageQueue $mq, int $offset): void
     {
-        $this->requireClient()->updateConsumerOffset($this->consumerGroup, $mq, $offset);
+        $this->requireClient();
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            $key = self::mqKey($mq);
+            persist_local_offset_entries($this->clientId ?? '', $this->consumerGroup, [$key => $offset], [$key => $mq]);
+            return;
+        }
+        $this->mqClient->updateConsumerOffset($this->consumerGroup, $mq, $offset);
     }
 
     public function searchOffset(MessageQueue $mq, int $timestamp): int
@@ -935,6 +948,17 @@ final class DefaultLitePullConsumer
     private const MODE_SUBSCRIBE = 1;
     private const MODE_ASSIGN = 2;
     private int $mode = self::MODE_NONE;
+
+    /**
+     * Service lifecycle: start is accepted only from CREATE_JUST. Once start has been
+     * attempted the state never returns to CREATE_JUST, so a second start (after a failed
+     * start or a shutdown) is refused instead of silently doing nothing.
+     */
+    private const SERVICE_CREATE_JUST = 0;
+    private const SERVICE_START_FAILED = 1;
+    private const SERVICE_RUNNING = 2;
+    private const SERVICE_SHUTDOWN_ALREADY = 3;
+    private int $serviceState = self::SERVICE_CREATE_JUST;
     /** @var array<string,MessageQueue> Assigned queues (key = mqKey) */
     private array $assigned = [];
 
@@ -1446,9 +1470,12 @@ final class DefaultLitePullConsumer
 
     public function start(): void
     {
-        if ($this->started) {
-            return;
+        if ($this->serviceState !== self::SERVICE_CREATE_JUST) {
+            throw new MQClientException(
+                'The PullConsumer service state not OK, maybe started once, ' . $this->serviceStateName());
         }
+        // Any failure from here on leaves the consumer in START_FAILED, so a retry is refused.
+        $this->serviceState = self::SERVICE_START_FAILED;
         Validators::checkGroup($this->consumerGroup);
         if ($this->consumerGroup === MixAll::DEFAULT_CONSUMER_GROUP) {
             throw new MQClientException(sprintf(
@@ -1459,11 +1486,12 @@ final class DefaultLitePullConsumer
         if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
             throw new MQClientException('name server address is not set');
         }
-        if ($this->subscription === [] && $this->mode !== self::MODE_ASSIGN) {
-            throw new MQClientException('subscription is not set, call subscribe() or assign() first');
-        }
         if (!isset($this->allocateMessageQueueStrategy)) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
+        }
+        if ($this->consumerTimeoutMillisWhenSuspend < $this->brokerSuspendMaxTimeMillis) {
+            throw new MQClientException(
+                'Long polling mode, the consumer consumerTimeoutMillisWhenSuspend must greater than brokerSuspendMaxTimeMillis');
         }
         // The start instant is checked whatever the policy is: a malformed value must fail here
         // rather than surface mid-consumption as a failed offset resolution on one queue.
@@ -1516,6 +1544,17 @@ final class DefaultLitePullConsumer
         // Queue-set change comparison: the first query is scheduled 10s after startup, not stealing RPC from the startup path.
         $this->nextMetadataCheckAt = microtime(true) + 10.0;
         $this->started = true;
+        $this->serviceState = self::SERVICE_RUNNING;
+    }
+
+    private function serviceStateName(): string
+    {
+        return match ($this->serviceState) {
+            self::SERVICE_START_FAILED => 'START_FAILED',
+            self::SERVICE_RUNNING => 'RUNNING',
+            self::SERVICE_SHUTDOWN_ALREADY => 'SHUTDOWN_ALREADY',
+            default => 'CREATE_JUST',
+        };
     }
 
     /** Prepare broker addresses for heartbeat: pull and register the topic routes this instance cares about. */
@@ -1545,11 +1584,9 @@ final class DefaultLitePullConsumer
 
     public function shutdown(): void
     {
-        if (!$this->started) {
+        if ($this->serviceState !== self::SERVICE_RUNNING) {
             return;
         }
-        $this->started = false;
-        $this->running = false;
         try {
             if ($this->autoCommit) {
                 $this->commit();
@@ -1559,9 +1596,12 @@ final class DefaultLitePullConsumer
         } catch (\Throwable) {
             Logger::debug('shutdown commit failed');
         }
+        $this->started = false;
+        $this->running = false;
         if ($this->mqClient !== null) {
             $this->mqClient->shutdown();
         }
+        $this->serviceState = self::SERVICE_SHUTDOWN_ALREADY;
     }
 
     public function isRunning(): bool
@@ -1706,7 +1746,15 @@ final class DefaultLitePullConsumer
         }
         $offset = $this->nextOffset[$key] ?? null;
         if ($offset === null) {
-            $offset = $this->resolveInitialOffset($mq);
+            try {
+                $offset = $this->resolveInitialOffset($mq);
+            } catch (\Throwable $e) {
+                // The committed offset could not be determined for a reason other than
+                // "not found": skip this queue for the round instead of starting at the tail.
+                Logger::debug("lite resolve initial offset failed for $mq->topic@$mq->queueId: " . $e->getMessage());
+                $this->pullIdleUntil[$key] = microtime(true) + 1.0;
+                return false;
+            }
             $this->nextOffset[$key] = $offset;
         }
         try {
@@ -2087,14 +2135,19 @@ final class DefaultLitePullConsumer
             // point at 0 forever.
             throw new MQClientException('The lite pull consumer is not running');
         }
-        // Reuse a committed offset when present (guaranteeing consumption resumes after restart)
-        try {
+        // Reuse a committed offset when present (guaranteeing consumption resumes after restart).
+        // Not found is a normal answer; any other query failure propagates so the caller skips
+        // this queue for the round instead of starting it at the tail.
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            $table = read_local_offset_table($this->clientId ?? '', $this->consumerGroup) ?? [];
+            if (isset($table[$key]) && $table[$key] >= 0) {
+                return $table[$key];
+            }
+        } else {
             $off = $this->mqClient->queryConsumerOffset($this->consumerGroup, $mq);
             if ($off !== null) {
                 return $off;
             }
-        } catch (\Throwable) {
-            // ignore
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
             return 0;
@@ -2331,6 +2384,15 @@ final class DefaultLitePullConsumer
         if ($cached !== null) {
             return $cached;
         }
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            // Broadcasting stores offsets in the local file; the broker is never asked.
+            $table = read_local_offset_table($this->clientId ?? '', $this->consumerGroup) ?? [];
+            $localOffset = $table[$key] ?? null;
+            if ($localOffset !== null) {
+                $this->offsetTable[$key] = $localOffset;
+            }
+            return $localOffset;
+        }
         $brokerOffset = $client->queryConsumerOffset($this->consumerGroup, $mq);
         if ($brokerOffset !== null) {
             $this->offsetTable[$key] = $brokerOffset;
@@ -2346,6 +2408,11 @@ final class DefaultLitePullConsumer
         $key = self::mqKey($mq);
         $offset = $this->offsetTable[$key] ?? null;
         if ($offset === null) {
+            return;
+        }
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            // Broadcasting commits to the local file only; the broker is never told.
+            persist_local_offset_entries($this->clientId ?? '', $this->consumerGroup, [$key => $offset], [$key => $mq]);
             return;
         }
         try {

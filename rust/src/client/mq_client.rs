@@ -34,7 +34,7 @@ use crate::common::message_const::{
 };
 use crate::common::message_decoder::{
     decode_message, decode_messages, decode_messages_with, message_properties_2_string,
-    string_2_message_properties, DecodeOptions,
+    string_2_message_properties, unwrap_inner_batch, DecodeOptions,
 };
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{MessageSysFlag, PullSysFlag};
@@ -2185,7 +2185,7 @@ impl MQClientInstance {
         resp_header.from_ext_fields(response.ext_fields());
         let mut found = response
             .body()
-            .map(|body| self.decode_received_messages(body))
+            .map(|body| unwrap_inner_batch(self.decode_received_messages(body)))
             .unwrap_or_default();
         // Stamp brokerName/queueId unconditionally
         for m in found.iter_mut() {
@@ -4375,7 +4375,7 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
 
     use super::*;
-    use crate::common::message_decoder::encode_message_ext;
+    use crate::common::message_decoder::{encode_message_ext, encode_messages};
     use crate::common::sysflag::PermName;
     use crate::remoting::protocol::body::MessageQueueForC;
     use crate::remoting::protocol::route::{BrokerData, QueueData};
@@ -6488,6 +6488,62 @@ mod tests {
         // Old brokers omit suggestWhichBrokerId: the caller books master=0 (None is passed out)
         assert_eq!(result.suggest_which_broker_id, None);
         assert_eq!(result.next_begin_offset, 7);
+        instance.shutdown();
+    }
+
+    /// A pulled message carrying the inner-batch pair is delivered as its members, not as the
+    /// envelope whose body is a nested batch.
+    #[tokio::test]
+    async fn pull_message_unwraps_an_inner_batch_envelope() {
+        let (instance, master, _slave) = instance_with_master_slave().await;
+        let members = vec![
+            crate::common::message::Message::with_tags_and_keys(
+                "T", Some(b"m1"), Some("TagA"), None, 0,
+            ),
+            crate::common::message::Message::with_tags_and_keys(
+                "T", Some(b"m2"), Some("TagB"), None, 0,
+            ),
+        ];
+        let mut envelope = sample_message();
+        envelope.queue_offset = 41;
+        envelope.sys_flag = MessageSysFlag::INNER_BATCH_FLAG | MessageSysFlag::NEED_UNWRAP_FLAG;
+        envelope.body = Some(encode_messages(&members));
+        let body = encode_message_ext(&envelope, false).unwrap();
+        master.script_resp_ext(vec![vec![
+            ("nextBeginOffset".to_string(), "43".to_string()),
+            ("minOffset".to_string(), "0".to_string()),
+            ("maxOffset".to_string(), "100".to_string()),
+        ]]);
+        master.script_resp_body(vec![body]);
+
+        let mq = MessageQueue::new(TOPIC, BROKER, 2);
+        let result = instance
+            .pull_message(
+                GROUP,
+                &mq,
+                41,
+                32,
+                PullSysFlag::build_sys_flag_basic(true, false, false, false),
+                0,
+                "*",
+                0,
+                "TAG",
+                3000,
+                -1,
+                15000,
+                None,
+                0,
+                Some(i64::from(MixAll::MASTER_ID)),
+            )
+            .await
+            .expect("pull");
+
+        assert_eq!(result.msg_found_list.len(), 2, "one message per batch member");
+        assert_eq!(result.msg_found_list[0].queue_offset, 41);
+        assert_eq!(result.msg_found_list[1].queue_offset, 42);
+        assert_eq!(result.msg_found_list[0].get_body(), b"m1");
+        assert_eq!(result.msg_found_list[1].get_property("TAGS"), Some("TagB"));
+        assert_eq!(result.msg_found_list[0].queue_id, 2);
         instance.shutdown();
     }
 

@@ -309,9 +309,12 @@ class TestConsumerWiring:
         assert "contains illegal characters" in str(ei.value)
 
     def test_legal_group_reaches_the_next_gate(self):
-        # reverse control: only a legal group name reaches the subscription/address validation, proving the errors above were not preempted by another check
+        # reverse control: only a legal group name reaches the following config checks, proving the
+        # errors above were not preempted by another check. A subscription is not required at start,
+        # so the next gate here is the allocation strategy.
         c = DefaultLitePullConsumer("GID_validators_lite")
         c.name_server_addrs = ["127.0.0.1:1"]
+        c.allocate_message_queue_strategy = None
         with pytest.raises(MQClientException) as ei:
             c.start()
-        assert "subscription is not set" in str(ei.value)
+        assert "allocateMessageQueueStrategy is null" in str(ei.value)

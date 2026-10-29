@@ -156,6 +156,51 @@ void testLoadReadsCompatWrittenFile() {
     std::filesystem::remove_all(dir, ec);
 }
 
+// A flush that names only one queue must overlay that queue on the table already on disk. Rebuilding
+// the file from the flushed set alone drops every other queue's entry, and a queue re-added later
+// restarts from the configured position instead of resuming.
+void testSaveMergesWithQueuesNotBeingFlushed() {
+    std::string dir = tempDir("merge");
+    std::string path = dir + "/offsets.json";
+    std::map<std::string, MessageQueue> map = mqMap();
+
+    DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 7}}), map);
+    // Queue B is flushed alone: A is not in this write, so it must survive from the file.
+    DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a1", 9}}), map);
+    std::map<std::string, int64_t> loaded = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
+    expect(loaded["Ttbroker-a0"] == 7, "merge_survives_unflushed_queue", std::to_string(loaded["Ttbroker-a0"]));
+    expect(loaded["Ttbroker-a1"] == 9, "merge_writes_flushed_queue", std::to_string(loaded["Ttbroker-a1"]));
+
+    // A is re-added and flushed: its new value replaces the old one and B is untouched.
+    DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 8}}), map);
+    loaded = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
+    expect(loaded["Ttbroker-a0"] == 8, "merge_readded_queue_resumes", std::to_string(loaded["Ttbroker-a0"]));
+    expect(loaded["Ttbroker-a1"] == 9, "merge_readd_keeps_sibling", std::to_string(loaded["Ttbroker-a1"]));
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// An unreadable generation must not be replaced by a partial table built from memory: the file stays
+// as it is until a readable generation exists again.
+void testUnreadableFileIsNotOverwritten() {
+    std::string dir = tempDir("unreadable");
+    std::string path = dir + "/offsets.json";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::string garbage = "{\"offsetTable\":{{{not-json";
+    {
+        std::ofstream f(path, std::ios::trunc);
+        f << garbage;
+    }
+
+    DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 7}}), mqMap());
+    expect(readFile(path) == garbage, "unreadable_main_left_alone", readFile(path));
+    expect(!std::filesystem::exists(path + ".bak"), "unreadable_main_makes_no_bak");
+
+    std::filesystem::remove_all(dir, ec);
+}
+
 }  // namespace
 
 int main() {
@@ -167,6 +212,8 @@ int main() {
     testRoundTripBuiltText();
     testSaveWritesCompatFormatAndRollsBak();
     testLoadReadsCompatWrittenFile();
+    testSaveMergesWithQueuesNotBeingFlushed();
+    testUnreadableFileIsNotOverwritten();
 
     std::printf("%s: %d checks, %d failures\n", "local_offsets", checks, fails);
     return fails == 0 ? 0 : 1;

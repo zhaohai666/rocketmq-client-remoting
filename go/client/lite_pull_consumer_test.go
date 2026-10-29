@@ -79,8 +79,18 @@ func TestLitePullConsumerStartValidation(t *testing.T) {
 
 	c3 := MustNewDefaultLitePullConsumer("GID_lite_validate")
 	c3.SetNameServerAddresses([]string{"127.0.0.1:1"})
-	if err := c3.Start(); err == nil || !strings.Contains(err.Error(), "subscription is not set") {
-		t.Fatalf("no subscription and no assignment: err = %v", err)
+	// No subscription is required at Start: subscribe() while RUNNING is legal.
+	if err := c3.Start(); err != nil {
+		t.Fatalf("start without a subscription: %v", err)
+	}
+	if err := c3.Start(); err == nil ||
+		!strings.Contains(err.Error(), "The PullConsumer service state not OK, maybe started once, RUNNING") {
+		t.Fatalf("second start: err = %v", err)
+	}
+	c3.Shutdown()
+	if err := c3.Start(); err == nil ||
+		!strings.Contains(err.Error(), "The PullConsumer service state not OK, maybe started once, SHUTDOWN_ALREADY") {
+		t.Fatalf("start after shutdown: err = %v", err)
 	}
 
 	c4 := MustNewDefaultLitePullConsumer("GID_lite_validate")
@@ -89,6 +99,33 @@ func TestLitePullConsumerStartValidation(t *testing.T) {
 	c4.SetConsumeTimestamp("20260132") // month 32: a parse failure, not a valid date
 	if err := c4.Start(); err == nil || !strings.Contains(err.Error(), "consumeTimestamp is invalid") {
 		t.Fatalf("bad consumeTimestamp: err = %v", err)
+	}
+
+	c5 := MustNewDefaultLitePullConsumer("GID_lite_validate")
+	c5.SetNameServerAddresses([]string{"127.0.0.1:1"})
+	c5.SetConsumerTimeoutMillisWhenSuspend(c5.BrokerSuspendMaxTimeMillis() - 1)
+	if err := c5.Start(); err == nil ||
+		!strings.Contains(err.Error(), "consumerTimeoutMillisWhenSuspend must greater than brokerSuspendMaxTimeMillis") {
+		t.Fatalf("suspend budget below the broker's: err = %v", err)
+	}
+}
+
+// A consumer may start with no subscription at all; subscribing while RUNNING
+// must wire the route and begin delivery without a restart.
+func TestLitePullConsumerSubscribeAfterStart(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"T": 1})
+	f.broker.setClientIDs(liteClientID(f))
+	c := newLiteConsumer(t, f, "GID_lite_late_subscribe")
+	c.SetConsumeFromWhere(ConsumeFromWhereFirstOffset)
+	c.SetAutoCommit(false)
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	requireNoError(t, "late subscribe", c.Subscribe("T", "*"))
+	f.broker.add("T", 0, "late-0")
+	got := pollAll(t, c, 1, 3*time.Second)
+	if len(got) != 1 || got[0] != "late-0" {
+		t.Fatalf("late subscription delivered %v, want [late-0]", got)
 	}
 }
 

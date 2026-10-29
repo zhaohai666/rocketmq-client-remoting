@@ -190,11 +190,19 @@ pub fn parse_addr(addr: &str) -> (String, String) {
     }
 }
 
-pub fn current_day_millis() -> u32 {
-    use chrono::Timelike as _;
-    let now = chrono::Local::now();
-    let secs = now.hour() * 3600 + now.minute() * 60 + now.second();
-    secs * 1000 + now.nanosecond() / 1_000_000
+/// Milliseconds since the start of the current month, local time, millisecond precision.
+///
+/// The UNIQ_KEY time segment is anchored to the month, not to the day: the first day of the
+/// month at 00:00:00.000 is the origin and the value resets when the month rolls over.
+pub fn current_month_millis() -> u32 {
+    use chrono::{Datelike as _, Local, TimeZone as _};
+    let now = Local::now();
+    let month_start = Local
+        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .unwrap_or(now);
+    let diff = now.timestamp_millis() - month_start.timestamp_millis();
+    u32::try_from(diff.max(0)).unwrap_or(u32::MAX)
 }
 
 /// ⚠ Determinism requirement: the "class-load hash" segment must not use the runtime's randomized string hash (per-process
@@ -217,7 +225,7 @@ pub fn create_uniq_id() -> String {
     }
     bytes.extend_from_slice(&(get_pid() as u16).to_be_bytes());
     bytes.extend_from_slice(&(java_string_hash("RocketMQClient") as u32).to_be_bytes());
-    bytes.extend_from_slice(&current_day_millis().to_be_bytes());
+    bytes.extend_from_slice(&current_month_millis().to_be_bytes());
     bytes.extend_from_slice(&counter.to_be_bytes());
     bytes_2_string(&bytes)
 }
@@ -308,8 +316,12 @@ mod tests {
     }
 
     #[test]
-    fn day_millis_stays_in_one_day() {
-        let ms = current_day_millis();
-        assert!(ms < 86_400_000, "millis of the current day must stay within one day, got {ms}");
+    fn uniq_id_time_segment_is_month_anchored_millis() {
+        let ms = current_month_millis();
+        // A full month of milliseconds fits in u32 and is not capped at one day.
+        assert!(
+            ms < 31 * 86_400_000,
+            "millis since the start of the month out of range, got {ms}"
+        );
     }
 }

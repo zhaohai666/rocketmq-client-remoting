@@ -420,8 +420,8 @@ void s5SendFirstFirstOffset(Env& env, DefaultMQProducer& prod) {
     // The regression this pins: an earlier draft resolved the initial offset of a SQL92
     // subscription to the max offset, silently skipping every message produced *before*
     // the consumer started (consumer-first passed only because the queues were empty and
-    // the max offset was 0 anyway). Java (RebalancePushImpl#computePullFromWhere) starts
-    // at 0 for FIRST_OFFSET regardless of the subscription type and lets the broker filter.
+    // the max offset was 0 anyway). A FIRST_OFFSET subscription starts at 0
+    // regardless of the subscription type and lets the broker filter.
     const std::string topic = "Sql92CppFirst_" + gStamp;
     env.topics.push_back(topic);
     try {
@@ -508,8 +508,8 @@ int main(int argc, char** argv) {
 
         // Preflight: does this broker accept SQL92 subscriptions at all? The broker answers
         // CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not support consumer to
-        // filter message by SQL92") unless it runs with enablePropertyFilter=true, and the
-        // Java client fails start() the same way. Detect that up front and say what to do,
+        // filter message by SQL92") unless it runs with enablePropertyFilter=true, and
+        // start() fails the same way here. Detect that up front and say what to do,
         // instead of failing confusingly deeper in.
         {
             const std::string preGroup = env.group("PREFLIGHT");
@@ -533,7 +533,7 @@ int main(int argc, char** argv) {
                 refuseMsg.find("does not support consumer to filter message by") != std::string::npos) {
                 std::printf("!! the broker refuses SQL92 subscriptions: %s\n", refuseMsg.c_str());
                 std::printf("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,\n");
-                std::printf("!!      then re-run this probe (the same requirement applies to the Java client).\n");
+                std::printf("!!      then re-run this probe (the requirement is the same for any client).\n");
                 std::printf("!! skipping end-to-end SQL92 verification: broker not configured for property filter\n");
                 prod.shutdown();
                 env.cleanup();

@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <map>
 #include <utility>
 
+#include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
@@ -39,6 +41,13 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
         start = pos + 1;
     }
     return out;
+}
+
+std::string localOffsetFilePath(const std::string& clientId, const std::string& group) {
+    std::string base = UtilAll::userHome();
+    if (base.empty()) base = ".";
+    return base + "/.rocketmq_offsets/" + (clientId.empty() ? "DEFAULT" : clientId) + "/"
+           + group + "/offsets.json";
 }
 
 int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallback) {
@@ -497,6 +506,14 @@ void DefaultMQPullConsumer::pullAsync(const MessageQueue& mq, const MessageSelec
 
 // ---------------------------------------------------------------- Consumer offset management
 bool DefaultMQPullConsumer::fetchConsumeOffset(const MessageQueue& mq, int64_t& outOffset) {
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        const std::map<std::string, int64_t> table = DefaultMQPushConsumer::loadLocalOffsetsAt(
+            localOffsetFilePath(clientId_, consumerGroup_));
+        auto it = table.find(DefaultMQPushConsumer::offsetKey(mq));
+        if (it == table.end()) return false;
+        outOffset = it->second;
+        return true;
+    }
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
@@ -504,6 +521,12 @@ bool DefaultMQPullConsumer::fetchConsumeOffset(const MessageQueue& mq, int64_t& 
 }
 
 void DefaultMQPullConsumer::updateConsumeOffset(const MessageQueue& mq, int64_t offset) {
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+        DefaultMQPushConsumer::saveLocalOffsetsAt(localOffsetFilePath(clientId_, consumerGroup_),
+                                                  {{key, offset}}, {{key, mq}});
+        return;
+    }
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }

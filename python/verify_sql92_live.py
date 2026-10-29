@@ -119,7 +119,7 @@ def main() -> int:
         # ---------- preflight: does this broker accept SQL92 subscriptions at all? ----------
         # The broker answers CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not
         # support consumer to filter message by SQL92") unless it runs with
-        # enablePropertyFilter=true, and the Java client fails start() the same way. Detect
+        # enablePropertyFilter=true, and start() fails the same way here. Detect
         # that up front and say what to do, instead of dying with a raw traceback inside S1.
         preflight, _ = new_consumer(GROUP + "_PREFLIGHT", MessageSelector.by_sql("color = 'red'"))
         try:
@@ -129,7 +129,7 @@ def main() -> int:
             if "does not support consumer to filter message by" in msg:
                 print("!! the broker refuses SQL92 subscriptions: %s" % msg)
                 print("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,")
-                print("!!      then re-run this probe (the same requirement applies to the Java client).")
+                print("!!      then re-run this probe (the requirement is the same for any client).")
                 print("!! skipping end-to-end SQL92 verification: broker not configured for property filter")
                 preflight.shutdown()
                 prod.shutdown()
@@ -232,8 +232,8 @@ def main() -> int:
         # An earlier draft resolved the initial offset of a SQL92 subscription to the max
         # offset, silently skipping every message produced *before* the consumer started
         # (consumer-first passed only because the queues were empty and max was 0 anyway).
-        # Java (RebalancePushImpl#computePullFromWhere) starts at 0 for FIRST_OFFSET
-        # regardless of the subscription type and lets the broker filter.
+        # A FIRST_OFFSET subscription starts at 0 regardless of the subscription
+        # type and lets the broker filter.
         print("\n---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------")
         first_topic = "Sql92First_%d" % STAMP
         prod.create_topic("TBW102", first_topic, 4)

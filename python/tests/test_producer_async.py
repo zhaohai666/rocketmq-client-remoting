@@ -720,15 +720,14 @@ def test_send_batch_writes_client_ids_before_encoding_the_body():
     inner = decode_batch_messages(batch.get_body())
     assert [m.get_property(UNIQ) for m in inner] == sub_ids
     assert [m.topic for m in batch.messages] == [p._with_namespace("TopicTest")] * 2
-    # (3) the msgId in the callback is the UNIQ_KEY of the **batch itself** (for a non inner-batch the
-    #    parsing layer of this port cannot get the list of sub-messages and therefore cannot assemble
-    #    the IDs one by one; see the comment in _parse_send_response for the reason)
+    # (3) SendResult.msgId: a response without batchUniqId answers every member's UNIQ_KEY joined by
+    #    commas, never the batch's own id and never the broker's offsetMsgId.
     response = RemotingCommand.create_response_command_with_header(ResponseCode.SUCCESS)
     response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0"}
     parsed = MQClientInstance._parse_send_response(None, response, batch, _mq("broker-a", 0))
-    assert parsed.msg_id == get_uniq_id(batch)
+    assert parsed.msg_id == ",".join(sub_ids)
     assert parsed.msg_id != "0" * 32, "it must not degrade into the broker's offsetMsgId"
-    assert "," not in parsed.msg_id
+    assert get_uniq_id(batch) not in parsed.msg_id.split(",")
     # the same one is used when the broker replied with a batchUniqId (inner-batch)
     response.ext_fields = {"msgId": "0" * 32, "queueId": "0", "queueOffset": "0",
                            "batchUniqId": get_uniq_id(batch)}

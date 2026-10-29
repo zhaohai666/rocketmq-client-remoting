@@ -6,9 +6,12 @@ import struct
 import zlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .message import Message, MessageExt, MessageBatch
+from .message import Message, MessageExt, MessageBatch, is_wait_store_msg_ok
 from .message_const import MessageConst
 from .sysflag import MessageSysFlag
+from rocketmq_logging import get_logger
+
+logger = get_logger(__name__)
 
 CHARSET_UTF8 = "utf-8"
 NAME_VALUE_SEPARATOR = 1
@@ -470,6 +473,58 @@ def decode_batch_messages(raw: bytes) -> List[Message]:
     return result
 
 
+def unwrap_inner_batch_messages(messages: List[MessageExt]) -> List[MessageExt]:
+    """Replace inner-batch envelopes with the messages packed in their bodies.
+
+    An envelope carrying both INNER_BATCH_FLAG and NEED_UNWRAP_FLAG in its sysFlag stores a serialized
+    batch in its body. Every member keeps its own flag, properties and body, while topic, queue id,
+    commit log offset, hosts and timestamps come from the envelope; its queue offset is the envelope
+    offset plus the member's position in the batch. Messages without the flags pass through unchanged.
+    A body that cannot be decoded leaves the envelope in place and is logged.
+    """
+    def _is_inner_batch(msg: MessageExt) -> bool:
+        return (MessageSysFlag.check(msg.get_sys_flag(), MessageSysFlag.INNER_BATCH_FLAG)
+                and MessageSysFlag.check(msg.get_sys_flag(), MessageSysFlag.NEED_UNWRAP_FLAG))
+
+    if not any(_is_inner_batch(m) for m in messages):
+        return messages
+    result: List[MessageExt] = []
+    for outer in messages:
+        if not _is_inner_batch(outer):
+            result.append(outer)
+            continue
+        body = outer.get_body()
+        if body is None:
+            logger.warning("inner batch body is not available, keep the envelope: %s", outer)
+            result.append(outer)
+            continue
+        try:
+            members = decode_batch_messages(bytes(body))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("decode inner batch message failed, keep the envelope: %s", e)
+            result.append(outer)
+            continue
+        for i, member in enumerate(members):
+            inner = MessageExt()
+            inner.set_topic(outer.get_topic())
+            inner.set_queue_offset(outer.get_queue_offset() + i)
+            inner.set_queue_id(outer.get_queue_id())
+            inner.set_flag(member.get_flag())
+            inner.set_properties(member.get_properties())
+            inner.set_body(member.get_body())
+            inner.set_store_host(outer.get_store_host())
+            inner.store_host_port = outer.store_host_port
+            inner.set_born_host(outer.get_born_host())
+            inner.born_host_port = outer.born_host_port
+            inner.set_born_timestamp(outer.get_born_timestamp())
+            inner.set_store_timestamp(outer.get_store_timestamp())
+            inner.set_sys_flag(outer.get_sys_flag())
+            inner.set_commit_log_offset(outer.get_commit_log_offset())
+            inner.set_wait_store_msg_ok(is_wait_store_msg_ok(outer))
+            result.append(inner)
+    return result
+
+
 def count_inner_msg_num(raw: bytes) -> int:
     pass
     count = 0
@@ -495,5 +550,5 @@ __all__ = [
     "create_message_id", "decode_message_id",
     "encode_message_ext", "decode_message", "decode_messages",
     "encode_message", "encode_messages", "decode_batch_message", "decode_batch_messages",
-    "count_inner_msg_num",
+    "count_inner_msg_num", "unwrap_inner_batch_messages",
 ]

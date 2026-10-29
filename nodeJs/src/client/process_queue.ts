@@ -12,11 +12,16 @@ import { MessageExt } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 
 export const PULL_MAX_IDLE_TIME_MS = 120_000;
+// A granted lock only shields the queue for this long; the periodic lock sweep
+// re-grants it, so a stale grant must not gate pulling forever.
+export const LOCK_MAX_LIVE_TIME_MS = 30_000;
 
 // processQueue is the per-queue state.
 export class ProcessQueue {
   dropped = false;
   locked = false;
+  lastLockTimestamp = 0; // unix millis of the last LOCK_BATCH_MQ grant
+  tryUnlockTimes = 0;
 
   // msgs holds every pulled-but-unacked message keyed by queueOffset.
   private msgs = new Map<number, MessageExt>();
@@ -209,9 +214,36 @@ export class ProcessQueue {
   setDropped(): void { this.dropped = true; }
   isDropped(): boolean { return this.dropped; }
 
-  // SetLocked records the LOCK_BATCH_MQ outcome for orderly consumption.
+  // SetLocked records the LOCK_BATCH_MQ outcome for orderly consumption. The
+  // grant timestamp is stamped separately by the sweep.
   setLocked(locked: boolean): void { this.locked = locked; }
   isLocked(): boolean { return this.locked; }
+
+  setLastLockTimestamp(ts: number): void { this.lastLockTimestamp = ts; }
+  lastLockTimestampValue(): number { return this.lastLockTimestamp; }
+
+  // A lock grant older than the live time is treated as unlocked at the pull
+  // gate; the periodic sweep is what renews it.
+  isLockExpired(): boolean {
+    return Date.now() - this.lastLockTimestamp > LOCK_MAX_LIVE_TIME_MS;
+  }
+
+  incTryUnlockTimes(): void { this.tryUnlockTimes++; }
+
+  // ConsumingStats is [min, max, count] over the batches handed to a listener
+  // but not settled yet (the orderly transaction view).
+  consumingStats(): [number, number, number] {
+    let min = -1;
+    let max = -1;
+    let count = 0;
+    for (const offset of this.order) {
+      if (!this.dispatched.has(offset)) continue;
+      if (min < 0 || offset < min) min = offset;
+      if (offset > max) max = offset;
+      count++;
+    }
+    return [min, max, count];
+  }
 
   // TouchPull stamps "a pull was started", the isPullExpired input.
   touchPull(): void { this.lastPullTimestamp = Date.now(); }

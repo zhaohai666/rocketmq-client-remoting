@@ -461,17 +461,16 @@ def test_manual_rollback_requeues_without_tps():
     assert len(stats.rt) == 1
 
 
-def test_manual_success_holds_the_batch_without_committing(monkeypatch):
-    pass
+def test_manual_success_settles_the_batch_without_committing(monkeypatch):
     stats = RecordingStats()
     h = Harness(stats=stats)
     h.c.suspend_current_queue_time_millis = 1000
     slept = []
     monkeypatch.setattr(consumer, "time", _FakeTime(slept))
     assert _consume(h, [msg(3, 0)], _manual(ConsumeOrderlyStatus.SUCCESS)) is False
-    assert h.c._consume_offsets[KEY] == 0
-    assert [m.queue_offset for m in h.c._pending[KEY]] == [3]
-    assert slept == [1.0], "without sleeping the next round would immediately get the same batch again: 100% CPU spinning"
+    assert h.c._consume_offsets[KEY] == 0, "SUCCESS does not commit: the offset is the listener's to advance"
+    assert list(h.c._pending[KEY]) == [], "a consumed batch is settled, not put back for an in-place replay"
+    assert slept == [], "nothing was put back, so there is no round to pace"
     assert stats.ok == [1], "only OK TPS is recorded"
     assert stats.failed == []
 

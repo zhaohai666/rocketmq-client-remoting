@@ -585,6 +585,9 @@ def test_assignment_change_resets_only_this_group_and_only_when_opted_in():
         mqc.reset_heartbeat_v2_fingerprint_table = \
             lambda owner=None: resets.append(owner)
         consumer._rebalance_pull_threads = lambda: None
+        # The transport here answers heartbeats only; resolve the queue's start explicitly so the
+        # rebalance keeps the queue instead of skipping it on an unanswerable offset read.
+        consumer._resolve_initial_offset = lambda client, mq: 0
         mqc.get_topic_subscribe_info = lambda topic: [
             MessageQueue(topic=topic, broker_name="broker-a", queue_id=0)]
         consumer.message_model = MessageModel.BROADCASTING

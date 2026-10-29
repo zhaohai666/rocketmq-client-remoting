@@ -98,6 +98,9 @@ public sealed class DefaultMQPullConsumer
 
     public void SetMessageModel(string model) => _messageModel = model;
 
+    // Offline test seam: redirects the broadcast offset file away from the user home.
+    public string? LocalOffsetPathForTest { get; set; }
+
     public void SetMessageQueueListener(IMessageQueueListener listener) =>
         _messageQueueListener = listener;
 
@@ -952,13 +955,45 @@ public sealed class DefaultMQPullConsumer
     }
 
     // ---------------- Offset management ----------------
-    /// <summary>false means this consumer group has no offset on that queue yet (the
-    /// broker replies QUERY_NOT_FOUND).</summary>
-    public bool FetchConsumeOffset(MessageQueue mq, out long outOffset) =>
-        RequireClient().QueryConsumerOffset(_consumerGroup, mq, out outOffset);
+    private string LocalOffsetPath() =>
+        LocalOffsetPathForTest ?? DefaultMQPushConsumer.BuildLocalOffsetPath(_clientId, _consumerGroup);
 
-    public void UpdateConsumeOffset(MessageQueue mq, long offset) =>
+    /// <summary>false means this consumer group has no offset on that queue yet. The
+    /// store follows the message model: broadcasting reads the local file, clustering
+    /// asks the broker.</summary>
+    public bool FetchConsumeOffset(MessageQueue mq, out long outOffset)
+    {
+        _ = RequireClient();
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            if (DefaultMQPushConsumer.LoadLocalOffsetsAt(LocalOffsetPath())
+                .TryGetValue(DefaultMQPushConsumer.LocalOffsetKey(mq), out long local))
+            {
+                outOffset = local;
+                return true;
+            }
+
+            outOffset = -1;
+            return false;
+        }
+
+        return RequireClient().QueryConsumerOffset(_consumerGroup, mq, out outOffset);
+    }
+
+    public void UpdateConsumeOffset(MessageQueue mq, long offset)
+    {
+        _ = RequireClient();
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            string key = DefaultMQPushConsumer.LocalOffsetKey(mq);
+            DefaultMQPushConsumer.SaveLocalOffsetsAt(LocalOffsetPath(),
+                new Dictionary<string, long>(StringComparer.Ordinal) { [key] = offset },
+                new Dictionary<string, MessageQueue>(StringComparer.Ordinal) { [key] = mq });
+            return;
+        }
+
         RequireClient().UpdateConsumerOffset(_consumerGroup, mq, offset);
+    }
 
     public long SearchOffset(MessageQueue mq, long timestamp) =>
         RequireClient().SearchOffsetByTimestamp(mq, timestamp);

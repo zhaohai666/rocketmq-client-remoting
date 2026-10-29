@@ -267,6 +267,14 @@ func (p *pullAPI) processPullResult(mq common.MessageQueue, result *PullResult,
 	if result.PullStatus != PullFound || len(result.MsgFoundList) == 0 {
 		return result
 	}
+	// A batch produced by one send travels as ONE envelope carrying the member
+	// messages in its body. Unwrap before filtering so every member is filtered,
+	// counted and delivered on its own.
+	if unwrapped, err := unwrapInnerBatchMessages(result.MsgFoundList); err != nil {
+		common.LogErrorf("decode inner batch failed for %v, keeping the envelope: %v", mq, err)
+	} else {
+		result.MsgFoundList = unwrapped
+	}
 	msgs := clientSideTagFilter(sub, result.MsgFoundList)
 	if len(p.hooks) > 0 {
 		ctx := &FilterMessageContext{
@@ -291,6 +299,76 @@ func (p *pullAPI) processPullResult(mq common.MessageQueue, result *PullResult,
 	}
 	result.MsgFoundList = msgs
 	return result
+}
+
+// ------------------------------------------------- inner-batch unwrap
+
+// isInnerBatchEnvelope reports whether a pulled message is a container whose
+// body is a message batch rather than a user payload. Both flags are required:
+// INNER_BATCH_FLAG marks the container, NEED_UNWRAP_FLAG says this client is
+// expected to unpack it.
+func isInnerBatchEnvelope(msg *common.MessageExt) bool {
+	return common.CheckFlag(msg.SysFlag, common.MessageSysFlagInnerBatch) &&
+		common.CheckFlag(msg.SysFlag, common.MessageSysFlagNeedUnwrap)
+}
+
+// unwrapInnerBatchMessages replaces every inner-batch envelope with one message
+// per batch member, in body order. A member inherits the envelope's routing and
+// store identity (topic, queue, hosts, timestamps, sysFlag, commitLogOffset,
+// broker) and keeps its own flag, properties and body — the wait-store flag is
+// one of the copied properties. queueOffset is the envelope's plus the member
+// index, so the members occupy the offsets the batch reserved.
+//
+// On any decode error nothing is replaced: the caller keeps the envelopes it
+// was given (a partially unpacked batch would silently drop members).
+func unwrapInnerBatchMessages(msgs []*common.MessageExt) ([]*common.MessageExt, error) {
+	needsUnwrap := false
+	for _, msg := range msgs {
+		if isInnerBatchEnvelope(msg) {
+			needsUnwrap = true
+			break
+		}
+	}
+	if !needsUnwrap {
+		return msgs, nil
+	}
+	out := make([]*common.MessageExt, 0, len(msgs))
+	for _, msg := range msgs {
+		if !isInnerBatchEnvelope(msg) {
+			out = append(out, msg)
+			continue
+		}
+		members, err := common.DecodeBatchMessagesStrict(msg.GetBody())
+		if err != nil {
+			return nil, err
+		}
+		for i, member := range members {
+			out = append(out, innerBatchMember(msg, member, i))
+		}
+	}
+	return out, nil
+}
+
+// innerBatchMember builds one delivered message out of an envelope and one
+// decoded batch member.
+func innerBatchMember(envelope *common.MessageExt, member *common.Message, index int) *common.MessageExt {
+	out := common.NewMessageExt()
+	out.Topic = envelope.Topic
+	out.QueueOffset = envelope.QueueOffset + int64(index)
+	out.QueueID = envelope.QueueID
+	out.Flag = member.Flag
+	out.Properties = member.Properties
+	out.Body = member.GetBody()
+	out.StoreHost = envelope.StoreHost
+	out.StoreHostPort = envelope.StoreHostPort
+	out.BornHost = envelope.BornHost
+	out.BornHostPort = envelope.BornHostPort
+	out.BornTimestamp = envelope.BornTimestamp
+	out.StoreTimestamp = envelope.StoreTimestamp
+	out.SysFlag = envelope.SysFlag
+	out.CommitLogOffset = envelope.CommitLogOffset
+	out.BrokerName = envelope.BrokerName
+	return out
 }
 
 // ---------------------------------------------------------------- small helpers

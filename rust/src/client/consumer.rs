@@ -80,7 +80,7 @@ use crate::common::message_const::{
     PROPERTY_TRANSACTION_PREPARED,
 };
 use crate::common::mix_all::MixAll;
-use crate::common::sysflag::{ConsumeInitMode, PullSysFlag};
+use crate::common::sysflag::{ConsumeInitMode, MessageSysFlag, PullSysFlag};
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::admin_body::MessageQueueKey;
@@ -118,6 +118,9 @@ pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
 
 pub const QUERY_ASSIGNMENT_TIMEOUT_MILLIS: i64 = 3000;
+
+/// Maximum lifetime of a queue lock granted by LOCK_BATCH_MQ (milliseconds).
+pub const REBALANCE_LOCK_MAX_LIVE_TIME: i64 = 30_000;
 
 /// The shutdown finalize budget for "draining the in-flight batches (including send-back RPC)".
 ///
@@ -725,6 +728,11 @@ struct State {
     mq_map: BTreeMap<String, MessageQueue>,
     /// Queues the broker has confirmed as locked in orderly consumption.
     lock_ok: BTreeSet<String>,
+    /// Per queue, when the broker granted the current lock (milliseconds); a grant older than
+    /// [`REBALANCE_LOCK_MAX_LIVE_TIME`] counts as expired.
+    lock_at: BTreeMap<String, i64>,
+    /// Per queue, when a batch was last consumed successfully (milliseconds).
+    last_consume_at: BTreeMap<String, i64>,
     /// Per-queue backlog delta for this batch (watermark estimation for topic-level flow control).
     msg_acc_cnt: BTreeMap<String, i64>,
     /// The **ownership token** of each queue's pull/POP loop.
@@ -2425,6 +2433,8 @@ impl DefaultMQPushConsumer {
         state.pending.remove(key);
         state.inflight_msgs.remove(key);
         state.lock_ok.remove(key);
+        state.lock_at.remove(key);
+        state.last_consume_at.remove(key);
         state.last_pull_at.remove(key); // a reused queue name must not inherit the old timestamp
         *state.queue_epoch.entry(key.to_string()).or_insert(0) += 1;
         let off = state.consume_offsets.remove(key);
@@ -2523,8 +2533,10 @@ async fn resolve_initial_offset(
             .await
         {
             Ok(Some(off)) => stored = off,
-            Ok(_) => {}
-            Err(e) => rmq_debug!("query consumer offset for {mq:?} not found: {e}"),
+            Ok(None) => {}
+            // Anything other than "not found" is a store read failure: the caller must skip this
+            // queue for the current round instead of starting it from the tail.
+            Err(e) => return Err(e),
         }
     }
 
@@ -2570,6 +2582,8 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
                 rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
             }
         }
+        // The revoked queue must not linger in the in-memory store after its final persist.
+        lock(&inner.state).consume_offsets.remove(&mq_key(mq));
         if orderly && !cfg.pop_mode {
             let _ = client
                 .unlock_batch_mq(&group, &client_id, std::slice::from_ref(mq), 1000)
@@ -2784,12 +2798,33 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         let orderly = lock(&inner.listener)
             .as_ref()
             .is_some_and(MessageListener::is_orderly);
-        // Orderly consumption: do not pull a queue the broker has not confirmed as locked (LOCK_BATCH_MQ)
-        if orderly && !lock(&inner.state).lock_ok.contains(&key) {
-            if wait_or_stop(&mut rx, 200).await {
-                return;
+        // Orderly consumption: a clustering queue must hold a broker grant from LOCK_BATCH_MQ before it is
+        // pulled, and a grant older than the maximum lock lifetime counts as expired. Broadcasting has no
+        // broker-side lock, so there every queue is implicitly locked.
+        if orderly && cfg.message_model == MessageModel::CLUSTERING {
+            let now = current_time_millis();
+            let (known, fresh) = {
+                let state = lock(&inner.state);
+                (
+                    state.lock_ok.contains(&key),
+                    state
+                        .lock_at
+                        .get(&key)
+                        .is_some_and(|at| now - *at <= REBALANCE_LOCK_MAX_LIVE_TIME),
+                )
+            };
+            if !(known && fresh) {
+                if known {
+                    rmq_warn!(
+                        "lock of {mq:?} is older than {REBALANCE_LOCK_MAX_LIVE_TIME} ms, \
+                         waiting for the next lock round"
+                    );
+                }
+                if wait_or_stop(&mut rx, 200).await {
+                    return;
+                }
+                continue;
             }
-            continue;
         }
         if flow_control_hit(&inner, &key) {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
@@ -3319,10 +3354,15 @@ async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
 
 async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
-        if !read_cfg(&inner).pop_mode {
+        let cfg = read_cfg(&inner);
+        let orderly = lock(&inner.listener)
+            .as_ref()
+            .is_some_and(MessageListener::is_orderly);
+        // Only orderly clustering consumption needs broker-side queue locks: broadcasting has no lock
+        // arbitration and POP uses its own invisible-time mechanism.
+        if orderly && !cfg.pop_mode && cfg.message_model == MessageModel::CLUSTERING {
             let mqs: Vec<MessageQueue> = lock(&inner.state).assigned.clone();
             if !mqs.is_empty() {
-                let cfg = read_cfg(&inner);
                 let client = match require_client(&inner) {
                     Ok(c) => c,
                     Err(_) => return,
@@ -3335,7 +3375,13 @@ async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                     Ok(ok) => {
                         let keys: BTreeSet<String> = ok.iter().map(mq_key).collect();
                         let n = keys.len();
-                        lock(&inner.state).lock_ok = keys;
+                        let now = current_time_millis();
+                        let mut state = lock(&inner.state);
+                        state.lock_ok = keys;
+                        state.lock_at.clear();
+                        for mq in &ok {
+                            state.lock_at.insert(mq_key(mq), now);
+                        }
                         rmq_debug!("lock_batch_mq: {n}/{} queues locked", mqs.len());
                     }
                     Err(e) => rmq_debug!("lock mq error: {e}"),
@@ -3448,7 +3494,14 @@ impl DefaultMQPushConsumer {
         }
         let tasks = &mut *lock(&self.inner.tasks);
         tasks.push(spawn_loop!(heartbeat_loop));
-        tasks.push(spawn_loop!(lock_loop));
+        let orderly = lock(&self.inner.listener)
+            .as_ref()
+            .is_some_and(MessageListener::is_orderly);
+        // The lock sweep exists only for orderly clustering consumption.
+        let cfg = read_cfg(&self.inner);
+        if orderly && !cfg.pop_mode && cfg.message_model == MessageModel::CLUSTERING {
+            tasks.push(spawn_loop!(lock_loop));
+        }
         // Dispatch and rebalance: rebalance needs the handle (it starts the per-queue loops), so it uses a clone of the consumer.
         // The dispatch loop does not go into tasks (shutdown must not abort it -- it may be holding an in-flight send-back RPC),
         // and is registered separately in dispatch_task so the finalize task waits for it within a bound.
@@ -3456,10 +3509,7 @@ impl DefaultMQPushConsumer {
         let rx = self.inner.stop.subscribe();
         tasks.push(handle.spawn(async move { rebalance_loop(consumer, rx).await }));
         *lock(&self.inner.dispatch_task) = Some(spawn_loop!(dispatch_loop));
-        let orderly = lock(&self.inner.listener)
-            .as_ref()
-            .is_some_and(MessageListener::is_orderly);
-        if !orderly && !read_cfg(&self.inner).pop_mode {
+        if !orderly && !cfg.pop_mode {
             tasks.push(spawn_loop!(clean_expire_loop));
         }
     }
@@ -3515,11 +3565,19 @@ async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
 
 fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     let cfg = read_cfg(inner);
+    local_offset_store_path(cfg.client_id.as_deref(), &cfg.consumer_group)
+}
+
+/// Local offset file location for a consumer identity: `~/.rocketmq_offsets/<clientId>/<group>/offsets.json`.
+pub(crate) fn local_offset_store_path(
+    client_id: Option<&str>,
+    group: &str,
+) -> Option<std::path::PathBuf> {
     let home = crate::common::util_all::user_home()?;
     let base = std::path::Path::new(&home)
         .join(".rocketmq_offsets")
-        .join(cfg.client_id.as_deref().unwrap_or("DEFAULT"))
-        .join(&cfg.consumer_group);
+        .join(client_id.unwrap_or("DEFAULT"))
+        .join(group);
     Some(base.join("offsets.json"))
 }
 
@@ -3741,10 +3799,16 @@ fn save_local_offsets_with(inner: &Inner, extra: &[(MessageQueue, Option<i64>)])
     let Some(path) = local_offset_path(inner) else {
         return Err(Error::client("HOME is not set, cannot store local offsets"));
     };
-    let (mut items, mut mq_map) = {
+    let (mut items, mut mq_map) = load_local_offset_table_at(&path)?;
+    {
         let st = lock(&inner.state);
-        (st.consume_offsets.clone(), st.mq_map.clone())
-    };
+        for (key, off) in &st.consume_offsets {
+            items.insert(key.clone(), *off);
+        }
+        for (key, mq) in &st.mq_map {
+            mq_map.insert(key.clone(), mq.clone());
+        }
+    }
     merge_retired_offsets(&mut items, &mut mq_map, extra);
     save_local_offsets_at(&path, &items, &mq_map)
 }
@@ -3804,6 +3868,104 @@ fn load_local_offsets_at(path: &std::path::Path) -> BTreeMap<String, i64> {
         }
     }
     BTreeMap::new()
+}
+
+/// The existing file's entries together with their queue identities, so the union write can keep
+/// entries for queues that are not part of this flush. A file that exists but cannot be read or
+/// parsed aborts the flush instead of being overwritten with a partial table.
+fn load_local_offset_table_at(
+    path: &std::path::Path,
+) -> Result<(BTreeMap<String, i64>, BTreeMap<String, MessageQueue>)> {
+    let mut unreadable = None;
+    for candidate in [path.to_path_buf(), path.with_file_name("offsets.json.bak")] {
+        let text = match std::fs::read_to_string(&candidate) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                unreadable = Some(format!("{}: {e}", candidate.display()));
+                continue;
+            }
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        match parse_local_offsets_with_queues(&text) {
+            Some(parsed) => return Ok(parsed),
+            None => unreadable = Some(format!("{}: malformed offset table", candidate.display())),
+        }
+    }
+    match unreadable {
+        Some(why) => Err(Error::client(format!(
+            "local offset store is unreadable, keeping the file: {why}"
+        ))),
+        None => Ok((BTreeMap::new(), BTreeMap::new())),
+    }
+}
+
+fn parse_local_offsets_with_queues(
+    text: &str,
+) -> Option<(BTreeMap<String, i64>, BTreeMap<String, MessageQueue>)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(flat) = serde_json::from_str::<BTreeMap<String, i64>>(trimmed) {
+        // A legacy flat table carries no queue identities, so its entries cannot be rewritten.
+        return Some((flat, BTreeMap::new()));
+    }
+    let entries = scan_offset_store_entries(trimmed)?;
+    let mut items = BTreeMap::new();
+    let mut mq_map = BTreeMap::new();
+    for (topic, broker, qid, off) in entries {
+        let mq = MessageQueue::new(&topic, &broker, qid);
+        let key = mq_key(&mq);
+        items.insert(key.clone(), off);
+        mq_map.insert(key, mq);
+    }
+    Some((items, mq_map))
+}
+
+/// Read the local offset of one queue (broadcasting pull/lite offset store).
+pub(crate) fn read_local_offset(
+    client_id: Option<&str>,
+    group: &str,
+    mq: &MessageQueue,
+) -> Option<i64> {
+    let path = local_offset_store_path(client_id, group)?;
+    load_local_offsets_at(&path).get(&mq_key(mq)).copied()
+}
+
+/// Write the given queue offsets into the local file, keeping every entry already present there.
+pub(crate) fn write_local_offsets(
+    client_id: Option<&str>,
+    group: &str,
+    entries: &[(MessageQueue, i64)],
+) -> Result<()> {
+    let Some(path) = local_offset_store_path(client_id, group) else {
+        return Err(Error::client("HOME is not set, cannot store local offsets"));
+    };
+    write_local_offsets_at(&path, entries)
+}
+
+/// Path-taking core of [`write_local_offsets`]: read the existing table, overlay `entries` and
+/// write the union.
+pub(crate) fn write_local_offsets_at(
+    path: &std::path::Path,
+    entries: &[(MessageQueue, i64)],
+) -> Result<()> {
+    let (mut items, mut mq_map) = load_local_offset_table_at(path)?;
+    for (mq, off) in entries {
+        let key = mq_key(mq);
+        items.insert(key.clone(), *off);
+        mq_map.insert(key, mq.clone());
+    }
+    save_local_offsets_at(path, &items, &mq_map)
+}
+
+/// Broker-backed consumers keep their offsets on the broker; broadcasting instances own a local
+/// file, so two hosts in one group cannot overwrite each other's progress.
+pub(crate) fn uses_local_offset_store(message_model: &str) -> bool {
+    message_model == MessageModel::BROADCASTING
 }
 
 // ================================================================ POP consumption
@@ -4837,11 +4999,10 @@ async fn consume_batch(
                 return Ok(false);
             }
             ConsumeOrderlyStatus::Success => {
+                // Manual commit: SUCCESS only records the successful consumption. The batch is
+                // neither committed nor put back, so it is not delivered again.
                 record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, false, None);
-                requeue_pending(inner, key, &batch);
-                let suspend = orderly_suspend_millis(&cfg, &ocontext);
-                tokio::time::sleep(Duration::from_millis(suspend)).await;
-                return Ok(false);
+                return Ok(true);
             }
         }
     }
@@ -5039,6 +5200,9 @@ fn advance_consume_offset(
     state
         .consume_offsets
         .insert(key.to_string(), cur.max(next_off));
+    state
+        .last_consume_at
+        .insert(key.to_string(), current_time_millis());
 }
 
 fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
@@ -5591,17 +5755,64 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             ..Default::default()
         };
         let state = lock(&self.inner.state);
+        let now = current_time_millis();
         for (key, mq) in &state.mq_map {
             if cfg.pop_mode && state.pop_queues.contains_key(key) {
                 continue;
             }
+            let cached: Vec<&MessageExt> = state
+                .pending
+                .get(key)
+                .into_iter()
+                .flatten()
+                .chain(state.inflight_msgs.get(key).into_iter().flatten())
+                .collect();
+            let mut cached_min = 0i64;
+            let mut cached_max = 0i64;
+            let mut transaction_min = 0i64;
+            let mut transaction_max = 0i64;
+            let mut transaction_count = 0i32;
+            let mut body_bytes = 0usize;
+            for (index, msg) in cached.iter().enumerate() {
+                if index == 0 || msg.queue_offset < cached_min {
+                    cached_min = msg.queue_offset;
+                }
+                if index == 0 || msg.queue_offset > cached_max {
+                    cached_max = msg.queue_offset;
+                }
+                body_bytes += msg.body.as_ref().map_or(0, |body| body.len());
+                if MessageSysFlag::get_transaction_value(msg.sys_flag)
+                    == MessageSysFlag::TRANSACTION_PREPARED_TYPE
+                {
+                    if transaction_count == 0 || msg.queue_offset < transaction_min {
+                        transaction_min = msg.queue_offset;
+                    }
+                    if transaction_count == 0 || msg.queue_offset > transaction_max {
+                        transaction_max = msg.queue_offset;
+                    }
+                    transaction_count += 1;
+                }
+            }
+            let locked = state.lock_ok.contains(key)
+                && state
+                    .lock_at
+                    .get(key)
+                    .is_some_and(|at| now - *at <= REBALANCE_LOCK_MAX_LIVE_TIME);
             let pqi = ProcessQueueInfo {
-                commit_offset: state.consume_offsets.get(key).copied().unwrap_or(0),
-                cached_msg_count: i32::try_from(state.pending.get(key).map_or(0, |dq| dq.len()))
-                    .unwrap_or(i32::MAX),
+                commit_offset: state.consume_offsets.get(key).copied().unwrap_or(-1),
+                cached_msg_min_offset: cached_min,
+                cached_msg_max_offset: cached_max,
+                cached_msg_count: i32::try_from(cached.len()).unwrap_or(i32::MAX),
+                cached_msg_size_in_mib: i32::try_from(body_bytes / (1024 * 1024)).unwrap_or(i32::MAX),
+                transaction_msg_min_offset: transaction_min,
+                transaction_msg_max_offset: transaction_max,
+                transaction_msg_count: transaction_count,
+                locked,
+                try_unlock_times: 0,
+                last_lock_timestamp: state.lock_at.get(key).copied().unwrap_or(0),
                 droped: false,
                 last_pull_timestamp: state.last_pull_at.get(key).copied().unwrap_or(0),
-                ..Default::default()
+                last_consume_timestamp: state.last_consume_at.get(key).copied().unwrap_or(0),
             };
             info.mq_table.push((
                 MessageQueueKey::new(&mq.topic, &mq.broker_name, mq.queue_id),
@@ -5620,15 +5831,14 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 let Some(mq) = mq_of.get(key) else {
                     continue;
                 };
-                let pqi = ProcessQueueInfo {
-                    cached_msg_count: pq.wait_ack_count(),
-                    droped: pq.is_dropped(),
-                    last_pull_timestamp: pq.last_pop_timestamp.load(Ordering::SeqCst),
-                    ..Default::default()
-                };
+                let pqi = serde_json::json!({
+                    "waitAckCount": pq.wait_ack_count(),
+                    "droped": pq.is_dropped(),
+                    "lastPopTimestamp": pq.last_pop_timestamp.load(Ordering::SeqCst),
+                });
                 info.mq_pop_table.push((
                     MessageQueueKey::new(&mq.topic, &mq.broker_name, mq.queue_id),
-                    pqi.to_json_value(),
+                    pqi,
                 ));
             }
         }
@@ -8453,10 +8663,14 @@ mod tests {
     #[tokio::test]
     async fn manual_success_holds_the_batch_without_committing() {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Success);
-        // Both are reconsumeTimes=0: in manual mode SUCCESS must not touch even the local counter
-        assert!(!h.run(orderly_batch(0, &[0, 0])).await);
+        // Both are reconsumeTimes=0: in manual mode SUCCESS must not touch even the local counter.
+        // The batch is finished (not requeued) but the offset stays where it was.
+        assert!(h.run(orderly_batch(0, &[0, 0])).await);
         assert_eq!(h.offset(), 0, "in manual mode SUCCESS does not commit");
-        assert_eq!(h.pending(), vec![(0, 0), (1, 0)], "the whole batch is returned in original order");
+        assert!(
+            h.pending().is_empty(),
+            "in manual mode SUCCESS must not put the batch back"
+        );
     }
 
     #[tokio::test]
@@ -9568,13 +9782,18 @@ mod tests {
             info.mq_table.is_empty(),
             "pop mode has no pull queues, mqTable must be empty"
         );
-        // The in-flight unacked count goes through cachedMsgCount
+        // The in-flight unacked count goes through waitAckCount, and the entry carries exactly
+        // the three pop fields.
+        let first = info.mq_pop_table[0].1.as_object().unwrap();
         assert_eq!(
-            info.mq_pop_table[0].1.get("cachedMsgCount"),
+            first.get("waitAckCount"),
             Some(&serde_json::Value::from(3))
         );
+        assert_eq!(first.get("droped"), Some(&serde_json::Value::from(false)));
+        assert!(first.contains_key("lastPopTimestamp"));
+        assert_eq!(first.len(), 3);
         assert_eq!(
-            info.mq_pop_table[1].1.get("cachedMsgCount"),
+            info.mq_pop_table[1].1.get("waitAckCount"),
             Some(&serde_json::Value::from(0))
         );
     }
@@ -9940,7 +10159,7 @@ mod tests {
         let info = consumer.consumer_running_info();
         assert_eq!(info.mq_pop_table.len(), 1);
         assert_eq!(
-            info.mq_pop_table[0].1.get("lastPullTimestamp"),
+            info.mq_pop_table[0].1.get("lastPopTimestamp"),
             Some(&serde_json::Value::from(1_700_000_000_789_i64))
         );
     }
@@ -10141,6 +10360,62 @@ mod tests {
         assert_eq!(loaded.get("Ttbroker-a1"), Some(&9));
         assert_eq!(loaded.get("Ttbroker-a0"), Some(&7));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two partial flushes must not lose each other: the file is the union, so a queue absent
+    /// from this round (for example one no longer held) keeps the offset it had.
+    #[test]
+    fn local_offsets_write_merges_with_the_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmq_rust_offsets_merge_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("offsets.json");
+        let q0 = MessageQueue::new("T", "broker-a", 0);
+        let q1 = MessageQueue::new("T", "broker-a", 1);
+        write_local_offsets_at(&path, &[(q0.clone(), 5)]).unwrap();
+        write_local_offsets_at(&path, &[(q1.clone(), 9)]).unwrap();
+
+        let loaded = load_local_offsets_at(&path);
+        assert_eq!(loaded.get(&mq_key(&q0)), Some(&5));
+        assert_eq!(loaded.get(&mq_key(&q1)), Some(&9));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file that exists but cannot be parsed is not silently replaced by a one-queue table.
+    #[test]
+    fn local_offsets_write_refuses_an_unreadable_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rmq_rust_offsets_corrupt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("offsets.json");
+        let garbage = "{\"offsetTable\":{{{";
+        std::fs::write(&path, garbage).unwrap();
+
+        let err = write_local_offsets_at(&path, &[(MessageQueue::new("T", "broker-a", 0), 5)])
+            .expect_err("an unreadable table must abort the flush");
+        assert!(
+            err.to_string().contains("local offset store is unreadable"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_broadcasting_uses_the_local_offset_store() {
+        assert!(uses_local_offset_store(MessageModel::BROADCASTING));
+        assert!(!uses_local_offset_store(MessageModel::CLUSTERING));
     }
 
     // ---------------- P5: postSubscriptionWhenPull / pullFromWhichNode ----------------

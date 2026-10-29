@@ -344,7 +344,7 @@ async fn run(namesrv: &str) -> Checker {
     // The SQL92 regression taught us that consumer-first probes can mask initial-offset
     // bugs (the queues are empty so max offset == 0). This leg pins the other ordering:
     // all messages exist BEFORE the consumer starts, which starts at 0 for FIRST_OFFSET
-    // regardless of the subscription type (Java RebalancePushImpl#computePullFromWhere).
+    // regardless of the subscription type (no stored offset -> 0).
     println!("\n---------- O3 send-first + CONSUME_FROM_FIRST_OFFSET ----------");
     let first_topic = format!("RustLiveOnewayFirst{}", env.stamp);
     if let Err(e) = env

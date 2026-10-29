@@ -292,7 +292,7 @@ try {
     // ---------- preflight: does this broker accept SQL92 subscriptions at all? ----------
     // The broker answers CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not
     // support consumer to filter message by SQL92") unless it runs with
-    // enablePropertyFilter=true, and the Java client fails start() the same way. Detect that
+    // enablePropertyFilter=true, and start() fails the same way here. Detect that
     // up front and say what to do, instead of dying with a raw error inside S1.
     [$pre, ] = new_consumer('PREFLIGHT', MessageSelector::bySql("color = 'red'"));
     try {
@@ -303,7 +303,7 @@ try {
         if (str_contains($e->getMessage(), 'does not support consumer to filter message by')) {
             echo '!! the broker refuses SQL92 subscriptions: ' . $e->getMessage() . PHP_EOL;
             echo '!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,' . PHP_EOL;
-            echo '!!      then re-run this probe (the same requirement applies to the Java client).' . PHP_EOL;
+            echo '!!      then re-run this probe (the requirement is the same for any client).' . PHP_EOL;
             echo '!! skipping end-to-end SQL92 verification: broker not configured for property filter' . PHP_EOL;
             $prod->shutdown();
             $admin->shutdown();
@@ -440,8 +440,8 @@ try {
     // An earlier draft resolved the initial offset of a SQL92 subscription to the max
     // offset, silently skipping every message produced *before* the consumer started
     // (consumer-first passed only because the queues were empty and max was 0 anyway).
-    // Java (RebalancePushImpl#computePullFromWhere) starts at 0 for FIRST_OFFSET
-    // regardless of the subscription type and lets the broker filter.
+    // A FIRST_OFFSET subscription starts at 0 regardless of the subscription
+    // type and lets the broker filter.
     echo PHP_EOL . '---------- S5 send-first + CONSUME_FROM_FIRST_OFFSET ----------' . PHP_EOL;
     $firstTopic = 'Sql92FirstPhp_' . $stamp;
     $admin->createTopic($brokerName, $firstTopic, 4);

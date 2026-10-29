@@ -1,9 +1,12 @@
 import zlib from 'node:zlib';
 import { Buffer } from 'node:buffer';
-import { Message, MessageExt, MessageBatch } from './message.ts';
+import { Message, MessageExt, MessageBatch, isWaitStoreMsgOK } from './message.ts';
 import { MessageSysFlag } from './sysflag.ts';
 import { compressFor, decompressFor } from './compress.ts';
 import { crc32Match } from './utilAll.ts';
+import { getLogger } from '../logging.ts';
+
+const logger = getLogger('common.message_decoder');
 
 const CHARSET = 'utf8';
 const NAME_VALUE_SEPARATOR = 1;
@@ -358,6 +361,63 @@ export function decodeBatchMessages(raw: Buffer): Message[] {
   }
   return result;
 }
+function isInnerBatchToUnwrap(msg: MessageExt): boolean {
+  const flag = msg.getSysFlag();
+  return MessageSysFlag.check(flag, MessageSysFlag.INNER_BATCH_FLAG)
+    && MessageSysFlag.check(flag, MessageSysFlag.NEED_UNWRAP_FLAG);
+}
+
+// An envelope carrying both INNER_BATCH_FLAG (body is a batch) and
+// NEED_UNWRAP_FLAG (the client asked to see the members) is replaced by its
+// members. Each member copies the envelope's routing/metadata fields and takes
+// the envelope's queue offset incremented by its position, because the broker
+// stored the whole batch under a single queue offset. A member that cannot be
+// decoded keeps the envelope and is logged.
+export function decodeInnerBatchMessages(msgs: MessageExt[]): MessageExt[] {
+  if (msgs.length === 0) return msgs;
+  let hasEnvelope = false;
+  for (const msg of msgs) {
+    if (isInnerBatchToUnwrap(msg)) { hasEnvelope = true; break; }
+  }
+  if (!hasEnvelope) return msgs;
+
+  const out: MessageExt[] = [];
+  for (const env of msgs) {
+    if (!isInnerBatchToUnwrap(env)) { out.push(env); continue; }
+    try {
+      const members = decodeBatchMessages(env.getBody() || Buffer.alloc(0));
+      if (members.length === 0) { out.push(env); continue; }
+      for (let i = 0; i < members.length; i++) {
+        const member = members[i];
+        const inner = new MessageExt(env.getTopic());
+        inner.setBody(member.getBody());
+        inner.setFlag(member.getFlag());
+        inner.setProperties({ ...(env.getProperties() || {}), ...(member.getProperties() || {}) });
+        inner.setQueueOffset(env.getQueueOffset() + i);
+        inner.setQueueId(env.getQueueId());
+        inner.setStoreHost(env.getStoreHost());
+        inner.storeHostPort = env.storeHostPort;
+        inner.setBornHost(env.getBornHost());
+        inner.bornHostPort = env.bornHostPort;
+        inner.setBornTimestamp(env.getBornTimestamp());
+        inner.setStoreTimestamp(env.getStoreTimestamp());
+        inner.setSysFlag(env.getSysFlag());
+        inner.setCommitLogOffset(env.getCommitLogOffset());
+        inner.setWaitStoreMsgOK(isWaitStoreMsgOK(env));
+        inner.setBrokerName(env.getBrokerName());
+        inner.setReconsumeTimes(env.getReconsumeTimes());
+        inner.setPreparedTransactionOffset(env.getPreparedTransactionOffset());
+        out.push(inner);
+      }
+    } catch (e) {
+      logger.error('unwrap inner batch %s failed, keep the envelope: %s',
+        env.getMsgId(), (e as Error).message);
+      out.push(env);
+    }
+  }
+  return out;
+}
+
 export function countInnerMsgNum(raw: Buffer): number {
   let count = 0;
   let pos = 0;
@@ -375,5 +435,6 @@ export default {
   MESSAGE_MAGIC_CODE, MESSAGE_MAGIC_CODE_V2, BLANK_MAGIC_CODE,
   createMessageId, decodeMessageId, messageProperties2String, string2MessageProperties,
   encodeMessageExt, decodeMessage, decodeMessages,
-  encodeMessage, encodeMessages, decodeBatchMessage, decodeBatchMessages, countInnerMsgNum, decompressBody,
+  encodeMessage, encodeMessages, decodeBatchMessage, decodeBatchMessages,
+  decodeInnerBatchMessages, countInnerMsgNum, decompressBody,
 };

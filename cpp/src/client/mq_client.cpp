@@ -77,6 +77,46 @@ int32_t sendRequestCode(const Message& msg) {
     return msg.isBatch ? RequestCode::SEND_BATCH_MESSAGE : RequestCode::SEND_MESSAGE_V2;
 }
 
+// Replace an inner-batch envelope with one message per batch member. A member keeps its own flag,
+// properties and body; routing and store identity come from the envelope, and the queue offsets are
+// the envelope's plus the member index. A body that does not decode completely leaves the envelope
+// intact, because a partially expanded batch would silently drop members.
+void unwrapInnerBatchMessage(const MessageExt& envelope, std::vector<MessageExt>& out) {
+    std::vector<Message> members;
+    if (!decodeBatchMessagesStrict(envelope.body, members) || members.empty()) {
+        logger_error("inner batch decode failed, keeping the envelope, msgId=" + envelope.msgId);
+        out.push_back(envelope);
+        return;
+    }
+    for (size_t i = 0; i < members.size(); ++i) {
+        const Message& member = members[i];
+        MessageExt inner;
+        inner.topic = envelope.topic;
+        inner.queueOffset = envelope.queueOffset + static_cast<int64_t>(i);
+        inner.queueId = envelope.queueId;
+        inner.flag = member.flag;
+        inner.properties = member.properties;
+        inner.body = member.body;
+        inner.hasBody = true;
+        inner.storeHost = envelope.storeHost;
+        inner.storeHostPort = envelope.storeHostPort;
+        inner.bornHost = envelope.bornHost;
+        inner.bornHostPort = envelope.bornHostPort;
+        inner.bornTimestamp = envelope.bornTimestamp;
+        inner.storeTimestamp = envelope.storeTimestamp;
+        inner.sysFlag = envelope.sysFlag;
+        inner.commitLogOffset = envelope.commitLogOffset;
+        inner.brokerName = envelope.brokerName;
+        inner.setWaitStoreMsgOk(envelope.isWaitStoreMsgOk());
+        out.push_back(std::move(inner));
+    }
+}
+
+bool isInnerBatchEnvelope(const MessageExt& msg) {
+    return MessageSysFlag::check(msg.sysFlag, MessageSysFlag::INNER_BATCH_FLAG)
+        && MessageSysFlag::check(msg.sysFlag, MessageSysFlag::NEED_UNWRAP_FLAG);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- clientId
@@ -1165,7 +1205,16 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     result.maxOffset = respHeader.maxOffset.value_or(0);
     result.suggestWhichBrokerId = respHeader.suggestWhichBrokerId;
     if (!response.body.empty()) {
-        result.msgFoundList = decodeMessages(response.body, decodeReadBody_);
+        const std::vector<MessageExt> decoded = decodeMessages(response.body, decodeReadBody_);
+        result.msgFoundList.clear();
+        result.msgFoundList.reserve(decoded.size());
+        for (const MessageExt& m : decoded) {
+            if (isInnerBatchEnvelope(m)) {
+                unwrapInnerBatchMessage(m, result.msgFoundList);
+            } else {
+                result.msgFoundList.push_back(m);
+            }
+        }
         for (MessageExt& m : result.msgFoundList) {
             m.brokerName = mq.brokerName;
             m.queueId = mq.queueId;

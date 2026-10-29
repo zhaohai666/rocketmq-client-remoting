@@ -154,7 +154,9 @@ class InnerIdGenerator:
         result += struct.pack(">H", pid & 0xFFFF)
         result += struct.pack(">I", abs(hash("RocketMQClient")) & 0xFFFFFFFF)
         now = datetime.datetime.now()
-        month_ms = ((now.hour * 60 + now.minute) * 60 + now.second) * 1000 + now.microsecond // 1000
+        # Milliseconds elapsed since the first day of the current month at 00:00:00.
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_ms = (now - month_start) // datetime.timedelta(milliseconds=1)
         result += struct.pack(">I", month_ms)
         result += struct.pack(">H", counter)
         return UtilAll.bytes_2_string(bytes(result))

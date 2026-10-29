@@ -40,32 +40,55 @@ class TestStatsItem:
 
     def test_minute_snapshot_diffs_samples(self):
         it = StatsItem("PULL_TPS", "T@G")
+        it.sample()                    # seeds the zero point at (now - 10s)
         it.add_value(10, 1)
         it.sample()                    # first cumulative point
         it.add_value(15, 1)
         it.sample()                    # second cumulative point
         ss = it.get_stats_data_in_minute()
-        assert ss.sum == 15
-        assert ss.times == 1
+        assert ss.sum == 25
+        assert ss.times == 2
         assert ss.tps >= 0
 
     def test_hour_window_separate_from_minute(self):
-        # Cumulative diff: two points (ts,100,2) → (ts,400,4): sum=400-100=300, timesDiff=2
+        # Cumulative diff: seed (ts,0,0) -> (ts,100,2) -> (ts,400,4)
         it = StatsItem("PULL_RT", "T@G")
+        it.sample_hour()
         it.add_value(100, 2)
         it.sample_hour()
         it.add_value(300, 2)
         it.sample_hour()
         ss = it.get_stats_data_in_hour()
-        assert ss.sum == 300 and ss.times == 2
-        assert abs(ss.avgpt - 150.0) < 1e-6
+        assert ss.sum == 400 and ss.times == 4
+        assert abs(ss.avgpt - 100.0) < 1e-6
 
     def test_minute_list_capped(self):
         it = StatsItem("PULL_TPS", "T@G")
         for _ in range(80):
             it.sample()
-        # capped at 60 points (MINUTE_LIST_MAX)
-        assert len(it._minute) == 60
+        # capped at 7 points (MINUTE_LIST_MAX)
+        assert len(it._minute) == 7
+
+    def test_day_window_seeds_and_caps(self):
+        it = StatsItem("CONSUME_OK_TPS", "T@G")
+        before = int(time.time() * 1000)
+        it.sample_day()
+        assert len(it._day) == 2
+        seed_ts, seed_value, seed_times = it._day[0]
+        assert (seed_value, seed_times) == (0, 0)
+        assert abs(before - 3600 * 1000 - seed_ts) < 2000
+        it.add_value(9, 1)
+        it.sample_day()
+        assert it.get_stats_data_in_day().sum == 9
+        for _ in range(40):
+            it.sample_day()
+        assert len(it._day) == 25
+
+    def test_hour_list_capped(self):
+        it = StatsItem("PULL_TPS", "T@G")
+        for _ in range(20):
+            it.sample_hour()
+        assert len(it._hour) == 7
 
 
 class TestStatsItemSet:

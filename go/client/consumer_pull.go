@@ -18,7 +18,10 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 			common.LogErrorf("pull loop panicked for %v: %v", mq, r)
 		}
 	}()
-	orderly := c.isOrderly()
+	// The lock gate is a CLUSTERING-only rule: a BROADCASTING orderly consumer
+	// owns every queue outright, so no broker lock is (or can be) granted and
+	// waiting for one would stall every queue forever.
+	orderlyClustering := c.isOrderly() && c.MessageModel() == MessageModelClustering
 	// The generic failed-round back-off is captured once when this loop is set
 	// up, so changing the knob after start never alters a loop already running.
 	failedDelay := c.failedRoundDelayValue()
@@ -45,11 +48,21 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		if !hasSub {
 			return
 		}
-		if orderly && !pq.IsLocked() {
+		if orderlyClustering && !pq.IsLocked() {
 			// Orderly in CLUSTERING: do not pull before LOCK_BATCH_MQ granted
 			// this queue, or we would consume what another instance is about to
 			// lock.
 			if c.sleepOrStop(stop, 200*time.Millisecond) {
+				return
+			}
+			continue
+		}
+		if orderlyClustering && pq.IsLockExpired() {
+			// The last grant is stale: the broker may have handed this queue to
+			// another instance. Back off briefly and let the periodic lock sweep
+			// re-acquire it.
+			common.LogWarnf("the message queue lock expired, so consume later, %v", mq)
+			if c.sleepOrStop(stop, 10*time.Millisecond) {
 				return
 			}
 			continue

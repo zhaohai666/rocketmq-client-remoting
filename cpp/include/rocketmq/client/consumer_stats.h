@@ -17,8 +17,11 @@
 namespace rocketmq {
 
 inline constexpr double kSamplingIntervalSeconds = 10.0;
-inline constexpr size_t kMinuteListMax = 60;   // ≈ 10 minute window
-inline constexpr size_t kHourListMax = 60;
+inline constexpr double kHourSamplingIntervalSeconds = 600.0;
+inline constexpr double kDaySamplingIntervalSeconds = 3600.0;
+inline constexpr size_t kMinuteListMax = 7;   // seven 10s points ≈ one minute plus the seed
+inline constexpr size_t kHourListMax = 7;     // seven 10min points, same window shape
+inline constexpr size_t kDayListMax = 25;     // 25 hourly points
 
 struct StatsSnapshot {
     int64_t sum = 0;
@@ -36,9 +39,11 @@ public:
     void addValue(int64_t incValue, int64_t incTimes);
     void sample();        // minute-level sample point (every 10s)
     void sampleHour();    // hour-level sample point (every 10 minutes)
+    void sampleDay();     // day-level sample point (every hour)
 
     StatsSnapshot getStatsDataInMinute();
     StatsSnapshot getStatsDataInHour();
+    StatsSnapshot getStatsDataInDay();
 
     int64_t value();
     int64_t times();
@@ -49,8 +54,17 @@ public:
         minute_.emplace_back(tsMs, value, times);
         hour_.emplace_back(tsMs, value, times);
     }
+    // Test only: chain lengths, so their caps are observable without decoding the window math.
+    size_t minuteSampleCountForTest() { return sampleCount(minute_); }
+    size_t hourSampleCountForTest() { return sampleCount(hour_); }
+    size_t daySampleCountForTest() { return sampleCount(day_); }
 
 private:
+    size_t sampleCount(const std::deque<std::tuple<int64_t, int64_t, int64_t>>& chain) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return chain.size();
+    }
+
     std::string statsName_;
     std::string statsKey_;
     std::mutex mutex_;
@@ -58,6 +72,7 @@ private:
     int64_t times_ = 0;
     std::deque<std::tuple<int64_t, int64_t, int64_t>> minute_;
     std::deque<std::tuple<int64_t, int64_t, int64_t>> hour_;
+    std::deque<std::tuple<int64_t, int64_t, int64_t>> day_;
 };
 
 class StatsItemSet {
@@ -70,6 +85,7 @@ public:
     std::vector<std::string> keys();
     void sampleAll();
     void sampleHourAll();
+    void sampleDayAll();
 
 private:
     std::string statsName_;

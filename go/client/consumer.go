@@ -1895,22 +1895,31 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	// cursor — so this whole block only applies to the pull path. Resolving
 	// offsets in POP mode would also issue QUERY_CONSUMER_OFFSET for a group
 	// whose offsets are never committed, wasting a round trip per queue.
+	//
+	// A queue whose offset could not be read is skipped for this round: it gets
+	// no process queue and no pull loop, and the next rebalance retries it. Only
+	// "no committed offset" (ReadOffset answers -1 without an error) falls
+	// through to the configured start position.
+	unresolved := map[common.MessageQueue]struct{}{}
 	if !c.IsPopMode() {
 		for _, mq := range assigned {
-			if _, already := was[mq]; already {
-				continue
-			}
 			c.mu.Lock()
 			_, has := c.offsetTable[mq]
+			_, hasPQ := c.processQueueTable[mq]
 			_, hasSub := c.subscription[mq.Topic]
 			store := c.offsetStore
 			c.mu.Unlock()
 			if has || !hasSub {
 				continue
 			}
+			if _, already := was[mq]; already && hasPQ {
+				// Held from an earlier round with a resolved cursor: nothing to do.
+				continue
+			}
 			next, err := c.computePullFromWhere(mq)
 			if err != nil {
-				common.LogDebugf("resolve initial offset for %v failed: %v", mq, err)
+				common.LogWarnf("resolve initial offset for %v failed, skip this round: %v", mq, err)
+				unresolved[mq] = struct{}{}
 				continue
 			}
 			if next < 0 {
@@ -1926,7 +1935,7 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 			}
 		}
 	}
-	c.syncPullLoops()
+	c.syncPullLoops(unresolved)
 	// AFTER the per-queue pull state has been rebuilt for this round, so the
 	// division inside uses this round's queue count and not the previous one's.
 	c.afterAssignmentChange(moved)
@@ -2194,6 +2203,10 @@ func (c *DefaultMQPushConsumer) FlowControlTriggered() int64 {
 // syncPullLoops is the classic updateProcessQueueTableInRebalance step: retire
 // what we no longer own, then start a pull goroutine per new queue.
 //
+// skip holds the queues whose initial offset could not be resolved this round
+// (a read error, not a missing offset): they get no process queue and no pull
+// loop, and the next rebalance retries them.
+//
 // Revocation has three mandatory steps — persist the CONSUMED offset, drop the
 // ProcessQueue (in-flight messages stop being consumed and go back to the new
 // owner), and UNLOCK_BATCH_MQ for an orderly clustering consumer. Missing any
@@ -2206,7 +2219,7 @@ func (c *DefaultMQPushConsumer) FlowControlTriggered() int64 {
 //
 // Order matters: retire -> settle -> add. Reversed, the new loop would start
 // from a stale offset and write the smaller value back.
-func (c *DefaultMQPushConsumer) syncPullLoops() {
+func (c *DefaultMQPushConsumer) syncPullLoops(skip map[common.MessageQueue]struct{}) {
 	if c.IsPopMode() {
 		c.syncPopLoops()
 		return
@@ -2237,6 +2250,11 @@ func (c *DefaultMQPushConsumer) syncPullLoops() {
 	c.mu.Lock()
 	for mq := range current {
 		if _, ok := c.processQueueTable[mq]; ok {
+			continue
+		}
+		if _, failed := skip[mq]; failed {
+			// The offset read failed for a reason other than "not found": leave
+			// the queue unassigned this round instead of resuming from the tail.
 			continue
 		}
 		pq := newProcessQueue(c.isOrderly())
@@ -2314,11 +2332,18 @@ func (c *DefaultMQPushConsumer) persistRevoked(revoked []revokedQueue) {
 		return
 	}
 	if broadcast {
-		// Broadcast offsets live in a local file. Persist BEFORE removing the
-		// offset so the value stays on disk and a rebuilt queue can continue from
-		// it; skipping this makes the queue rescan from consumeFromWhere.
-		if err := store.PersistAll(nil); err != nil {
-			common.LogDebugf("persist local offsets on revoke failed: %v", err)
+		// Broadcast offsets live in a local file. Persist each revoked queue
+		// BEFORE the offset entry is dropped so a rebuilt queue can continue
+		// from it; the file store merges the overlay, so the entries of every
+		// queue that stays assigned survive.
+		for _, q := range revoked {
+			if !q.hasOffset {
+				continue
+			}
+			store.UpdateOffset(q.mq, q.offset, false)
+			if err := store.Persist(q.mq); err != nil {
+				common.LogDebugf("persist local offset on revoke failed for %v: %v", q.mq, err)
+			}
 		}
 		return
 	}
@@ -2411,9 +2436,14 @@ func (c *DefaultMQPushConsumer) computePullFromWhere(mq common.MessageQueue) (in
 		return -1, common.ClientError("consumer not started")
 	}
 	last := int64(-1)
-	if v, err := store.ReadOffset(mq, ReadFromStore); err == nil {
-		last = v
+	v, err := store.ReadOffset(mq, ReadFromStore)
+	if err != nil {
+		// Any failure other than QUERY_NOT_FOUND must not fall back to the
+		// configured start position: resuming from the tail would silently skip
+		// everything the group has not consumed yet.
+		return -1, err
 	}
+	last = v
 	if last >= 0 {
 		return last, nil
 	}

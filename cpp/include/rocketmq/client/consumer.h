@@ -562,9 +562,13 @@ public:
     static std::string buildLocalOffsetsJson(const std::map<std::string, int64_t>& items,
                                              const std::map<std::string, MessageQueue>& mqMap);
     // Strict JSON (the old flat-map shape) first, then a scan of the object-as-key shape; nullopt when both fail.
+    // When `queues` is given, the object-as-key scan also returns the queue identities.
     static std::optional<std::map<std::string, int64_t>> parseLocalOffsetsText(
-        const std::string& text);
+        const std::string& text,
+        std::map<std::string, MessageQueue>* queues = nullptr);
     // Persist / read back at an explicit path (.bak rotation and the atomic .tmp rename all live here); the instance methods delegate to these.
+    // The write merges with the file already on disk: only the given queues are overlaid, so entries of
+    // queues this instance no longer owns survive. A file that exists but cannot be read is left alone.
     static void saveLocalOffsetsAt(const std::string& path,
                                    const std::map<std::string, int64_t>& items,
                                    const std::map<std::string, MessageQueue>& mqMap);
@@ -706,6 +710,9 @@ public:
     // moved-set detection, the division and the immediate heartbeat from the real assignment path
     // instead of from a hand-written moved list.
     void doRebalanceForTest() { doRebalance(); }
+    // Record an orderly lock grant of the given age, so the expiry gate is observable without waiting
+    // for a sweep cycle or a 30s window.
+    void grantOrderlyLockForTest(const MessageQueue& mq, int64_t ageMillis);
     // The subscription version the next heartbeat would carry for this topic.
     int64_t subscriptionVersion(const std::string& topic) const;
     // Pin a topic's version to a value no clock can collide with, so "the moved topic was re-stamped"
@@ -1131,8 +1138,9 @@ private:
     // Offsets frozen by an OFFSET_ILLEGAL correction (ControllableOffset.allowToUpdate=false):
     // while frozen, neither ack nor empty-response correction may change them; unfrozen when the queue is rebuilt.
     std::set<std::string> frozenOffsets_;
-    // Orderly consumption: queue keys whose broker LOCK_BATCH_MQ confirmation reported a successful lock
-    std::set<std::string> lockOk_;
+    // Orderly consumption: successful LOCK_BATCH_MQ grants, valued by the steady-clock millisecond
+    // of the grant so a stale grant can expire even when the lock sweep stops answering.
+    std::map<std::string, int64_t> lockOk_;
 
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};

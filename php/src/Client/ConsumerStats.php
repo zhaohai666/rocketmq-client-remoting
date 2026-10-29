@@ -32,6 +32,9 @@ final class StatsItem
     /** @var list<array{0:int,1:int,2:int}> */
     private array $hour = [];
 
+    /** @var list<array{0:int,1:int,2:int}> */
+    private array $day = [];
+
     public function __construct(
         public string $statsName,
         public string $statsKey,
@@ -83,6 +86,11 @@ final class StatsItem
     /** Append a minute-level sample point (called by the sampling thread every 10s). */
     public function sample(): void
     {
+        if ($this->minute === []) {
+            // Seed a zero snapshot one interval back, so the first window covers the values
+            // accumulated since startup instead of reporting a zero delta.
+            $this->minute[] = [(int) (microtime(true) * 1000.0) - 10000, 0, 0];
+        }
         $this->minute[] = $this->sampleData();
         while (count($this->minute) > ConsumerStatsManager::MINUTE_LIST_MAX) {
             array_shift($this->minute);
@@ -92,9 +100,24 @@ final class StatsItem
     /** Append an hour-level sample point (called by the sampling thread every 10 minutes). */
     public function sampleHour(): void
     {
+        if ($this->hour === []) {
+            $this->hour[] = [(int) (microtime(true) * 1000.0) - 600000, 0, 0];
+        }
         $this->hour[] = $this->sampleData();
         while (count($this->hour) > ConsumerStatsManager::HOUR_LIST_MAX) {
             array_shift($this->hour);
+        }
+    }
+
+    /** Append a day-level sample point (called by the sampling thread every hour). */
+    public function sampleDay(): void
+    {
+        if ($this->day === []) {
+            $this->day[] = [(int) (microtime(true) * 1000.0) - 3600000, 0, 0];
+        }
+        $this->day[] = $this->sampleData();
+        while (count($this->day) > ConsumerStatsManager::DAY_LIST_MAX) {
+            array_shift($this->day);
         }
     }
 
@@ -108,6 +131,11 @@ final class StatsItem
         return self::computeStatsData($this->hour);
     }
 
+    public function getStatsDataInDay(): StatsSnapshot
+    {
+        return self::computeStatsData($this->day);
+    }
+
     public function getMinuteSampleCount(): int
     {
         return count($this->minute);
@@ -116,6 +144,11 @@ final class StatsItem
     public function getHourSampleCount(): int
     {
         return count($this->hour);
+    }
+
+    public function getDaySampleCount(): int
+    {
+        return count($this->day);
     }
 }
 
@@ -167,14 +200,26 @@ final class StatsItemSet
             $this->find($key)?->sampleHour();
         }
     }
+
+    public function sampleDayAll(): void
+    {
+        foreach ($this->keys() as $key) {
+            $this->find($key)?->sampleDay();
+        }
+    }
 }
 
 final class ConsumerStatsManager
 {
     public const SAMPLING_INTERVAL_SECONDS = 10.0;
     public const HOUR_SAMPLING_INTERVAL_SECONDS = 600.0;
-    public const MINUTE_LIST_MAX = 60;
-    public const HOUR_LIST_MAX = 60;
+    public const DAY_SAMPLING_INTERVAL_SECONDS = 3600.0;
+    /** Minute window: one sample every 10s, capped at 7 points (6 intervals plus the seed). */
+    public const MINUTE_LIST_MAX = 7;
+    /** Hour window: one sample every 10min, capped at 7 points. */
+    public const HOUR_LIST_MAX = 7;
+    /** Day window: one sample every hour, capped at 25 points. */
+    public const DAY_LIST_MAX = 25;
 
     public StatsItemSet $topicAndGroupPullRt;
     public StatsItemSet $topicAndGroupPullTps;
@@ -224,8 +269,9 @@ final class ConsumerStatsManager
 
     /**
      * One round of the sampling thread: minute-level sampling of all StatsItemSets; every
-     * 60 rounds (60 x 10s = 10 minutes) an hour-level sample is appended (corresponding
-     * to the loop body of the sampling loop).
+     * 60 rounds (60 x 10s = 10 minutes) an hour-level sample is appended, and every 360
+     * rounds (1 hour) a day-level sample (corresponding to the loop bodies of the
+     * sampling schedule).
      */
     public function sampleOnce(): void
     {
@@ -236,6 +282,11 @@ final class ConsumerStatsManager
         if ($this->rounds % 60 === 0) {
             foreach ($this->sets as $s) {
                 $s->sampleHourAll();
+            }
+        }
+        if ($this->rounds % 360 === 0) {
+            foreach ($this->sets as $s) {
+                $s->sampleDayAll();
             }
         }
     }

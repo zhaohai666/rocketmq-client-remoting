@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 33 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 34 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -61,7 +61,7 @@ repository-wide **duplicate-class-name static guard** (PHP has no module isolati
 when the same FQCN is declared in two files the one autoloaded first silently wins and
 the other dies — this guard cannot be skipped), then chains **32** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 5,033 assertions across the 33 suites pass**; any failure exits with a
+**guard CLEAN, all 5,124 assertions across the 34 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -506,7 +506,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 33 suites with 5,033 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 34 suites with 5,124 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

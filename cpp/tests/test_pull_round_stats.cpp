@@ -29,6 +29,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -46,6 +51,7 @@
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
+#include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/body.h"
 #include "rocketmq/remoting/protocol/codes.h"
@@ -89,6 +95,7 @@ void expectInt(long long actual, long long expected, const std::string& name,
 
 const char* kTopic = "PullRoundStatsTopic";
 const char* kBroker = "broker-a";
+const char* kGroup = "GID_PullRoundStats";
 
 int64_t steadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -117,6 +124,73 @@ public:
 
 private:
     int previous_ = 0;
+};
+
+// Captures the process log so a WARN the gate emits can be read back from the log, not assumed.
+class ScopedLogFile {
+public:
+    explicit ScopedLogFile(const std::string& name) {
+        path_ = (std::filesystem::temp_directory_path() / name).string();
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+        setLogFile(path_);
+    }
+    ~ScopedLogFile() { setLogFile(std::string()); }
+
+    std::string contents() {
+        flushLogFile();
+        std::ifstream in(path_);
+        return std::string((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    }
+
+private:
+    std::string path_;
+};
+
+// Point HOME at a throw-away directory: the broadcasting offset file is rooted at $HOME.
+void setHomeEnv(const char* value) {
+#if defined(_WIN32)
+    _putenv_s("HOME", value);
+#else
+    setenv("HOME", value, 1);
+#endif
+}
+
+void clearHomeEnv() {
+#if defined(_WIN32)
+    _putenv_s("HOME", "");
+#else
+    unsetenv("HOME");
+#endif
+}
+
+class ScopedHome {
+public:
+    explicit ScopedHome(const char* tag) {
+        const char* old = std::getenv("HOME");
+        if (old != nullptr) old_ = old;
+        dir_ = (std::filesystem::temp_directory_path() /
+                ("rmq_pull_round_home_" + std::string(tag) + "_" +
+                 std::to_string(UtilAll::currentTimeMillis())))
+                   .string();
+        std::error_code ec;
+        std::filesystem::create_directories(dir_, ec);
+        setHomeEnv(dir_.c_str());
+    }
+    ~ScopedHome() {
+        if (old_.empty()) {
+            clearHomeEnv();
+        } else {
+            setHomeEnv(old_.c_str());
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+private:
+    std::string dir_;
+    std::string old_;
 };
 
 // ---------------------------------------------------------------- fake endpoint
@@ -200,6 +274,16 @@ public:
         return pullCount_;
     }
 
+    // Every request code the endpoint received; the orderly gate is judged on this wire evidence.
+    size_t countCode(int32_t code) {
+        std::lock_guard<std::mutex> lk(state_);
+        size_t n = 0;
+        for (int32_t c : codes_) {
+            if (c == code) ++n;
+        }
+        return n;
+    }
+
 private:
     static bool readN(socket_t s, char* buf, size_t n) {
         size_t got = 0;
@@ -274,6 +358,10 @@ private:
             RemotingCommand req;
             if (!RemotingCommand::tryDecode(frame, req, nullptr)) break;
             if (req.isResponseType()) break;
+            {
+                std::lock_guard<std::mutex> lk(state_);
+                codes_.push_back(req.code);
+            }
             RemotingCommand resp;
             resp.opaque = req.opaque;
             resp.markResponseType();
@@ -348,6 +436,7 @@ private:
     int64_t maxOffset_ = 0;
     std::vector<PullReply> pullScripts_;
     size_t pullCount_ = 0;
+    std::vector<int32_t> codes_;
     std::mutex workersM_;
     std::vector<std::thread> workers_;
     std::thread acceptor_;
@@ -361,6 +450,16 @@ TopicRouteData routeOneQueue(const std::string& addr) {
     addrs[MixAll::MASTER_ID] = addr;
     route.brokerDatas.emplace_back("DefaultCluster", kBroker, addrs);
     route.queueDatas.emplace_back(kBroker, 1, 1, 6, 0);
+    return route;
+}
+
+// The same broker with no writable/readable queue yet: a consumer starting on this route has an empty
+// assignment, which keeps its rebalance loop on the short retry arm.
+TopicRouteData routeNoQueue(const std::string& addr) {
+    TopicRouteData route;
+    std::map<int64_t, std::string> addrs;
+    addrs[MixAll::MASTER_ID] = addr;
+    route.brokerDatas.emplace_back("DefaultCluster", kBroker, addrs);
     return route;
 }
 
@@ -418,6 +517,25 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         delivered_ += static_cast<int>(msgs.size());
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+    }
+    int delivered() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return delivered_;
+    }
+
+private:
+    std::mutex mu_;
+    int delivered_ = 0;
+};
+
+// An orderly listener: its `orderly()` flag is what makes the consumer go through the lock gate.
+class CountingOrderlyListener : public MessageListenerOrderly {
+public:
+    ConsumeOrderlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
+                                        ConsumeOrderlyContext&) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        delivered_ += static_cast<int>(msgs.size());
+        return ConsumeOrderlyStatus::SUCCESS;
     }
     int delivered() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -712,6 +830,205 @@ void testDeliveredRoundPacesAndIdleFoundDoesNot() {
     }
 }
 
+// ---------------------------------------------------------------- leg F: the orderly lock gate
+
+// A BROADCASTING orderly consumer has no competing consumer for the queue, so every grant is implicit:
+// it must pull and deliver without any LOCK_BATCH_MQ grant and never take part in the lock protocol.
+void testOrderlyBroadcastingPullsWithoutLockGrant() {
+    ScopedHome home("orderly_broadcast");
+    MockEndpoint ep;
+    // Start on a route without queues: the broadcast assignment is empty, so the rebalance loop keeps
+    // its short (2s) retry arm and the shutdown at the end of this case does not wait a full period.
+    ep.addRoute(kTopic, routeNoQueue(ep.address()));
+    ep.setMaxOffset(0);
+    ep.scriptPull(foundReply(1, {taggedRow("TagA", 0)}));
+
+    auto listener = std::make_shared<CountingOrderlyListener>();
+    DefaultMQPushConsumer c("GID_OrderlyBroadcastGate");
+    c.setMessageModel(MessageModel::BROADCASTING);
+    c.setInstanceName("orderly_broadcast_gate");
+    c.setNamesrvAddr(ep.address());
+    c.setMessageListener(listener);
+    // The subscription exists from the start (start() requires one), but its route has no queues yet.
+    c.subscribe(kTopic, "*");
+    {
+        QuietLog quiet;
+        c.start();
+        // The queue appears after startup: the next rebalance round takes it with no lock protocol.
+        ep.addRoute(kTopic, routeOneQueue(ep.address()));
+        c.client().updateTopicRouteInfoFromNameServer(kTopic);
+        c.doRebalanceForTest();
+        expect(waitFor([&] { return ep.pullCount() >= 3; }),
+               "the broadcasting orderly consumer pulls with no lock grant",
+               "pullCount=" + std::to_string(ep.pullCount()));
+        expectInt(static_cast<long long>(ep.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
+                  "broadcasting never sends LOCK_BATCH_MQ");
+        expect(waitFor([&] { return listener->delivered() >= 1; }),
+               "the broadcasting orderly consumer delivers without a grant");
+        c.shutdown();
+    }
+}
+
+// A CLUSTERING orderly consumer must not pull a queue before the broker confirmed its lock: with no
+// grant the pull count stays frozen, and only a recorded fresh grant opens the gate.
+void testOrderlyClusteringWaitsForAGrant() {
+    MockEndpoint ep;
+    ep.addRoute(kTopic, routeOneQueue(ep.address()));
+    ep.setMaxOffset(0);
+
+    auto listener = std::make_shared<CountingOrderlyListener>();
+    DefaultMQPushConsumer c("GID_OrderlyClusterGate");
+    c.setInstanceName("orderly_cluster_gate");
+    c.setNamesrvAddr(ep.address());
+    c.setMessageListener(listener);
+    c.subscribe(kTopic, "*");
+    {
+        QuietLog quiet;
+        c.start();
+        ep.setCidList({c.clientId()});
+        c.doRebalanceForTest();
+        expect(waitFor([&] { return !c.assignedQueueKeys().empty(); }),
+               "precondition: the queue is assigned to this consumer");
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        expectInt(static_cast<long long>(ep.pullCount()), 0,
+                  "no pull is issued before a lock grant");
+        expectInt(listener->delivered(), 0, "nothing is delivered before a lock grant");
+
+        const MessageQueue mq(kTopic, kBroker, 0);
+        c.grantOrderlyLockForTest(mq, 0);
+        expect(waitFor([&] { return ep.pullCount() >= 3; }),
+               "a fresh lock grant opens the gate",
+               "pullCount=" + std::to_string(ep.pullCount()));
+        c.shutdown();
+    }
+}
+
+// A grant older than the 30s trust window may already belong to another consumer: the queue must stay
+// held (no pull), one warning must be logged, and only a new grant may resume pulling.
+void testOrderlyStaleGrantHoldsTheQueueAndWarns() {
+    ScopedLogFile log("pull_orderly_lock_expiry.log");
+    MockEndpoint ep;
+    ep.addRoute(kTopic, routeOneQueue(ep.address()));
+    ep.setMaxOffset(0);
+
+    auto listener = std::make_shared<CountingOrderlyListener>();
+    DefaultMQPushConsumer c("GID_OrderlyLockExpiry");
+    c.setInstanceName("orderly_lock_expiry");
+    c.setNamesrvAddr(ep.address());
+    c.setMessageListener(listener);
+    c.subscribe(kTopic, "*");
+    {
+        c.start();
+        ep.setCidList({c.clientId()});
+        c.doRebalanceForTest();
+        expect(waitFor([&] { return !c.assignedQueueKeys().empty(); }),
+               "precondition: the queue is assigned to this consumer");
+
+        const MessageQueue mq(kTopic, kBroker, 0);
+        c.grantOrderlyLockForTest(mq, 31000);
+        const bool warned = waitFor([&] {
+            return log.contents().find("orderly lock expired for queue") != std::string::npos;
+        }, 4000);
+        expect(warned, "a grant older than the trust window is reported as expired");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        expectInt(static_cast<long long>(ep.pullCount()), 0,
+                  "an expired grant does not open the gate");
+
+        c.grantOrderlyLockForTest(mq, 0);
+        expect(waitFor([&] { return ep.pullCount() >= 3; }),
+               "a fresh grant after the expiry resumes pulling",
+               "pullCount=" + std::to_string(ep.pullCount()));
+        c.shutdown();
+    }
+}
+
+// ---------------------------------------------------------------- leg G: inner-batch unwrap on pull
+
+MessageExt innerEnvelope(int64_t queueOffset, const Bytes& batchBody, const std::string& msgId) {
+    MessageExt env = taggedRow("", queueOffset);
+    env.sysFlag = MessageSysFlag::INNER_BATCH_FLAG | MessageSysFlag::NEED_UNWRAP_FLAG;
+    env.body = batchBody;
+    env.msgId = msgId;
+    return env;
+}
+
+void testInnerBatchEnvelopeIsUnwrappedOnPull() {
+    MockEndpoint ep;
+    ep.addRoute(kTopic, routeOneQueue(ep.address()));
+
+    Message m0;
+    m0.body = "member-0";
+    m0.flag = 0x11;
+    m0.setTags("TagA");
+    m0.properties["memberKey"] = "v0";
+    Message m1;
+    m1.body = "member-1";
+    m1.flag = 0x22;
+    m1.setTags("TagB");
+    m1.properties["memberKey"] = "v1";
+    const Bytes batch = encodeMessages({m0, m1});
+
+    PullReply expanded;
+    expanded.code = ResponseCode::SUCCESS;
+    expanded.ext = pullExt(42);
+    expanded.body = encodeMessageExt(innerEnvelope(40, batch, "ENVELOPE-1"), false);
+    ep.scriptPull(expanded);
+
+    const Bytes truncated = batch.substr(0, batch.size() - 3);
+    PullReply damaged;
+    damaged.code = ResponseCode::SUCCESS;
+    damaged.ext = pullExt(52);
+    damaged.body = encodeMessageExt(innerEnvelope(50, truncated, "ENVELOPE-2"), false);
+    ep.scriptPull(damaged);
+
+    auto instance = std::make_unique<MQClientInstance>(
+        "127.0.0.1@6666#1", std::vector<std::string>{ep.address()});
+    instance->updateTopicRouteInfoFromNameServer(kTopic);
+    const MessageQueue mq(kTopic, kBroker, 0);
+    {
+        QuietLog quiet;
+        const PullResult first =
+            instance->pullMessage(kGroup, mq, 40, 32, /*sysFlag=*/0, /*commitOffset=*/0, "*", 0,
+                                  ExpressionType::TAG, /*timeoutMillis=*/3000);
+        expectInt(static_cast<long long>(first.msgFoundList.size()), 2,
+                  "an inner-batch envelope expands to one message per member");
+        if (first.msgFoundList.size() == 2) {
+            const MessageExt& a = first.msgFoundList[0];
+            const MessageExt& b = first.msgFoundList[1];
+            expectInt(a.queueOffset, 40, "the first member keeps the envelope offset");
+            expectInt(b.queueOffset, 41, "the next member offset advances by one");
+            expectInt(a.queueId, 0, "members carry the envelope queue id");
+            expect(a.topic == kTopic && a.brokerName == kBroker,
+                   "members take routing identity from the envelope");
+            expect(a.body == "member-0" && b.body == "member-1",
+                   "each member keeps its own body", "a=" + a.body + " b=" + b.body);
+            expect(a.getTags() == "TagA" && b.getTags() == "TagB",
+                   "each member keeps its own properties");
+            expect(a.getProperty("memberKey") == "v0" && b.getProperty("memberKey") == "v1",
+                   "non-tag member properties survive the expansion");
+            expectInt(a.flag, 0x11, "the member flag comes from the member entry");
+            expectInt(b.flag, 0x22, "the second member flag comes from the second entry");
+        }
+        expectInt(first.nextBeginOffset, 42,
+                  "the cursor still follows the envelope's nextBeginOffset");
+
+        const PullResult second =
+            instance->pullMessage(kGroup, mq, 50, 32, /*sysFlag=*/0, /*commitOffset=*/0, "*", 0,
+                                  ExpressionType::TAG, /*timeoutMillis=*/3000);
+        expectInt(static_cast<long long>(second.msgFoundList.size()), 1,
+                  "a truncated batch body is not partially expanded");
+        if (second.msgFoundList.size() == 1) {
+            const MessageExt& kept = second.msgFoundList[0];
+            expect(kept.body == truncated,
+                   "the damaged envelope is kept verbatim instead of losing members");
+            expectInt(kept.queueOffset, 50, "the kept envelope keeps its own offset");
+            expect(MessageSysFlag::check(kept.sysFlag, MessageSysFlag::INNER_BATCH_FLAG),
+                   "the kept envelope still carries its inner-batch flag");
+        }
+    }
+    instance->shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -719,6 +1036,10 @@ int main() {
     testFoundRoundsRecordRtAlwaysAndTpsOnlyForDeliveredRows();
     testFailedRoundWaitsTheConfiguredBackoff();
     testDeliveredRoundPacesAndIdleFoundDoesNot();
+    testOrderlyBroadcastingPullsWithoutLockGrant();
+    testOrderlyClusteringWaitsForAGrant();
+    testOrderlyStaleGrantHoldsTheQueueAndWarns();
+    testInnerBatchEnvelopeIsUnwrappedOnPull();
     std::printf("pull_round_stats: %d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

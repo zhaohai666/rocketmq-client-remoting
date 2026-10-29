@@ -41,15 +41,33 @@ void StatsItem::addValue(int64_t incValue, int64_t incTimes) {
 }
 
 void StatsItem::sample() {
+    const int64_t now = nowMillis();
     std::lock_guard<std::mutex> lk(mutex_);
-    minute_.emplace_back(nowMillis(), value_, times_);
+    if (minute_.empty()) {
+        minute_.emplace_back(now - static_cast<int64_t>(kSamplingIntervalSeconds * 1000), 0, 0);
+    }
+    minute_.emplace_back(now, value_, times_);
     while (minute_.size() > kMinuteListMax) minute_.pop_front();
 }
 
 void StatsItem::sampleHour() {
+    const int64_t now = nowMillis();
     std::lock_guard<std::mutex> lk(mutex_);
-    hour_.emplace_back(nowMillis(), value_, times_);
+    if (hour_.empty()) {
+        hour_.emplace_back(now - static_cast<int64_t>(kHourSamplingIntervalSeconds * 1000), 0, 0);
+    }
+    hour_.emplace_back(now, value_, times_);
     while (hour_.size() > kHourListMax) hour_.pop_front();
+}
+
+void StatsItem::sampleDay() {
+    const int64_t now = nowMillis();
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (day_.empty()) {
+        day_.emplace_back(now - static_cast<int64_t>(kDaySamplingIntervalSeconds * 1000), 0, 0);
+    }
+    day_.emplace_back(now, value_, times_);
+    while (day_.size() > kDayListMax) day_.pop_front();
 }
 
 StatsSnapshot StatsItem::getStatsDataInMinute() {
@@ -60,6 +78,11 @@ StatsSnapshot StatsItem::getStatsDataInMinute() {
 StatsSnapshot StatsItem::getStatsDataInHour() {
     std::lock_guard<std::mutex> lk(mutex_);
     return computeStatsData(hour_);
+}
+
+StatsSnapshot StatsItem::getStatsDataInDay() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return computeStatsData(day_);
 }
 
 int64_t StatsItem::value() {
@@ -111,6 +134,12 @@ void StatsItemSet::sampleAll() {
 void StatsItemSet::sampleHourAll() {
     for (const auto& key : keys()) {
         if (auto item = find(key)) item->sampleHour();
+    }
+}
+
+void StatsItemSet::sampleDayAll() {
+    for (const auto& key : keys()) {
+        if (auto item = find(key)) item->sampleDay();
     }
 }
 
@@ -173,6 +202,13 @@ void ConsumerStatsManager::sampleLoop() {
             topicAndGroupConsumeRT_.sampleHourAll();
             topicAndGroupConsumeOKTPS_.sampleHourAll();
             topicAndGroupConsumeFailedTPS_.sampleHourAll();
+        }
+        if (rounds % 360 == 0) {  // 360 x 10s = 1 hour
+            topicAndGroupPullRT_.sampleDayAll();
+            topicAndGroupPullTPS_.sampleDayAll();
+            topicAndGroupConsumeRT_.sampleDayAll();
+            topicAndGroupConsumeOKTPS_.sampleDayAll();
+            topicAndGroupConsumeFailedTPS_.sampleDayAll();
         }
     }
 }

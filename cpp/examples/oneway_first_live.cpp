@@ -3,8 +3,8 @@
 // Pins the send-then-subscribe ordering the other oneway probes never cover:
 // all messages exist BEFORE the consumer starts. A new consumer group with
 // CONSUME_FROM_FIRST_OFFSET resolves its initial offset to 0 regardless of the
-// subscription type (Java parity: RebalancePushImpl#computePullFromWhere with
-// no stored offset -> 0), and the broker delivers whatever the pull covers.
+// subscription type (no stored offset -> 0), and the broker delivers whatever
+// the pull covers.
 // The sync control message proves the consumer is healthy, so a missing oneway
 // body cannot be blamed on the consumer itself.
 //

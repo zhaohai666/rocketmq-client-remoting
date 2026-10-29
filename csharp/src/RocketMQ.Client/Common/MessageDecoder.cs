@@ -351,13 +351,14 @@ public static class MessageDecoder
                 outMsg.Properties = new PropertyMap();
             }
 
-            // msgId = storeHost(ip+port) + commitLogOffset
+            // The store-path id is always available as the offset message id;
+            // the plain msgId prefers the client-assigned UNIQ_KEY when the
+            // message carries one and falls back to the store-path id.
             byte[] storeAddrRaw = IpAndPortToBytes(storeHost, storePort, storehostLen == 20);
-            outMsg.MsgId = CreateMessageId(storeAddrRaw, physicOffset);
-            if (isClient)
-            {
-                outMsg.OffsetMsgId = outMsg.MsgId;
-            }
+            string offsetMsgId = CreateMessageId(storeAddrRaw, physicOffset);
+            outMsg.OffsetMsgId = offsetMsgId;
+            string uniqId = outMsg.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
+            outMsg.MsgId = isClient && !string.IsNullOrEmpty(uniqId) ? uniqId : offsetMsgId;
 
             return true;
         }
@@ -396,6 +397,88 @@ public static class MessageDecoder
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Replace every message that carries both INNER_BATCH_FLAG and
+    /// NEED_UNWRAP_FLAG with its batch members: one message per member,
+    /// sharing the outer topic/queue/flag/store coordinates and taking the
+    /// member's own body and properties. A decode failure keeps the original
+    /// list untouched (and logs).
+    /// </summary>
+    public static List<MessageExt> UnwrapInnerBatchMessages(List<MessageExt> msgs)
+    {
+        bool needUnwrap = false;
+        foreach (MessageExt m in msgs)
+        {
+            if (MessageSysFlag.Check(m.SysFlag, MessageSysFlag.InnerBatchFlag)
+                && MessageSysFlag.Check(m.SysFlag, MessageSysFlag.NeedUnwrapFlag))
+            {
+                needUnwrap = true;
+                break;
+            }
+        }
+
+        if (!needUnwrap)
+        {
+            return msgs;
+        }
+
+        try
+        {
+            var unwrapped = new List<MessageExt>(msgs.Count);
+            foreach (MessageExt outer in msgs)
+            {
+                if (!MessageSysFlag.Check(outer.SysFlag, MessageSysFlag.InnerBatchFlag)
+                    || !MessageSysFlag.Check(outer.SysFlag, MessageSysFlag.NeedUnwrapFlag))
+                {
+                    unwrapped.Add(outer);
+                    continue;
+                }
+
+                List<Message> members = DecodeBatchMessages(outer.Body);
+                if (members.Count == 0)
+                {
+                    throw new InvalidOperationException("empty inner batch body");
+                }
+
+                for (int i = 0; i < members.Count; i++)
+                {
+                    Message member = members[i];
+                    var ext = new MessageExt
+                    {
+                        Topic = outer.Topic,
+                        QueueOffset = outer.QueueOffset + i,
+                        QueueId = outer.QueueId,
+                        Flag = member.Flag,
+                        Properties = new PropertyMap(member.Properties),
+                        Body = member.Body,
+                        HasBody = true,
+                        StoreHost = outer.StoreHost,
+                        StoreHostPort = outer.StoreHostPort,
+                        BornHost = outer.BornHost,
+                        BornHostPort = outer.BornHostPort,
+                        BornTimestamp = outer.BornTimestamp,
+                        StoreTimestamp = outer.StoreTimestamp,
+                        SysFlag = outer.SysFlag,
+                        CommitLogOffset = outer.CommitLogOffset,
+                        BrokerName = outer.BrokerName,
+                        OffsetMsgId = outer.OffsetMsgId,
+                    };
+                    ext.WaitStoreMsgOk = outer.WaitStoreMsgOk;
+                    string uniqId = ext.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
+                    ext.MsgId = !string.IsNullOrEmpty(uniqId) ? uniqId : outer.OffsetMsgId;
+                    unwrapped.Add(ext);
+                }
+            }
+
+            return unwrapped;
+        }
+        catch (Exception e)
+        {
+            ClientLog.Error("failed to decode the inner batch, keeping the outer message: " + e.Message);
+            return msgs;
+        }
     }
 
     // --------------------------------------- 2) 6-segment lightweight format: batch message body

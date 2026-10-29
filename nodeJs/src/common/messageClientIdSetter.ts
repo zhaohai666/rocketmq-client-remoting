@@ -10,16 +10,31 @@ function ipToBytes(ip) {
   return b;
 }
 
-const FIX_STRING = bytes2string(ipToBytes(getHostIp()));
+// The id is 16 raw bytes rendered as 32 uppercase hex chars:
+//   IP (4) + pid (2) + class hash (4) + millis into the month (4) + counter (2).
+const IP = ipToBytes(getHostIp());
+const PID = Buffer.alloc(2);
+PID.writeUInt16BE(getPid() & 0xffff, 0);
+const CLASS_HASH = Buffer.alloc(4); // reserved slot, always 0
+
+// Start instant of the elapsed-millis field: local start of the month this
+// process was launched in.
+function monthStartMillis(now: number): number {
+  const d = new Date(now);
+  return new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0).getTime();
+}
+const START_TIME = monthStartMillis(Date.now());
+
 const COUNTER = { value: 0 };
-const COUNTER_MAX = 0x7fffffff;
+const COUNTER_MAX = 0xffff;
 
 export function createUniqID() {
   COUNTER.value = (COUNTER.value + 1) & COUNTER_MAX;
-  const pid = (getPid() & 0xffff).toString(16).padStart(4, '0');
-  const ts = Math.floor(Date.now() / 1000).toString(16).padStart(8, '0');
-  const counter = COUNTER.value.toString(16).padStart(8, '0');
-  return `${FIX_STRING}${pid}${ts}${counter}`;
+  const elapsed = Buffer.alloc(4);
+  elapsed.writeUInt32BE((Date.now() - START_TIME) >>> 0, 0);
+  const counter = Buffer.alloc(2);
+  counter.writeUInt16BE(COUNTER.value, 0);
+  return bytes2string(Buffer.concat([IP, PID, CLASS_HASH, elapsed, counter]));
 }
 
 export default { createUniqID };

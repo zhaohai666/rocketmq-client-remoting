@@ -499,8 +499,8 @@ async fn s5_send_first_first_offset(env: &Env, ck: &mut Checker) {
     // The regression this pins: an earlier draft resolved the initial offset of a SQL92
     // subscription to the max offset, silently skipping every message produced *before*
     // the consumer started (consumer-first passed only because the queues were empty and
-    // the max offset was 0 anyway). Java (RebalancePushImpl#computePullFromWhere) starts
-    // at 0 for FIRST_OFFSET regardless of the subscription type and lets the broker filter.
+    // the max offset was 0 anyway). A FIRST_OFFSET subscription starts at 0
+    // regardless of the subscription type and lets the broker filter.
     let topic = format!("RustLiveSql92First{}", env.stamp);
     if let Err(e) = env
         .admin
@@ -620,8 +620,8 @@ async fn run(namesrv: &str) -> Checker {
 
     // Preflight: does this broker accept SQL92 subscriptions at all? The broker answers
     // CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not support consumer to
-    // filter message by SQL92") unless it runs with enablePropertyFilter=true, and the Java
-    // client fails start() the same way. Detect that up front and say what to do, instead of
+    // filter message by SQL92") unless it runs with enablePropertyFilter=true, and start()
+    // fails the same way here. Detect that up front and say what to do, instead of
     // reporting four confusing FAILs deeper in.
     {
         let (preflight, _inbox) = match env.consumer(
@@ -646,7 +646,7 @@ async fn run(namesrv: &str) -> Checker {
                 if msg.contains("does not support consumer to filter message by") {
                     println!("!! the broker refuses SQL92 subscriptions: {msg}");
                     println!("!! fix: set enablePropertyFilter=true in broker.conf and restart the broker,");
-                    println!("!!      then re-run this probe (the same requirement applies to the Java client).");
+                    println!("!!      then re-run this probe (the requirement is the same for any client).");
                     println!("!! skipping end-to-end SQL92 verification: broker not configured for property filter");
                     let retry_topic = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, env.group);
                     let _ = env.admin.delete_topic(&env.topic, None).await;

@@ -175,23 +175,51 @@ export class LocalFileOffsetStore implements OffsetStore {
     return offset === undefined ? -1 : offset;
   }
 
-  // PersistAll writes the whole table (all entries ARE this consumer's
-  // queues).
-  async persistAll(_mqs: MessageQueue[]): Promise<void> {
-    return this.persistFile();
-  }
-
-  async persist(_mq: MessageQueue): Promise<void> {
-    return this.persistFile();
-  }
-
-  private async persistFile(): Promise<void> {
-    const entries: Record<string, number> = {};
-    for (const [key, offset] of this.table) {
-      const parsed = parseMqKey(key);
-      if (parsed) entries[messageQueueKeyJson(parsed)] = offset;
+  // PersistAll merges with the on-disk table: the file still holds offsets for
+  // queues this round no longer owns, so read it back and overlay only the
+  // flushed queues instead of replacing the file with the in-memory table.
+  async persistAll(mqs: MessageQueue[]): Promise<void> {
+    if (mqs.length === 0) return;
+    const merged = this.readDiskTable();
+    for (const mq of mqs) {
+      const key = mqKey(mq);
+      const offset = this.table.get(key);
+      if (offset === undefined) continue;
+      merged.set(key, offset);
     }
-    const body = JSON.stringify({ offsetTable: entries });
+    this.writeTable(merged);
+  }
+
+  async persist(mq: MessageQueue): Promise<void> {
+    const key = mqKey(mq);
+    const offset = this.table.get(key);
+    if (offset === undefined) return;
+    const merged = this.readDiskTable();
+    merged.set(key, offset);
+    this.writeTable(merged);
+  }
+
+  private readDiskTable(): Map<string, number> {
+    let data: Buffer | null = null;
+    try {
+      data = fs.readFileSync(this.storePath);
+    } catch (e1) {
+      try {
+        data = fs.readFileSync(this.storePath + '.bak');
+      } catch (e2) {
+        return new Map(); // both missing -> nothing on disk yet
+      }
+    }
+    try {
+      return decodeLocalOffsetTable(data);
+    } catch (e) {
+      logger.warning('read local offset store %s failed: %s', this.storePath, (e as Error).message);
+      return new Map();
+    }
+  }
+
+  private writeTable(table: Map<string, number>): void {
+    const body = encodeLocalOffsetTable(table);
     if (fs.existsSync(this.storePath)) {
       try { fs.writeFileSync(this.storePath + '.bak', fs.readFileSync(this.storePath)); } catch (e) { /* best effort */ }
     }
@@ -209,7 +237,10 @@ export class LocalFileOffsetStore implements OffsetStore {
 
 // ------------------------------------------------------------- file format
 
-function messageQueueKeyJson(mq: MessageQueue): string {
+// Encoder for the inline-object MessageQueue key form used by the local offset
+// file: {"brokerName":"b","queueId":0,"topic":"T"}. Also reused by the running
+// info table.
+export function messageQueueKeyJson(mq: MessageQueue): string {
   return JSON.stringify({
     brokerName: mq.getBrokerName(),
     queueId: mq.getQueueId(),
@@ -217,25 +248,117 @@ function messageQueueKeyJson(mq: MessageQueue): string {
   });
 }
 
+// The table is written with inline JSON object keys, which JSON.stringify
+// cannot produce (it would quote and escape the key text). Serialize the outer
+// document by hand so the keys stay raw objects.
+function encodeLocalOffsetTable(table: Map<string, number>): string {
+  const entries: string[] = [];
+  for (const [key, offset] of table) {
+    const mq = parseMqKey(key);
+    if (!mq) continue;
+    entries.push(`${messageQueueKeyJson(mq)}:${offset}`);
+  }
+  const body = entries.length === 0 ? '' : `\n\t${entries.join(',\n\t')}\n`;
+  return `{\n\t"offsetTable":{${body}}\n}\n`;
+}
+
+// Reads the offset table accepting all three key spellings seen on disk:
+// an inline object key, a quoted-string key holding that same JSON text, and
+// the legacy topic@brokerName@queueId text.
 function decodeLocalOffsetTable(data: Buffer): Map<string, number> {
   const out = new Map<string, number>();
-  const obj = JSON.parse(data.toString('utf-8'));
-  const raw = obj && obj['offsetTable'];
-  if (!raw || typeof raw !== 'object') return out;
-  for (const [k, v] of Object.entries(raw)) {
-    let inner: any;
-    try { inner = JSON.parse(k); } catch (e) { continue; }
-    if (!inner || typeof inner !== 'object') continue;
-    const mq = new MessageQueue(
-      String(inner['topic'] ?? ''),
-      String(inner['brokerName'] ?? ''),
-      Number(inner['queueId'] ?? 0) | 0,
-    );
-    const offset = typeof v === 'number' ? v : parseInt(String(v), 10);
+  const text = data.toString('utf-8');
+  const marker = /"offsetTable"\s*:\s*\{/.exec(text);
+  if (!marker) return out;
+  let i = marker.index + marker[0].length;
+  while (i < text.length) {
+    while (i < text.length && (text[i] === ',' || /\s/.test(text[i]))) i++;
+    if (i >= text.length || text[i] === '}') break;
+    let keyText: string;
+    if (text[i] === '{') {
+      const end = scanBalancedObject(text, i);
+      if (end < 0) break;
+      keyText = text.slice(i, end + 1);
+      i = end + 1;
+    } else if (text[i] === '"') {
+      const parsed = readJsonString(text, i);
+      if (parsed.next < 0) break;
+      keyText = parsed.value;
+      i = parsed.next;
+    } else {
+      break;
+    }
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text[i] !== ':') break;
+    i++;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    const numStart = i;
+    while (i < text.length && /[-+0-9.eE]/.test(text[i])) i++;
+    const offset = Number(text.slice(numStart, i));
     if (Number.isNaN(offset)) continue;
-    out.set(mqKey(mq), offset);
+    const mq = parseFileKey(keyText);
+    if (mq) out.set(mqKey(mq), offset);
   }
   return out;
+}
+
+function parseFileKey(keyText: string): MessageQueue | null {
+  const trimmed = keyText.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const inner = JSON.parse(trimmed);
+      if (!inner || typeof inner !== 'object') return null;
+      return new MessageQueue(
+        String(inner['topic'] ?? ''),
+        String(inner['brokerName'] ?? ''),
+        Number(inner['queueId'] ?? 0) | 0,
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+  return parseMqKey(trimmed);
+}
+
+function scanStringEnd(text: string, start: number): number {
+  let i = start + 1;
+  while (i < text.length) {
+    if (text[i] === '\\') { i += 2; continue; }
+    if (text[i] === '"') return i;
+    i++;
+  }
+  return -1;
+}
+
+function readJsonString(text: string, start: number): { value: string; next: number } {
+  const end = scanStringEnd(text, start);
+  if (end < 0) return { value: '', next: -1 };
+  try {
+    return { value: String(JSON.parse(text.slice(start, end + 1))), next: end + 1 };
+  } catch (e) {
+    return { value: '', next: -1 };
+  }
+}
+
+function scanBalancedObject(text: string, start: number): number {
+  let depth = 0;
+  let i = start;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') {
+      const end = scanStringEnd(text, i);
+      if (end < 0) return -1;
+      i = end + 1;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+    i++;
+  }
+  return -1;
 }
 
 // parseMqKey reverses mqKey() (test/file helpers).

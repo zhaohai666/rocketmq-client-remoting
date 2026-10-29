@@ -15,7 +15,8 @@ from common.message_client_id_setter import get_uniq_id, set_uniq_id
 from common.message_const import MessageConst
 from common.message_decoder import (decode_message, decode_messages, decompress_body,
                                       message_properties_2_string,
-                                      string_2_message_properties)
+                                      string_2_message_properties,
+                                      unwrap_inner_batch_messages)
 from common.mix_all import MixAll
 from common.subscription_data import ExpressionType, SubscriptionData
 from common.sysflag import MessageSysFlag, PullSysFlag
@@ -807,7 +808,13 @@ class MQClientInstance:
         if response.code in status_map:
             header = SendMessageResponseHeader()
             header.from_ext_fields(response.ext_fields)
-            uniq_msg_id = get_uniq_id(msg) or header.batch_uniq_id
+            if isinstance(msg, MessageBatch):
+                # A batch result identifies the whole send: prefer the broker-side batch id, otherwise
+                # join every member's own unique id. The batch envelope's own id must not mask members.
+                uniq_msg_id = header.batch_uniq_id or ",".join(
+                    get_uniq_id(m) or "" for m in msg.messages)
+            else:
+                uniq_msg_id = get_uniq_id(msg) or header.batch_uniq_id
             result = SendResult(
                 send_status=status_map[response.code],
                 msg_id=uniq_msg_id or header.msg_id,
@@ -938,6 +945,7 @@ class MQClientInstance:
         found = []
         if response.body:
             found = decode_messages(response.body, read_body=self.decode_read_body)
+            found = unwrap_inner_batch_messages(found)
             for m in found:
                 m.broker_name = mq.broker_name
                 m.queue_id = mq.queue_id

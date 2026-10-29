@@ -14,8 +14,10 @@ logger = get_logger(__name__)
 
 SAMPLING_INTERVAL_SECONDS = 10.0
 HOUR_SAMPLING_INTERVAL_SECONDS = 600.0
-MINUTE_LIST_MAX = 60
-HOUR_LIST_MAX = 60
+DAY_SAMPLING_INTERVAL_SECONDS = 3600.0
+MINUTE_LIST_MAX = 7
+HOUR_LIST_MAX = 7
+DAY_LIST_MAX = 25
 
 
 class StatsSnapshot:
@@ -53,7 +55,7 @@ def compute_stats_data(cs_list) -> StatsSnapshot:
 
 
 class StatsItem:
-    """Single-item statistics: cumulative value/times + minute/hour two-level sampling chains."""
+    """Single-item statistics: cumulative value/times + minute/hour/day sampling chains."""
 
     def __init__(self, stats_name: str, stats_key: str) -> None:
         self.stats_name = stats_name
@@ -64,6 +66,7 @@ class StatsItem:
         # element = (timestamp_ms, cumulative value, cumulative times)
         self._minute: Deque[Tuple[int, int, int]] = deque()
         self._hour: Deque[Tuple[int, int, int]] = deque()
+        self._day: Deque[Tuple[int, int, int]] = deque()
 
     def add_value(self, inc_value: int, inc_times: int) -> None:
         with self._lock:
@@ -80,22 +83,32 @@ class StatsItem:
         with self._lock:
             return self._times
 
-    def _sample_locked(self) -> Tuple[int, int, int]:
-        return (int(time.time() * 1000), self._value, self._times)
+    def _append_sample_locked(self, chain: Deque[Tuple[int, int, int]],
+                              max_len: int, period_ms: int) -> None:
+        now = int(time.time() * 1000)
+        if not chain:
+            chain.append((now - period_ms, 0, 0))
+        chain.append((now, self._value, self._times))
+        while len(chain) > max_len:
+            chain.popleft()
 
     def sample(self) -> None:
         """Append a minute-level sampling point (called by the sampling thread every 10s)."""
         with self._lock:
-            self._minute.append(self._sample_locked())
-            while len(self._minute) > MINUTE_LIST_MAX:
-                self._minute.popleft()
+            self._append_sample_locked(
+                self._minute, MINUTE_LIST_MAX, int(SAMPLING_INTERVAL_SECONDS * 1000))
 
     def sample_hour(self) -> None:
         """Append an hour-level sampling point (called by the sampling thread every 10 minutes)."""
         with self._lock:
-            self._hour.append(self._sample_locked())
-            while len(self._hour) > HOUR_LIST_MAX:
-                self._hour.popleft()
+            self._append_sample_locked(
+                self._hour, HOUR_LIST_MAX, int(HOUR_SAMPLING_INTERVAL_SECONDS * 1000))
+
+    def sample_day(self) -> None:
+        """Append a day-level sampling point (called by the sampling thread every hour)."""
+        with self._lock:
+            self._append_sample_locked(
+                self._day, DAY_LIST_MAX, int(DAY_SAMPLING_INTERVAL_SECONDS * 1000))
 
     def get_stats_data_in_minute(self) -> StatsSnapshot:
         with self._lock:
@@ -104,6 +117,10 @@ class StatsItem:
     def get_stats_data_in_hour(self) -> StatsSnapshot:
         with self._lock:
             return compute_stats_data(self._hour)
+
+    def get_stats_data_in_day(self) -> StatsSnapshot:
+        with self._lock:
+            return compute_stats_data(self._day)
 
 
 class StatsItemSet:
@@ -140,6 +157,10 @@ class StatsItemSet:
     def sample_hour_all(self) -> None:
         for key in self.keys():
             self.find(key).sample_hour()
+
+    def sample_day_all(self) -> None:
+        for key in self.keys():
+            self.find(key).sample_day()
 
 
 class ConsumerStatsManager:
@@ -178,13 +199,18 @@ class ConsumerStatsManager:
 
     def _sample_loop(self) -> None:
         rounds = 0
+        hour_every = int(HOUR_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS)
+        day_every = int(DAY_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS)
         while not self._stop.wait(SAMPLING_INTERVAL_SECONDS):
             rounds += 1
             for s in self._sets:
                 s.sample_all()
-            if rounds % 60 == 0:    # 60 * 10s = 10 minutes
+            if rounds % hour_every == 0:    # 60 * 10s = 10 minutes
                 for s in self._sets:
                     s.sample_hour_all()
+                if rounds % day_every == 0:    # 360 * 10s = 1 hour
+                    for s in self._sets:
+                        s.sample_day_all()
 
     @staticmethod
     def _key(topic: str, group: str) -> str:

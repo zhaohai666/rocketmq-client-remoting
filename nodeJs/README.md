@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **48** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 43 套逐条计出 **1536** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **49** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 44 套逐条计出 **1585** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -41,7 +41,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/client_config_gaps_smoke.ts`（客户端配置旋钮） | 44 通过 / 0 失败 |
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
 | `test/consumer_heartbeat_registration_smoke.ts`（消费端心跳注册） | 14 通过 / 0 失败 |
-| `test/consumer_smoke.ts` | 30 通过 / 0 失败 |
+| `test/consumer_smoke.ts` | 34 通过 / 0 失败 |
 | `test/consumer_status_reply_smoke.ts`（221 状态应答 + 307/309 未托管组 + 220 单向） | 22 通过 / 0 失败 |
 | `test/fixes2_smoke.ts` | 40 项检查通过 |
 | `test/flow_control_smoke.ts`（每队列三条闸门：只判本队列「持有」的一切——未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值按字面取值（不 clamp 到 1、0 不是「关闭」，合法区间由启动配置检查把守），字节闸门按消息体整 MiB 向下取整而不是 storeSize，跨度闸门不作用于顺序消费；命中原因按 条数 → 字节 → 跨度 的固定顺序、一次判定只记一个计数，告警第 1 次及其后每 1000 次；缓存闸门 50ms、broker 215 的 20ms、其余拉取失败走唯一的可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，拉取与 POP 两条路径共用、每条队列循环建立时取值）；POP 队列的待 ack 欠账闸门默认 96、严格大于才停，命中记进拉取路径同一个流控计数与告警节奏，POP 被 broker 回 215 同样只等 20ms；lite 路径 `poll()` 就地拉取、无预取缓冲，所以只按队列停在 215 的 20ms、其余错误码不 park、兄弟队列不受影响，且 broker 拒绝码以带 `responseCode` 的 `MQBrokerException` 交给调用方） | 148 项检查通过 |
@@ -54,6 +54,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
 | `test/offset_persist_timer_smoke.ts` | 27 通过 / 0 失败 |
+| `test/parity_gaps_smoke.ts`（能力缺口的显式回归） | 45 通过 / 0 失败 |
 | `test/pop_batch_ack_smoke.ts`（200151 请求形状） | 9 通过 / 0 失败 |
 | `test/pop_init_mode_smoke.ts`（起始策略到 POP initMode 的翻译） | 14 项检查通过 |
 | `test/pop_pre_deliver_filter_smoke.ts`（POP 轮次的交付前过滤；第 8 节把同一问题问给 pull 路径） | 27 项检查通过 |
@@ -409,7 +410,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 48 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 49 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

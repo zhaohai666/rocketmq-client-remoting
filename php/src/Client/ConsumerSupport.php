@@ -67,6 +67,12 @@ final class ConsumerDefaults
      * whereas PULL_MAX_IDLE_TIME asks "is this loop still alive".
      */
     public const PULL_TIME_DELAY_WHEN_SUSPEND = 1.0;
+
+    /**
+     * Maximum age (ms) of an orderly queue-lock grant. A queue whose latest broker
+     * confirmation is older than this is treated as unlocked at the pull gate.
+     */
+    public const REBALANCE_LOCK_MAX_LIVE_TIME_MS = 30000;
 }
 
 /** Queue sort key: topic -> brokerName -> queueId. */
@@ -399,6 +405,130 @@ function scan_offset_table_body(string $text): ?array
         return null;
     }
     return $entries;
+}
+
+/**
+ * Absolute path of the local offset file of one consumer group.
+ *
+ * Layout: <home>/.rocketmq_offsets/<clientId>/<consumerGroup>/offsets.json.
+ */
+function local_offset_file_path(string $clientId, string $consumerGroup): string
+{
+    $home = getenv('HOME') ?: '';
+    return implode(DIRECTORY_SEPARATOR, [
+        $home,
+        '.rocketmq_offsets',
+        $clientId !== '' ? $clientId : 'DEFAULT',
+        $consumerGroup,
+        'offsets.json',
+    ]);
+}
+
+/**
+ * Read the local offset table, falling back to the `.bak` copy when the primary file is
+ * missing or unparsable.
+ *
+ * @return array<string,int>|null key = topic.brokerName.queueId concatenated string, null when no copy is readable
+ */
+function read_local_offset_table(string $clientId, string $consumerGroup): ?array
+{
+    $path = local_offset_file_path($clientId, $consumerGroup);
+    foreach ([$path, $path . '.bak'] as $candidate) {
+        if (!is_file($candidate)) {
+            continue;
+        }
+        $text = @file_get_contents($candidate);
+        if ($text === false || $text === '') {
+            continue;
+        }
+        $parsed = parse_local_offsets_json($text);
+        if ($parsed !== null) {
+            return $parsed;
+        }
+    }
+    return null;
+}
+
+/**
+ * Merge the offsets about to be flushed into the table already on disk.
+ *
+ * The write is a union, not a replacement: queues this round did not flush keep their stored
+ * value and their queue identity, including queues that are no longer part of the current
+ * assignment. Flushed queues overlay the stored entry by queue key.
+ *
+ * @param string|null $existingText raw contents of the current file (null when absent/unreadable)
+ * @param array<string,int> $items key = topic.brokerName.queueId concatenated string
+ * @param array<string,MessageQueue> $mqMap queue identity for the flushed keys
+ */
+function build_merged_local_offsets_json(?string $existingText, array $items, array $mqMap): string
+{
+    $records = [];
+    $order = [];
+    if ($existingText !== null && trim($existingText) !== '') {
+        foreach (scan_offset_table_body(trim($existingText)) ?? [] as [$topic, $broker, $qid, $off]) {
+            $key = $topic . $broker . (string) $qid;
+            $records[$key] = ['brokerName' => $broker, 'queueId' => $qid, 'topic' => $topic, 'offset' => $off];
+            $order[] = $key;
+        }
+    }
+    foreach ($items as $key => $off) {
+        $mq = $mqMap[$key] ?? null;
+        if ($mq === null) {
+            // Without queue identity the entry cannot be written in this format.
+            continue;
+        }
+        if (!isset($records[$key])) {
+            $order[] = $key;
+        }
+        $records[$key] = [
+            'brokerName' => $mq->brokerName,
+            'queueId' => (int) $mq->queueId,
+            'topic' => $mq->topic,
+            'offset' => (int) $off,
+        ];
+    }
+    $parts = [];
+    $written = [];
+    foreach ($order as $key) {
+        if (isset($written[$key])) {
+            continue;
+        }
+        $written[$key] = true;
+        $record = $records[$key];
+        $obj = json_encode([
+            'brokerName' => $record['brokerName'],
+            'queueId' => (int) $record['queueId'],
+            'topic' => $record['topic'],
+        ], JSON_UNESCAPED_SLASHES);
+        $parts[] = $obj . ':' . (string) (int) $record['offset'];
+    }
+    return '{"offsetTable":{' . implode(',', $parts) . '}}';
+}
+
+/**
+ * Persist the given queue offsets into the local file, preserving entries already on disk.
+ *
+ * @param array<string,int> $items key = topic.brokerName.queueId concatenated string
+ * @param array<string,MessageQueue> $mqMap queue identity for the flushed keys
+ */
+function persist_local_offset_entries(string $clientId, string $consumerGroup, array $items, array $mqMap): void
+{
+    $path = local_offset_file_path($clientId, $consumerGroup);
+    $dir = dirname($path);
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0777, true);
+    }
+    $existing = is_file($path) ? @file_get_contents($path) : false;
+    $text = build_merged_local_offsets_json($existing === false ? null : $existing, $items, $mqMap);
+    if (is_file($path)) {
+        $prev = (string) @file_get_contents($path);
+        if ($prev !== '') {
+            @file_put_contents($path . '.bak', $prev);
+        }
+    }
+    $tmp = $path . '.tmp';
+    file_put_contents($tmp, $text);
+    @rename($tmp, $path);
 }
 
 /**

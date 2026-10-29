@@ -597,26 +597,35 @@ func DecodeBatchMessage(raw []byte) (*Message, error) {
 }
 
 func DecodeBatchMessages(raw []byte) []*Message {
+	result, _ := DecodeBatchMessagesStrict(raw)
+	return result
+}
+
+// DecodeBatchMessagesStrict decodes a message batch and reports the first frame
+// that cannot be read. DecodeBatchMessages keeps whatever it managed to parse;
+// an inner-batch unwrap must not silently ship a truncated batch, so it uses
+// this variant and keeps the envelope on any error.
+func DecodeBatchMessagesStrict(raw []byte) ([]*Message, error) {
 	var result []*Message
 	pos := 0
 	total := len(raw)
 	for pos < total {
 		if total-pos < 4 {
-			break
+			return result, DecodeError(fmt.Sprintf("batch frame header truncated at offset %d", pos))
 		}
 		storeSize := int32(binary.BigEndian.Uint32(raw[pos : pos+4]))
 		if storeSize <= 0 || int(storeSize) > total-pos {
-			break
+			return result, DecodeError(fmt.Sprintf("batch frame size %d out of range at offset %d", storeSize, pos))
 		}
 		end := pos + int(storeSize)
 		msg, err := DecodeBatchMessage(raw[pos:end])
 		if err != nil {
-			break
+			return result, err
 		}
 		result = append(result, msg)
 		pos = end
 	}
-	return result
+	return result, nil
 }
 
 func CountInnerMsgNum(raw []byte) int32 {

@@ -61,8 +61,8 @@ The 73 cases are the 72 test binaries plus 1 codec-interop case. Assertions are 
 each binary's own summary line (the wording differs per binary — `N checks, M failures`,
 `N passed, M failed`, `PASS=n FAIL=m`, `[PASS] n checks, [FAIL] m`, `checks=n fails=m`,
 `ALL PASS (n checks)` and a few more variants): running all 72
-serially gives **8,384 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
-**8,457 assertions in total**.
+serially gives **8,474 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
+**8,547 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 

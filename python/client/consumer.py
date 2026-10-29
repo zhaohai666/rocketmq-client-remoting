@@ -89,6 +89,15 @@ PULL_MAX_IDLE_TIME = 120.0
 # after suspend(), the pull/pop loop does not exit; it just backs off this long each round before checking the gate again.
 PULL_TIME_DELAY_WHEN_SUSPEND = 1.0
 
+# Maximum live time of an orderly-consumption queue lock (default 30000ms).
+# Rebalance reclaims queues from brokers continuously, so a lock confirmed once is only valid for a bounded
+# period; a queue whose lock stamp is older than this must stop pulling (clustering mode only).
+ORDERLY_LOCK_MAX_LIVE_TIME_MILLIS = 30000
+
+# Backoff used while an orderly queue has no valid lock. The listener must not see messages from a queue
+# this instance does not own, so the loop idles briefly and re-checks instead of pulling.
+ORDERLY_PULL_WAIT_LOCK_MILLIS = 200
+
 # Per-round backoff when the client's **own** cached-message thresholds hit (default 50ms):
 # the local buffer is full, so a short pause that lets the listener drain it is enough -- longer
 # costs throughput, shorter just spins. Distinct from the broker's FLOW_CONTROL(215) reply below.
@@ -760,6 +769,109 @@ _OBJ_AS_KEY_RE = re.compile(r'(\{[^{}]*\})\s*:\s*(-?\d+)')
 _FIELD_RE = re.compile(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|-?\d+)')
 
 
+def _local_offset_path_for(client_id: Optional[str], consumer_group: str) -> str:
+    base = os.path.join(os.path.expanduser("~"), ".rocketmq_offsets",
+                        client_id or "DEFAULT", consumer_group)
+    return os.path.join(base, "offsets.json")
+
+
+def _local_offset_key(mq: MessageQueue) -> str:
+    return "%s%s%d" % (mq.topic, mq.broker_name, mq.queue_id)
+
+
+def _parse_local_offsets_entries(text: str) -> Optional[List[Tuple[MessageQueue, int]]]:
+    """Parse a local offset file into queue/offset pairs; None when the text is not a table.
+
+    The flat-map branch yields no pairs because a plain string key carries no queue fields.
+    """
+    if not text or not text.strip():
+        return None
+    stripped = text.strip()
+    body = _scan_offset_table_body(stripped)
+    if body is not None:
+        return [(MessageQueue(topic, broker, int(qid)), int(off))
+                for (topic, broker, qid), off in body]
+    try:
+        data = json.loads(stripped)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, dict):
+        return []
+    return None
+
+
+def _read_local_offset_entries(
+        path: str) -> Tuple[Optional[List[Tuple[MessageQueue, int]]], bool]:
+    """Read the table from the main file, falling back to .bak.
+
+    Returns (entries, exists); entries is None when a file exists but no generation parses.
+    """
+    exists = False
+    for candidate in (path, path + ".bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            exists = True
+            continue
+        exists = True
+        entries = _parse_local_offsets_entries(text)
+        if entries is not None:
+            return entries, True
+    return None, exists
+
+
+def _write_local_offsets(path: str,
+                         overlay: Iterable[Tuple[MessageQueue, int]]) -> None:
+    """Merge ``overlay`` into the table already on disk and write the union atomically."""
+    entries, exists = _read_local_offset_entries(path)
+    if entries is None:
+        if exists:
+            logger.warning("local offset file %s is not parseable, skip this persist", path)
+            return
+        entries = []
+    table: Dict[str, Tuple[MessageQueue, int]] = {}
+    for mq, off in entries:
+        table[_local_offset_key(mq)] = (mq, int(off))
+    for mq, off in overlay:
+        table[_local_offset_key(mq)] = (mq, int(off))
+    items = {key: off for key, (_, off) in table.items()}
+    mq_map = {key: mq for key, (mq, _) in table.items()}
+    text = _build_local_offsets_json(items, mq_map)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            prev = f.read()
+    except OSError:
+        prev = None
+    if prev is not None and _parse_local_offsets_entries(prev) is not None:
+        try:
+            with open(path + ".bak", "w", encoding="utf-8") as f:
+                f.write(prev)
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _load_local_offsets_at(path: str) -> Dict[str, int]:
+    # Main file missing/empty/parse failed -> fall back to .bak
+    for candidate in (path, path + ".bak"):
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        parsed = _parse_local_offsets_json(text)
+        if parsed is not None:
+            return parsed
+    return {}
+
+
 class PopProcessQueue:
     """Queue state in POP mode.
 
@@ -939,6 +1051,9 @@ class DefaultMQPushConsumer:
         self._queue_epoch: Dict[str, int] = {}
         # Ordered consumption: the set of queue keys that broker LOCK_BATCH_MQ(41) confirmed as locked
         self._lock_ok: Set[str] = set()
+        # Moment (time.time()) at which each confirmed lock was obtained. A lock stops being usable after
+        # ORDERLY_LOCK_MAX_LIVE_TIME_MILLIS even if this instance still lists the queue as assigned.
+        self._lock_stamps: Dict[str, float] = {}
         self._flow_control_triggered = 0
         self._dispatch_thread: Optional[threading.Thread] = None
         self._clean_expire_thread: Optional[threading.Thread] = None
@@ -2042,6 +2157,7 @@ class DefaultMQPushConsumer:
         # will not touch it again, and old batch references must not be left in the registration here either.
         self._inflight_msgs.pop(key, None)
         self._lock_ok.discard(key)
+        self._lock_stamps.pop(key, None)
         # Epoch +1 => all in-flight batches' acks are voided; the frozen flag is **kept** until
         # the queue is rebuilt (_rebalance_pull_threads unfreezes), to prevent the corrected offset from being overwritten by an old ack.
         self._queue_epoch[key] = self._queue_epoch.get(key, 0) + 1
@@ -2193,6 +2309,38 @@ class DefaultMQPushConsumer:
                                  _strategy_name(self.allocate_strategy), e)
                     return
                 assigned.extend(got)
+        # Newly assigned queues resolve their initial offset **immediately** (clear the dirty offset -> compute the start per consume_from_where -> write into the offset table).
+        # It cannot be left to lazy resolution at first pull: CONSUME_FROM_LAST_OFFSET's semantics are "the latest offset at the allocation moment",
+        # and lazy resolution would skip all messages produced between "after allocation" and "before first pull" (on live systems this presents as the consumer never receiving anything).
+        # A store read failing for any reason other than "not found" means the stored position is
+        # unknown: skip that queue for this round (no process queue, retried next cycle) instead of
+        # silently starting at the tail/max offset and skipping messages.
+        skipped: Set[str] = set()
+        # POP names no offset -- the start position rides the request -- so a POP
+        # assignment never reads one and never loses a queue to an unreadable
+        # offset table. Only the pull path resolves its first cursor here.
+        if not self.pop_mode:
+            for mq in assigned:
+                key = self._mq_key(mq)
+                if key in was:
+                    continue
+                with self._lock:
+                    if key in self._offset_table:
+                        continue
+                    sub = self.subscription_data.get(mq.topic)
+                if sub is None:
+                    continue
+                try:
+                    off = self._resolve_initial_offset(client, mq)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("doRebalance, %s, compute offset failed, %s: %s",
+                                   self.consumer_group, mq, e)
+                    skipped.add(key)
+                    continue
+                with self._lock:
+                    self._offset_table.setdefault(key, off)
+        if skipped:
+            assigned = [mq for mq in assigned if self._mq_key(mq) not in skipped]
         with self._lock:
             self._assigned = assigned
         # The topics whose queue SET moved, so a swap that keeps the count (one queue
@@ -2210,26 +2358,6 @@ class DefaultMQPushConsumer:
             # lite-pull consumer's assignment change leaves the fingerprints alone.
             if self.use_heartbeat_v2:
                 client.reset_heartbeat_v2_fingerprint_table(self.consumer_group)
-        # Newly assigned queues resolve their initial offset **immediately** (clear the dirty offset -> compute the start per consume_from_where -> write into the offset table).
-        # It cannot be left to lazy resolution at first pull: CONSUME_FROM_LAST_OFFSET's semantics are "the latest offset at the allocation moment",
-        # and lazy resolution would skip all messages produced between "after allocation" and "before first pull" (on live systems this presents as the consumer never receiving anything).
-        for mq in assigned:
-            key = self._mq_key(mq)
-            if key in was:
-                continue
-            with self._lock:
-                if key in self._offset_table:
-                    continue
-                sub = self.subscription_data.get(mq.topic)
-            if sub is None:
-                continue
-            try:
-                off = self._resolve_initial_offset(client, mq)
-            except Exception as e:  # noqa: BLE001
-                logger.debug("resolve initial offset for %s failed: %s", mq, e)
-                continue
-            with self._lock:
-                self._offset_table.setdefault(key, off)
         self._rebalance_pull_threads()
         # Everything the moved set owes is paid in one place, in one order that cannot
         # drift, and only AFTER _rebalance_pull_threads rebuilt the per-queue pull state
@@ -2331,6 +2459,7 @@ class DefaultMQPushConsumer:
         """Single-queue pull loop: long-poll pull -> push into the pending buffer."""
         client = self._require_client()
         orderly = self._is_orderly()
+        broadcast = self.message_model == MessageModel.BROADCASTING
         key = self._mq_key(mq)
         # The generic error backoff is taken when this loop is set up, like the POP loop's invisible
         # time: reconfiguring the knob later does not change a loop that is already running.
@@ -2355,9 +2484,10 @@ class DefaultMQPushConsumer:
                 sub = self.subscription_data.get(mq.topic)
             if sub is None:
                 return
-            # Ordered consumption: queues not confirmed locked by the broker (LOCK_BATCH_MQ) are not pulled
-            if orderly and key not in self._lock_ok:
-                time.sleep(0.2)
+            # Ordered consumption: in clustering mode only queues covered by a live broker lock
+            # (LOCK_BATCH_MQ) may be pulled. Broadcasting owns every queue implicitly, so it needs no lock.
+            if orderly and not broadcast and not self._orderly_lock_ready(key):
+                time.sleep(ORDERLY_PULL_WAIT_LOCK_MILLIS / 1000.0)
                 continue
             # Flow control: count / bytes / concurrency span, all per queue
             # (the topic knobs were already divided into these per-queue thresholds by the rebalance)
@@ -3058,14 +3188,13 @@ class DefaultMQPushConsumer:
             if local is not None and local >= 0:
                 stored = local
         else:
-            # Cluster mode: first query the committed offset on the broker
-            try:
-                remote = client.query_consumer_offset(self.consumer_group, mq,
-                                                      set_zero_if_not_found=False)
-                if remote is not None and remote >= 0:
-                    stored = remote
-            except Exception as e:  # noqa: BLE001
-                logger.debug("query consumer offset for %s not found: %s", mq, e)
+            # Cluster mode: first query the committed offset on the broker. "Not found" (None) is a
+            # normal first start and falls through to the policy; any other failure must propagate so
+            # the caller can skip this queue for the round instead of guessing an offset.
+            remote = client.query_consumer_offset(self.consumer_group, mq,
+                                                  set_zero_if_not_found=False)
+            if remote is not None and remote >= 0:
+                stored = remote
 
         if stored >= 0:
             return stored
@@ -3632,15 +3761,10 @@ class DefaultMQPushConsumer:
                 # Difference from the auto-commit branch: a poison message handed to the broker is **not committed**,
                 # and whether the offset advances is up to the binlog consumer itself
                 return False
-            # SUCCESS + autoCommit=False: only record OK TPS, do not commit.
-            # This port does not expose the queue buffer to the listener (there is no commit opening),
-            # so it does not maintain an explicit commit() subtable like "currently consuming";
-            # doing nothing would let this batch be swallowed by the dispatch thread with the offset unmoved. Equivalently here it pushes back to
-            # the head and waits one suspend period: the offset likewise does not advance, no messages are lost, and the consume thread is not turned into a busy wait
-            # (without sleep, the next round would get the same batch immediately, which under the DEFAULT config is 100% CPU spinning).
+            # SUCCESS + autoCommit=False: record OK TPS, do not commit and do not re-deliver.
+            # The batch has been consumed successfully, so holding it back would only replay it; the
+            # offset stays where it was until the listener explicitly commits.
             self._record_consume_stats(mq.topic, len(batch), obegin_ms, failed=False)
-            self._requeue_pending(key, batch)
-            time.sleep(self._orderly_suspend_millis(ocontext) / 1000.0)
             return False
         # ---- Concurrent consumption ----
         # The batch is already registered as "in the listener's hands" by ``_consume_batch``: the timeout
@@ -3998,10 +4122,8 @@ class DefaultMQPushConsumer:
                 logger.debug("update consumer offset failed for %s: %s", mq, e)
 
     def _local_offset_path(self) -> str:
-        # Local offset file path: $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
-        base = os.path.join(os.path.expanduser("~"), ".rocketmq_offsets",
-                            self.client_id or "DEFAULT", self.consumer_group)
-        return os.path.join(base, "offsets.json")
+        # $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+        return _local_offset_path_for(self.client_id, self.consumer_group)
 
     def _save_local_offsets(self,
                             extra: Optional[Iterable[Tuple[MessageQueue, Optional[int]]]] = None) -> None:
@@ -4011,44 +4133,19 @@ class DefaultMQPushConsumer:
         the order must be write the file first, then remove the in-memory entries, with the values in the file
         kept so the rebuilt queue can resume from them (see the broadcast branch of ``_on_queues_revoked``).
         """
+        overlay: List[Tuple[MessageQueue, int]] = []
         with self._lock:
-            items = dict(self._consume_offsets)
-            mq_map = dict(self._mq_map)
+            for key, off in self._consume_offsets.items():
+                mq = self._mq_map.get(key)
+                if mq is not None:
+                    overlay.append((mq, int(off)))
         for mq, off in extra or ():
-            if off is None:
-                continue
-            key = self._mq_key(mq)
-            items[key] = int(off)
-            mq_map.setdefault(key, mq)
-        path = self._local_offset_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        text = _build_local_offsets_json(items, mq_map)
-        # The old content rolls to .bak first, then the new file is written
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                prev = f.read()
-            if prev:
-                with open(path + ".bak", "w", encoding="utf-8") as f:
-                    f.write(prev)
-        except OSError:
-            pass
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.replace(tmp, path)
+            if off is not None:
+                overlay.append((mq, int(off)))
+        _write_local_offsets(self._local_offset_path(), overlay)
 
     def _load_local_offsets(self) -> Dict[str, int]:
-        # Main file missing/empty/parse failed -> fall back to .bak
-        for path in (self._local_offset_path(), self._local_offset_path() + ".bak"):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except OSError:
-                continue
-            parsed = _parse_local_offsets_json(text)
-            if parsed is not None:
-                return parsed
-        return {}
+        return _load_local_offsets_at(self._local_offset_path())
 
     # ---------------- Ordered consumption queue locks ----------------
     def _start_lock_loop(self) -> None:
@@ -4073,12 +4170,24 @@ class DefaultMQPushConsumer:
                     if mqs:
                         ok = client.lock_batch_mq(self.consumer_group, self.client_id or "", mqs)
                         ok_keys = {"%s%s%d" % (m.topic, m.broker_name, m.queue_id) for m in ok}
+                        now = time.time()
                         with self._lock:
                             self._lock_ok = ok_keys
+                            self._lock_stamps = {k: now for k in ok_keys}
                         logger.debug("lock_batch_mq: %d/%d queues locked", len(ok_keys), len(mqs))
                 except Exception as e:  # noqa: BLE001
                     logger.debug("lock mq error: %s", e)
             self._stop.wait(20.0)
+
+    def _orderly_lock_ready(self, key: str) -> bool:
+        """Whether the broker lock for this queue is confirmed and still within its live time."""
+        with self._lock:
+            if key not in self._lock_ok:
+                return False
+            stamp = self._lock_stamps.get(key)
+        if stamp is None:
+            return False
+        return (time.time() - stamp) * 1000.0 <= ORDERLY_LOCK_MAX_LIVE_TIME_MILLIS
 
     def _is_orderly(self) -> bool:
         return isinstance(self.message_listener, MessageListenerOrderly)
@@ -4695,11 +4804,22 @@ class DefaultMQPullConsumer:
             raise MQClientException("executor rejected", None, e) from e
 
     # ---------------- Offset management ----------------
+    def _local_offset_path(self) -> str:
+        return _local_offset_path_for(self.client_id, self.consumer_group)
+
     def fetch_consume_offset(self, mq: MessageQueue) -> Optional[int]:
-        return self._require_client().query_consumer_offset(self.consumer_group, mq)
+        client = self._require_client()
+        if self.message_model == MessageModel.BROADCASTING:
+            return _load_local_offsets_at(self._local_offset_path()).get(
+                _local_offset_key(mq))
+        return client.query_consumer_offset(self.consumer_group, mq)
 
     def update_consume_offset(self, mq: MessageQueue, offset: int) -> None:
-        self._require_client().update_consumer_offset(self.consumer_group, mq, offset)
+        client = self._require_client()
+        if self.message_model == MessageModel.BROADCASTING:
+            _write_local_offsets(self._local_offset_path(), [(mq, int(offset))])
+            return
+        client.update_consumer_offset(self.consumer_group, mq, offset)
 
     def search_offset(self, mq: MessageQueue, timestamp: int) -> int:
         return self._require_client().search_offset_by_timestamp(mq, timestamp)
@@ -4872,6 +4992,17 @@ _LITE_MODE_NONE = 0
 _LITE_MODE_SUBSCRIBE = 1
 _LITE_MODE_ASSIGN = 2
 
+_LITE_STATE_CREATE_JUST = 0
+_LITE_STATE_START_FAILED = 1
+_LITE_STATE_RUNNING = 2
+_LITE_STATE_SHUTDOWN_ALREADY = 3
+_LITE_STATE_NAMES = {
+    _LITE_STATE_CREATE_JUST: "CREATE_JUST",
+    _LITE_STATE_START_FAILED: "START_FAILED",
+    _LITE_STATE_RUNNING: "RUNNING",
+    _LITE_STATE_SHUTDOWN_ALREADY: "SHUTDOWN_ALREADY",
+}
+
 
 class DefaultLitePullConsumer:
     """Lite pull consumer.
@@ -4989,6 +5120,7 @@ class DefaultLitePullConsumer:
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
         self._running = False
+        self._service_state = _LITE_STATE_CREATE_JUST
         self._pull_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
 
@@ -5241,6 +5373,21 @@ class DefaultLitePullConsumer:
             self.subscription_data[ns] = FilterAPI.build_subscription_data(ns, sub_expression)
         except Exception:
             self.subscription_data.pop(ns, None)
+        self._notify_running_subscription(ns)
+
+    def _notify_running_subscription(self, topic: str) -> None:
+        """A subscription added while RUNNING needs its route and a fresh heartbeat."""
+        if not self._started or self._mq_client is None:
+            return
+        self._mq_client.register_topic_in_use(topic)
+        try:
+            self._mq_client.get_topic_publish_info(topic)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lite subscribe: refresh route for %s failed: %s", topic, e)
+        try:
+            self._send_heartbeat_to_all_broker()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("lite subscribe: heartbeat failed: %s", e)
 
     def subscribe_with_selector(self, topic: str, selector) -> None:
         # Carry the selector's expression type end-to-end: TAG keeps the tag semantics
@@ -5263,6 +5410,7 @@ class DefaultLitePullConsumer:
         sub = SubscriptionData(topic=ns, sub_string=expression)
         sub.expression_type = selector_type
         self.subscription_data[ns] = sub
+        self._notify_running_subscription(ns)
 
     def unsubscribe(self, topic: str) -> None:
         if not topic or not topic.strip():
@@ -5346,8 +5494,13 @@ class DefaultLitePullConsumer:
                                 concurrent_heartbeat_thread_pool_size=self.concurrent_heartbeat_thread_pool_size)
 
     def start(self) -> None:
-        if self._started:
-            return
+        if self._service_state != _LITE_STATE_CREATE_JUST:
+            state = _LITE_STATE_NAMES[self._service_state]
+            raise MQClientException(
+                "The PullConsumer service state not OK, maybe started once, %s" % state)
+        # A failed start latches: part of the instance may already be registered,
+        # so this consumer must not be retried.
+        self._service_state = _LITE_STATE_START_FAILED
         # Purely local validation, done first
         validators.check_group(self.consumer_group)
         if self.consumer_group == MixAll.DEFAULT_CONSUMER_GROUP:
@@ -5356,8 +5509,8 @@ class DefaultLitePullConsumer:
                 % MixAll.DEFAULT_CONSUMER_GROUP)
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
-        if not self.subscription and self._mode != _LITE_MODE_ASSIGN:
-            raise MQClientException("subscription is not set, call subscribe() or assign() first")
+        if self.message_model not in (MessageModel.BROADCASTING, MessageModel.CLUSTERING):
+            raise MQClientException("messageModel is null")
         # Unconditionally validated at startup:
         # the loop below resolving initial offsets swallows exceptions; throwing late would be a silent degradation to consuming from max offset.
         self._parse_consume_timestamp(self.consume_timestamp)
@@ -5365,6 +5518,9 @@ class DefaultLitePullConsumer:
         # rather than waiting for None.allocate in rebalance to throw AttributeError and be silently swallowed.
         if self.allocate_message_queue_strategy is None:
             raise MQClientException("allocateMessageQueueStrategy is null")
+        if self.consumer_timeout_millis_when_suspend < self.broker_suspend_max_time_millis:
+            raise MQClientException(
+                "Long polling mode, the consumer consumerTimeoutMillisWhenSuspend must greater than brokerSuspendMaxTimeMillis")
         # Only CLUSTERING rewrites instanceName; the clientId policy is
         # `<local IP>@<instanceName>[@<unitName>][@STREAM]`.
         if self.message_model == MessageModel.CLUSTERING:
@@ -5406,6 +5562,7 @@ class DefaultLitePullConsumer:
         self._send_heartbeat_to_all_broker()
         self._start_heartbeat_loop()
         self._started = True
+        self._service_state = _LITE_STATE_RUNNING
         self._pull_thread = threading.Thread(
             target=self._pull_service_loop, daemon=True,
             name="rmq-lite-pull-%s" % self.consumer_group)
@@ -5429,10 +5586,14 @@ class DefaultLitePullConsumer:
                 logger.debug("lite start: refresh route for %s failed: %s", topic, e)
 
     def shutdown(self) -> None:
+        if self._service_state == _LITE_STATE_SHUTDOWN_ALREADY:
+            return
         if not self._started:
+            self._service_state = _LITE_STATE_SHUTDOWN_ALREADY
             return
         self._started = False
         self._running = False
+        self._service_state = _LITE_STATE_SHUTDOWN_ALREADY
         # shutdown goes through the offset persist step (_persist_offset_table): flush the in-memory offset table once per the currently held queues,
         # regardless of auto_commit (values accumulated with persist=False in manual mode must also be persisted).
         # Auto-commit mode takes one more step, commit(): this port does not have that 5s timer,
@@ -5864,12 +6025,17 @@ class DefaultLitePullConsumer:
             # permanently at 0. Throw to let the caller take note; the real resolution is left to the pull loop after start.
             raise MQClientException("The lite pull consumer is not running")
         # Use the committed offset if there is one (to guarantee resuming consumption after restart)
-        try:
-            off = self._mq_client.query_consumer_offset(self.consumer_group, mq)
+        if self.message_model == MessageModel.BROADCASTING:
+            off = self._load_local_offsets().get(_local_offset_key(mq))
             if off is not None:
                 return off
-        except Exception:
-            pass
+        else:
+            try:
+                off = self._mq_client.query_consumer_offset(self.consumer_group, mq)
+                if off is not None:
+                    return off
+            except Exception:
+                pass
         if self.consume_from_where == ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET:
             # The FIRST_OFFSET branch is the same shape as push (take 0 directly),
             # and no minOffset query is sent -- minOffset is the admin-side policy (master only),
@@ -6062,15 +6228,29 @@ class DefaultLitePullConsumer:
         cached = self._offset_table.get(mq)
         if cached is not None:
             return cached
+        if self.message_model == MessageModel.BROADCASTING:
+            local_offset = self._load_local_offsets().get(_local_offset_key(mq))
+            if local_offset is not None:
+                self._offset_table[mq] = local_offset
+            return local_offset
         broker_offset = self._mq_client.query_consumer_offset(self.consumer_group, mq)
         if broker_offset is not None:
             self._offset_table[mq] = broker_offset
         return broker_offset
 
+    def _local_offset_path(self) -> str:
+        return _local_offset_path_for(self.client_id, self.consumer_group)
+
+    def _load_local_offsets(self) -> Dict[str, int]:
+        return _load_local_offsets_at(self._local_offset_path())
+
     def _persist_offset(self, mq: MessageQueue) -> None:
-        """Persist one queue: only sends this queue's in-memory offset to the broker, with no cleanup."""
+        """Persist one queue: only sends this queue's in-memory offset to the store, with no cleanup."""
         offset = self._offset_table.get(mq)
         if offset is None:
+            return
+        if self.message_model == MessageModel.BROADCASTING:
+            _write_local_offsets(self._local_offset_path(), [(mq, int(offset))])
             return
         try:
             self._mq_client.update_consumer_offset(self.consumer_group, mq, offset)
@@ -6079,7 +6259,7 @@ class DefaultLitePullConsumer:
 
     def _persist_offset_table(self, mqs) -> None:
         """Persist a set of queues: the part of the in-memory offset table falling on ``mqs``
-        is written to the broker, and entries **not** in it are deleted from the table on the way (the sweep of queues this instance no longer holds).
+        is written to the offset store, and entries **not** in it are deleted from the table on the way (the sweep of queues this instance no longer holds).
 
         The second half is this table's real semantics: it only serves the currently held queues, and revoked queues left in the table would never be
         committed again, so this persist sweeps them away as it goes. The cost is that ``commit(some queues, persist=True)`` drops the other
@@ -6091,7 +6271,12 @@ class DefaultLitePullConsumer:
         for mq in list(self._offset_table.keys()):
             if mq not in wanted:
                 del self._offset_table[mq]
-                continue
+        if self.message_model == MessageModel.BROADCASTING:
+            overlay = [(mq, int(offset)) for mq, offset in self._offset_table.items()]
+            if overlay:
+                _write_local_offsets(self._local_offset_path(), overlay)
+            return
+        for mq in list(self._offset_table.keys()):
             self._persist_offset(mq)
 
     def commit(self, offsets=None, persist: bool = True) -> None:

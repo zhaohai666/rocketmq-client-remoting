@@ -1333,6 +1333,10 @@ final class RunClientFlowControl
         $c->setAutoCommit(false);
         $this->setLiteProp($c, 'started', true);
         $this->setLiteProp($c, 'running', true);
+        // A consumer that is started and running has completed start(), so its service state is
+        // RUNNING -- the gate shutdown() reads before doing anything.
+        $this->setLiteProp($c, 'serviceState',
+            (new \ReflectionClassConstant(DefaultLitePullConsumer::class, 'SERVICE_RUNNING'))->getValue());
         $c->mqClient = $inst;
         $assigned = [];
         $nextOffset = [];

@@ -288,6 +288,59 @@ static void testLitePullAutoCommitIntervalFloor() {
              "a rejected setting leaves the accepted interval running");
 }
 
+// ---------------------------------------------------------------- start state machine
+// Only CREATE_JUST may start. A second start must name the state it observed (RUNNING after a
+// successful start, START_FAILED after a refused one, SHUTDOWN_ALREADY after shutdown) instead of
+// silently returning; a start that throws leaves START_FAILED behind; and a subscription is not a
+// start precondition -- subscribe() while RUNNING is legal.
+static void testLiteStartStateMachine() {
+    DefaultLitePullConsumer c("LiteStateGroup");
+    c.setNamesrvAddr("127.0.0.1:1");
+    // No subscription: a lite consumer may be started and subscribed later.
+    CHECK_EQ(threwMessage([&] { c.start(); }), std::string("none"),
+             "start succeeds without a subscription");
+    CHECK_EQ(c.serviceStateForTest(), std::string("RUNNING"), "state is RUNNING after start");
+    CHECK(refusedWith(threwMessage([&] { c.start(); }),
+                      "The PullConsumer service state not OK, maybe started once, RUNNING"),
+          "a second start is refused with the RUNNING state");
+    c.shutdown();
+    CHECK_EQ(c.serviceStateForTest(), std::string("SHUTDOWN_ALREADY"), "state is SHUTDOWN_ALREADY");
+    CHECK(refusedWith(threwMessage([&] { c.start(); }),
+                      "The PullConsumer service state not OK, maybe started once, SHUTDOWN_ALREADY"),
+          "start after shutdown is refused with the SHUTDOWN_ALREADY state");
+
+    // A refused start leaves START_FAILED behind and the retry names it.
+    DefaultLitePullConsumer badTimestamp("LiteStateBadTimestamp");
+    badTimestamp.setNamesrvAddr("127.0.0.1:1");
+    badTimestamp.setConsumeTimestamp("1700000000000");
+    CHECK(refusedWith(threwMessage([&] { badTimestamp.start(); }), "consumeTimestamp is invalid"),
+          "the malformed timestamp refuses the start");
+    CHECK_EQ(badTimestamp.serviceStateForTest(), std::string("START_FAILED"),
+             "a refused start leaves START_FAILED");
+    CHECK(refusedWith(threwMessage([&] { badTimestamp.start(); }),
+                      "The PullConsumer service state not OK, maybe started once, START_FAILED"),
+          "the retry reports the state the failed start left behind");
+
+    // The suspended-consumer timeout may not undercut the broker's own suspend ceiling.
+    DefaultLitePullConsumer tooShort("LiteStateTooShort");
+    tooShort.setConsumerTimeoutMillisWhenSuspend(19999);
+    CHECK(refusedWith(threwMessage([&] { tooShort.start(); }),
+                      "consumerTimeoutMillisWhenSuspend must be greater than or equal to "
+                      "brokerSuspendMaxTimeMillis"),
+          "a timeout below the broker suspend maximum is refused");
+    CHECK_EQ(tooShort.serviceStateForTest(), std::string("START_FAILED"),
+             "the timeout refusal also leaves START_FAILED");
+
+    // Paired control: the same timeout at the ceiling is accepted.
+    DefaultLitePullConsumer atCeiling("LiteStateAtCeiling");
+    atCeiling.setNamesrvAddr("127.0.0.1:1");
+    atCeiling.setBrokerSuspendMaxTimeMillis(20000);
+    atCeiling.setConsumerTimeoutMillisWhenSuspend(20000);
+    CHECK_EQ(threwMessage([&] { atCeiling.start(); }), std::string("none"),
+             "a timeout equal to the broker suspend maximum starts");
+    atCeiling.shutdown();
+}
+
 // ---------------------------------------------------------------- 221 GetConsumerStatusBody
 static void testGetConsumerStatusBodyWireShape() {
     GetConsumerStatusBody b;
@@ -347,6 +400,7 @@ int main() {
     testLitePullOffsetTable();
     testLitePullConsumeTimestamp();
     testLitePullAutoCommitIntervalFloor();
+    testLiteStartStateMachine();
     testGetConsumerStatusBodyWireShape();
     testConsumeMessageDirectlyResult();
     std::cout << "lite_pull: " << g_pass << " passed, " << g_fail << " failed\n";

@@ -60,16 +60,79 @@ void testStatsItemSampling() {
     StatsItem item("PULL_RT", "T@G");
     item.addValue(100, 2);
     item.sample();
+    // The first sample is preceded by a zero point one period back, so a single sample already
+    // measures a window instead of collapsing to zero.
+    StatsSnapshot seeded = item.getStatsDataInMinute();
+    expectEq(std::to_string(seeded.sum), "100", "first minute sample sum over seed");
+    expectEq(std::to_string(seeded.times), "2", "first minute sample times over seed");
+    expectNear(seeded.tps, 10.0, 1e-9, "first minute sample tps over the 10s seed span");
     item.addValue(200, 2);
     item.sample();
     StatsSnapshot m = item.getStatsDataInMinute();
-    expectEq(std::to_string(m.sum), "200", "minute window sum (differential)");
-    expectEq(std::to_string(m.times), "2", "minute window times");
+    expectEq(std::to_string(m.sum), "300", "minute window sum (differential)");
+    expectEq(std::to_string(m.times), "4", "minute window times");
     // The hour chain samples independently, so the hour-window sum covers only hour points
     item.sampleHour();
     StatsSnapshot h = item.getStatsDataInHour();
-    expectEq(std::to_string(h.sum), "0", "hour chain has single point -> 0");
-    expectEq(std::to_string(h.times), "0", "hour chain times");
+    expectEq(std::to_string(h.sum), "300", "hour chain seeded then cumulative");
+    expectEq(std::to_string(h.times), "4", "hour chain times");
+    expectNear(h.tps, 300.0 / 600.0, 1e-9, "hour chain tps over the 10min seed span");
+    item.sampleDay();
+    StatsSnapshot d = item.getStatsDataInDay();
+    expectEq(std::to_string(d.sum), "300", "day chain seeded then cumulative");
+    expectEq(std::to_string(d.times), "4", "day chain times");
+}
+
+void testStatsChainCaps() {
+    StatsItem item("PULL_RT", "T@G");
+    for (int i = 0; i < 20; ++i) item.sample();
+    expectEq(std::to_string(item.minuteSampleCountForTest()), "7", "minute chain cap");
+    for (int i = 0; i < 20; ++i) item.sampleHour();
+    expectEq(std::to_string(item.hourSampleCountForTest()), "7", "hour chain cap");
+    for (int i = 0; i < 40; ++i) item.sampleDay();
+    expectEq(std::to_string(item.daySampleCountForTest()), "25", "day chain cap");
+}
+
+// The very first sample of each chain is preceded by a seed point one sampling period back with
+// 0/0. The seed's timestamp is observable through the window's span: a first sample carrying
+// `value` yields tps == value / period, and the chain holds exactly seed + current.
+void testFirstSampleIsSeededAtNowMinusPeriod() {
+    const struct {
+        const char* chain;
+        double periodSeconds;
+    } cases[] = {{"minute", kSamplingIntervalSeconds},
+                 {"hour", kHourSamplingIntervalSeconds},
+                 {"day", kDaySamplingIntervalSeconds}};
+    for (const auto& c : cases) {
+        StatsItem item("PULL_RT", std::string("seed@") + c.chain);
+        item.addValue(3600, 1);
+        if (std::string(c.chain) == "minute") {
+            item.sample();
+            expectEq(std::to_string(item.minuteSampleCountForTest()), "2", "minute: seed plus current");
+            expectNear(item.getStatsDataInMinute().tps, 3600.0 / c.periodSeconds, 1e-9,
+                       "minute: first sum spans one 10s seed period");
+        } else if (std::string(c.chain) == "hour") {
+            item.sampleHour();
+            expectEq(std::to_string(item.hourSampleCountForTest()), "2", "hour: seed plus current");
+            expectNear(item.getStatsDataInHour().tps, 3600.0 / c.periodSeconds, 1e-9,
+                       "hour: first sum spans one 10min seed period");
+        } else {
+            item.sampleDay();
+            expectEq(std::to_string(item.daySampleCountForTest()), "2", "day: seed plus current");
+            expectNear(item.getStatsDataInDay().tps, 3600.0 / c.periodSeconds, 1e-9,
+                       "day: first sum spans one 1h seed period");
+        }
+    }
+
+    // A chain sampled with no recorded value is still the 0/0 seed plus a 0/0 point.
+    StatsItem empty("PULL_RT", "empty@seed");
+    empty.sample();
+    empty.sampleHour();
+    empty.sampleDay();
+    expectEq(std::to_string(empty.getStatsDataInMinute().sum), "0", "empty minute sum");
+    expectEq(std::to_string(empty.getStatsDataInMinute().times), "0", "empty minute times");
+    expectEq(std::to_string(empty.getStatsDataInHour().sum), "0", "empty hour sum");
+    expectEq(std::to_string(empty.getStatsDataInDay().sum), "0", "empty day sum");
 }
 
 void testManagerConsumeStatus() {
@@ -148,6 +211,8 @@ void testConsumeStatusJson() {
 int main() {
     testComputeStatsData();
     testStatsItemSampling();
+    testStatsChainCaps();
+    testFirstSampleIsSeededAtNowMinusPeriod();
     testManagerConsumeStatus();
     testStartShutdown();
     testConsumeStatusJson();

@@ -46,6 +46,11 @@ type processQueue struct {
 	consumeOrderly bool
 }
 
+// rebalanceLockMaxLiveTimeMillis is how long an orderly queue lock stays valid
+// after the broker granted it: a grant older than this is treated as unlocked,
+// because the broker may already have handed the queue to another instance.
+const rebalanceLockMaxLiveTimeMillis int64 = 30_000
+
 func newProcessQueue(consumeOrderly bool) *processQueue {
 	return &processQueue{
 		msgs:              map[int64]*common.MessageExt{},
@@ -408,6 +413,14 @@ func (pq *processQueue) IsLocked() bool {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	return pq.locked
+}
+
+// IsLockExpired reports whether the last confirmed grant is older than the
+// lock lifetime, so pulling from this queue would race the next owner.
+func (pq *processQueue) IsLockExpired() bool {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+	return common.CurrentTimeMillis()-pq.lastLockTimestamp > rebalanceLockMaxLiveTimeMillis
 }
 
 // TouchPull stamps "a pull was started", the isPullExpired input.

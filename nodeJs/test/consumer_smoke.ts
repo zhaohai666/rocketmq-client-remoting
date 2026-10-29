@@ -100,18 +100,41 @@ console.log('== LocalFileOffsetStore ==');
   const mq = new MessageQueue('T', 'broker-a', 0);
   store.updateOffset(mq, 42, false);
   await store.persistAll([mq]);
-  // The keys of the offsets file are in the compact inline object shape (the key
-  // itself is a JSON object).
+  // Queue keys are inline JSON objects, not quoted strings.
   const file = path.join(base, 'cid1', 'g1', 'offsets.json');
-  const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-  const keys = Object.keys(raw.offsetTable);
-  check('file key is the fastjson2 object-key shape',
-    keys.length === 1 && JSON.parse(keys[0]).topic === 'T' && JSON.parse(keys[0]).queueId === 0);
+  const text = fs.readFileSync(file, 'utf8');
+  check('file key is an inline JSON object',
+    text.includes('"offsetTable"')
+    && text.includes('{"brokerName":"broker-a","queueId":0,"topic":"T"}:42'), text);
+  check('the key is not a quoted string', !/"offsetTable":\{"\{/.test(text), text);
 
   const store2 = new LocalFileOffsetStore('cid1', 'g1', base);
   await store2.load();
   const back = await store2.readOffset(mq, ReadOffsetMode.READ_FROM_STORE);
   check('load round-trips offset 42', back === 42);
+
+  // A quoted-string key from an older file is still understood.
+  const quoted = new MessageQueue('Q', 'broker-q', 3);
+  fs.writeFileSync(file, JSON.stringify({
+    offsetTable: { [JSON.stringify({ brokerName: 'broker-q', queueId: 3, topic: 'Q' })]: 9 },
+  }));
+  const storeQuoted = new LocalFileOffsetStore('cid1', 'g1', base);
+  await storeQuoted.load();
+  check('a quoted-string key is accepted on read',
+    (await storeQuoted.readOffset(quoted, ReadOffsetMode.READ_FROM_STORE)) === 9);
+
+  // A queue absent from this flush survives it.
+  const survivor = new MessageQueue('S', 'broker-s', 1);
+  fs.writeFileSync(file, `{"offsetTable":{{"brokerName":"broker-s","queueId":1,"topic":"S"}:77}}`);
+  store.updateOffset(mq, 43, false);
+  await store.persistAll([mq]);
+  const mergedText = fs.readFileSync(file, 'utf8');
+  check('persistAll keeps an entry it did not flush', /"topic":"S"\}:77/.test(mergedText), mergedText);
+  const storeMerged = new LocalFileOffsetStore('cid1', 'g1', base);
+  await storeMerged.load();
+  check('the flushed queue and the survivor are both on disk',
+    (await storeMerged.readOffset(mq, ReadOffsetMode.READ_FROM_STORE)) === 43
+    && (await storeMerged.readOffset(survivor, ReadOffsetMode.READ_FROM_STORE)) === 77);
 
   // Corrupt file → empty table + warning, not an error.
   fs.writeFileSync(file, 'NOT JSON{{{');

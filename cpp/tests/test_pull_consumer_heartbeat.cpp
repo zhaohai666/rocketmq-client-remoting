@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -14,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/lite_pull_consumer.h"
 #include "rocketmq/client/pull_consumer.h"
@@ -184,6 +187,24 @@ public:
         return unregisters_[i];
     }
 
+    /// Whether this request code was ever received (offset-store selection is judged on the wire).
+    bool sawCode(int32_t code) {
+        std::lock_guard<std::mutex> lk(state_);
+        for (int32_t c : codes_) {
+            if (c == code) return true;
+        }
+        return false;
+    }
+
+    size_t countCode(int32_t code) {
+        std::lock_guard<std::mutex> lk(state_);
+        size_t n = 0;
+        for (int32_t c : codes_) {
+            if (c == code) ++n;
+        }
+        return n;
+    }
+
     static bool decodeConsumerData(const std::string& body, ConsumerData& out) {
         JsonValue v;
         std::string err;
@@ -195,6 +216,23 @@ public:
     }
 
 private:
+    static std::string offsetWireKey(const PropertyMap& ext) {
+        auto at = [&ext](const char* k) {
+            auto it = ext.find(k);
+            return it == ext.end() ? std::string() : it->second;
+        };
+        return at("consumerGroup") + "|" + at("topic") + "|" + at("queueId");
+    }
+
+    static int64_t wireInt(const PropertyMap& ext, const char* key) {
+        auto it = ext.find(key);
+        if (it == ext.end()) return -1;
+        try {
+            return std::stoll(it->second);
+        } catch (...) {
+            return -1;
+        }
+    }
     void acceptLoop() {
         while (running_.load()) {
             fd_set rfds;
@@ -218,6 +256,10 @@ private:
         while (running_.load() && readFrame(sock, running_, frame)) {
             RemotingCommand req;
             if (!RemotingCommand::tryDecode(frame, req, nullptr)) break;
+            {
+                std::lock_guard<std::mutex> lk(state_);
+                codes_.push_back(req.code);
+            }
             RemotingCommand resp;
             resp.opaque = req.opaque;
             resp.markResponseType();
@@ -241,6 +283,19 @@ private:
                 std::lock_guard<std::mutex> lk(state_);
                 unregisters_.push_back(req.extFields);
                 resp.code = ResponseCode::SUCCESS;
+            } else if (req.code == RequestCode::UPDATE_CONSUMER_OFFSET) {
+                std::lock_guard<std::mutex> lk(state_);
+                brokerOffsets_[offsetWireKey(req.extFields)] = wireInt(req.extFields, "commitOffset");
+                resp.code = ResponseCode::SUCCESS;
+            } else if (req.code == RequestCode::QUERY_CONSUMER_OFFSET) {
+                std::lock_guard<std::mutex> lk(state_);
+                auto it = brokerOffsets_.find(offsetWireKey(req.extFields));
+                if (it == brokerOffsets_.end()) {
+                    resp.code = ResponseCode::QUERY_NOT_FOUND;
+                } else {
+                    resp.code = ResponseCode::SUCCESS;
+                    resp.extFields["offset"] = std::to_string(it->second);
+                }
             } else {
                 resp.code = ResponseCode::SUCCESS;
             }
@@ -258,6 +313,8 @@ private:
     std::map<std::string, Bytes> routes_;
     std::vector<std::string> heartbeats_;
     std::vector<PropertyMap> unregisters_;
+    std::vector<int32_t> codes_;
+    std::map<std::string, int64_t> brokerOffsets_;
     std::mutex workersM_;
     std::vector<std::thread> workers_;
     std::thread acceptor_;
@@ -305,6 +362,52 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
     }
     return fn();
 }
+
+// Point HOME at a throw-away directory: the broadcasting offset store is rooted at $HOME.
+void setHomeEnv(const char* value) {
+#if defined(_WIN32)
+    _putenv_s("HOME", value);
+#else
+    setenv("HOME", value, 1);
+#endif
+}
+
+void clearHomeEnv() {
+#if defined(_WIN32)
+    _putenv_s("HOME", "");
+#else
+    unsetenv("HOME");
+#endif
+}
+
+class ScopedHome {
+public:
+    explicit ScopedHome(const char* tag) {
+        const char* old = std::getenv("HOME");
+        if (old != nullptr) old_ = old;
+        dir_ = (std::filesystem::temp_directory_path() /
+                ("rmq_pull_home_" + std::string(tag) + "_" +
+                 std::to_string(UtilAll::currentTimeMillis())))
+                   .string();
+        std::error_code ec;
+        std::filesystem::create_directories(dir_, ec);
+        setHomeEnv(dir_.c_str());
+    }
+    ~ScopedHome() {
+        if (old_.empty()) {
+            clearHomeEnv();
+        } else {
+            setHomeEnv(old_.c_str());
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+    const std::string& path() const { return dir_; }
+
+private:
+    std::string dir_;
+    std::string old_;
+};
 
 // ---------------------------------------------------------------- 1. start registers immediately
 
@@ -485,6 +588,78 @@ void testLitePullHeartbeatIsActivelyTyped() {
     consumer.shutdown();
 }
 
+// ---------------------------------------------------------------- 7. offset store selection
+
+void testPullBroadcastingKeepsOffsetsLocal() {
+    ScopedHome home("broadcast_offsets");
+    MockEndpoint namesrv;
+    MockEndpoint broker;
+    namesrv.addRoute(kTopic, routeOne(kBroker, MixAll::MASTER_ID, broker.address()));
+
+    DefaultMQPullConsumer consumer("PG_PullBroadcastOffsets");
+    consumer.setInstanceName("pull_broadcast_offsets");
+    consumer.setNamesrvAddr(namesrv.address());
+    consumer.setMessageModel(MessageModel::BROADCASTING);
+    auto listener = std::make_shared<NoopListener>();
+    consumer.registerMessageQueueListener(kTopic, listener);
+    consumer.start();
+    expect(waitFor([&] { return broker.heartbeatCount() >= 1; }),
+           "precondition: the broker is reachable, so any offset RPC would be observed");
+
+    const MessageQueue mq(kTopic, kBroker, 0);
+    int64_t missing = -1;
+    expect(!consumer.fetchConsumeOffset(mq, missing),
+           "broadcasting has no offset before one is committed");
+
+    consumer.updateConsumeOffset(mq, 12);
+    int64_t fetched = -1;
+    const bool answered = consumer.fetchConsumeOffset(mq, fetched);
+    expect(answered && fetched == 12, "broadcasting answers the offset it committed",
+           "answered=" + std::string(answered ? "yes" : "no") + " offset=" + std::to_string(fetched));
+
+    const std::string path = home.path() + "/.rocketmq_offsets/" + consumer.clientId() +
+                             "/PG_PullBroadcastOffsets/offsets.json";
+    const std::map<std::string, int64_t> table = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    expect(table.count(key) && table.at(key) == 12,
+           "broadcasting commit lands in the local offset file under the queue key");
+
+    expect(!broker.sawCode(RequestCode::UPDATE_CONSUMER_OFFSET),
+           "broadcasting never sends UPDATE_CONSUMER_OFFSET");
+    expect(!broker.sawCode(RequestCode::QUERY_CONSUMER_OFFSET),
+           "broadcasting never sends QUERY_CONSUMER_OFFSET");
+    consumer.shutdown();
+}
+
+void testPullClusteringUsesBrokerOffsets() {
+    MockEndpoint namesrv;
+    MockEndpoint broker;
+    namesrv.addRoute(kTopic, routeOne(kBroker, MixAll::MASTER_ID, broker.address()));
+
+    DefaultMQPullConsumer consumer("PG_PullClusterOffsets");
+    consumer.setInstanceName("pull_cluster_offsets");
+    consumer.setNamesrvAddr(namesrv.address());
+    consumer.setMessageModel(MessageModel::CLUSTERING);
+    auto listener = std::make_shared<NoopListener>();
+    consumer.registerMessageQueueListener(kTopic, listener);
+    consumer.start();
+    expect(waitFor([&] { return broker.heartbeatCount() >= 1; }),
+           "precondition: the broker is reachable");
+
+    const MessageQueue mq(kTopic, kBroker, 0);
+    consumer.updateConsumeOffset(mq, 21);
+    expect(waitFor([&] { return broker.sawCode(RequestCode::UPDATE_CONSUMER_OFFSET); }),
+           "clustering sends UPDATE_CONSUMER_OFFSET to the broker");
+
+    int64_t fetched = -1;
+    const bool answered = consumer.fetchConsumeOffset(mq, fetched);
+    expect(answered && fetched == 21, "clustering reads the offset back from the broker",
+           "answered=" + std::string(answered ? "yes" : "no") + " offset=" + std::to_string(fetched));
+    expect(broker.sawCode(RequestCode::QUERY_CONSUMER_OFFSET),
+           "clustering sends QUERY_CONSUMER_OFFSET to the broker");
+    consumer.shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -494,6 +669,8 @@ int main() {
     testHeartbeatLoopRepeats();
     testShutdownUnregistersTheGroupOnEveryBroker();
     testLitePullHeartbeatIsActivelyTyped();
+    testPullBroadcastingKeepsOffsetsLocal();
+    testPullClusteringUsesBrokerOffsets();
     std::printf("%d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

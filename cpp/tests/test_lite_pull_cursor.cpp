@@ -14,7 +14,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -691,7 +693,120 @@ void testTimestampStartUsesTheConfiguredInstant() {
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 6. LitePull cache flow control
+// ---------------------------------------------------------------- 6. Offset store selection
+
+// The lite pull consumer keeps BROADCASTING progress in the local offset file and never talks to the
+// broker's commit table; CLUSTERING keeps talking to the broker. Two hosts of one broadcast group
+// sharing a broker-side commit would overwrite each other's progress, so the local file is the
+// contract, not an optimization.
+namespace {
+
+void setHomeEnv(const char* value) {
+#if defined(_WIN32)
+    _putenv_s("HOME", value);
+#else
+    setenv("HOME", value, 1);
+#endif
+}
+
+void clearHomeEnv() {
+#if defined(_WIN32)
+    _putenv_s("HOME", "");
+#else
+    unsetenv("HOME");
+#endif
+}
+
+class ScopedHome {
+public:
+    explicit ScopedHome(const char* tag) {
+        const char* old = std::getenv("HOME");
+        if (old != nullptr) old_ = old;
+        dir_ = (std::filesystem::temp_directory_path() /
+                ("rmq_lite_home_" + std::string(tag) + "_" +
+                 std::to_string(UtilAll::currentTimeMillis())))
+                   .string();
+        std::error_code ec;
+        std::filesystem::create_directories(dir_, ec);
+        setHomeEnv(dir_.c_str());
+    }
+    ~ScopedHome() {
+        if (old_.empty()) {
+            clearHomeEnv();
+        } else {
+            setHomeEnv(old_.c_str());
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+    const std::string& path() const { return dir_; }
+
+private:
+    std::string dir_;
+    std::string old_;
+};
+
+}  // namespace
+
+void testLiteBroadcastingKeepsOffsetsLocal() {
+    ScopedHome home("lite_broadcast");
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+
+    auto c = std::make_unique<DefaultLitePullConsumer>("LitePG_BroadcastOffsets");
+    c->setInstanceName("lite_broadcast_offsets");
+    c->setNamesrvAddr(cluster.address());
+    c->setMessageModel(MessageModel::BROADCASTING);
+    c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c->setAutoCommit(false);
+    c->assign({queue0()});
+    c->start();
+
+    const MessageQueue mq = queue0();
+    std::map<MessageQueue, int64_t> offsets;
+    offsets[mq] = 5;
+    c->commit(offsets, /*persist=*/true);
+
+    const std::string path = home.path() + "/.rocketmq_offsets/" + c->clientId() +
+                             "/LitePG_BroadcastOffsets/offsets.json";
+    const auto table = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
+    const std::string key = DefaultMQPushConsumer::offsetKey(mq);
+    expect(table.count(key) && table.at(key) == 5,
+           "broadcasting commit lands in the local offset file");
+    expectInt(c->committed(mq), 5, "committed() answers the committed value");
+    expect(!cluster.sawRequest(RequestCode::UPDATE_CONSUMER_OFFSET),
+           "broadcasting never sends UPDATE_CONSUMER_OFFSET");
+    expect(!cluster.sawRequest(RequestCode::QUERY_CONSUMER_OFFSET),
+           "broadcasting never sends QUERY_CONSUMER_OFFSET");
+    c->shutdown();
+}
+
+void testLiteClusteringStillUsesTheBroker() {
+    MockEndpoint cluster;
+    cluster.addRoute(kTopic, routeMaster(cluster.address()));
+
+    auto c = std::make_unique<DefaultLitePullConsumer>("LitePG_ClusterOffsets");
+    c->setInstanceName("lite_cluster_offsets");
+    c->setNamesrvAddr(cluster.address());
+    c->setMessageModel(MessageModel::CLUSTERING);
+    c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c->setAutoCommit(false);
+    c->assign({queue0()});
+    c->start();
+
+    const MessageQueue mq = queue0();
+    std::map<MessageQueue, int64_t> offsets;
+    offsets[mq] = 6;
+    c->commit(offsets, /*persist=*/true);
+
+    expect(waitFor([&] { return cluster.sawRequest(RequestCode::UPDATE_CONSUMER_OFFSET); }),
+           "clustering still sends UPDATE_CONSUMER_OFFSET to the broker");
+    expect(!cluster.sawRequest(RequestCode::LOCK_BATCH_MQ),
+           "a lite consumer sends no orderly lock traffic");
+    c->shutdown();
+}
+
+// ---------------------------------------------------------------- 7. LitePull cache flow control
 
 namespace {
 
@@ -1297,6 +1412,8 @@ int main() {
     testLitePullCarriesTheLiteCodeAndFlag();
     testLastStartSkipsTheBacklogExceptOnTheRetryQueue();
     testTimestampStartUsesTheConfiguredInstant();
+    testLiteBroadcastingKeepsOffsetsLocal();
+    testLiteClusteringStillUsesTheBroker();
     testLiteCacheCountStrictBoundary();
     testLiteCacheCountIsPerQueueNotSummed();
     testLiteCacheSizeIsPerQueueNotSummed();

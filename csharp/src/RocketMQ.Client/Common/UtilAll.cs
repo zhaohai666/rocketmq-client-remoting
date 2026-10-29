@@ -363,7 +363,7 @@ internal static class IpParse
 
 /// <summary>
 /// The C# counterpart of MessageClientIDSetter:
-/// IP(4|16B) + PID(2B) + hash(4B) + millis-of-day(4B) + auto-increment(2B).
+/// IP(4|16B) + PID(2B) + hash(4B) + millis-since-start-of-month(4B) + auto-increment(2B).
 /// </summary>
 public static class InnerIdGenerator
 {
@@ -402,10 +402,19 @@ public static class InnerIdGenerator
 
         writer.WriteUInt32(unchecked((uint)classHash));
 
+        // Millisecond precision anchored at the start of the current month:
+        // callers recover the instant from this segment, so it must not be
+        // truncated to seconds nor anchored at the start of the day.
         var now = DateTimeOffset.Now;
-        uint dayMs = unchecked(
-            (uint)((((now.Hour * 60) + now.Minute) * 60 + now.Second) * 1000));
-        writer.WriteUInt32(dayMs);
+        var monthStart = new DateTimeOffset(now.Year, now.Month, 1, 0, 0, 0, now.Offset);
+        long monthMs = (long)(now - monthStart).TotalMilliseconds;
+        if (monthMs < 0)
+        {
+            // A clock that stepped backwards must not wrap the 4-byte field
+            monthMs = 0;
+        }
+
+        writer.WriteUInt32(unchecked((uint)monthMs));
 
         writer.WriteInt16(unchecked((short)(c & 0xFFFF)));
 

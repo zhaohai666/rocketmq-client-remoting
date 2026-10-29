@@ -7,6 +7,7 @@ import zlib
 from typing import Dict, List, Optional
 
 from .mix_all import MixAll
+from .message_const import MessageConst
 
 
 class MessageQueue:
@@ -256,7 +257,12 @@ class MessageExt(Message):
         self.store_host = store_host
 
     def get_msg_id(self) -> Optional[str]:
-        return self.msg_id
+        # Received messages carry the producer-generated unique key as a property; when present it is
+        # the canonical id, while the store-path id stays available as the offset message id.
+        uniq_key = self.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+        if uniq_key:
+            return uniq_key
+        return self.offset_msg_id or self.msg_id
 
     def set_msg_id(self, msg_id: Optional[str]) -> None:
         self.msg_id = msg_id

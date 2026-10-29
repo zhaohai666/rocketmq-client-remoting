@@ -189,6 +189,10 @@ public:
     void unsubscribe(const std::string& topic);
 
     // ---------------- Lifecycle ----------------
+    enum class ServiceState { CREATE_JUST, RUNNING, START_FAILED, SHUTDOWN_ALREADY };
+    static std::string serviceStateName(ServiceState state);
+    // The lifecycle state start() sees: a second start must report why it was refused.
+    std::string serviceStateForTest() const { return serviceStateName(serviceState_.load()); }
     void start();
     void shutdown();
 
@@ -267,6 +271,9 @@ private:
 
     void rebalance();
     void metadataLoop();
+    // The up-front configuration checks of start(): group, message model, allocate strategy and the
+    // suspend timeout pairing. A subscription is deliberately not required -- it may arrive while running.
+    void checkConfig();
     // Claims one of the two mutually exclusive modes: the first subscribe()/assign()/
     // setSubExpressionForAssign() decides, and a later call that claims the other
     // mode is refused.
@@ -378,6 +385,7 @@ private:
     std::unique_ptr<MQClientInstance> mqClient_;
     std::atomic<bool> started_{false};
     std::atomic<bool> running_{false};
+    std::atomic<ServiceState> serviceState_{ServiceState::CREATE_JUST};
 
     std::mutex bufferMutex_;
     std::condition_variable bufferCv_;

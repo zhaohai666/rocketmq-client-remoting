@@ -15,7 +15,7 @@ from common.message import MessageExt, MessageQueue
 from common.subscription_data import ExpressionType
 from common.sysflag import PullSysFlag
 from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType
+from remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType, MessageModel
 from remoting.protocol.remoting_command import RemotingCommand
 
 
@@ -174,11 +174,70 @@ class TestLifecycle:
         with pytest.raises(MQClientException):
             c.start()
 
-    def test_start_without_subscription_or_assign_raises(self):
+    def test_start_without_subscription_succeeds_and_late_subscribe_wires_route_and_heartbeat(self):
         c = _Lite("LitePG_UT", _store=STORE)
         c.set_namesrv_addr("127.0.0.1:9876")
+        beats = []
+
+        def _record_heartbeat():
+            beats.append(c._build_heartbeat())
+            return 0
+
+        c._send_heartbeat_to_all_broker = _record_heartbeat
+        c._start_heartbeat_loop = lambda: None
+        c.start()
+        try:
+            assert c._started is True
+            c._mock.events.clear()
+            beats.clear()
+            c.subscribe("T", "TagA")
+            assert c.subscription["T"] == "TagA"
+            assert c._mock.events == ["register:T", "route:T"]
+            assert len(beats) == 1
+            subs = list(beats[0].consumer_data_set)[0].subscription_data_set
+            assert [s.topic for s in subs] == ["T"]
+        finally:
+            c.shutdown()
+
+    def test_start_state_machine_messages(self):
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.start()
+        try:
+            with pytest.raises(MQClientException) as running:
+                c.start()
+            assert str(running.value) == (
+                "The PullConsumer service state not OK, maybe started once, RUNNING")
+        finally:
+            c.shutdown()
+        with pytest.raises(MQClientException) as stopped:
+            c.start()
+        assert str(stopped.value) == (
+            "The PullConsumer service state not OK, maybe started once, SHUTDOWN_ALREADY")
+
+    def test_failed_start_is_latched(self):
+        c = _Lite("LitePG_UT", _store=STORE)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.set_consume_timestamp("1700000000000")
         with pytest.raises(MQClientException):
             c.start()
+        with pytest.raises(MQClientException) as failed:
+            c.start()
+        assert str(failed.value) == (
+            "The PullConsumer service state not OK, maybe started once, START_FAILED")
+
+    def test_check_config_rejects_invalid_model_and_timeout(self):
+        bad_model = _Lite("LitePG_UT", _store=STORE)
+        bad_model.set_namesrv_addr("127.0.0.1:9876")
+        bad_model.message_model = "NOT_A_MODEL"
+        with pytest.raises(MQClientException, match="messageModel is null"):
+            bad_model.start()
+
+        bad_timeout = _Lite("LitePG_UT", _store=STORE)
+        bad_timeout.set_namesrv_addr("127.0.0.1:9876")
+        bad_timeout.set_consumer_timeout_millis_when_suspend(1000)
+        with pytest.raises(MQClientException, match="consumerTimeoutMillisWhenSuspend"):
+            bad_timeout.start()
 
     def test_shutdown_before_start_is_noop(self):
         c = _Lite("LitePG_UT", _store=STORE)
@@ -224,12 +283,15 @@ class TestLifecycle:
         with pytest.raises(MQClientException, match="consumeTimestamp is invalid"):
             c.start()
         # A legal value must not be killed by this startup guard
-        c.set_consume_timestamp("20230101000000")
-        c.start()
+        fresh = _Lite("LitePG_UT", _store=STORE)
+        fresh.set_namesrv_addr("127.0.0.1:9876")
+        fresh.assign([MessageQueue("T", "broker-a", 0)])
+        fresh.set_consume_timestamp("20230101000000")
+        fresh.start()
         try:
-            assert c._started is True
+            assert fresh._started is True
         finally:
-            c.shutdown()
+            fresh.shutdown()
 
     def test_heartbeat_declares_consume_actively_per_the_wire_contract(self):
         c = _Lite("LitePG_UT", _store=STORE)
@@ -262,6 +324,28 @@ class TestLifecycle:
             assert "register:T" in assigned._mock.events, assigned._mock.events
         finally:
             assigned.shutdown()
+
+
+class TestBroadcastOffsetStore:
+    def test_commit_and_read_stay_in_the_local_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mq = MessageQueue("TBcast", "broker-a", 0)
+        c = _Lite("LitePG_Bcast", _store=STORE,
+                  message_model=MessageModel.BROADCASTING)
+        c.set_auto_commit(False)
+        c.set_namesrv_addr("127.0.0.1:9876")
+        c.assign([mq])
+        c.start()
+        try:
+            c.commit({mq: 4})
+            assert c._mock.updates == []
+            assert c._load_local_offsets()["TBcastbroker-a0"] == 4
+            c._offset_table.clear()
+            assert c.committed(mq) == 4
+            assert c._mock.queries == []
+        finally:
+            c.shutdown()
+        assert c._mock.updates == []
 
 
 class TestAssignMode:

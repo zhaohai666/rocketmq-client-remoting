@@ -101,6 +101,31 @@ const (
 	liteModeAssign
 )
 
+// The lite consumer's service state, mirroring the classic lifecycle: only a
+// never-started consumer may start, a successful start becomes RUNNING, and a
+// shutdown of a running consumer becomes SHUTDOWN_ALREADY forever.
+const (
+	liteStateCreateJust = iota
+	liteStateStartFailed
+	liteStateRunning
+	liteStateShutdownAlready
+)
+
+func liteStateName(state int) string {
+	switch state {
+	case liteStateCreateJust:
+		return "CREATE_JUST"
+	case liteStateStartFailed:
+		return "START_FAILED"
+	case liteStateRunning:
+		return "RUNNING"
+	case liteStateShutdownAlready:
+		return "SHUTDOWN_ALREADY"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 type TopicMessageQueueChangeListener interface {
 	OnChanged(topic string, messageQueues []common.MessageQueue)
 }
@@ -143,6 +168,12 @@ type DefaultLitePullConsumer struct {
 	autoCommit               bool
 	autoCommitIntervalMillis int64
 	pullIntervalMillis       int64
+	// Long-poll pair. The broker may hold a request for
+	// brokerSuspendMaxTimeMillis; the client must therefore wait at least that
+	// long (consumerTimeoutMillisWhenSuspend) or it would give up on a request
+	// the broker still considers alive.
+	brokerSuspendMaxTimeMillis       int64
+	consumerTimeoutMillisWhenSuspend int64
 
 	// The cache budgets, all four judged per queue BEFORE a pull request is
 	// built. They are plain budgets: no clamping, and a value of 0 trips on the
@@ -192,8 +223,14 @@ type DefaultLitePullConsumer struct {
 	// ---- runtime ----
 	instance *Instance
 	pullAPI  *pullAPI
-	started  bool
-	stopCh   chan struct{}
+	// offsetStore is chosen at Start by message model: broadcasting keeps its
+	// committed offsets in the local file, clustering asks the broker.
+	offsetStore OffsetStore
+	// serviceState is the start/stop state machine; started mirrors RUNNING
+	// for the hot paths that only care about "is it serving".
+	serviceState int
+	started      bool
+	stopCh       chan struct{}
 
 	// buffer + its own wakeup channel: Poll waits on bufNotify, the pull
 	// loop drops one token in per enqueue. A single token is enough — every
@@ -214,42 +251,44 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		return nil, err
 	}
 	return &DefaultLitePullConsumer{
-		consumerGroup:              group,
-		instanceName:               common.DefaultInstanceName,
-		messageModel:               MessageModelClustering,
-		consumeFromWhere:           ConsumeFromWhereLastOffset,
-		consumeTimestamp:           defaultConsumeTimestamp(),
-		pollNamesrvIntv:            defaultConsumerPollNamesrvInterval,
-		decodeReadBody:             true,
-		mqClientAPITimeoutMillis:   DefaultMQClientAPITimeoutMillis,
-		pullBatchSize:              DefaultLitePullBatchSize,
-		pollTimeoutMillis:          DefaultLitePollTimeoutMillis,
-		autoCommit:                 true,
-		autoCommitIntervalMillis:   DefaultLiteAutoCommitIntervalMillis,
-		pullIntervalMillis:         DefaultLitePullIntervalMillis,
-		pullThresholdForAll:        DefaultLitePullThresholdForAll,
-		pullThresholdForQueue:      DefaultLitePullThresholdForQueue,
-		pullThresholdSizeForQueue:  DefaultLitePullThresholdSizeForQueue,
-		consumeMaxSpan:             DefaultLiteConsumeMaxSpan,
-		pullPause:                  map[common.MessageQueue]litePullPause{},
-		streamRequest:              true,
-		allocateStrategy:           AllocateMessageQueueAveragely{},
-		subscription:               map[string]string{},
-		subscriptionData:           map[string]*remoting.SubscriptionData{},
-		assignSubExpr:              map[string]string{},
-		assigned:                   map[common.MessageQueue]struct{}{},
-		nextOffset:                 map[common.MessageQueue]int64{},
-		consumeOffset:              map[common.MessageQueue]int64{},
-		offsetTable:                map[common.MessageQueue]int64{},
-		seekOffset:                 map[common.MessageQueue]int64{},
-		paused:                     map[common.MessageQueue]struct{}{},
-		nextAutoCommitDeadline:     -1,
-		topicChangeListeners:       map[string]TopicMessageQueueChangeListener{},
-		messageQueuesForTopic:      map[string][]common.MessageQueue{},
-		topicMetadataCheckInterval: DefaultLiteTopicMetadataCheckIntervalMillis,
-		stopCh:                     make(chan struct{}),
-		bufNotify:                  make(chan struct{}, 1),
-		cacheStats:                 map[common.MessageQueue]*liteQueueCache{},
+		consumerGroup:                    group,
+		instanceName:                     common.DefaultInstanceName,
+		messageModel:                     MessageModelClustering,
+		consumeFromWhere:                 ConsumeFromWhereLastOffset,
+		consumeTimestamp:                 defaultConsumeTimestamp(),
+		pollNamesrvIntv:                  defaultConsumerPollNamesrvInterval,
+		decodeReadBody:                   true,
+		mqClientAPITimeoutMillis:         DefaultMQClientAPITimeoutMillis,
+		pullBatchSize:                    DefaultLitePullBatchSize,
+		pollTimeoutMillis:                DefaultLitePollTimeoutMillis,
+		autoCommit:                       true,
+		autoCommitIntervalMillis:         DefaultLiteAutoCommitIntervalMillis,
+		pullIntervalMillis:               DefaultLitePullIntervalMillis,
+		brokerSuspendMaxTimeMillis:       DefaultBrokerSuspendMaxTimeMillis,
+		consumerTimeoutMillisWhenSuspend: DefaultConsumerTimeoutMillisWhenSuspend,
+		pullThresholdForAll:              DefaultLitePullThresholdForAll,
+		pullThresholdForQueue:            DefaultLitePullThresholdForQueue,
+		pullThresholdSizeForQueue:        DefaultLitePullThresholdSizeForQueue,
+		consumeMaxSpan:                   DefaultLiteConsumeMaxSpan,
+		pullPause:                        map[common.MessageQueue]litePullPause{},
+		streamRequest:                    true,
+		allocateStrategy:                 AllocateMessageQueueAveragely{},
+		subscription:                     map[string]string{},
+		subscriptionData:                 map[string]*remoting.SubscriptionData{},
+		assignSubExpr:                    map[string]string{},
+		assigned:                         map[common.MessageQueue]struct{}{},
+		nextOffset:                       map[common.MessageQueue]int64{},
+		consumeOffset:                    map[common.MessageQueue]int64{},
+		offsetTable:                      map[common.MessageQueue]int64{},
+		seekOffset:                       map[common.MessageQueue]int64{},
+		paused:                           map[common.MessageQueue]struct{}{},
+		nextAutoCommitDeadline:           -1,
+		topicChangeListeners:             map[string]TopicMessageQueueChangeListener{},
+		messageQueuesForTopic:            map[string][]common.MessageQueue{},
+		topicMetadataCheckInterval:       DefaultLiteTopicMetadataCheckIntervalMillis,
+		stopCh:                           make(chan struct{}),
+		bufNotify:                        make(chan struct{}, 1),
+		cacheStats:                       map[common.MessageQueue]*liteQueueCache{},
 	}, nil
 }
 
@@ -426,6 +465,36 @@ func (c *DefaultLitePullConsumer) SetPollNameServerInterval(millis int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pollNamesrvIntv = millis
+}
+
+// SetBrokerSuspendMaxTimeMillis sets how long the broker may hold a long-poll
+// request (default 20s). Start refuses a client budget below it.
+func (c *DefaultLitePullConsumer) SetBrokerSuspendMaxTimeMillis(v int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.brokerSuspendMaxTimeMillis = v
+}
+
+// BrokerSuspendMaxTimeMillis reports the broker-side suspend budget.
+func (c *DefaultLitePullConsumer) BrokerSuspendMaxTimeMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.brokerSuspendMaxTimeMillis
+}
+
+// SetConsumerTimeoutMillisWhenSuspend sets the client's long-poll budget
+// (default 30s); it must not fall below BrokerSuspendMaxTimeMillis.
+func (c *DefaultLitePullConsumer) SetConsumerTimeoutMillisWhenSuspend(v int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.consumerTimeoutMillisWhenSuspend = v
+}
+
+// ConsumerTimeoutMillisWhenSuspend reports the client's long-poll budget.
+func (c *DefaultLitePullConsumer) ConsumerTimeoutMillisWhenSuspend() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.consumerTimeoutMillisWhenSuspend
 }
 
 // SetPullBatchSize sets how many messages one pull request asks for. The value is
@@ -702,12 +771,25 @@ func (c *DefaultLitePullConsumer) Subscribe(topic, subExpression string) error {
 		return err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := c.claimModeLocked(liteModeSubscribe); err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	c.subscription[topic] = subExpression
 	c.subscriptionData[topic] = sub
+	instance := c.instance
+	running := c.started
+	c.mu.Unlock()
+	if running && instance != nil {
+		// A subscription added while RUNNING needs its route and its heartbeat
+		// now: the rebalance loop only reads the cached route table, and the
+		// broker only learns the expression from a fresh heartbeat.
+		instance.RegisterTopicInUse(topic)
+		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
+			common.LogDebugf("lite subscribe: route refresh for %s failed: %v", topic, err)
+		}
+		c.sendHeartbeatToAllBrokers()
+	}
 	return nil
 }
 
@@ -884,13 +966,18 @@ func (c *DefaultLitePullConsumer) Resume(mqs []common.MessageQueue) {
 
 // Start validates the config, opens the instance, resolves initial offsets
 // for assign-mode queues, registers the group, and spawns the two background
-// loops (self-heartbeat + pull). Idempotent.
+// loops (self-heartbeat + pull). Only a consumer that was never started may
+// start; a second Start and a Start after Shutdown are refused.
 func (c *DefaultLitePullConsumer) Start() error {
 	c.mu.Lock()
-	if c.started {
+	if c.serviceState != liteStateCreateJust {
+		state := liteStateName(c.serviceState)
 		c.mu.Unlock()
-		return nil
+		return common.ClientError("The PullConsumer service state not OK, maybe started once, " + state)
 	}
+	// A failed start is latched: part of the engine may already be registered,
+	// so the caller must build a new consumer instead of retrying this one.
+	c.serviceState = liteStateStartFailed
 	if err := c.checkConfigLocked(); err != nil {
 		c.mu.Unlock()
 		return err
@@ -934,7 +1021,14 @@ func (c *DefaultLitePullConsumer) Start() error {
 	c.mu.Lock()
 	instance.RegisterConsumerGroup(c.consumerGroup)
 	c.pullAPI = newPullAPI(instance, c.consumerGroup)
+	if c.messageModel == MessageModelBroadcasting {
+		c.offsetStore = NewLocalFileOffsetStore(c.clientID, c.consumerGroup)
+	} else {
+		c.offsetStore = NewRemoteBrokerOffsetStore(instance, c.consumerGroup)
+	}
+	store := c.offsetStore
 	c.started = true
+	c.serviceState = liteStateRunning
 	topics := make([]string, 0, len(c.subscription))
 	for t := range c.subscription {
 		topics = append(topics, t)
@@ -945,6 +1039,10 @@ func (c *DefaultLitePullConsumer) Start() error {
 		}
 	}
 	c.mu.Unlock()
+
+	if err := store.Load(); err != nil {
+		common.LogWarnf("lite start: load offset store failed for %s: %v", c.consumerGroup, err)
+	}
 
 	// Refresh routes FIRST so the assign-mode offset resolution below (and the
 	// synchronous heartbeat after it) can actually reach a broker: the
@@ -980,11 +1078,22 @@ func (c *DefaultLitePullConsumer) checkConfigLocked() error {
 	if len(c.nameServerAddrs) == 0 {
 		return common.ClientError("name server address is not set")
 	}
-	if len(c.subscription) == 0 && c.mode != liteModeAssign {
-		return common.ClientError("subscription is not set, call subscribe() or assign() first")
+	if c.messageModel == "" {
+		return common.ClientError("messageModel is null")
 	}
+	if c.allocateStrategy == nil {
+		return common.ClientError("allocateMessageQueueStrategy is null")
+	}
+	// A subscription is deliberately NOT required: subscribe() may be called
+	// while the consumer is running.
 	if _, err := parseConsumeTimestamp(c.consumeTimestamp); err != nil {
 		return err
+	}
+	// The long poll can only work if the CLIENT waits longer than the BROKER
+	// is allowed to hold the request.
+	if c.consumerTimeoutMillisWhenSuspend < c.brokerSuspendMaxTimeMillis {
+		return common.ClientError(
+			"Long polling mode, the consumer consumerTimeoutMillisWhenSuspend must greater than brokerSuspendMaxTimeMillis")
 	}
 	return nil
 }
@@ -996,6 +1105,7 @@ func (c *DefaultLitePullConsumer) Shutdown() {
 		return
 	}
 	c.started = false
+	c.serviceState = liteStateShutdownAlready
 	close(c.stopCh)
 	// Wake a Poll parked on the buffer so it can drain what is left.
 	c.notifyBufferLocked()
@@ -1277,8 +1387,9 @@ func (c *DefaultLitePullConsumer) SeekToEnd(mq common.MessageQueue) error {
 }
 
 // Committed reads the queue's committed offset: the in-memory commit table
-// first (a persist=false Commit's value counts), then the broker, with the
-// broker's answer backfilled into the table. -1 means nobody has committed.
+// first (a persist=false Commit's value counts), then the offset store —
+// the local file when broadcasting, the broker when clustering — with the
+// answer backfilled into the store. -1 means nobody has committed.
 // A consumer that never started has no committed offset to report -- the table
 // belongs to a session that is not running, so it is not read.
 func (c *DefaultLitePullConsumer) Committed(mq common.MessageQueue) (int64, error) {
@@ -1291,22 +1402,12 @@ func (c *DefaultLitePullConsumer) Committed(mq common.MessageQueue) (int64, erro
 		c.mu.Unlock()
 		return off, nil
 	}
-	instance := c.instance
-	group := c.consumerGroup
+	store := c.offsetStore
 	c.mu.Unlock()
-	if instance == nil {
+	if store == nil {
 		return -1, common.ClientError("The consumer not running, please start it first.")
 	}
-	offset, found, err := instance.QueryConsumerOffset(group, mq, litePullRPCTimeoutMillis, "", false)
-	if err != nil || !found {
-		return -1, err
-	}
-	c.mu.Lock()
-	if _, ok := c.offsetTable[mq]; !ok {
-		c.offsetTable[mq] = offset
-	}
-	c.mu.Unlock()
-	return offset, nil
+	return store.ReadOffset(mq, ReadMemoryFirst)
 }
 
 // OffsetForTimestamp is the MQAdmin pass-through (search offset by time).
@@ -1431,38 +1532,33 @@ func (c *DefaultLitePullConsumer) persistOffsetTable(scope []common.MessageQueue
 			offset int64
 		}{mq, off})
 	}
-	instance := c.instance
-	group := c.consumerGroup
+	store := c.offsetStore
 	c.mu.Unlock()
-	if instance == nil {
+	if store == nil {
 		// Shutdown already flipped `started`; the FINAL persist still has to
-		// use the not-yet-closed instance, which is why this reads the field
-		// instead of requireInstance().
+		// use the store built at Start, which is why this reads the field
+		// instead of requiring a running consumer.
 		return nil
 	}
 	sort.Slice(toSend, func(i, j int) bool { return toSend[i].mq.CompareTo(toSend[j].mq) < 0 })
-	var firstErr error
+	queues := make([]common.MessageQueue, 0, len(toSend))
 	for _, e := range toSend {
-		if err := instance.UpdateConsumerOffset(group, e.mq, e.offset, litePullRPCTimeoutMillis, ""); err != nil {
-			common.LogDebugf("lite persist failed for %v: %v", e.mq, err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+		store.UpdateOffset(e.mq, e.offset, false)
+		queues = append(queues, e.mq)
 	}
-	return firstErr
+	return store.PersistAll(queues)
 }
 
 func (c *DefaultLitePullConsumer) persistOneOffset(mq common.MessageQueue) {
 	c.mu.Lock()
 	off, ok := c.offsetTable[mq]
-	instance := c.instance
-	group := c.consumerGroup
+	store := c.offsetStore
 	c.mu.Unlock()
-	if !ok || instance == nil {
+	if !ok || store == nil {
 		return
 	}
-	if err := instance.UpdateConsumerOffset(group, mq, off, litePullRPCTimeoutMillis, ""); err != nil {
+	store.UpdateOffset(mq, off, false)
+	if err := store.Persist(mq); err != nil {
 		common.LogDebugf("lite persist failed for %v: %v", mq, err)
 	}
 }
@@ -1630,7 +1726,6 @@ func (c *DefaultLitePullConsumer) resolveOffsetsFor(mqs []common.MessageQueue) {
 		return
 	}
 	c.mu.Lock()
-	group := c.consumerGroup
 	model := c.messageModel
 	fromWhere := c.consumeFromWhere
 	ts := c.consumeTimestamp
@@ -1643,7 +1738,7 @@ func (c *DefaultLitePullConsumer) resolveOffsetsFor(mqs []common.MessageQueue) {
 	c.mu.Unlock()
 
 	for _, mq := range pending {
-		offset, err := c.resolveInitialOffset(instance, group, mq, model, fromWhere, ts)
+		offset, err := c.resolveInitialOffset(instance, mq, model, fromWhere, ts)
 		if err != nil {
 			common.LogDebugf("lite: resolve initial offset failed for %v: %v", mq, err)
 			continue
@@ -1656,21 +1751,25 @@ func (c *DefaultLitePullConsumer) resolveOffsetsFor(mqs []common.MessageQueue) {
 	}
 }
 
-func (c *DefaultLitePullConsumer) resolveInitialOffset(instance *Instance, group string,
+func (c *DefaultLitePullConsumer) resolveInitialOffset(instance *Instance,
 	mq common.MessageQueue, model, fromWhere, consumeTS string) (int64, error) {
 	c.mu.Lock()
 	if off, ok := c.seekOffset[mq]; ok {
 		c.mu.Unlock()
 		return off, nil
 	}
+	store := c.offsetStore
 	c.mu.Unlock()
 	// found=false (QUERY_NOT_FOUND) is NOT a committed 0 — it must fall through
 	// to the consumeFromWhere branch, or a fresh group would start at offset 0
-	// even under CONSUME_FROM_LAST_OFFSET.
-	if offset, found, err := instance.QueryConsumerOffset(group, mq, litePullRPCTimeoutMillis, "", false); err != nil {
-		common.LogDebugf("lite query offset failed for %v: %v", mq, err)
-	} else if found {
-		return offset, nil
+	// even under CONSUME_FROM_LAST_OFFSET. Broadcasting reads the local file
+	// here; clustering asks the broker through the remote store.
+	if store != nil {
+		if offset, err := store.ReadOffset(mq, ReadMemoryFirst); err != nil {
+			common.LogDebugf("lite query offset failed for %v: %v", mq, err)
+		} else if offset >= 0 {
+			return offset, nil
+		}
 	}
 	if fromWhere == ConsumeFromWhereFirstOffset {
 		return 0, nil
@@ -1881,7 +1980,7 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 		c.mu.Lock()
 		model, fromWhere, ts := c.messageModel, c.consumeFromWhere, c.consumeTimestamp
 		c.mu.Unlock()
-		offset, err = c.resolveInitialOffset(instance, group, mq, model, fromWhere, ts)
+		offset, err = c.resolveInitialOffset(instance, mq, model, fromWhere, ts)
 		if err != nil {
 			common.LogDebugf("lite: resolve offset failed for %v: %v", mq, err)
 			return false

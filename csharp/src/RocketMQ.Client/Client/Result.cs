@@ -306,10 +306,9 @@ public sealed class SelectMessageQueueByRandom : IMessageQueueSelector
     }
 }
 
-// Java's SelectMessageQueueByMachineRoom is an empty shell that returns null; this repo
-// lands one shared contract across all ports: take the first queue whose brokerName
-// starts with arg (the machine-room id, broker naming convention "<idc>-<broker>") and
-// fall back to the first queue when nothing matches.
+// One shared contract for the machine-room selector: take the first queue whose
+// brokerName starts with arg (the machine-room id, broker naming convention
+// "<idc>-<broker>") and fall back to the first queue when nothing matches.
 public sealed class SelectMessageQueueByMachineRoom : IMessageQueueSelector
 {
     public MessageQueue Select(IReadOnlyList<MessageQueue> mqs, Message msg, string arg)

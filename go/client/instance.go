@@ -43,6 +43,17 @@ type ClientInstanceConfig struct {
 	ConnectTimeoutMillis int64
 	InvokeTimeoutMillis  int64
 	TLSEnable            bool
+	// TLSCertFile / TLSKeyFile are the PEM client certificate chain and its
+	// private key presented on every TLS connection. TLSCAFile is the PEM
+	// bundle trusted as the broker's certificate anchor. Left empty, no client
+	// identity is presented and the transport keeps its default trust
+	// behaviour.
+	TLSCertFile string
+	TLSKeyFile  string
+	TLSCAFile   string
+	// TLSTestMode selects the relaxed TLS test mode (insecure trust, no
+	// hostname check). nil keeps the default, which is ON.
+	TLSTestMode *bool
 	// NamesrvWsAddr is the address-server URL; when set and no nameserver is
 	// configured, start() fetches addresses from it (TopAddressing).
 	NamesrvWsAddr string
@@ -311,7 +322,21 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 	remotingConfig.ConnectTimeoutMillis = config.ConnectTimeoutMillis
 	remotingConfig.InvokeTimeoutMillis = config.InvokeTimeoutMillis
 	remotingConfig.TLSEnable = config.TLSEnable
+	// An unset field keeps the transport default (the ROCKETMQ_TLS_* env
+	// value), so a client that never mentions a certificate does not clear it.
+	if config.TLSCertFile != "" {
+		remotingConfig.TLSCertFile = config.TLSCertFile
+	}
+	if config.TLSKeyFile != "" {
+		remotingConfig.TLSKeyFile = config.TLSKeyFile
+	}
+	if config.TLSCAFile != "" {
+		remotingConfig.TLSCAFile = config.TLSCAFile
+	}
 	remotingConfig.TLSTestMode = true
+	if config.TLSTestMode != nil {
+		remotingConfig.TLSTestMode = *config.TLSTestMode
+	}
 	remotingConfig.EnableReconnectForGoAway = true
 	remotingConfig.SocksProxy = config.SocksProxy
 	inst.remoting = remoting.NewRemotingClientWithConfig(remotingConfig)

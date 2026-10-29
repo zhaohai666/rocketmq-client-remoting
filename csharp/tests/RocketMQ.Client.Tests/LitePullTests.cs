@@ -566,4 +566,104 @@ public class LitePullTests
             c.Shutdown();
         }
     }
+
+    // ---------------------------------------------------------------- start state machine
+
+    private static string StateMessage(string state) =>
+        "The PullConsumer service state not OK, maybe started once, " + state;
+
+    [Fact]
+    public void Start_WhileRunning_ReportsRunning()
+    {
+        using var cluster = MockCluster.Start(1);
+        var c = new DefaultLitePullConsumer("GID_LiteStateRunning");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-state-running");
+        c.Start();
+        try
+        {
+            var ex = Assert.Throws<MQClientException>(c.Start);
+            Assert.Equal(StateMessage("RUNNING"), ex.Message);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void Start_AfterFailedStart_ReportsStartFailed()
+    {
+        var c = new DefaultLitePullConsumer("GID_LiteStateFailed");
+        Assert.Throws<MQClientException>(c.Start);   // no name server address
+
+        // The state check comes first, so even a repaired config cannot start this instance.
+        c.SetNamesrvAddr("127.0.0.1:1");
+        var ex = Assert.Throws<MQClientException>(c.Start);
+        Assert.Equal(StateMessage("START_FAILED"), ex.Message);
+    }
+
+    [Fact]
+    public void Start_AfterShutdown_ReportsShutdownAlreadyAndStaysIdempotent()
+    {
+        var c = new DefaultLitePullConsumer("GID_LiteStateShutdown");
+        c.Shutdown();
+        c.Shutdown();   // idempotent
+
+        var ex = Assert.Throws<MQClientException>(c.Start);
+        Assert.Equal(StateMessage("SHUTDOWN_ALREADY"), ex.Message);
+    }
+
+    [Fact]
+    public void CheckConfig_ValidatesModelStrategyAndLongPollingBudget_WithoutASubscription()
+    {
+        new DefaultLitePullConsumer("GID_LiteCheckConfig").CheckConfig();
+
+        var model = new DefaultLitePullConsumer("GID_LiteCheckConfig");
+        model.SetMessageModel("UNKNOWN_MODEL");
+        Assert.Contains("messageModel", Assert.Throws<MQClientException>(model.CheckConfig).Message);
+
+        var strategy = new DefaultLitePullConsumer("GID_LiteCheckConfig");
+        strategy.SetAllocateMessageQueueStrategy(null);
+        Assert.Contains("allocateMessageQueueStrategy",
+            Assert.Throws<MQClientException>(strategy.CheckConfig).Message);
+
+        var suspend = new DefaultLitePullConsumer("GID_LiteCheckConfig");
+        suspend.SetBrokerSuspendMaxTimeMillis(30000);
+        suspend.SetConsumerTimeoutMillisWhenSuspend(20000);
+        Assert.Contains("consumerTimeoutMillisWhenSuspend",
+            Assert.Throws<MQClientException>(suspend.CheckConfig).Message);
+
+        var group = new DefaultLitePullConsumer();
+        Assert.Contains("consumerGroup", Assert.Throws<MQClientException>(group.CheckConfig).Message);
+    }
+
+    [Fact]
+    public void Start_WithoutSubscription_AllowsALateSubscribeThatRefreshesRouteAndHeartbeat()
+    {
+        using var cluster = MockCluster.Start(1);
+        const string topic = "LiteLateSubscribeTopic";
+        var c = new DefaultLitePullConsumer("GID_LiteLateSubscribe");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-late-subscribe");
+        c.Start();
+        try
+        {
+            Assert.True(c.IsStarted);
+            cluster.ClearRequests();
+
+            c.Subscribe(topic, "*");
+
+            Assert.True(cluster.CountRequestsWith(RequestCode.GetRouteinfoByTopic, "topic", topic) >= 1,
+                "the late subscription refreshes its route");
+            HeartbeatData? heartbeat = LastHeartbeatFor(cluster, c.ConsumerGroup);
+            Assert.NotNull(heartbeat);
+            Assert.Contains(heartbeat!.ConsumerDataSet.SelectMany(d => d.SubscriptionDataSet),
+                s => s.Topic == topic);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
 }

@@ -1185,10 +1185,23 @@ public sealed class MQClientInstance : IDisposable
 
         var respHeader = new SendMessageResponseHeader();
         respHeader.FromExtFields(response.ExtFields);
-        string clientUniqId = MessageClientIDSetter.GetUniqId(msg);
-        string msgId = !string.IsNullOrEmpty(clientUniqId)
-            ? clientUniqId
-            : respHeader.BatchUniqId ?? respHeader.MsgId ?? string.Empty;
+        string msgId;
+        if (msg is MessageBatch batch)
+        {
+            // An inner batch answers with its envelope id; otherwise the id is
+            // the comma-joined member ids (a one-member batch is still a batch)
+            msgId = !string.IsNullOrEmpty(respHeader.BatchUniqId)
+                ? respHeader.BatchUniqId!
+                : string.Join(",", batch.Messages.ConvertAll(
+                    m => MessageClientIDSetter.GetUniqId(m)));
+        }
+        else
+        {
+            string clientUniqId = MessageClientIDSetter.GetUniqId(msg);
+            msgId = !string.IsNullOrEmpty(clientUniqId)
+                ? clientUniqId
+                : respHeader.MsgId ?? string.Empty;
+        }
         string regionId = MixAll.DefaultTraceRegionId;
         if (response.ExtFields.TryGetValue(MessageConst.PropertyMsgRegion, out string? rid)
             && !string.IsNullOrEmpty(rid))

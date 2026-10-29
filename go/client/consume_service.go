@@ -544,6 +544,11 @@ func (c *DefaultMQPushConsumer) lockMQOnce() {
 	if c.instance == nil {
 		return
 	}
+	// BROADCASTING owns every queue: there is no competing instance to lock
+	// against, so the sweep is never performed (and never started) there.
+	if c.MessageModel() == MessageModelBroadcasting {
+		return
+	}
 	mqs := c.assignedQueues()
 	if len(mqs) == 0 {
 		return

@@ -203,8 +203,7 @@ class TestPersistAndRebuild:
         assert h.key in h.c._mq_map
         assert h.key in h.c._queue_threads
         assert h.key not in h.c._offset_table           # the old cursor is gone along with the revocation
-        # the initial offset never depends on the subscription type (Java parity:
-        # RebalancePushImpl#computePullFromWhereWithException has no SQL92 special case)
+        # the initial offset never depends on the subscription type
         assert h.c._resolve_initial_offset(h.client, h.mq) == 3
 
     def test_backward_reset_repulls_from_the_new_position(self):

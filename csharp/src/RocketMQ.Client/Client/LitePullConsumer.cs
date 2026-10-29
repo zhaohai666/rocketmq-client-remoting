@@ -121,7 +121,13 @@ public sealed class DefaultLitePullConsumer
     private readonly Dictionary<string, List<MessageQueue>> _messageQueuesForTopic =
         new(StringComparer.Ordinal);
 
+    private const int ServiceStateCreateJust = 0;
+    private const int ServiceStateRunning = 1;
+    private const int ServiceStateStartFailed = 2;
+    private const int ServiceStateShutdownAlready = 3;
+
     private MQClientInstance? _mqClient;
+    private int _serviceState = ServiceStateCreateJust;
     private bool _started;
     private bool _running;
     private Thread? _pullThread;
@@ -153,6 +159,9 @@ public sealed class DefaultLitePullConsumer
     public void SetInstanceName(string name) => _instanceName = name;
 
     public void SetMessageModel(string model) => _messageModel = model;
+
+    // Offline test seam: redirects the broadcast offset file away from the user home.
+    public string? LocalOffsetPathForTest { get; set; }
 
     public void SetAllocateMessageQueueStrategy(IAllocateMessageQueueStrategy? strategy) =>
         _allocateMessageQueueStrategy = strategy;
@@ -583,6 +592,8 @@ public sealed class DefaultLitePullConsumer
                 _subscriptionData.Remove(ns);
             }
         }
+
+        NotifySubscriptionChanged(ns);
     }
 
     /// <summary>Selector-flavoured subscribe: the expression type is carried end-to-end
@@ -623,6 +634,8 @@ public sealed class DefaultLitePullConsumer
                 _subscriptionData.Remove(ns);
             }
         }
+
+        NotifySubscriptionChanged(ns);
     }
 
     public void SetSubExpressionForAssign(string topic, string subExpression)
@@ -707,16 +720,15 @@ public sealed class DefaultLitePullConsumer
     }
 
     // ---------------- lifecycle ----------------
-    public void Start()
+    private static MQClientException ServiceStateError(string state) =>
+        new("The PullConsumer service state not OK, maybe started once, " + state);
+
+    /// <summary>Start-up configuration gate. A subscription is deliberately not required:
+    /// subscribing while RUNNING is supported.</summary>
+    public void CheckConfig()
     {
         lock (_lock)
         {
-            if (_started) return;
-            if (_namespace.Length > 0)
-            {
-                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
-            }
-
             Validators.CheckGroup(_consumerGroup);
             if (_consumerGroup == MixAll.DefaultConsumerGroup)
             {
@@ -724,15 +736,9 @@ public sealed class DefaultLitePullConsumer
                                             + ", please specify another one.");
             }
 
-            if (_nameServerAddrs.Count == 0)
+            if (_messageModel != MessageModel.Clustering && _messageModel != MessageModel.Broadcasting)
             {
-                throw new MQClientException("name server address is not set");
-            }
-
-            bool hasSub;
-            lock (_lock)
-            {
-                hasSub = _subscription.Count > 0;
+                throw new MQClientException("messageModel is invalid: " + _messageModel);
             }
 
             if (_allocateMessageQueueStrategy is null)
@@ -740,9 +746,41 @@ public sealed class DefaultLitePullConsumer
                 throw new MQClientException("allocateMessageQueueStrategy is null");
             }
 
-            if (!hasSub && !_assignMode)
+            if (_consumerTimeoutMillisWhenSuspend < _brokerSuspendMaxTimeMillis)
             {
-                throw new MQClientException("subscription is not set, call Subscribe() or Assign() first");
+                throw new MQClientException("Long polling mode, the consumer consumerTimeoutMillisWhenSuspend"
+                    + " must greater than brokerSuspendMaxTimeMillis");
+            }
+        }
+    }
+
+    public void Start()
+    {
+        lock (_lock)
+        {
+            switch (_serviceState)
+            {
+                case ServiceStateCreateJust:
+                    break;
+                case ServiceStateRunning:
+                    throw ServiceStateError("RUNNING");
+                case ServiceStateStartFailed:
+                    throw ServiceStateError("START_FAILED");
+                default:
+                    throw ServiceStateError("SHUTDOWN_ALREADY");
+            }
+
+            _serviceState = ServiceStateStartFailed;
+            if (_namespace.Length > 0)
+            {
+                _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
+            }
+
+            CheckConfig();
+
+            if (_nameServerAddrs.Count == 0)
+            {
+                throw new MQClientException("name server address is not set");
             }
 
             ParseConsumeTimestamp(_consumeTimestamp);
@@ -821,6 +859,7 @@ public sealed class DefaultLitePullConsumer
             _metadataThread = new Thread(MetadataLoop)
                 { IsBackground = true, Name = "rmq-lite-meta-" + _consumerId() };
             _metadataThread.Start();
+            _serviceState = ServiceStateRunning;
         }
     }
 
@@ -830,6 +869,7 @@ public sealed class DefaultLitePullConsumer
         List<MessageQueue> scope;
         lock (_lock)
         {
+            _serviceState = ServiceStateShutdownAlready;
             if (!_started) return;
             _started = false;
             _running = false;
@@ -1472,15 +1512,26 @@ public sealed class DefaultLitePullConsumer
 
         MQClientInstance client = RequireClient();
 
-        try
+        if (_messageModel == MessageModel.Broadcasting)
         {
-            if (client.QueryConsumerOffset(_consumerGroup, mq, out long off))
+            if (DefaultMQPushConsumer.LoadLocalOffsetsAt(LocalOffsetPath())
+                .TryGetValue(DefaultMQPushConsumer.LocalOffsetKey(mq), out long local) && local >= 0)
             {
-                return off;
+                return local;
             }
         }
-        catch
+        else
         {
+            try
+            {
+                if (client.QueryConsumerOffset(_consumerGroup, mq, out long off))
+                {
+                    return off;
+                }
+            }
+            catch
+            {
+            }
         }
 
         if (_consumeFromWhere == ConsumeFromWhere.ConsumeFromFirstOffset)
@@ -1782,6 +1833,23 @@ public sealed class DefaultLitePullConsumer
 
         MQClientInstance? client = _mqClient;
         if (client is null) return -1;
+
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            if (!DefaultMQPushConsumer.LoadLocalOffsetsAt(LocalOffsetPath())
+                .TryGetValue(DefaultMQPushConsumer.LocalOffsetKey(mq), out long local))
+            {
+                return -1;
+            }
+
+            lock (_lock)
+            {
+                _offsetTable[mq] = local;
+            }
+
+            return local;
+        }
+
         long off;
         try
         {
@@ -1889,14 +1957,10 @@ public sealed class DefaultLitePullConsumer
 
         MQClientInstance? client = _mqClient;
         if (client is null) return;
-        try
+        PersistToStore(client, new List<KeyValuePair<MessageQueue, long>>
         {
-            client.UpdateConsumerOffset(_consumerGroup, mq, offset);
-        }
-        catch
-        {
-            ClientLog.Debug("lite persist failed for " + mq);
-        }
+            new(mq, offset),
+        });
     }
 
     private void PersistOffsetTable(ICollection<MessageQueue> mqs)
@@ -1920,7 +1984,31 @@ public sealed class DefaultLitePullConsumer
 
         MQClientInstance? client = _mqClient;
         if (client is null) return;
-        foreach (KeyValuePair<MessageQueue, long> kv in toSend)
+        PersistToStore(client, toSend);
+    }
+
+    /// <summary>Broadcasting owns the local file; clustering commits to the broker.</summary>
+    private void PersistToStore(MQClientInstance client,
+        IReadOnlyList<KeyValuePair<MessageQueue, long>> items)
+    {
+        if (items.Count == 0) return;
+
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            var offsets = new Dictionary<string, long>(StringComparer.Ordinal);
+            var mqMap = new Dictionary<string, MessageQueue>(StringComparer.Ordinal);
+            foreach (KeyValuePair<MessageQueue, long> kv in items)
+            {
+                string key = DefaultMQPushConsumer.LocalOffsetKey(kv.Key);
+                offsets[key] = kv.Value;
+                mqMap[key] = kv.Key;
+            }
+
+            DefaultMQPushConsumer.SaveLocalOffsetsAt(LocalOffsetPath(), offsets, mqMap);
+            return;
+        }
+
+        foreach (KeyValuePair<MessageQueue, long> kv in items)
         {
             try
             {
@@ -1932,6 +2020,9 @@ public sealed class DefaultLitePullConsumer
             }
         }
     }
+
+    private string LocalOffsetPath() =>
+        LocalOffsetPathForTest ?? DefaultMQPushConsumer.BuildLocalOffsetPath(_clientId, _consumerGroup);
 
     public long OffsetForTimestamp(MessageQueue mq, long timestamp) =>
         RequireClient().SearchOffsetByTimestamp(mq, timestamp);
@@ -2157,6 +2248,27 @@ public sealed class DefaultLitePullConsumer
 
         hb.AddConsumerData(cd);
         return hb;
+    }
+
+    /// <summary>Subscribe() while RUNNING: pick up the topic's route, register it for the
+    /// background refresh and push one heartbeat so brokers learn the subscription now.</summary>
+    private void NotifySubscriptionChanged(string topic)
+    {
+        if (!_running || _mqClient is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _mqClient.RegisterTopicInUse(topic);
+            _mqClient.UpdateTopicRouteInfoFromNameServer(topic);
+            SendHeartbeatToAllBroker();
+        }
+        catch (Exception e)
+        {
+            ClientLog.Debug("immediate heartbeat after subscribe(" + topic + ") failed: " + e.Message);
+        }
     }
 
     /// <summary>

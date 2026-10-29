@@ -32,6 +32,16 @@ namespace rocketmq {
 
 namespace {
 
+// A LOCK_BATCH_MQ grant is trusted for half a minute; past that the broker may already have handed
+// the queue to another consumer, so pulling on it would break orderly delivery.
+constexpr int64_t kOrderlyLockMaxLiveMillis = 30000;
+
+int64_t steadyMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 std::string trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return std::string();
@@ -1165,14 +1175,28 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
-        // Orderly consumption: queues the broker has not confirmed as locked (LOCK_BATCH_MQ) are not pulled
-        if (orderly) {
+        // Orderly CLUSTERING consumption: queues the broker has not confirmed as locked (LOCK_BATCH_MQ)
+        // are not pulled. BROADCASTING has no competing consumer, so it never waits for a grant.
+        if (orderly && messageModel_ != MessageModel::BROADCASTING) {
             bool locked = false;
+            bool expired = false;
             {
                 std::lock_guard<std::mutex> lk(lock_);
-                locked = lockOk_.find(key) != lockOk_.end();
+                auto it = lockOk_.find(key);
+                if (it != lockOk_.end()) {
+                    if (steadyMillis() - it->second > kOrderlyLockMaxLiveMillis) {
+                        lockOk_.erase(it);
+                        expired = true;
+                    } else {
+                        locked = true;
+                    }
+                }
             }
             if (!locked) {
+                if (expired) {
+                    logger_warn("orderly lock expired for queue " + mq.toString()
+                                + ", waiting for the next lock round");
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 continue;
             }
@@ -2978,7 +3002,7 @@ std::string DefaultMQPushConsumer::buildLocalOffsetsJson(
 }
 
 std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalOffsetsText(
-    const std::string& text) {
+    const std::string& text, std::map<std::string, MessageQueue>* queues) {
     // Try strict JSON first (the flat map older versions used to write); the "object as key"
     // format always fails strict parsing (the pretty variant included), so it falls through to the scanner below.
     size_t b = text.find_first_not_of(" \t\r\n");
@@ -3051,6 +3075,10 @@ std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalO
             return std::nullopt;
         }
         out[topic + broker + std::to_string(queueId)] = off;
+        if (queues != nullptr) {
+            (*queues)[topic + broker + std::to_string(queueId)] =
+                MessageQueue(topic, broker, static_cast<int32_t>(queueId));
+        }
         if (offsetScanEat(trimmed, pos, ',')) continue;
         if (offsetScanEat(trimmed, pos, '}')) break;
         return std::nullopt;
@@ -3062,28 +3090,72 @@ std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalO
     return out;
 }
 
+namespace {
+
+// Answers the table already on disk (main file first, then .bak). False means a file exists but
+// neither generation parses: the caller must keep it rather than overwrite it with a partial table.
+bool loadLocalOffsetTableAt(const std::string& path, std::map<std::string, int64_t>& items,
+                            std::map<std::string, MessageQueue>& mqMap) {
+    bool unreadable = false;
+    for (const std::string& candidate : {path, path + ".bak"}) {
+        std::ifstream f(candidate);
+        if (!f.is_open()) continue;
+        std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        std::map<std::string, MessageQueue> queues;
+        auto parsed = DefaultMQPushConsumer::parseLocalOffsetsText(text, &queues);
+        if (parsed.has_value()) {
+            items = std::move(*parsed);
+            mqMap = std::move(queues);
+            return true;
+        }
+        unreadable = true;
+    }
+    return !unreadable;
+}
+
+}  // namespace
+
 void DefaultMQPushConsumer::saveLocalOffsetsAt(const std::string& path,
                                                const std::map<std::string, int64_t>& items,
                                                const std::map<std::string, MessageQueue>& mqMap) {
+    // Merge instead of rewriting: rebuilding from memory alone drops the entries of queues this
+    // instance no longer owns, and a queue re-added later would restart from the configured position.
+    std::map<std::string, int64_t> merged;
+    std::map<std::string, MessageQueue> mergedMq;
+    if (!loadLocalOffsetTableAt(path, merged, mergedMq)) {
+        logger_error("local offset store " + path + " is unreadable, skipping the persist");
+        return;
+    }
+    for (const auto& kv : items) {
+        merged[kv.first] = kv.second;
+    }
+    for (const auto& kv : mqMap) {
+        mergedMq[kv.first] = kv.second;
+    }
+
     std::string dir = path.substr(0, path.find_last_of('/'));
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    // Offset-file writer contract: the previous content rolls into .bak before the new file is written
-    std::ifstream prevIn(path);
-    if (prevIn.is_open()) {
-        std::string prev((std::istreambuf_iterator<char>(prevIn)),
-                         std::istreambuf_iterator<char>());
-        prevIn.close();
-        if (!prev.empty()) {
-            std::ofstream bak(path + ".bak", std::ios::trunc);
-            if (bak.is_open()) bak << prev;
+    // Offset-file writer contract: the previous content rolls into .bak before the new file is written.
+    // A corrupt main file must not replace a good .bak generation.
+    {
+        std::ifstream prevIn(path);
+        if (prevIn.is_open()) {
+            std::string prev((std::istreambuf_iterator<char>(prevIn)),
+                             std::istreambuf_iterator<char>());
+            prevIn.close();
+            if (!prev.empty() && parseLocalOffsetsText(prev).has_value()) {
+                std::ofstream bak(path + ".bak", std::ios::trunc);
+                if (bak.is_open()) bak << prev;
+            }
         }
     }
     // Write .tmp first, then rename atomically, so a half-written file never appears (same writer contract)
     std::string tmp = path + ".tmp";
     {
         std::ofstream f(tmp, std::ios::trunc);
-        if (f.is_open()) f << buildLocalOffsetsJson(items, mqMap);
+        if (f.is_open()) f << buildLocalOffsetsJson(merged, mergedMq);
     }
     std::filesystem::rename(tmp, path, ec);
 }
@@ -3137,6 +3209,11 @@ std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsets() const {
 }
 
 // ---------------------------------------------------------------- Orderly consume queue locks
+void DefaultMQPushConsumer::grantOrderlyLockForTest(const MessageQueue& mq, int64_t ageMillis) {
+    std::lock_guard<std::mutex> lk(lock_);
+    lockOk_[offsetKey(mq)] = steadyMillis() - ageMillis;
+}
+
 void DefaultMQPushConsumer::lockLoop() {
     if (!isOrderly() || messageModel_ == MessageModel::BROADCASTING) {
         return;
@@ -3154,9 +3231,10 @@ void DefaultMQPushConsumer::lockLoop() {
                 if (!mqs.empty()) {
                     std::vector<MessageQueue> ok =
                         mqClient_->lockBatchMq(consumerGroup_, clientId_, mqs);
-                    std::set<std::string> okKeys;
+                    std::map<std::string, int64_t> okKeys;
+                    const int64_t grantedAt = steadyMillis();
                     for (const MessageQueue& mq : ok) {
-                        okKeys.insert(offsetKey(mq));
+                        okKeys[offsetKey(mq)] = grantedAt;
                     }
                     std::lock_guard<std::mutex> lk(lock_);
                     lockOk_ = std::move(okKeys);
@@ -3543,45 +3621,58 @@ void DefaultMQPushConsumer::doRebalance() {
             assigned.insert(assigned.end(), got.begin(), got.end());
         }
     }
+    // Newly assigned queues resolve their initial offset IMMEDIATELY into offsetTable_ (same contract as
+    // the queue-table sync -> resolve the initial offset -> persist it through the offset store).
+    // It must not be resolved lazily at the first pull: CONSUME_FROM_LAST_OFFSET means "the max offset at
+    // assignment time", and lazy resolution would skip messages produced between assignment and the first pull.
+    //
+    // A queue whose offset store cannot be read is dropped from this round (no process queue, no pull
+    // loop): falling back to the configured start position would start it at the tail. The next
+    // rebalance retries it.
+    std::vector<MessageQueue> resolved;
+    resolved.reserve(assigned.size());
+    for (const MessageQueue& mq : assigned) {
+        const std::string key = offsetKey(mq);
+        if (!wasKeys.count(key)) {
+            bool subscribed = false;
+            bool hasOffset = false;
+            {
+                std::lock_guard<std::mutex> lk(lock_);
+                subscribed = subscriptionData_.find(mq.topic) != subscriptionData_.end();
+                hasOffset = offsetTable_.count(key) != 0;
+            }
+            if (!subscribed) continue;
+            if (!hasOffset) {
+                try {
+                    const int64_t off = resolveInitialOffset(mq);
+                    std::lock_guard<std::mutex> lk(lock_);
+                    offsetTable_.emplace(key, off);
+                } catch (const std::exception& e) {
+                    logger_warn("resolve initial offset for " + mq.toString()
+                                + " failed, skipping it this round: " + e.what());
+                    continue;
+                } catch (...) {
+                    logger_warn("resolve initial offset for " + mq.toString()
+                                + " failed, skipping it this round");
+                    continue;
+                }
+            }
+        }
+        resolved.push_back(mq);
+    }
     {
         std::lock_guard<std::mutex> lk(lock_);
-        assignedQueues_ = assigned;
+        assignedQueues_ = resolved;
     }
     std::map<std::string, std::set<std::string>> nowByTopic;
-    for (const MessageQueue& mq : assigned) {
+    for (const MessageQueue& mq : resolved) {
         nowByTopic[mq.topic].insert(offsetKey(mq));
     }
     const std::vector<std::string> moved = movedTopicsForTest(wasByTopic, nowByTopic);
     const bool changed = !moved.empty();
     if (changed) {
         logger_info("rebalance result changed, group=" + consumerGroup_
-                    + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
-    }
-    // Newly assigned queues resolve their initial offset IMMEDIATELY into offsetTable_ (same contract as
-    // the queue-table sync -> resolve the initial offset -> persist it through the offset store).
-    // It must not be resolved lazily at the first pull: CONSUME_FROM_LAST_OFFSET means "the max offset at
-    // assignment time", and lazy resolution would skip messages produced between assignment and the first pull.
-    for (const MessageQueue& mq : assigned) {
-        std::string key = offsetKey(mq);
-        if (wasKeys.count(key)) {
-            continue;
-        }
-        {
-            std::lock_guard<std::mutex> lk(lock_);
-            if (offsetTable_.count(key)) continue;
-            // sanity: still subscribed to this topic (no offset semantics attached to
-            // the subscription itself -- see resolveInitialOffset)
-            if (subscriptionData_.find(mq.topic) == subscriptionData_.end()) continue;
-        }
-        try {
-            int64_t off = resolveInitialOffset(mq);
-            std::lock_guard<std::mutex> lk(lock_);
-            if (!offsetTable_.count(key)) {
-                offsetTable_[key] = off;
-            }
-        } catch (const std::exception& e) {
-            logger_debug("resolve initial offset for " + mq.toString() + " failed: " + e.what());
-        }
+                    + " clientId=" + clientId_ + " assigned=" + std::to_string(resolved.size()));
     }
     rebalancePullThreads();
     // The round's assignment changed the queue SET of at least one topic: pay what that change owes,
@@ -3978,14 +4069,12 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq) {
         auto it = local.find(offsetKey(mq));
         if (it != local.end()) stored = it->second;
     } else {
-        try {
-            int64_t remote = 0;
-            if (c.queryConsumerOffset(consumerGroup_, mq, remote, 5000, std::string(),
-                                      /*setZeroIfNotFound=*/false)) {
-                stored = remote;
-            }
-        } catch (const std::exception& e) {
-            logger_debug("query consumer offset for " + mq.toString() + " not found: " + e.what());
+        // A failed query must reach the rebalance as a failure: treating it as "no committed offset"
+        // would start the queue at the tail and silently skip the backlog.
+        int64_t remote = 0;
+        if (c.queryConsumerOffset(consumerGroup_, mq, remote, 5000, std::string(),
+                                  /*setZeroIfNotFound=*/false)) {
+            stored = remote;
         }
     }
 

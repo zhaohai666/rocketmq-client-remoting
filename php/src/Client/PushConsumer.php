@@ -207,6 +207,13 @@ final class DefaultMQPushConsumer
     private array $queueEpoch = [];
     /** @var array<string,bool> Queues confirmed locked by broker LOCK_BATCH_MQ (orderly consumption) */
     private array $lockOk = [];
+
+    /**
+     * @var array<string,float> Grant time of the latest broker lock confirmation per queue
+     * (seconds). A grant older than the queue-lock max live time counts as unlocked even if
+     * no later sweep has replaced it, so a stalled lock sweep cannot pin a queue forever.
+     */
+    private array $lockTimestamps = [];
     private int $flowControlTriggered = 0;
     /**
      * Per-round wait after this client's OWN cache thresholds trip, in milliseconds. The local
@@ -1221,7 +1228,7 @@ final class DefaultMQPushConsumer
         unset($this->pending[$key], $this->idleUntil[$key], $this->suspendedUntil[$key], $this->flowControlUntil[$key]);
         // In-flight registrations are voided together.
         unset($this->inflightMsgs[$key], $this->msgQueueInflight[$key]);
-        unset($this->lockOk[$key]);
+        unset($this->lockOk[$key], $this->lockTimestamps[$key]);
         // Epoch +1 invalidates all acks of in-flight batches; the freeze mark is kept until the queue is rebuilt.
         $this->queueEpoch[$key] = ($this->queueEpoch[$key] ?? 0) + 1;
         $off = $this->consumeOffsets[$key] ?? null;
@@ -1713,9 +1720,14 @@ final class DefaultMQPushConsumer
             $this->armFailedRoundBackoff($key);
             return false;
         }
-        // Orderly consumption: queues not confirmed locked by the broker (LOCK_BATCH_MQ) are not pulled.
-        if ($orderly && !isset($this->lockOk[$key])) {
-            return false;
+        if ($orderly && $this->messageModel !== MessageModel::BROADCASTING) {
+            // A locked queue is pullable only while the latest broker grant is still fresh.
+            // Broadcasting owns every queue locally and never locks, so it is not gated.
+            $grantedAt = $this->lockTimestamps[$key] ?? null;
+            if (!isset($this->lockOk[$key]) || $grantedAt === null
+                || ($now - $grantedAt) * 1000.0 > ConsumerDefaults::REBALANCE_LOCK_MAX_LIVE_TIME_MS) {
+                return false;
+            }
         }
         // Suspend retry not yet due (PHP adaptation: replaces orderly consumption's sleep).
         if (isset($this->suspendedUntil[$key]) && $now < $this->suspendedUntil[$key]) {
@@ -2102,13 +2114,11 @@ final class DefaultMQPushConsumer
                 $stored = $value;
             }
         } else {
-            try {
-                $remote = $client->queryConsumerOffset($this->consumerGroup, $mq, 5000, null, false);
-                if ($remote !== null && $remote >= 0) {
-                    $stored = $remote;
-                }
-            } catch (\Throwable $e) {
-                Logger::debug("query consumer offset for $mq not found: " . $e->getMessage());
+            // QUERY_NOT_FOUND arrives as null; every other failure must propagate so the
+            // caller skips this queue for the round instead of silently starting at the tail.
+            $remote = $client->queryConsumerOffset($this->consumerGroup, $mq, 5000, null, false);
+            if ($remote !== null && $remote >= 0) {
+                $stored = $remote;
             }
         }
 
@@ -3043,14 +3053,7 @@ final class DefaultMQPushConsumer
 
     private function localOffsetPath(): string
     {
-        $home = getenv('HOME') ?: '';
-        return implode(DIRECTORY_SEPARATOR, [
-            $home,
-            '.rocketmq_offsets',
-            $this->clientId ?: 'DEFAULT',
-            $this->consumerGroup,
-            'offsets.json',
-        ]);
+        return local_offset_file_path($this->clientId ?? '', $this->consumerGroup);
     }
 
     private function saveLocalOffsets(?array $extra = null): void
@@ -3065,39 +3068,14 @@ final class DefaultMQPushConsumer
             $items[$key] = (int) $off;
             $mqMap[$key] = $mqMap[$key] ?? $mq;
         }
-        $path = $this->localOffsetPath();
-        $dir = dirname($path);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0777, true);
-        }
-        $text = build_local_offsets_json($items, $mqMap);
-        if (is_file($path)) {
-            $prev = (string) @file_get_contents($path);
-            if ($prev !== '') {
-                @file_put_contents($path . '.bak', $prev);
-            }
-        }
-        $tmp = $path . '.tmp';
-        file_put_contents($tmp, $text);
-        @rename($tmp, $path);
+        // Merge with the table already on disk: queues this round did not flush keep their
+        // stored offset instead of being erased by a full replacement.
+        persist_local_offset_entries($this->clientId ?? '', $this->consumerGroup, $items, $mqMap);
     }
 
     private function loadLocalOffsets(): array
     {
-        foreach ([$this->localOffsetPath(), $this->localOffsetPath() . '.bak'] as $path) {
-            if (!is_file($path)) {
-                continue;
-            }
-            $text = @file_get_contents($path);
-            if ($text === false || $text === '') {
-                continue;
-            }
-            $parsed = parse_local_offsets_json($text);
-            if ($parsed !== null) {
-                return $parsed;
-            }
-        }
-        return [];
+        return read_local_offset_table($this->clientId ?? '', $this->consumerGroup) ?? [];
     }
 
     // ---------------- Orderly consumption queue lock ----------------
@@ -3110,8 +3088,11 @@ final class DefaultMQPushConsumer
             if ($mqs !== []) {
                 $ok = $client->lockBatchMq($this->consumerGroup, $this->clientId ?? '', $mqs);
                 $okKeys = [];
+                $now = microtime(true);
                 foreach ($ok as $m) {
-                    $okKeys[self::mqKey($m)] = true;
+                    $key = self::mqKey($m);
+                    $okKeys[$key] = true;
+                    $this->lockTimestamps[$key] = $now;
                 }
                 $this->lockOk = $okKeys;
                 Logger::debug(sprintf('lock_batch_mq: %d/%d queues locked', count($okKeys), count($mqs)));

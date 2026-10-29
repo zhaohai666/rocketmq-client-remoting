@@ -1107,8 +1107,9 @@ final class RunClientLeaf
     {
         $this->checkSame(10.0, ConsumerStatsManager::SAMPLING_INTERVAL_SECONDS, 'SAMPLING_INTERVAL_SECONDS=10');
         $this->checkSame(600.0, ConsumerStatsManager::HOUR_SAMPLING_INTERVAL_SECONDS, 'HOUR_SAMPLING_INTERVAL_SECONDS=600');
-        $this->checkSame(60, ConsumerStatsManager::MINUTE_LIST_MAX, 'MINUTE_LIST_MAX=60');
-        $this->checkSame(60, ConsumerStatsManager::HOUR_LIST_MAX, 'HOUR_LIST_MAX=60');
+        $this->checkSame(7, ConsumerStatsManager::MINUTE_LIST_MAX, 'MINUTE_LIST_MAX=7');
+        $this->checkSame(7, ConsumerStatsManager::HOUR_LIST_MAX, 'HOUR_LIST_MAX=7');
+        $this->checkSame(25, ConsumerStatsManager::DAY_LIST_MAX, 'DAY_LIST_MAX=25');
 
         // StatsSnapshot defaults
         $ss = new StatsSnapshot();
@@ -1157,11 +1158,11 @@ final class RunClientLeaf
         usleep(2000);
         $item->addValue(15, 1);
         $item->sample();
-        $this->checkSame(2, $item->getMinuteSampleCount(), 'two samples → 2 points');
+        $this->checkSame(3, $item->getMinuteSampleCount(), 'first sample seeds a point, then two samples → 3 points');
         $snap = $item->getStatsDataInMinute();
-        $this->checkSame(15, $snap->sum, 'minute snapshot sum=window delta');
-        $this->checkSame(1, $snap->times, 'minute snapshot times delta');
-        $this->checkSame(15.0, $snap->avgpt, 'minute snapshot avgpt');
+        $this->checkSame(30, $snap->sum, 'minute snapshot sum=window delta');
+        $this->checkSame(4, $snap->times, 'minute snapshot times delta');
+        $this->checkSame(7.5, $snap->avgpt, 'minute snapshot avgpt');
         $this->check($snap->tps > 0, 'minute snapshot tps>0');
         $this->checkSame(0, $item->getStatsDataInHour()->sum, 'hour chain unsampled → sum=0');
 
@@ -1170,11 +1171,11 @@ final class RunClientLeaf
         for ($i = 0; $i < 65; $i++) {
             $over->sample();
         }
-        $this->checkSame(60, $over->getMinuteSampleCount(), 'minute chain overflow truncated to 60');
+        $this->checkSame(7, $over->getMinuteSampleCount(), 'minute chain overflow truncated to 7');
         for ($i = 0; $i < 65; $i++) {
             $over->sampleHour();
         }
-        $this->checkSame(60, $over->getHourSampleCount(), 'hour chain overflow truncated to 60');
+        $this->checkSame(7, $over->getHourSampleCount(), 'hour chain overflow truncated to 7');
 
         // StatsItemSet
         $set = new StatsItemSet('PULL_TPS');
@@ -1186,9 +1187,9 @@ final class RunClientLeaf
         $this->checkSame([7, 3], [$set->find('k2')->getValue(), $set->find('k2')->getTimes()], 'StatsItemSet.addValue');
         $this->checkSame(['k1', 'k2'], $set->keys(), 'StatsItemSet.keys order');
         $set->sampleAll();
-        $this->checkSame(1, $set->find('k2')->getMinuteSampleCount(), 'sampleAll samples everything');
+        $this->checkSame(2, $set->find('k2')->getMinuteSampleCount(), 'sampleAll samples everything (seed + one)');
         $set->sampleHourAll();
-        $this->checkSame(1, $set->find('k2')->getHourSampleCount(), 'sampleHourAll samples everything');
+        $this->checkSame(2, $set->find('k2')->getHourSampleCount(), 'sampleHourAll samples everything (seed + one)');
 
         // ConsumerStatsManager: key = topic@group
         $mgr = new ConsumerStatsManager();
@@ -1233,7 +1234,7 @@ final class RunClientLeaf
         $failed->addValue(7, 1);
         $failed->sampleHour();
         $cs2 = $mgr2->consumeStatus('G', 'T');
-        $this->checkSame(7, $cs2->consumeFailedMsgs, 'consumeFailedMsgs=hour-window sum');
+        $this->checkSame(12, $cs2->consumeFailedMsgs, 'consumeFailedMsgs=hour-window sum');
         $mgr->shutdown();
     }
 

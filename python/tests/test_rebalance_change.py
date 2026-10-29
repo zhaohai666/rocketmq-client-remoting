@@ -355,3 +355,45 @@ def test_no_listener_installed_still_pays_the_broker_side():
         assert transport.beat_count() == beats + 2
     finally:
         c._stop.set()
+
+
+def test_pop_round_never_waits_on_a_pull_offset():
+    """POP names no start offset -- initMode on the request carries it -- so a queue
+    whose offset store cannot be read still gets popped this round. Dropping it would
+    park the queue until the store recovers, even though POP never asked it anything."""
+    c, _transport, route = _consumer("G_py_rc_pop_offset", pop=True)
+    try:
+        route.set(TOPIC_A, 2)
+
+        def unreadable(_client, mq):
+            raise RuntimeError("offset store unreadable for %s" % mq)
+
+        c._resolve_initial_offset = unreadable
+        c._do_rebalance()
+
+        keys = {c._mq_key(mq) for mq in c._assigned_queues()}
+        assert keys == {c._mq_key(MessageQueue(topic=TOPIC_A, broker_name=BROKER, queue_id=i))
+                        for i in range(2)}, "a POP round keeps every queue it was assigned"
+        assert c._pop_queues, "and starts a POP loop for each of them"
+    finally:
+        c._stop.set()
+
+
+def test_pull_round_drops_a_queue_it_cannot_place():
+    """Control for the POP leg: on the pull path the first cursor is the start
+    position, so a queue whose store read fails is skipped for the round instead of
+    being pulled from a guessed offset."""
+    c, _transport, route = _consumer("G_py_rc_pull_offset")
+    try:
+        route.set(TOPIC_A, 2)
+
+        def unreadable(_client, mq):
+            raise RuntimeError("offset store unreadable for %s" % mq)
+
+        c._resolve_initial_offset = unreadable
+        c._do_rebalance()
+
+        assert c._assigned_queues() == [], "an unplaceable queue must not be pulled"
+        assert not c._queue_threads, "and must get no pull loop"
+    finally:
+        c._stop.set()

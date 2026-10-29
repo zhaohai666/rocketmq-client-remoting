@@ -25,12 +25,19 @@ use crate::{bail, rmq_debug};
 
 pub const SAMPLING_INTERVAL_SECONDS: f64 = 10.0;
 pub const HOUR_SAMPLING_INTERVAL_SECONDS: f64 = 600.0;
-pub const MINUTE_LIST_MAX: usize = 60;
-/// Hour snapshot chain length.
-pub const HOUR_LIST_MAX: usize = 60;
+pub const DAY_SAMPLING_INTERVAL_SECONDS: f64 = 3600.0;
+/// Minute snapshot chain length (10s samples).
+pub const MINUTE_LIST_MAX: usize = 7;
+/// Hour snapshot chain length (10min samples).
+pub const HOUR_LIST_MAX: usize = 7;
+/// Day snapshot chain length (1h samples).
+pub const DAY_LIST_MAX: usize = 25;
 /// How many minute-sampling rounds make one hour sample: `600s / 10s = 60` (the hardcoded `% 60`).
 pub const HOUR_SAMPLING_ROUNDS: u64 =
     (HOUR_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS) as u64;
+/// How many minute-sampling rounds make one day sample: `3600s / 10s = 360`.
+pub const DAY_SAMPLING_ROUNDS: u64 =
+    (DAY_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS) as u64;
 
 pub type CallSnapshot = (i64, i64, i64);
 
@@ -99,6 +106,7 @@ struct ItemState {
     /// Element = `(timestamp_ms, cumulative value, cumulative times)`.
     minute: VecDeque<CallSnapshot>,
     hour: VecDeque<CallSnapshot>,
+    day: VecDeque<CallSnapshot>,
 }
 
 impl StatsItem {
@@ -150,6 +158,13 @@ impl StatsItem {
     /// both tests and "back-filling historical points" rely on it, with no wall-clock sleeping.
     pub fn sample_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
+        if state.minute.is_empty() {
+            state.minute.push_back((
+                ts_ms - (SAMPLING_INTERVAL_SECONDS as i64) * 1000,
+                0,
+                0,
+            ));
+        }
         let point = (ts_ms, state.value, state.times);
         state.minute.push_back(point);
         while state.minute.len() > MINUTE_LIST_MAX {
@@ -166,10 +181,40 @@ impl StatsItem {
     /// Explicit-clock variant of [`StatsItem::sample_hour`].
     pub fn sample_hour_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
+        if state.hour.is_empty() {
+            state.hour.push_back((
+                ts_ms - (HOUR_SAMPLING_INTERVAL_SECONDS as i64) * 1000,
+                0,
+                0,
+            ));
+        }
         let point = (ts_ms, state.value, state.times);
         state.hour.push_back(point);
         while state.hour.len() > HOUR_LIST_MAX {
             state.hour.pop_front();
+        }
+    }
+
+    /// Appends a day-level sample point (called by the sampler every hour).
+    pub fn sample_day(&self) {
+        let ts = current_time_millis();
+        self.sample_day_at(ts);
+    }
+
+    /// Explicit-clock variant of [`StatsItem::sample_day`].
+    pub fn sample_day_at(&self, ts_ms: i64) {
+        let mut state = lock(&self.state);
+        if state.day.is_empty() {
+            state.day.push_back((
+                ts_ms - (DAY_SAMPLING_INTERVAL_SECONDS as i64) * 1000,
+                0,
+                0,
+            ));
+        }
+        let point = (ts_ms, state.value, state.times);
+        state.day.push_back(point);
+        while state.day.len() > DAY_LIST_MAX {
+            state.day.pop_front();
         }
     }
 
@@ -183,6 +228,11 @@ impl StatsItem {
         compute_stats_data_pair(state.hour.front(), state.hour.back())
     }
 
+    pub fn get_stats_data_in_day(&self) -> StatsSnapshot {
+        let state = lock(&self.state);
+        compute_stats_data_pair(state.day.front(), state.day.back())
+    }
+
     /// The current minute-chain length.
     pub fn minute_len(&self) -> usize {
         lock(&self.state).minute.len()
@@ -191,6 +241,11 @@ impl StatsItem {
     /// The current hour-chain length.
     pub fn hour_len(&self) -> usize {
         lock(&self.state).hour.len()
+    }
+
+    /// The current day-chain length.
+    pub fn day_len(&self) -> usize {
+        lock(&self.state).day.len()
     }
 }
 
@@ -262,6 +317,15 @@ impl StatsItemSet {
         for key in self.keys() {
             if let Some(item) = self.find(&key) {
                 item.sample_hour();
+            }
+        }
+    }
+
+    /// Samples every item in this set (day level).
+    pub fn sample_day_all(&self) {
+        for key in self.keys() {
+            if let Some(item) = self.find(&key) {
+                item.sample_day();
             }
         }
     }
@@ -460,6 +524,13 @@ impl ConsumerStatsManager {
         }
     }
 
+    /// Samples one full round of day points.
+    pub fn sample_day_all(&self) {
+        for set in self.inner.sets.as_slice() {
+            set.sample_day_all();
+        }
+    }
+
 
     /// The stats key: `topic@group`; note **topic comes first**.
     pub fn key(topic: &str, group: &str) -> String {
@@ -538,7 +609,13 @@ impl ConsumerStatsManager {
             cs.pull_tps = item.get_stats_data_in_minute().tps;
         }
         if let Some(item) = self.inner.sets.topic_and_group_consume_rt.find(&key) {
-            cs.consume_rt = item.get_stats_data_in_minute().avgpt;
+            let minute = item.get_stats_data_in_minute();
+            // An idle minute window says nothing; fall back to the hour window.
+            cs.consume_rt = if minute.sum == 0 {
+                item.get_stats_data_in_hour().avgpt
+            } else {
+                minute.avgpt
+            };
         }
         if let Some(item) = self.inner.sets.topic_and_group_consume_ok_tps.find(&key) {
             cs.consume_ok_tps = item.get_stats_data_in_minute().tps;
@@ -552,7 +629,7 @@ impl ConsumerStatsManager {
 }
 
 /// One sampling round: minute points always, hour points only when `rounds % hour_every_rounds == 0`
-/// (`rounds` starts at 1).
+/// (`rounds` starts at 1), day points every six hour rounds.
 fn sample_round(inner: &Inner, rounds: u64) {
     for set in inner.sets.as_slice() {
         set.sample_all();
@@ -560,6 +637,12 @@ fn sample_round(inner: &Inner, rounds: u64) {
     if inner.hour_every_rounds != 0 && rounds % inner.hour_every_rounds == 0 {
         for set in inner.sets.as_slice() {
             set.sample_hour_all();
+        }
+        let day_every_rounds = inner.hour_every_rounds.saturating_mul(6);
+        if day_every_rounds != 0 && rounds % day_every_rounds == 0 {
+            for set in inner.sets.as_slice() {
+                set.sample_day_all();
+            }
         }
     }
 }
@@ -685,9 +768,12 @@ mod tests {
     fn sampling_constants_match_reference() {
         assert!(almost(SAMPLING_INTERVAL_SECONDS, 10.0));
         assert!(almost(HOUR_SAMPLING_INTERVAL_SECONDS, 600.0));
-        assert_eq!(MINUTE_LIST_MAX, 60);
-        assert_eq!(HOUR_LIST_MAX, 60);
+        assert!(almost(DAY_SAMPLING_INTERVAL_SECONDS, 3600.0));
+        assert_eq!(MINUTE_LIST_MAX, 7);
+        assert_eq!(HOUR_LIST_MAX, 7);
+        assert_eq!(DAY_LIST_MAX, 25);
         assert_eq!(HOUR_SAMPLING_ROUNDS, 60);
+        assert_eq!(DAY_SAMPLING_ROUNDS, 360);
         assert_eq!(
             Duration::from_secs_f64(SAMPLING_INTERVAL_SECONDS),
             Duration::from_secs(10)
@@ -711,52 +797,73 @@ mod tests {
     fn minute_snapshot_diffs_two_cumulative_points() {
         let it = StatsItem::new("PULL_TPS", "T@G");
         it.add_value(10, 1);
-        it.sample_at(1_000); // first cumulative point
+        it.sample_at(10_000); // first cumulative point
+        // The first sample seeds a zero point one period earlier.
+        assert_eq!(it.minute_len(), 2);
         it.add_value(15, 1);
-        it.sample_at(2_000); // second cumulative point
+        it.sample_at(20_000); // second cumulative point
         let ss = it.get_stats_data_in_minute();
-        assert_eq!(ss.sum, 15);
-        assert_eq!(ss.times, 1);
-        // 15 msgs / 1s = 15/s
-        assert!(almost(ss.tps, 15.0));
-        assert!(almost(ss.avgpt, 15.0));
+        assert_eq!(ss.sum, 25);
+        assert_eq!(ss.times, 2);
+        // 25 msgs / 20s = 1.25/s
+        assert!(almost(ss.tps, 1.25));
+        assert!(almost(ss.avgpt, 12.5));
     }
 
     #[test]
     fn hour_window_is_separate_from_minute() {
-        // cumulative diff: two points (ts,100,2) -> (ts,400,4): sum=300, timesDiff=2, avgpt=150
+        // The first hour sample seeds a zero point one sampling period earlier, so the two points
+        // (ts0,0,0) -> (ts1,400,4) diff to sum=400 over timesDiff=4, avgpt=100.
         let it = StatsItem::new("PULL_RT", "T@G");
         it.add_value(100, 2);
         it.sample_hour_at(0);
         it.add_value(300, 2);
         it.sample_hour_at(1_000);
         let ss = it.get_stats_data_in_hour();
-        assert_eq!(ss.sum, 300);
-        assert_eq!(ss.times, 2);
-        assert!(almost(ss.avgpt, 150.0));
+        assert_eq!(ss.sum, 400);
+        assert_eq!(ss.times, 4);
+        assert!(almost(ss.avgpt, 100.0));
         // the minute chain is untouched by the hour sampling
         assert_eq!(it.get_stats_data_in_minute(), StatsSnapshot::default());
     }
 
     #[test]
     fn both_chains_are_capped_and_oldest_points_are_dropped() {
-        // fixed scenario (80 rounds, each round add_value(1,1) then sample at ts=i):
-        //   the chain caps at 60 points, first=(20,21,21), last=(79,80,80)
-        //   -> sum=59 tps=1000.00 avgpt=1.00 times=59
+        // 80 rounds, each round add_value(1,1) then sample at ts=i. The minute and hour chains cap
+        // at 7, so only rounds 73..79 survive (values 74..80); the day chain caps at 25.
         let it = StatsItem::new("PULL_TPS", "T@G");
         for i in 0..80_i64 {
             it.add_value(1, 1);
             it.sample_at(i);
             it.sample_hour_at(i);
+            it.sample_day_at(i);
         }
         assert_eq!(it.minute_len(), MINUTE_LIST_MAX);
         assert_eq!(it.hour_len(), HOUR_LIST_MAX);
+        assert_eq!(it.day_len(), DAY_LIST_MAX);
         let ss = it.get_stats_data_in_minute();
-        assert_eq!(ss.sum, 59);
-        assert_eq!(ss.times, 59);
+        assert_eq!(ss.sum, 6);
+        assert_eq!(ss.times, 6);
         assert!(almost(ss.tps, 1_000.0), "{ss}");
         assert!(almost(ss.avgpt, 1.0), "{ss}");
         assert!(almost(it.get_stats_data_in_hour().tps, 1_000.0));
+        // the day chain keeps rounds 56..80: 24 messages over 24 sampled units
+        assert_eq!(it.get_stats_data_in_day().sum, 24);
+    }
+
+    #[test]
+    fn first_snapshot_is_seeded_one_period_earlier_with_zero() {
+        let it = StatsItem::new("PULL_TPS", "T@G");
+        it.add_value(5, 1);
+        it.sample_at(10_000);
+        it.sample_hour_at(10_000);
+        it.sample_day_at(10_000);
+        {
+            let state = lock(&it.state);
+            assert_eq!(state.minute.front(), Some(&(0, 0, 0)));
+            assert_eq!(state.hour.front(), Some(&(-590_000, 0, 0)));
+            assert_eq!(state.day.front(), Some(&(-3_590_000, 0, 0)));
+        }
     }
 
     #[test]
@@ -767,8 +874,8 @@ mod tests {
         it.add_value(4, 1);
         it.sample();
         let ss = it.get_stats_data_in_minute();
-        assert_eq!(ss.sum, 4);
-        assert_eq!(ss.times, 1);
+        assert_eq!(ss.sum, 7);
+        assert_eq!(ss.times, 2);
         assert!(ss.tps >= 0.0);
     }
 
@@ -798,16 +905,19 @@ mod tests {
     }
 
     #[test]
-    fn sample_all_walks_every_item_in_both_granularities() {
+    fn sample_all_walks_every_item_in_all_granularities() {
         let s = StatsItemSet::new("PULL_TPS");
         s.add_value("a", 1, 1);
         s.add_value("b", 2, 1);
         s.sample_all();
         s.sample_hour_all();
+        s.sample_day_all();
         for key in ["a", "b"] {
             let it = s.find(key).expect("present");
-            assert_eq!(it.minute_len(), 1);
-            assert_eq!(it.hour_len(), 1);
+            // Every chain seeds one zero point before the first cumulative point.
+            assert_eq!(it.minute_len(), 2);
+            assert_eq!(it.hour_len(), 2);
+            assert_eq!(it.day_len(), 2);
         }
         assert_eq!(s.keys(), vec!["a".to_string(), "b".to_string()]);
     }
@@ -921,6 +1031,36 @@ mod tests {
     }
 
     #[test]
+    fn consume_rt_falls_back_to_the_hour_window_when_minute_sum_is_zero() {
+        let m = ConsumerStatsManager::new();
+        m.inc_consume_rt(GROUP, TOPIC, 10);
+        let it = m
+            .topic_and_group_consume_rt()
+            .find(KEY)
+            .expect("consume_rt item");
+        let now = current_time_millis();
+        {
+            let mut state = lock(&it.state);
+            state.minute.clear();
+            state.minute.push_back((now - 1_000, 0, 0));
+            state.minute.push_back((now, 0, 4));
+            state.hour.clear();
+            state.hour.push_back((now - 1_000, 0, 0));
+            state.hour.push_back((now, 40, 4));
+        }
+        // no traffic in the minute window -> the hour window answers (40/4 = 10ms)
+        assert!(almost(m.consume_status(GROUP, TOPIC).consume_rt, 10.0));
+        {
+            let mut state = lock(&it.state);
+            state.minute.clear();
+            state.minute.push_back((now - 1_000, 0, 0));
+            state.minute.push_back((now, 20, 4));
+        }
+        // minute traffic wins over the hour window (20/4 = 5ms)
+        assert!(almost(m.consume_status(GROUP, TOPIC).consume_rt, 5.0));
+    }
+
+    #[test]
     fn consume_failed_msgs_reads_the_hour_window() {
         let m = ConsumerStatsManager::new();
         m.inc_consume_failed_tps(GROUP, TOPIC, 7);
@@ -942,7 +1082,8 @@ mod tests {
 
     #[test]
     fn round_robin_follows_the_mod_60_rule() {
-        // hour points are taken only when rounds % hour_every_rounds == 0 (60 replaced by 3 here for easy asserts)
+        // hour points are taken only when rounds % hour_every_rounds == 0 (60 replaced by 3 here for easy asserts);
+        // each first sample seeds a zero point
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 3);
         m.inc_pull_tps(GROUP, TOPIC, 1);
         for rounds in 1..=3 {
@@ -952,28 +1093,28 @@ mod tests {
             .topic_and_group_pull_tps()
             .find(KEY)
             .expect("item");
-        assert_eq!(it.minute_len(), 3);
-        assert_eq!(it.hour_len(), 1);
-        sample_round(&m.inner, 4);
         assert_eq!(it.minute_len(), 4);
-        assert_eq!(it.hour_len(), 1);
-        sample_round(&m.inner, 6);
         assert_eq!(it.hour_len(), 2);
+        assert_eq!(it.day_len(), 0);
+        sample_round(&m.inner, 4);
+        assert_eq!(it.minute_len(), 5);
+        assert_eq!(it.hour_len(), 2);
+        sample_round(&m.inner, 6);
+        assert_eq!(it.hour_len(), 3);
+        sample_round(&m.inner, 18);
+        assert_eq!(it.hour_len(), 4);
+        assert_eq!(it.day_len(), 2, "a day point needs six hour rounds");
     }
 
     #[test]
     fn round_robin_with_zero_hour_period_never_samples_hour() {
-        // division-by-zero guard: hour_every_rounds == 0 disables hour sampling
+        // division-by-zero guard: hour_every_rounds == 0 disables hour and day sampling
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 0);
         m.inc_pull_rt(GROUP, TOPIC, 5);
-        sample_round(&m.inner, 60);
-        assert_eq!(
-            m.topic_and_group_pull_rt()
-                .find(KEY)
-                .expect("item")
-                .hour_len(),
-            0
-        );
+        sample_round(&m.inner, 600);
+        let it = m.topic_and_group_pull_rt().find(KEY).expect("item");
+        assert_eq!(it.hour_len(), 0);
+        assert_eq!(it.day_len(), 0);
     }
 
     #[test]
@@ -986,6 +1127,7 @@ mod tests {
         m.inc_consume_failed_tps(GROUP, TOPIC, 1);
         m.sample_all();
         m.sample_hour_all();
+        m.sample_day_all();
         for set in [
             m.topic_and_group_pull_rt(),
             m.topic_and_group_pull_tps(),
@@ -994,8 +1136,9 @@ mod tests {
             m.topic_and_group_consume_failed_tps(),
         ] {
             let it = set.find(KEY).expect("item");
-            assert_eq!(it.minute_len(), 1, "{}", set.stats_name());
-            assert_eq!(it.hour_len(), 1, "{}", set.stats_name());
+            assert_eq!(it.minute_len(), 2, "{}", set.stats_name());
+            assert_eq!(it.hour_len(), 2, "{}", set.stats_name());
+            assert_eq!(it.day_len(), 2, "{}", set.stats_name());
         }
     }
 

@@ -112,3 +112,29 @@ def test_load_reads_a_fastjson_written_file(offset_home):
     with open(path, "w", encoding="utf-8") as f:
         f.write(FASTJSON_OFFSETS_COMPACT)
     assert c._load_local_offsets() == {"Ttbroker-a1": 9, "Ttbroker-a0": 7}
+
+
+def test_save_merges_queues_already_on_disk(offset_home):
+    c = DefaultMQPushConsumer("g_local_offsets_merge")
+    queued = MessageQueue("Tt", "broker-a", 0)
+    flushed = MessageQueue("Tt", "broker-a", 1)
+    path = c._local_offset_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(_build_local_offsets_json({"Ttbroker-a0": 7}, {"Ttbroker-a0": queued}))
+    c._mq_map.update({"Ttbroker-a1": flushed})
+    with c._lock:
+        c._consume_offsets["Ttbroker-a1"] = 9
+    c._save_local_offsets()
+    assert c._load_local_offsets() == {"Ttbroker-a0": 7, "Ttbroker-a1": 9}
+
+
+def test_save_does_not_overwrite_an_unparseable_file(offset_home):
+    c = _consumer_with_offsets(offset_home)
+    path = c._local_offset_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"offsetTable":{{{')
+    c._save_local_offsets()
+    with open(path, encoding="utf-8") as f:
+        assert f.read() == '{"offsetTable":{{{'

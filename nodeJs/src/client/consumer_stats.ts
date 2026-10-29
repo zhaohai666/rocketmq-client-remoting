@@ -4,8 +4,9 @@
 // The real model (NOT what the "one bucket per minute" name suggests):
 //
 // * A StatsItem maintains CUMULATIVE value/times (monotonically increasing)
-//   with two sample-snapshot chains attached: `csListMinute` (one cumulative
-//   point every 10s) and `csListHour` (one cumulative point every 10 minutes);
+//   with three sample-snapshot chains attached: minute (one cumulative point
+//   every 10s, max 7), hour (every 10 minutes, max 7) and day (every hour,
+//   max 25);
 // * Snapshots are computed by computeStatsData:
 //       sum       = last.value - first.value          (window difference)
 //       tps       = sum * 1000.0 / (last.ts - first.ts)  (per second)
@@ -31,12 +32,16 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('consumer-stats');
 
-// Sampling interval: minute takes a point every 10s, hour every 10min.
+// Sampling interval: minute chain takes a point every 10s, hour chain every
+// 10min, day chain every 1h.
 export const SAMPLING_INTERVAL_SECONDS = 10.0;
 export const HOUR_SAMPLING_INTERVAL_SECONDS = 600.0;
-// Snapshot-chain length cap: about 60 points ≈ a 10-minute window (minute chain).
-const MINUTE_LIST_MAX = 60;
-const HOUR_LIST_MAX = 60;
+export const DAY_SAMPLING_INTERVAL_SECONDS = 3600.0;
+// Snapshot-chain length caps: the minute chain spans ~1 minute (7 x 10s), the
+// hour chain ~1 hour (7 x 10min), and the day chain ~1 day (25 x 1h).
+const MINUTE_LIST_MAX = 7;
+const HOUR_LIST_MAX = 7;
+const DAY_LIST_MAX = 25;
 
 export class StatsSnapshot {
   sum = 0;
@@ -74,6 +79,7 @@ export class StatsItem {
   // Entries = (timestamp_ms, cumulative value, cumulative times).
   private _minute: SamplePoint[] = [];
   private _hour: SamplePoint[] = [];
+  private _day: SamplePoint[] = [];
 
   constructor(statsName: string, statsKey: string) {
     this.statsName = statsName;
@@ -92,16 +98,33 @@ export class StatsItem {
     return { ts: Date.now(), value: this._value, times: this._times };
   }
 
-  // Append a minute-level sample point (every 10s from the sampler timer).
+  // Append a minute-level sample point (every 10s from the sampler timer). An
+  // empty chain is seeded with one zero point one period back, so the first
+  // window has a real span instead of a single point.
   sample(): void {
+    if (this._minute.length === 0) {
+      this._minute.push({ ts: Date.now() - SAMPLING_INTERVAL_SECONDS * 1000, value: 0, times: 0 });
+    }
     this._minute.push(this._samplePoint());
     while (this._minute.length > MINUTE_LIST_MAX) this._minute.shift();
   }
 
   // Append an hour-level sample point (every 10 minutes from the sampler).
   sampleHour(): void {
+    if (this._hour.length === 0) {
+      this._hour.push({ ts: Date.now() - HOUR_SAMPLING_INTERVAL_SECONDS * 1000, value: 0, times: 0 });
+    }
     this._hour.push(this._samplePoint());
     while (this._hour.length > HOUR_LIST_MAX) this._hour.shift();
+  }
+
+  // Append a day-level sample point (every hour from the sampler).
+  sampleDay(): void {
+    if (this._day.length === 0) {
+      this._day.push({ ts: Date.now() - DAY_SAMPLING_INTERVAL_SECONDS * 1000, value: 0, times: 0 });
+    }
+    this._day.push(this._samplePoint());
+    while (this._day.length > DAY_LIST_MAX) this._day.shift();
   }
 
   getStatsDataInMinute(): StatsSnapshot {
@@ -110,6 +133,10 @@ export class StatsItem {
 
   getStatsDataInHour(): StatsSnapshot {
     return computeStatsData(this._hour);
+  }
+
+  getStatsDataInDay(): StatsSnapshot {
+    return computeStatsData(this._day);
   }
 }
 
@@ -149,6 +176,10 @@ export class StatsItemSet {
   sampleHourAll(): void {
     for (const key of this.keys()) this.find(key)!.sampleHour();
   }
+
+  sampleDayAll(): void {
+    for (const key of this.keys()) this.find(key)!.sampleDay();
+  }
 }
 
 export class ConsumerStatsManager {
@@ -182,6 +213,9 @@ export class ConsumerStatsManager {
         for (const s of this._sets) s.sampleAll();
         if (this._rounds % 60 === 0) { // 60 x 10s = 10 minutes
           for (const s of this._sets) s.sampleHourAll();
+        }
+        if (this._rounds % 360 === 0) { // 360 x 10s = 1 hour
+          for (const s of this._sets) s.sampleDayAll();
         }
       } catch (e) {
         logger.warn(`stats sample failed: ${(e as Error).message}`);

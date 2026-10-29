@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
@@ -236,25 +239,47 @@ func (s *LocalFileOffsetStore) ReadOffset(mq common.MessageQueue, mode ReadOffse
 	return offset, nil
 }
 
-// PersistAll writes the whole table (all entries ARE this consumer's queues).
+// PersistAll flushes the named queues into the file. Only those entries are
+// overlaid; every other queue already in the file survives.
 func (s *LocalFileOffsetStore) PersistAll(mqs []common.MessageQueue) error {
-	return s.persistFile()
+	if len(mqs) == 0 {
+		return nil
+	}
+	return s.persistMerged(mqs)
 }
 
 func (s *LocalFileOffsetStore) Persist(mq common.MessageQueue) error {
-	return s.persistFile()
+	return s.persistMerged([]common.MessageQueue{mq})
 }
 
-func (s *LocalFileOffsetStore) persistFile() error {
+// persistMerged reads the on-disk table first, overlays the in-memory offset of
+// each queue being flushed, and writes the union. Rebuilding the file from
+// memory alone would drop the entries of queues this consumer no longer owns,
+// and a queue re-added later would restart from the configured start position.
+func (s *LocalFileOffsetStore) persistMerged(mqs []common.MessageQueue) error {
 	s.mu.Lock()
-	table := make(map[common.MessageQueue]int64, len(s.table))
-	for k, v := range s.table {
-		table[k] = v
+	overlay := make(map[common.MessageQueue]int64, len(mqs))
+	for _, mq := range mqs {
+		if offset, ok := s.table[mq]; ok {
+			overlay[mq] = offset
+		}
 	}
 	path := s.storePath
 	s.mu.Unlock()
+	if len(overlay) == 0 {
+		return nil
+	}
 
-	body := encodeLocalOffsetTable(table)
+	disk, err := readLocalOffsetTable(path)
+	if err != nil {
+		common.LogErrorf("read local offset store %s failed, skip persist: %v", path, err)
+		return err
+	}
+	for mq, offset := range overlay {
+		disk[mq] = offset
+	}
+	body := encodeLocalOffsetTable(disk)
+
 	if _, err := os.Stat(path); err == nil {
 		prev, err := os.ReadFile(path)
 		if err == nil {
@@ -269,16 +294,69 @@ func (s *LocalFileOffsetStore) persistFile() error {
 	return os.WriteFile(path, body, 0o644)
 }
 
+// readLocalOffsetTable answers the table currently on disk, falling back to the
+// .bak generation when the main file is unreadable, empty or unparseable. Two
+// missing files answer an empty table; a .bak that exists but cannot be parsed
+// is an error, so a flush never overwrites a file it could not read.
+func readLocalOffsetTable(path string) (map[common.MessageQueue]int64, error) {
+	table, ok, err := readLocalOffsetFile(path)
+	if ok {
+		return table, nil
+	}
+	bak, bakOK, bakErr := readLocalOffsetFile(path + ".bak")
+	if bakOK {
+		return bak, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if bakErr != nil {
+		return nil, bakErr
+	}
+	return map[common.MessageQueue]int64{}, nil
+}
+
+func readLocalOffsetFile(path string) (map[common.MessageQueue]int64, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil, false, nil
+	}
+	table, err := decodeLocalOffsetTable(data)
+	if err != nil {
+		return nil, false, err
+	}
+	return table, true, nil
+}
+
 // StorePath exposes the backing file path (diagnostics).
 func (s *LocalFileOffsetStore) StorePath() string { return s.storePath }
 
-// {"offsetTable":{"{\"brokerName\":\"b\",\"queueId\":1,\"topic\":\"T\"}":9}}
+// encodeLocalOffsetTable writes the queue as an INLINE OBJECT map key:
+//
+//	{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"T"}:9}}
+//
+// This is the object-keyed spelling the offset file uses: a quoted-string key
+// ("{\"brokerName\"...}") is a different type and cannot be read back by other
+// offset-file readers. Entries are sorted by queue for a stable file.
 func encodeLocalOffsetTable(table map[common.MessageQueue]int64) []byte {
-	entries := make(map[string]any, len(table))
-	for mq, offset := range table {
-		entries[remoting.MessageQueueKeyJSON(mq)] = offset
+	queues := make([]common.MessageQueue, 0, len(table))
+	for mq := range table {
+		queues = append(queues, mq)
 	}
-	return remoting.EncodeJSON(map[string]any{"offsetTable": entries})
+	sort.Slice(queues, func(i, j int) bool { return queues[i].CompareTo(queues[j]) < 0 })
+
+	var b strings.Builder
+	b.WriteString(`{"offsetTable":{`)
+	for i, mq := range queues {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(remoting.MessageQueueKeyJSON(mq))
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatInt(table[mq], 10))
+	}
+	b.WriteString("}}")
+	return []byte(b.String())
 }
 
 func decodeLocalOffsetTable(data []byte) (map[common.MessageQueue]int64, error) {

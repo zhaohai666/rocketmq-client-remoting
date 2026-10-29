@@ -9,7 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from client.consumer import DefaultMQPullConsumer, PullCallback
+from client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
+                             PullCallback)
 from client.consumer_result import PullResult, PullStatus
 from client.consume_executor import ConsumeExecutor
 from client.exception import MQBrokerException, MQClientException
@@ -63,6 +64,51 @@ class TestLifecycle:
         listener = _L()
         c.set_message_queue_listener(listener)
         assert c.message_queue_listener is listener
+
+
+class TestBroadcastOffsetStore:
+    class _Client:
+        def __init__(self):
+            self.updates = []
+            self.queries = []
+
+        def update_consumer_offset(self, group, mq, offset):
+            self.updates.append((mq, offset))
+
+        def query_consumer_offset(self, group, mq):
+            self.queries.append(mq)
+            return None
+
+    def test_broadcasting_offsets_use_the_local_file_not_the_broker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mq = MessageQueue("TBcast", "broker-a", 0)
+        c = DefaultMQPullConsumer("PG_Broadcast", message_model=MessageModel.BROADCASTING)
+        c.client_id = "cid@broadcast"
+        fake = self._Client()
+        c._mq_client = fake
+        c._started = True
+
+        c.update_consume_offset(mq, 17)
+        assert c.fetch_consume_offset(mq) == 17
+        assert fake.updates == [] and fake.queries == []
+
+        push = DefaultMQPushConsumer("PG_Broadcast")
+        push.client_id = c.client_id
+        assert c._local_offset_path() == push._local_offset_path()
+
+    def test_clustering_offsets_go_to_the_broker(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mq = MessageQueue("TClust", "broker-a", 0)
+        c = DefaultMQPullConsumer("PG_Cluster")
+        c.client_id = "cid@cluster"
+        fake = self._Client()
+        c._mq_client = fake
+        c._started = True
+
+        c.update_consume_offset(mq, 5)
+        c.fetch_consume_offset(mq)
+        assert fake.updates == [(mq, 5)]
+        assert fake.queries == [mq]
 
 
 class TestPullSysFlagParity:

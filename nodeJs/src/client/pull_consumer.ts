@@ -24,7 +24,7 @@ import { RemotingCommand } from '../remoting/remotingCommand.ts';
 import { RemotingSerializable } from '../remoting/serialize.ts';
 import { ConsumerSendMsgBackRequestHeader } from '../remoting/headers.ts';
 import { Validators } from '../common/validators.ts';
-import { MQBrokerException } from '../remoting/exception.ts';
+import { MQBrokerException, MQClientException } from '../remoting/exception.ts';
 import type { TopicRouteData } from '../remoting/route.ts';
 import { getLogger } from '../logging.ts';
 
@@ -334,6 +334,8 @@ export class DefaultMQPullConsumer {
     // The pull entry checks the service state first: a shutdown facade must report,
     // never keep pulling through the (still open) client instance it shared.
     if (!this.started || !this.pullAPI) throw new Error('consumer not started');
+    if (offset < 0) throw new MQClientException('offset < 0');
+    if (maxNums <= 0) throw new MQClientException('maxNums <= 0');
     const topic = mq.getTopic();
     let sub: SubscriptionData;
     if (subExpression == null) {
@@ -347,7 +349,7 @@ export class DefaultMQPullConsumer {
     // subscription bit on.
     const sysFlag = PullSysFlag.buildSysFlag(false, suspend, true, false);
     let result = await this.pullAPI.pullKernel(mq, offset, sub, sysFlag, 0,
-      maxNums > 0 ? maxNums : this.pullBatchSize, suspendTimeoutMillis, timeoutMillis);
+      maxNums, suspendTimeoutMillis, timeoutMillis);
     result = this.pullAPI.processPullResult(mq, result, sub);
     return result;
   }
@@ -364,7 +366,7 @@ export class DefaultMQPullConsumer {
     if (!this.offsetStore) throw new Error('consumer not started');
     if (fromStore) await this._warmQueueRoute(mq.getTopic());
     return this.offsetStore.readOffset(mq,
-      fromStore ? ReadOffsetMode.READ_FROM_STORE : ReadOffsetMode.READ_FROM_MEMORY);
+      fromStore ? ReadOffsetMode.READ_FROM_STORE : ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
   }
 
   // The offset store resolves a queue's broker address from the cached route

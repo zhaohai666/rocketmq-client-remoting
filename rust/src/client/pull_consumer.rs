@@ -27,9 +27,9 @@ use crate::client::allocate_strategy::{
 };
 use crate::client::consumer::{
     changed_topics, client_side_tag_filter, consume_timestamp_millis, default_consume_timestamp,
-    is_flow_control_warn_trip, mq_key, mq_sort_key, plan_initial_offset, queues_by_topic, sort_mqs,
-    MessageQueueListener, MessageSelector,
-    StartOffsetPlan, CACHE_SIZE_GATE_MIB, DEFAULT_INSTANCE_NAME,
+    is_flow_control_warn_trip, mq_key, mq_sort_key, plan_initial_offset, queues_by_topic,
+    read_local_offset, sort_mqs, uses_local_offset_store, write_local_offsets, MessageQueueListener,
+    MessageSelector, StartOffsetPlan, CACHE_SIZE_GATE_MIB, DEFAULT_INSTANCE_NAME,
     PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL,
 };
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
@@ -1088,7 +1088,15 @@ impl DefaultMQPullConsumer {
 
     pub async fn fetch_consume_offset(&self, mq: &MessageQueue) -> Result<Option<i64>> {
         let client = self.require_client()?;
-        let group = self.consumer_group();
+        let cfg = self.config();
+        if uses_local_offset_store(&cfg.message_model) {
+            return Ok(read_local_offset(
+                cfg.client_id.as_deref(),
+                &cfg.consumer_group,
+                mq,
+            ));
+        }
+        let group = cfg.consumer_group;
         client
             .query_consumer_offset(&group, mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None, false)
             .await
@@ -1096,7 +1104,15 @@ impl DefaultMQPullConsumer {
 
     pub async fn update_consume_offset(&self, mq: &MessageQueue, offset: i64) -> Result<()> {
         let client = self.require_client()?;
-        let group = self.consumer_group();
+        let cfg = self.config();
+        if uses_local_offset_store(&cfg.message_model) {
+            return write_local_offsets(
+                cfg.client_id.as_deref(),
+                &cfg.consumer_group,
+                &[(mq.clone(), offset)],
+            );
+        }
+        let group = cfg.consumer_group;
         client
             .update_consumer_offset(&group, mq, offset, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
             .await
@@ -1312,10 +1328,10 @@ pub struct LitePullConsumerConfig {
     /// `auto_commit_interval_millis` = 5000; a setting below the 1000 ms floor is ignored, so the
     /// interval that was already running keeps running.
     pub auto_commit_interval_millis: i64,
-    /// `consumer_timeout_millis_when_suspend` = 30000: lite always short-polls,
-    /// the field is kept only for the config shape; the pull path never reads it.
+    /// `consumer_timeout_millis_when_suspend` = 30000: lite always short-polls, so only the
+    /// start-time validation of the long-polling ratio reads it.
     pub consumer_timeout_millis_when_suspend: i64,
-    /// `broker_suspend_max_time_millis` = 20000: same as above, the pull path never reads it.
+    /// `broker_suspend_max_time_millis` = 20000: same as above, read only by that validation.
     pub broker_suspend_max_time_millis: i64,
     /// `pull_interval_millis` = 50: backoff when the queue tail is empty (`max(0, ms)`).
     pub pull_interval_millis: i64,
@@ -1686,12 +1702,34 @@ impl Default for LiteState {
     }
 }
 
+/// Lifecycle of a lite consumer: only a freshly constructed instance may start, and every start
+/// after the first attempt reports the state it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteServiceState {
+    CreateJust,
+    Running,
+    StartFailed,
+    ShutdownAlready,
+}
+
+impl LiteServiceState {
+    fn name(&self) -> &'static str {
+        match self {
+            LiteServiceState::CreateJust => "CREATE_JUST",
+            LiteServiceState::Running => "RUNNING",
+            LiteServiceState::StartFailed => "START_FAILED",
+            LiteServiceState::ShutdownAlready => "SHUTDOWN_ALREADY",
+        }
+    }
+}
+
 struct LiteInner {
     cfg: RwLock<LitePullConsumerConfig>,
     state: Mutex<LiteState>,
     client: Mutex<Option<MQClientInstance>>,
     started: AtomicBool,
     running: AtomicBool,
+    service_state: Mutex<LiteServiceState>,
     runtime: OnceLock<tokio::runtime::Handle>,
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -1719,6 +1757,7 @@ impl Default for LiteInner {
             client: Mutex::new(None),
             started: AtomicBool::new(false),
             running: AtomicBool::new(false),
+            service_state: Mutex::new(LiteServiceState::CreateJust),
             runtime: OnceLock::new(),
             stop: watch::channel(false).0,
             tasks: Mutex::new(Vec::new()),
@@ -2251,7 +2290,7 @@ impl DefaultLitePullConsumer {
                 .insert(topic.clone(), sub_expression.to_string());
             match FilterAPI::build_subscription_data(&topic, Some(sub_expression)) {
                 Ok(sub) => {
-                    state.subscription_data.insert(topic, sub);
+                    state.subscription_data.insert(topic.clone(), sub);
                 }
                 Err(e) => {
                     rmq_debug!("lite subscribe: build subscription data failed: {e}");
@@ -2259,7 +2298,31 @@ impl DefaultLitePullConsumer {
                 }
             }
         }
+        self.wire_subscription_after_subscribe(&topic);
         Ok(())
+    }
+
+    /// A subscription added while running must reach the brokers now: refresh its route and send a
+    /// heartbeat carrying it instead of waiting for the next heartbeat round.
+    fn wire_subscription_after_subscribe(&self, topic: &str) {
+        if !self.inner.running.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(handle) = self.runtime_handle() else {
+            return;
+        };
+        let inner = self.inner.clone();
+        let topic = topic.to_string();
+        handle.spawn(async move {
+            let Ok(client) = Self::require_client(&inner) else {
+                return;
+            };
+            client.register_topic_in_use(&topic);
+            if let Err(e) = client.get_topic_publish_info(&topic, false).await {
+                rmq_debug!("lite subscribe: refresh route for {topic} failed: {e}");
+            }
+            send_lite_heartbeat(&inner).await;
+        });
     }
 
     /// Subscribe using a [`MessageSelector`]: the selector's expression type is kept
@@ -2284,7 +2347,7 @@ impl DefaultLitePullConsumer {
                 .insert(topic.clone(), selector.expression.clone());
             match pull_selector_subscription(&topic, selector) {
                 Ok(sub) => {
-                    state.subscription_data.insert(topic, sub);
+                    state.subscription_data.insert(topic.clone(), sub);
                 }
                 Err(e) => {
                     rmq_debug!("lite subscribe: build subscription data failed: {e}");
@@ -2292,6 +2355,7 @@ impl DefaultLitePullConsumer {
                 }
             }
         }
+        self.wire_subscription_after_subscribe(&topic);
         Ok(())
     }
 
@@ -2443,22 +2507,28 @@ impl DefaultLitePullConsumer {
 
     // ---------------- Lifecycle ----------------
 
-    /// Idempotent; first checks the group name, then requires a name server and an existing subscription or assign;
-    /// **first caches the routes of the subscribed topics, then sends one heartbeat synchronously**, finally starts the background loops.
+    /// Only a freshly constructed consumer starts; a second start reports the state that blocked
+    /// it. The group, message model, allocation settings and the long-polling timeout are checked
+    /// first; a subscription is not required, so `subscribe()` may also be called while running.
+    /// **First caches the routes of the subscribed topics, then sends one heartbeat synchronously**,
+    /// finally starts the background loops.
     ///
     /// Heartbeats only go to brokers already known in the route table, so the route refresh must happen before that synchronous heartbeat
     /// (see [`refresh_route_for_heartbeat`](Self::refresh_route_for_heartbeat)):
     /// otherwise the start() round sends 0 heartbeats and subscriptions would only reach the broker at the heartbeat loop's first round 5s later,
     /// so with multiple instances in one group the peers would see each other one heartbeat cycle late.
     pub async fn start(&self) -> Result<()> {
-        if self
-            .inner
-            .started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
         {
-            return Ok(());
+            let mut state = lock(&self.inner.service_state);
+            if *state != LiteServiceState::CreateJust {
+                return Err(Error::client(format!(
+                    "The PullConsumer service state not OK, maybe started once, {}",
+                    state.name()
+                )));
+            }
+            *state = LiteServiceState::StartFailed;
         }
+        self.inner.started.store(true, Ordering::Release);
         let cfg = self.config();
         if let Err(e) = validators::check_group(&cfg.consumer_group) {
             self.inner.started.store(false, Ordering::Release);
@@ -2470,16 +2540,23 @@ impl DefaultLitePullConsumer {
                 "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.",
             ));
         }
+        if !matches!(
+            cfg.message_model.as_str(),
+            MessageModel::CLUSTERING | MessageModel::BROADCASTING
+        ) {
+            self.inner.started.store(false, Ordering::Release);
+            bail!("messageModel is invalid, must be CLUSTERING or BROADCASTING");
+        }
+        if cfg.consumer_timeout_millis_when_suspend < cfg.broker_suspend_max_time_millis {
+            self.inner.started.store(false, Ordering::Release);
+            bail!(
+                "Long polling mode, the consumer consumerTimeoutMillisWhenSuspend must greater \
+                 than brokerSuspendMaxTimeMillis"
+            );
+        }
         if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
-        }
-        {
-            let state = lock(&self.inner.state);
-            if state.subscription.is_empty() && !state.assign_mode {
-                self.inner.started.store(false, Ordering::Release);
-                bail!("subscription is not set, call subscribe() or assign() first");
-            }
         }
         if let Err(e) = consume_timestamp_millis(&cfg.consume_timestamp) {
             self.inner.started.store(false, Ordering::Release);
@@ -2561,6 +2638,7 @@ impl DefaultLitePullConsumer {
         // Register the tag subscriptions with the broker first, then start the background pull
         self.refresh_route_for_heartbeat().await;
         self.send_heartbeat_to_all_broker().await;
+        *lock(&self.inner.service_state) = LiteServiceState::Running;
         self.inner.running.store(true, Ordering::Release);
         let _ = self.inner.stop.send(false);
         self.spawn_loops();
@@ -2584,6 +2662,7 @@ impl DefaultLitePullConsumer {
         {
             return;
         }
+        *lock(&self.inner.service_state) = LiteServiceState::ShutdownAlready;
         self.inner.running.store(false, Ordering::Release);
         let _ = self.inner.stop.send(true);
         for task in lock(&self.inner.tasks).drain(..) {
@@ -2898,14 +2977,24 @@ impl DefaultLitePullConsumer {
         if let Some(cached) = lock(&self.inner.state).offset_table.get(&key).copied() {
             return Ok(Some(cached));
         }
-        let group = self.consumer_group();
-        let broker_offset = client
-            .query_consumer_offset(&group, mq, LITE_PULL_RPC_TIMEOUT_MILLIS, None, false)
-            .await?;
-        if let Some(offset) = broker_offset {
+        let cfg = self.config();
+        let local = if uses_local_offset_store(&cfg.message_model) {
+            read_local_offset(cfg.client_id.as_deref(), &cfg.consumer_group, mq)
+        } else {
+            client
+                .query_consumer_offset(
+                    &cfg.consumer_group,
+                    mq,
+                    LITE_PULL_RPC_TIMEOUT_MILLIS,
+                    None,
+                    false,
+                )
+                .await?
+        };
+        if let Some(offset) = local {
             lock(&self.inner.state).offset_table.insert(key, offset);
         }
-        Ok(broker_offset)
+        Ok(local)
     }
 
     async fn maybe_auto_commit(&self) {
@@ -3010,12 +3099,28 @@ impl DefaultLitePullConsumer {
         let Some(offset) = lock(&self.inner.state).offset_table.get(&key).copied() else {
             return;
         };
+        let cfg = self.config();
+        if uses_local_offset_store(&cfg.message_model) {
+            if let Err(e) = write_local_offsets(
+                cfg.client_id.as_deref(),
+                &cfg.consumer_group,
+                &[(mq.clone(), offset)],
+            ) {
+                rmq_debug!("lite persist failed for {mq:?}: {e}");
+            }
+            return;
+        }
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
         };
-        let group = self.consumer_group();
         if let Err(e) = client
-            .update_consumer_offset(&group, mq, offset, LITE_PULL_RPC_TIMEOUT_MILLIS, None)
+            .update_consumer_offset(
+                &cfg.consumer_group,
+                mq,
+                offset,
+                LITE_PULL_RPC_TIMEOUT_MILLIS,
+                None,
+            )
             .await
         {
             rmq_debug!("lite persist failed for {mq:?}: {e}");
@@ -3044,10 +3149,14 @@ impl DefaultLitePullConsumer {
             }
             out
         };
+        let cfg = self.config();
+        if uses_local_offset_store(&cfg.message_model) {
+            return write_local_offsets(cfg.client_id.as_deref(), &cfg.consumer_group, &to_send);
+        }
         let Some(client) = lock(&self.inner.client).clone() else {
             return Ok(());
         };
-        let group = self.consumer_group();
+        let group = cfg.consumer_group;
         let mut first_err = None;
         for (mq, offset) in to_send {
             if let Err(e) = client
@@ -3587,8 +3696,8 @@ impl DefaultLitePullConsumer {
 /// `seek` → the offset committed on the broker (so consumption continues after a restart)
 /// → `CONSUME_FROM_FIRST_OFFSET` ⇒ min → `CONSUME_FROM_TIMESTAMP` ⇒ query by timestamp → otherwise max.
 ///
-/// Unlike the push consumer's `resolve_initial_offset`: lite has no local offset store for broadcasting mode,
-/// no SQL92 special case, and no special start for `%RETRY%` (lite does not auto-subscribe retry topics).
+/// Unlike the push consumer's `resolve_initial_offset`: lite has no SQL92 special case and no
+/// special start for `%RETRY%` (lite does not auto-subscribe retry topics).
 async fn resolve_initial_offset(
     inner: &LiteInner,
     client: &MQClientInstance,
@@ -3600,19 +3709,25 @@ async fn resolve_initial_offset(
         return Ok(offset);
     }
     let mut stored = -1i64;
-    match client
-        .query_consumer_offset(
-            &cfg.consumer_group,
-            mq,
-            LITE_PULL_RPC_TIMEOUT_MILLIS,
-            None,
-            false,
-        )
-        .await
-    {
-        Ok(Some(offset)) => stored = offset,
-        Ok(None) => {}
-        Err(e) => rmq_debug!("lite query offset failed for {mq:?}: {e}"),
+    if uses_local_offset_store(&cfg.message_model) {
+        if let Some(off) = read_local_offset(cfg.client_id.as_deref(), &cfg.consumer_group, mq) {
+            stored = off;
+        }
+    } else {
+        match client
+            .query_consumer_offset(
+                &cfg.consumer_group,
+                mq,
+                LITE_PULL_RPC_TIMEOUT_MILLIS,
+                None,
+                false,
+            )
+            .await
+        {
+            Ok(Some(offset)) => stored = offset,
+            Ok(None) => {}
+            Err(e) => rmq_debug!("lite query offset failed for {mq:?}: {e}"),
+        }
     }
     match plan_initial_offset(
         stored,
@@ -3933,31 +4048,111 @@ mod tests {
         assert!(!c.is_started());
     }
 
+    /// A subscription is a pre-start setting only for the pull shape it filters: it is not a start
+    /// gate, and one added while running must reach the brokers without waiting for the next round.
     #[tokio::test]
-    async fn lite_consumer_requires_subscription_or_assign_before_start() {
-        let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c.set_namesrv_addr("127.0.0.1:9876");
-        let e = c
+    async fn lite_start_needs_no_subscription_and_subscribing_while_running_announces_it() {
+        let cluster = FakePullCluster::start().await;
+        let c = DefaultLitePullConsumer::new("LitePG_NoSub").unwrap();
+        c.set_instance_name("lite_start_without_subscription");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.start()
+            .await
+            .expect("a lite consumer without a subscription may start");
+        assert!(c.is_started());
+
+        c.subscribe("T", "*").unwrap();
+        wait_until(
+            || {
+                cluster.master.heartbeats().iter().any(|hb| {
+                    hb.consumer_data_set
+                        .iter()
+                        .any(|cd| cd.subscription_data_set.iter().any(|s| s.topic == "T"))
+                })
+            },
+            "subscribing while running sends a heartbeat carrying the topic",
+        )
+        .await;
+        c.shutdown();
+    }
+
+    /// Only a fresh consumer starts; every later attempt reports the state that blocked it.
+    #[tokio::test]
+    async fn lite_start_reports_running_start_failed_and_shutdown_already() {
+        let cluster = FakePullCluster::start().await;
+        let c = DefaultLitePullConsumer::new("LitePG_State").unwrap();
+        c.set_instance_name("lite_state_running");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.start().await.expect("the first start succeeds");
+        let err = c
             .start()
             .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(
-            e.contains("subscription is not set, call subscribe() or assign() first"),
-            "{e}"
+            .expect_err("a running consumer can not start twice")
+            .to_string();
+        assert_eq!(
+            err,
+            "MQClientException: The PullConsumer service state not OK, maybe started once, RUNNING"
         );
-        // The missing name server check comes first, and the order is fixed
-        let c2 = DefaultLitePullConsumer::new("LitePG").unwrap();
-        c2.subscribe("T", "*").unwrap();
-        let e2 = c2
+        c.shutdown();
+        let err = c
             .start()
             .await
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default();
-        assert!(e2.contains("name server address is not set"), "{e2}");
-        c2.shutdown();
+            .expect_err("a shut-down consumer can not restart")
+            .to_string();
+        assert!(
+            err.ends_with("The PullConsumer service state not OK, maybe started once, SHUTDOWN_ALREADY"),
+            "{err}"
+        );
+
+        let failed = DefaultLitePullConsumer::new("LitePG_StateFailed").unwrap();
+        failed.set_instance_name("lite_state_failed");
+        failed.set_namesrv_addr(&cluster.namesrv_addr);
+        failed.set_message_model("NOT_A_MODEL");
+        let err = failed
+            .start()
+            .await
+            .expect_err("an unknown message model is rejected")
+            .to_string();
+        assert!(err.contains("messageModel is invalid"), "{err}");
+        let err = failed
+            .start()
+            .await
+            .expect_err("a failed start is terminal too")
+            .to_string();
+        assert!(
+            err.ends_with("The PullConsumer service state not OK, maybe started once, START_FAILED"),
+            "{err}"
+        );
+    }
+
+    /// The long-poll hold must fit inside the broker's suspend window; equality is allowed.
+    #[tokio::test]
+    async fn lite_start_rejects_a_suspend_timeout_shorter_than_the_broker_window() {
+        let c = DefaultLitePullConsumer::new("LitePG_Timeout").unwrap();
+        c.set_namesrv_addr("127.0.0.1:1");
+        c.update_config(|cfg| {
+            cfg.consumer_timeout_millis_when_suspend = cfg.broker_suspend_max_time_millis - 1;
+        });
+        let err = c
+            .start()
+            .await
+            .expect_err("the client would give up before the broker answers")
+            .to_string();
+        assert!(
+            err.contains(
+                "consumerTimeoutMillisWhenSuspend must greater than brokerSuspendMaxTimeMillis"
+            ),
+            "{err}"
+        );
+
+        let equal = DefaultLitePullConsumer::new("LitePG_TimeoutEqual").unwrap();
+        equal.set_instance_name("lite_timeout_equal");
+        equal.set_namesrv_addr("127.0.0.1:1");
+        equal.update_config(|cfg| {
+            cfg.consumer_timeout_millis_when_suspend = cfg.broker_suspend_max_time_millis;
+        });
+        equal.start().await.expect("equality is inside the window");
+        equal.shutdown();
     }
 
     // ---------------------------------------------------------- Config shape
@@ -4647,6 +4842,7 @@ mod tests {
     #[tokio::test]
     async fn lite_start_rejects_epoch_millis_timestamp() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
+        c.set_instance_name("lite_epoch_reject");
         c.update_config(|cfg| {
             cfg.name_server_addrs = vec!["127.0.0.1:9876".to_string()];
             cfg.consume_timestamp = "1700000000000".to_string();
@@ -4654,10 +4850,18 @@ mod tests {
         c.assign(&[queue("T", "broker-a", 0)]).unwrap();
         let err = c.start().await.unwrap_err().to_string();
         assert!(err.contains("consumeTimestamp is invalid"), "{err}");
-        // A valid wall clock must not be killed by this guard by mistake
-        c.set_consume_timestamp("20230101000000");
-        assert!(c.start().await.is_ok());
         c.shutdown();
+
+        // A valid wall clock must not be killed by this guard by mistake
+        let ok = DefaultLitePullConsumer::new("LitePG").unwrap();
+        ok.set_instance_name("lite_epoch_ok");
+        ok.update_config(|cfg| {
+            cfg.name_server_addrs = vec!["127.0.0.1:9876".to_string()];
+            cfg.consume_timestamp = "20230101000000".to_string();
+        });
+        ok.assign(&[queue("T", "broker-a", 0)]).unwrap();
+        assert!(ok.start().await.is_ok());
+        ok.shutdown();
     }
 
     #[test]

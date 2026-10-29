@@ -14,6 +14,7 @@ package remoting
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -97,6 +98,14 @@ type ClientConfig struct {
 	// TLS test mode (tls.test.mode.enable, default true): trust
 	// self-signed certs, skip hostname checks.
 	TLSTestMode bool
+	// TLSCertFile and TLSKeyFile are the PEM client certificate chain and its
+	// private key; when both are set every TLS connection presents them.
+	TLSCertFile string
+	TLSKeyFile  string
+	// TLSCAFile is a PEM bundle used as the trust anchors for the broker's
+	// certificate. With no anchors configured the platform roots apply (or,
+	// under test mode, none at all).
+	TLSCAFile string
 	// On GO_AWAY(1500) retry once over a fresh connection; off -> the
 	// SendRequest error surfaces directly (enableReconnectForGoAway = false).
 	EnableReconnectForGoAway bool
@@ -116,6 +125,9 @@ func NewClientConfig() ClientConfig {
 		ConnectTimeoutMillis:      3000,
 		InvokeTimeoutMillis:       3000,
 		TLSEnable:                 envBool("ROCKETMQ_TLS_ENABLE", false),
+		TLSCertFile:               envString("ROCKETMQ_TLS_CERT_FILE"),
+		TLSKeyFile:                envString("ROCKETMQ_TLS_KEY_FILE"),
+		TLSCAFile:                 envString("ROCKETMQ_TLS_CA_FILE"),
 		TLSTestMode:               envBool("ROCKETMQ_TLS_TEST_MODE", true),
 		EnableReconnectForGoAway:  true,
 		ChannelIdleTimeoutSeconds: DefaultChannelIdleTimeoutSeconds,
@@ -131,6 +143,10 @@ func (c *RemotingClient) channelIdleTimeout() time.Duration {
 		seconds = DefaultChannelIdleTimeoutSeconds
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func envString(key string) string {
+	return strings.TrimSpace(os.Getenv(key))
 }
 
 func envBool(key string, def bool) bool {
@@ -246,6 +262,12 @@ type RemotingClient struct {
 	sweepMu   sync.Mutex
 	sweeping  bool
 	sweepStop chan struct{}
+
+	// tlsOnce builds the identity/trust part of the TLS config once; the
+	// per-connection clone only stamps the peer's ServerName onto it.
+	tlsOnce sync.Once
+	tlsBase *tls.Config
+	tlsErr  error
 }
 
 func NewRemotingClient() *RemotingClient {
@@ -801,10 +823,13 @@ func (c *RemotingClient) connect(addr string) (*connection, error) {
 }
 
 func (c *RemotingClient) wrapTLS(raw net.Conn, host, addr string) (net.Conn, error) {
-	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
-	if c.config.TLSTestMode {
-		cfg.InsecureSkipVerify = true
+	base, err := c.baseTLSConfig()
+	if err != nil {
+		_ = raw.Close()
+		return nil, common.ConnectError(fmt.Sprintf("%s (%v)", addr, err))
 	}
+	cfg := base.Clone()
+	cfg.ServerName = host
 	timeout := time.Duration(c.config.ConnectTimeoutMillis) * time.Millisecond
 	if timeout <= 0 {
 		timeout = time.Second
@@ -817,6 +842,48 @@ func (c *RemotingClient) wrapTLS(raw net.Conn, host, addr string) (net.Conn, err
 	}
 	_ = raw.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+// baseTLSConfig loads the configured client identity and trust anchors once.
+// An unreadable or malformed file is reported at the first TLS connect instead
+// of silently downgrading to an anonymous client.
+func (c *RemotingClient) baseTLSConfig() (*tls.Config, error) {
+	c.tlsOnce.Do(func() {
+		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if c.config.TLSTestMode {
+			cfg.InsecureSkipVerify = true
+		}
+		caFile := strings.TrimSpace(c.config.TLSCAFile)
+		if caFile != "" {
+			pemBytes, err := os.ReadFile(caFile)
+			if err != nil {
+				c.tlsErr = fmt.Errorf("read tls trust certificate %s: %v", caFile, err)
+				return
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pemBytes) {
+				c.tlsErr = fmt.Errorf("tls trust certificate %s contains no PEM certificate", caFile)
+				return
+			}
+			cfg.RootCAs = pool
+		}
+		certFile := strings.TrimSpace(c.config.TLSCertFile)
+		keyFile := strings.TrimSpace(c.config.TLSKeyFile)
+		if certFile != "" || keyFile != "" {
+			if certFile == "" || keyFile == "" {
+				c.tlsErr = fmt.Errorf("tls client identity needs both a certificate and a key file")
+				return
+			}
+			pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				c.tlsErr = fmt.Errorf("load tls client identity %s: %v", certFile, err)
+				return
+			}
+			cfg.Certificates = []tls.Certificate{pair}
+		}
+		c.tlsBase = cfg
+	})
+	return c.tlsBase, c.tlsErr
 }
 
 // readLoop reassembles frames (totalLength prefix + headerLength-marked

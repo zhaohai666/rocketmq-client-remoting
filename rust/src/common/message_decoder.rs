@@ -525,6 +525,92 @@ pub fn decode_batch_messages(raw: &[u8]) -> Vec<Message> {
     result
 }
 
+/// Replaces every pulled message that carries both the inner-batch and the unwrap flag with one
+/// message per member of its body (a message batch); the envelope fields travel to each member.
+/// A body that does not decode completely leaves the envelope in place.
+pub(crate) fn unwrap_inner_batch(messages: Vec<MessageExt>) -> Vec<MessageExt> {
+    use crate::common::message_const::{
+        PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, PROPERTY_WAIT_STORE_MSG_OK,
+    };
+    use crate::rmq_error;
+
+    let mut out = Vec::with_capacity(messages.len());
+    for envelope in messages {
+        let flagged = envelope.sys_flag & MessageSysFlag::INNER_BATCH_FLAG != 0
+            && envelope.sys_flag & MessageSysFlag::NEED_UNWRAP_FLAG != 0;
+        if !flagged {
+            out.push(envelope);
+            continue;
+        }
+        let decoded = envelope
+            .body
+            .as_deref()
+            .ok_or_else(|| Error::Decode("inner batch has no body".into()))
+            .and_then(decode_inner_batch_members);
+        let members = match decoded {
+            Ok(members) if !members.is_empty() => members,
+            Ok(_) => {
+                rmq_error!("inner batch of {} has no member", envelope.topic);
+                out.push(envelope);
+                continue;
+            }
+            Err(e) => {
+                rmq_error!("decode inner batch of {} failed: {e}", envelope.topic);
+                out.push(envelope);
+                continue;
+            }
+        };
+        for (i, member) in members.into_iter().enumerate() {
+            let mut ext = MessageExt::new();
+            ext.topic = envelope.topic.clone();
+            ext.queue_offset = envelope.queue_offset + i as i64;
+            ext.queue_id = envelope.queue_id;
+            ext.flag = member.flag;
+            ext.properties = member.properties;
+            ext.body = Some(member.body.unwrap_or_default());
+            ext.store_host = envelope.store_host.clone();
+            ext.store_host_port = envelope.store_host_port;
+            ext.born_host = envelope.born_host.clone();
+            ext.born_host_port = envelope.born_host_port;
+            ext.born_timestamp = envelope.born_timestamp;
+            ext.store_timestamp = envelope.store_timestamp;
+            ext.sys_flag = envelope.sys_flag;
+            ext.commit_log_offset = envelope.commit_log_offset;
+            ext.broker_name = envelope.broker_name.clone();
+            if let Some(ok) = envelope.get_wait_store_msg_ok() {
+                ext.put_property(PROPERTY_WAIT_STORE_MSG_OK, ok);
+            }
+            // A member has no store offset of its own, so its identity comes from the property.
+            ext.msg_id = ext
+                .get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+                .map(str::to_string);
+            out.push(ext);
+        }
+    }
+    out
+}
+
+fn decode_inner_batch_members(raw: &[u8]) -> Result<Vec<Message>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < raw.len() {
+        if raw.len() - pos < 4 {
+            return Err(Error::Decode("truncated inner batch record".into()));
+        }
+        let store_size =
+            i32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+        if store_size <= 0 || store_size as usize > raw.len() - pos {
+            return Err(Error::Decode(format!(
+                "illegal inner batch record size: {store_size}"
+            )));
+        }
+        let end = pos + store_size as usize;
+        out.push(decode_batch_message(&raw[pos..end])?);
+        pos = end;
+    }
+    Ok(out)
+}
+
 pub fn count_inner_msg_num(raw: &[u8]) -> i32 {
     let mut count = 0i32;
     let mut pos = 0usize;
@@ -1058,6 +1144,65 @@ mod tests {
         let mut raw = encode_messages(&[Message::new("T", Some(b"m1"))]);
         raw.extend_from_slice(b"\x00\x00");
         assert_eq!(decode_batch_messages(&raw).len(), 1);
+    }
+
+    fn inner_batch_envelope(body: &[u8]) -> MessageExt {
+        let flags = MessageSysFlag::INNER_BATCH_FLAG | MessageSysFlag::NEED_UNWRAP_FLAG;
+        let flags = flags.to_string();
+        let mut envelope = build_ext(&[("sys_flag", flags.as_str())]);
+        envelope.set_body(Some(body));
+        envelope.set_wait_store_msg_ok(true);
+        envelope
+    }
+
+    #[test]
+    fn inner_batch_is_replaced_by_one_message_per_member() {
+        let members = vec![
+            Message::with_tags_and_keys("", Some(b"m1"), Some("TagA"), None, 11),
+            Message::with_tags_and_keys("", Some(b"m2"), Some("TagB"), None, 12),
+        ];
+        let envelope = inner_batch_envelope(&encode_messages(&members));
+        let out = unwrap_inner_batch(vec![envelope]);
+        assert_eq!(out.len(), 2);
+        for (i, (msg, member)) in out.iter().zip(members.iter()).enumerate() {
+            assert_eq!(msg.get_topic(), "TopicTest");
+            assert_eq!(msg.get_queue_offset(), 88 + i as i64);
+            assert_eq!(msg.get_queue_id(), 3);
+            assert_eq!(msg.get_flag(), member.get_flag());
+            assert_eq!(msg.get_body(), member.get_body());
+            assert_eq!(msg.get_property("TAGS"), member.get_property("TAGS"));
+            assert_eq!(msg.get_store_host(), Some("127.0.0.1"));
+            assert_eq!(msg.get_born_host(), Some("127.0.0.1"));
+            assert_eq!(msg.born_timestamp, 1_700_000_000_000);
+            assert_eq!(msg.store_timestamp, 1_700_000_000_123);
+            assert_eq!(msg.sys_flag, envelope_flag());
+            assert_eq!(msg.commit_log_offset, 1024);
+            assert_eq!(msg.get_wait_store_msg_ok(), Some("true"));
+        }
+    }
+
+    fn envelope_flag() -> i32 {
+        MessageSysFlag::INNER_BATCH_FLAG | MessageSysFlag::NEED_UNWRAP_FLAG
+    }
+
+    #[test]
+    fn an_undecodable_inner_batch_keeps_the_envelope() {
+        let raw = encode_messages(&[Message::new("", Some(b"m1"))]);
+        let truncated = &raw[..raw.len() - 1];
+        let out = unwrap_inner_batch(vec![inner_batch_envelope(truncated)]);
+        assert_eq!(out.len(), 1, "a broken batch must not lose the message");
+        assert_eq!(out[0].get_queue_offset(), 88);
+        assert_eq!(out[0].sys_flag, envelope_flag());
+    }
+
+    #[test]
+    fn a_message_without_the_unwrap_pair_is_left_alone() {
+        let mut envelope = build_ext(&[]);
+        envelope.sys_flag = MessageSysFlag::INNER_BATCH_FLAG;
+        envelope.set_body(Some(&encode_messages(&[Message::new("", Some(b"m1"))])));
+        let out = unwrap_inner_batch(vec![envelope]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_queue_offset(), 88);
     }
 
     // --------------------------------------------------------- crc32

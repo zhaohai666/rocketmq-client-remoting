@@ -19,6 +19,8 @@ import type { OffsetStore } from './offset_store.ts';
 import { PullStatus } from './consumer_result.ts';
 import { MessageModel, ConsumeType, ConsumeFromWhere } from '../remoting/heartbeat.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
+import { AllocateMessageQueueAveragely } from './allocate.ts';
+import type { AllocateMessageQueueStrategy } from './allocate.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { FilterAPI, SubscriptionData } from '../common/subscriptionData.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
@@ -140,6 +142,13 @@ export class DefaultLitePullConsumer {
   concurrentHeartbeatThreadPoolSize = DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE;
   // Page size of the paged metadata admin calls (maxTopicNum / maxGroupNum).
   maxPageSizeInGetMetadata = 2000;
+  // Queue allocation used by subscribe() mode.
+  allocateMessageQueueStrategy: AllocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
+  // Long-polling bounds. They are validated at start(); a consumer configured
+  // to time out before the broker's suspend window would give up on every
+  // parked pull.
+  brokerSuspendMaxTimeMillis = 20000;
+  consumerTimeoutMillisWhenSuspend = 30000;
 
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
   // The CONSUME_FROM_TIMESTAMP start instant ("yyyyMMddHHmmss"); the format is checked at start().
@@ -171,6 +180,10 @@ export class DefaultLitePullConsumer {
   private topicChangeListeners = new Map<string, TopicMessageQueueChangeListener>();
   private messageQueuesForTopic = new Map<string, MessageQueue[]>();
   private started = false;
+  // Start state machine: a consumer can only be started from CREATE_JUST.
+  // Every other state refuses, so a second start() can never run a half-built
+  // second incarnation.
+  private _serviceState: 'CREATE_JUST' | 'RUNNING' | 'START_FAILED' | 'SHUTDOWN_ALREADY' = 'CREATE_JUST';
   private _rebalanceTimer: NodeJS.Timeout | null = null;
   private _autoCommitTimer: NodeJS.Timeout | null = null;
   private _metadataTimer: NodeJS.Timeout | null = null;
@@ -257,6 +270,22 @@ export class DefaultLitePullConsumer {
   getMaxPageSizeInGetMetadata(): number { return this.maxPageSizeInGetMetadata; }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
+  getServiceState(): string { return this._serviceState; }
+
+  setAllocateMessageQueueStrategy(strategy: AllocateMessageQueueStrategy): this {
+    this.allocateMessageQueueStrategy = strategy;
+    return this;
+  }
+  getAllocateMessageQueueStrategy(): AllocateMessageQueueStrategy {
+    return this.allocateMessageQueueStrategy;
+  }
+  setBrokerSuspendMaxTimeMillis(ms: number): this { this.brokerSuspendMaxTimeMillis = ms; return this; }
+  getBrokerSuspendMaxTimeMillis(): number { return this.brokerSuspendMaxTimeMillis; }
+  setConsumerTimeoutMillisWhenSuspend(ms: number): this {
+    this.consumerTimeoutMillisWhenSuspend = ms;
+    return this;
+  }
+  getConsumerTimeoutMillisWhenSuspend(): number { return this.consumerTimeoutMillisWhenSuspend; }
 
   // Sets the topic metadata comparison period (anything below the floor or
   // otherwise illegal is clamped to the floor).
@@ -280,6 +309,15 @@ export class DefaultLitePullConsumer {
     this.claimMode('subscribe');
     const expr = subExpression || '*';
     this.subscription.set(topic, FilterAPI.buildSubscriptionData(topic, expr));
+    // A subscription added while RUNNING needs its route and a heartbeat now:
+    // the rebalance loop only reads the cached route, and the broker learns the
+    // expression only from a fresh heartbeat.
+    const client = this.mqClient;
+    if (this.started && client) {
+      void client.updateTopicRouteInfoFromNameServer(topic, false).catch((e) =>
+        logger.debug('lite subscribe: route refresh for %s failed: %s', topic, (e as Error).message));
+      void client.sendHeartbeatToAllBrokers().catch(() => {});
+    }
     return this;
   }
 
@@ -346,13 +384,37 @@ export class DefaultLitePullConsumer {
     this.paused.delete(key);
   }
 
-  async start(): Promise<void> {
-    if (this.started) return;
+  // _checkConfig validates the pre-start configuration. Subscription is NOT a
+  // precondition here: queues can also be named after start() via assign().
+  private _checkConfig(): void {
     Validators.checkGroup(this.consumerGroup);
-    if (!this.nameServerAddr) throw new Error('name server address is not set');
-    if (this.mode === 'none') {
-      throw new Error('subscription is not set, call subscribe() or assign() first');
+    if (this.consumerGroup === MixAll.DEFAULT_CONSUMER_GROUP) {
+      throw new Error(`consumerGroup can not equal ${MixAll.DEFAULT_CONSUMER_GROUP}`);
     }
+    if (!this.messageModel) throw new Error('messageModel can not be null');
+    if (!this.allocateMessageQueueStrategy) throw new Error('allocateMessageQueueStrategy can not be null');
+    if (this.consumerTimeoutMillisWhenSuspend < this.brokerSuspendMaxTimeMillis) {
+      throw new Error('Long polling mode, the consumer consumerTimeoutMillisWhenSuspend '
+        + 'must greater than brokerSuspendMaxTimeMillis');
+    }
+  }
+
+  async start(): Promise<void> {
+    switch (this._serviceState) {
+      case 'CREATE_JUST':
+        // Leave CREATE_JUST before anything can fail, so a failed start is not
+        // retried with half of the state already built.
+        this._serviceState = 'START_FAILED';
+        this._checkConfig();
+        break;
+      case 'RUNNING':
+      case 'START_FAILED':
+      case 'SHUTDOWN_ALREADY':
+        throw new Error(`The PullConsumer service state not OK, maybe started once, ${this._serviceState}`);
+      default:
+        break;
+    }
+    if (!this.nameServerAddr) throw new Error('name server address is not set');
     // The start instant is checked whatever the policy is: a malformed value must fail here rather
     // than surface mid-consumption as a failed offset resolution on one queue.
     parseConsumeTimestamp(this.consumeTimestamp);
@@ -424,6 +486,7 @@ export class DefaultLitePullConsumer {
     // So start() proactively sends one extra heartbeat.
     await client.sendHeartbeatToAllBrokers().catch(() => {});
     this.started = true;
+    this._serviceState = 'RUNNING';
     // The metadata comparison loop starts unconditionally, whether or not any
     // listener was registered.
     this._startMetadataLoop();
@@ -459,6 +522,7 @@ export class DefaultLitePullConsumer {
       MQClientManager.getInstance().unregisterClient(this.mqClient.clientId, this.mqClient);
     }
     this.started = false;
+    this._serviceState = 'SHUTDOWN_ALREADY';
   }
 
   // _doRebalance assigns queues only in subscribe() mode.
@@ -492,9 +556,8 @@ export class DefaultLitePullConsumer {
         const ids = Array.isArray(body) ? body
           : (body && Array.isArray(body['consumerIdList'])) ? body['consumerIdList'] : [];
         if (!ids.length) continue;
-        const { AllocateMessageQueueAveragely } = await import('./allocate.ts');
         const sorted = [...mqAll].sort((a, b) => a.compareTo(b));
-        assigned.push(...new AllocateMessageQueueAveragely().allocate(
+        assigned.push(...this.allocateMessageQueueStrategy.allocate(
           this.consumerGroup, this.clientID, sorted, ids.map(String).sort()));
       } catch (e) {
         logger.debug('lite pull rebalance: no consumer id list for %s: %s', topic, (e as Error).message);

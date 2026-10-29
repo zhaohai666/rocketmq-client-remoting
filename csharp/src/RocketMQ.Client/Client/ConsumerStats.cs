@@ -17,8 +17,12 @@ public sealed class StatsSnapshot
 public static class StatsItems
 {
     public const double SamplingIntervalSeconds = 10.0;
-    public const int MinuteListMax = 60;   // ~10-minute window
-    public const int HourListMax = 60;
+    public const int MinuteSampleIntervalMs = 10_000;
+    public const int HourSampleIntervalMs = 600_000;
+    public const int DaySampleIntervalMs = 3_600_000;
+    public const int MinuteListMax = 7;
+    public const int HourListMax = 7;
+    public const int DayListMax = 25;
 
     public static StatsSnapshot Compute(IReadOnlyList<(long ts, long value, long times)> csList)
     {
@@ -48,12 +52,13 @@ public static class StatsItems
     }
 }
 
-/// <summary>Single stats item: cumulative value/times plus minute/hour two-level sampling chains.</summary>
+/// <summary>Single stats item: cumulative value/times plus minute/hour/day sampling chains.</summary>
 public sealed class StatsItem
 {
     private readonly object _lock = new();
     private readonly List<(long ts, long value, long times)> _minute = new();
     private readonly List<(long ts, long value, long times)> _hour = new();
+    private readonly List<(long ts, long value, long times)> _day = new();
     private long _value;
     private long _times;
 
@@ -91,6 +96,14 @@ public sealed class StatsItem
         }
     }
 
+    public void SampleDay()
+    {
+        lock (_lock)
+        {
+            AppendDay(UtilAll.CurrentTimeMillis(), _value, _times);
+        }
+    }
+
     public StatsSnapshot GetStatsDataInMinute()
     {
         lock (_lock)
@@ -104,6 +117,14 @@ public sealed class StatsItem
         lock (_lock)
         {
             return StatsItems.Compute(_hour);
+        }
+    }
+
+    public StatsSnapshot GetStatsDataInDay()
+    {
+        lock (_lock)
+        {
+            return StatsItems.Compute(_day);
         }
     }
 
@@ -123,11 +144,28 @@ public sealed class StatsItem
         {
             AppendMinute(tsMs, value, times);
             AppendHour(tsMs, value, times);
+            AppendDay(tsMs, value, times);
         }
     }
 
+    // Test-only: sample points with an injected timestamp.
+    public void AppendDaySampleForTest(long tsMs, long value, long times)
+    {
+        lock (_lock)
+        {
+            AppendDay(tsMs, value, times);
+        }
+    }
+
+    // The first point is a zero baseline one period back, so a fresh window's sum is the
+    // cumulative delta rather than zero.
     private void AppendMinute(long ts, long v, long t)
     {
+        if (_minute.Count == 0)
+        {
+            _minute.Add((ts - StatsItems.MinuteSampleIntervalMs, 0, 0));
+        }
+
         _minute.Add((ts, v, t));
         if (_minute.Count > StatsItems.MinuteListMax)
         {
@@ -137,10 +175,29 @@ public sealed class StatsItem
 
     private void AppendHour(long ts, long v, long t)
     {
+        if (_hour.Count == 0)
+        {
+            _hour.Add((ts - StatsItems.HourSampleIntervalMs, 0, 0));
+        }
+
         _hour.Add((ts, v, t));
         if (_hour.Count > StatsItems.HourListMax)
         {
             _hour.RemoveAt(0);
+        }
+    }
+
+    private void AppendDay(long ts, long v, long t)
+    {
+        if (_day.Count == 0)
+        {
+            _day.Add((ts - StatsItems.DaySampleIntervalMs, 0, 0));
+        }
+
+        _day.Add((ts, v, t));
+        if (_day.Count > StatsItems.DayListMax)
+        {
+            _day.RemoveAt(0);
         }
     }
 }
@@ -205,6 +262,14 @@ public sealed class StatsItemSet
         foreach (string key in Keys())
         {
             Find(key)?.SampleHour();
+        }
+    }
+
+    public void SampleDayAll()
+    {
+        foreach (string key in Keys())
+        {
+            Find(key)?.SampleDay();
         }
     }
 }
@@ -311,6 +376,14 @@ public sealed class ConsumerStatsManager : IDisposable
                 foreach (StatsItemSet s in _sets)
                 {
                     s.SampleHourAll();
+                }
+
+                if (rounds % 360 == 0)   // 6 x 10min = 1 hour
+                {
+                    foreach (StatsItemSet s in _sets)
+                    {
+                        s.SampleDayAll();
+                    }
                 }
             }
         }
