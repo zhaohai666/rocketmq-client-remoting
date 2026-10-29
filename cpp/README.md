@@ -46,17 +46,17 @@ cmake --build build -j6
 cd build && ctest --output-on-failure
 ```
 
-产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、72 个测试二进制与
+产出静态库 `build/librocketmq_remoting.a`（别名 `rocketmq::remoting`）、73 个测试二进制与
 44 个 `build/examples/` 工具。本机实测：
 
 ```
-100% tests passed out of 73
-Total Test time (real) = 145.90 sec   # ctest --output-on-failure（串行）
+100% tests passed out of 74
+Total Test time (real) = 156.79 sec   # ctest --output-on-failure（串行）
 ```
 
-73 个用例 = 72 个测试二进制 + 1 个编解码互调用例。断言数按每个二进制自己的汇总行汇总（措辞按二进制不同：`N checks, M failures`、
-`N passed, M failed`、`PASS=n FAIL=m`、`[PASS] n checks, [FAIL] m`、`checks=n fails=m`、`ALL PASS (n checks)` 等）：逐个串行跑 `build/tests/` 下 72 个测试二进制，各取自己那行汇总，checks 合计
-**8,474 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,547 项**。
+74 个用例 = 73 个测试二进制 + 1 个编解码互调用例。断言数按每个二进制自己的汇总行汇总（措辞按二进制不同：`N checks, M failures`、
+`N passed, M failed`、`PASS=n FAIL=m`、`[PASS] n checks, [FAIL] m`、`checks=n fails=m`、`ALL PASS (n checks)` 等）：逐个串行跑 `build/tests/` 下 73 个测试二进制，各取自己那行汇总，checks 合计
+**8,512 项、failures 0**；`tests/interop_check.py` 另有 **73 项 PASS**，合计 **8,585 项**。
 
 不依赖集群的协议层自检：
 
@@ -702,7 +702,7 @@ cpp/
 │                               hook / trace / request_reply / backpressure / validators /
 │                               result / exception
 ├── src/                        与 include 同构的实现（common / remoting / client）
-├── tests/                      72 个测试源文件 + interop_check.py = 73 个 ctest 用例
+├── tests/                      73 个测试源文件 + interop_check.py = 74 个 ctest 用例
 ├── examples/                   rmq_selfcheck / rmq_interop + 41 个真机联调工具
 └── tools/                      Windows 头文件准备与语法检查脚本
 ```

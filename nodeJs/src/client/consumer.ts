@@ -63,7 +63,7 @@ import {
 } from '../remoting/heartbeat.ts';
 import { GetConsumerStatusBody } from '../remoting/bodies.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
-import { MessageExt, MessageQueue, Message } from '../common/message.ts';
+import { MessageExt, MessageQueue } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { defaultConsumeTimestamp, parseConsumeTimestamp, currentTimeMillis } from '../common/utilAll.ts';
@@ -71,6 +71,7 @@ import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscript
 import { decodeMessages, decodeInnerBatchMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
 import { DefaultMQProducer } from './producer.ts';
+import { buildRetryMessage } from './retry_message.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
 import { AclRPCHook } from '../remoting/acl.ts';
 import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
@@ -2016,24 +2017,42 @@ export class DefaultMQPushConsumer {
   //
   // `offset` is the message's commitLogOffset, NOT its queueOffset — the
   // broker looks the record up by physical offset.
+  //
+  // A refused bounce — a missing master, a transport error or a non-success
+  // answer — degrades to re-sending the message as a normal message to
+  // %RETRY%<group> through the internal producer, so the redelivery is not
+  // lost; only when that send fails too does the original error reach the
+  // caller.
   async sendMessageBack(msg: MessageExt, delayLevel: number): Promise<void> {
     const client = this.mqClient;
     if (!client) throw new Error('consumer not started');
     const maxReconsume = this.maxReconsumeTimes === -1 ? 16 : this.maxReconsumeTimes;
-    const addr = client.findBrokerAddressInPublish(msg.getBrokerName());
-    if (!addr) throw new Error(`Broker[${msg.getBrokerName()}] master node does not exist`);
-    const h = new ConsumerSendMsgBackRequestHeader();
-    h.offset = msg.getCommitLogOffset();
-    h.group = this.consumerGroup;
-    h.delayLevel = delayLevel;
-    h.originMsgId = msg.getMsgId();
-    h.originTopic = msg.getTopic();
-    h.unitMode = this.unitMode;
-    h.maxReconsumeTimes = maxReconsume;
-    const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
-    const response = await client.remotingClient.invokeSync(client.vipChannel(addr), request, 5000);
-    if (response.code !== ResponseCode.SUCCESS) {
-      throw new Error(`sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`);
+    try {
+      const addr = client.findBrokerAddressInPublish(msg.getBrokerName());
+      if (!addr) throw new Error(`Broker[${msg.getBrokerName()}] master node does not exist`);
+      const h = new ConsumerSendMsgBackRequestHeader();
+      h.offset = msg.getCommitLogOffset();
+      h.group = this.consumerGroup;
+      h.delayLevel = delayLevel;
+      h.originMsgId = msg.getMsgId();
+      h.originTopic = msg.getTopic();
+      h.unitMode = this.unitMode;
+      h.maxReconsumeTimes = maxReconsume;
+      const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
+      const response = await client.remotingClient.invokeSync(client.vipChannel(addr), request, 5000);
+      if (response.code !== ResponseCode.SUCCESS) {
+        throw new Error(`sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`);
+      }
+    } catch (e) {
+      logger.error('Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %s; fallback to normal send',
+        this.consumerGroup, msg.getBrokerName(), msg.getMsgId(), (e as Error).message);
+      try {
+        await this._sendRetryMessage(msg, maxReconsume);
+      } catch (fallbackError) {
+        logger.error('Fallback normal send failed, consumerGroup=%s, msg=%s: %s',
+          this.consumerGroup, msg.getMsgId(), (fallbackError as Error).message);
+        throw e;
+      }
     }
   }
 
@@ -2206,31 +2225,22 @@ export class DefaultMQPushConsumer {
   }
 
   private async _doOrderlySendMessageBack(msg: MessageExt): Promise<boolean> {
-    const producer = await this._innerProducer();
-    if (!producer) return false;
-    const retryTopic = MixAll.getRetryTopic(this.consumerGroup);
-    const newMsg = new Message(retryTopic, Buffer.from(msg.getBody() || Buffer.alloc(0)));
-    newMsg.setProperties({ ...(msg.getProperties() || {}) });
-    newMsg.setFlag(msg.getFlag());
-    let originMsgID = msg.getMsgId();
-    const orig = msg.getProperty(MessageConst.PROPERTY_ORIGIN_MESSAGE_ID);
-    if (orig) originMsgID = orig;
-    if (originMsgID) newMsg.putProperty(MessageConst.PROPERTY_ORIGIN_MESSAGE_ID, originMsgID);
-    newMsg.putProperty(MessageConst.PROPERTY_RETRY_TOPIC, msg.getTopic());
-    newMsg.putProperty(MessageConst.PROPERTY_RECONSUME_TIME, String(msg.getReconsumeTimes() + 1));
-    newMsg.putProperty(MessageConst.PROPERTY_MAX_RECONSUME_TIMES, String(this._orderlyMaxReconsumeTimes()));
-    // The half-message marker must go, else the broker treats it as a
-    // transaction check-back message all over again.
-    msg.removeProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
-    newMsg.setDelayTimeLevel(3 + msg.getReconsumeTimes());
     try {
-      await producer.sendBySelector(newMsg, undefined);
+      await this._sendRetryMessage(msg, this._orderlyMaxReconsumeTimes());
       return true;
     } catch (e) {
       logger.debug('orderly send message back failed, group=%s msg=%s: %s',
         this.consumerGroup, msg.getMsgId(), (e as Error).message);
       return false;
     }
+  }
+
+  // _sendRetryMessage sends a failed delivery as a normal message to
+  // %RETRY%<group> through the internal producer.
+  private async _sendRetryMessage(msg: MessageExt, maxReconsume: number): Promise<void> {
+    const producer = await this._innerProducer();
+    if (!producer) throw new Error('inner producer is not available');
+    await producer.sendBySelector(buildRetryMessage(this.consumerGroup, msg, maxReconsume), undefined);
   }
 
   // _innerProducer lazily builds the CLIENT_INNER_PRODUCER used by the orderly

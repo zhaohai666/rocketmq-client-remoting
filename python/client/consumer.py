@@ -872,6 +872,28 @@ def _load_local_offsets_at(path: str) -> Dict[str, int]:
     return {}
 
 
+def _build_retry_message(msg: MessageExt, consumer_group: str,
+                         max_reconsume_times: int) -> Message:
+    """Build the normal message that carries a failed delivery to ``%RETRY%<group>``.
+
+    The body and properties are copied, the origin id falls back to the message id, the retry
+    bookkeeping is written, and the half-message marker is cleared so the broker does not treat
+    the copy as a transaction check-back all over again.
+    """
+    new_msg = Message(MixAll.get_retry_topic(consumer_group), msg.body)
+    new_msg.properties = dict(msg.properties)
+    new_msg.flag = msg.flag
+    origin_msg_id = MessageAccessor.get_origin_message_id(msg) or msg.msg_id
+    if origin_msg_id:
+        MessageAccessor.set_origin_message_id(new_msg, origin_msg_id)
+    MessageAccessor.put_property(new_msg, MessageConst.PROPERTY_RETRY_TOPIC, msg.topic)
+    MessageAccessor.set_reconsume_time(new_msg, msg.get_reconsume_times() + 1)
+    MessageAccessor.set_max_reconsume_times(new_msg, max_reconsume_times)
+    MessageAccessor.clear_property(new_msg, MessageConst.PROPERTY_TRANSACTION_PREPARED)
+    new_msg.set_delay_time_level(3 + msg.get_reconsume_times())
+    return new_msg
+
+
 class PopProcessQueue:
     """Queue state in POP mode.
 
@@ -3954,44 +3976,34 @@ class DefaultMQPushConsumer:
     def _orderly_send_message_back(self, msg: MessageExt) -> bool:
         """Ordered consumption's redelivery: use the internal producer to forward the message to the retry topic.
 
-        Take the instance's built-in internal producer and send this message **as a normal message** to `%RETRY%<group>`:
-        the broker's retry/DLQ handling on its send path, seeing that the group still holds an unexpired
-        queue lock (a characteristic of ordered consumption groups), directly redirects it to `%DLQ%<group>`. Among the property settings,
-        `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` are lifted into the request header by the send side
-        (see `mq_client._build_send_request`); the peer matches on these headers, and changing them breaks compatibility.
+        Take the instance's built-in internal producer and send this message **as a normal message** to `%RETRY%<group>`
+        (see :func:`_build_retry_message` for the properties it carries): the broker's retry/DLQ handling on its send path,
+        seeing that the group still holds an unexpired queue lock (a characteristic of ordered consumption groups),
+        directly redirects it to `%DLQ%<group>`.
 
         Failure only returns false, never throws: the whole block catches exceptions; throwing to the consume thread would leave this one neither
         acked nor redelivered, only able to wait for the lock to time out.
         """
         try:
-            client = self._require_client()
-            new_msg = Message(MixAll.get_retry_topic(self.consumer_group), msg.body)
-            new_msg.properties = dict(msg.properties)
-            new_msg.flag = msg.flag
-            origin_msg_id = MessageAccessor.get_origin_message_id(msg) or msg.msg_id
-            if origin_msg_id:
-                MessageAccessor.set_origin_message_id(new_msg, origin_msg_id)
-            MessageAccessor.put_property(new_msg, MessageConst.PROPERTY_RETRY_TOPIC, msg.topic)
-            MessageAccessor.set_reconsume_time(new_msg, msg.get_reconsume_times() + 1)
-            MessageAccessor.set_max_reconsume_times(new_msg,
-                                                    self._orderly_max_reconsume_times())
-            # The half-message flag must be cleared, otherwise the broker would treat it as a transaction-check message again
-            MessageAccessor.clear_property(new_msg,
-                                           MessageConst.PROPERTY_TRANSACTION_PREPARED)
-            new_msg.set_delay_time_level(3 + msg.get_reconsume_times())
-            publish = client.get_topic_publish_info(new_msg.topic, is_default=True)
-            mq = publish.select_one_message_queue() if publish is not None else None
-            if mq is None:
-                raise MQClientException("no writable queue for retry topic %s" % new_msg.topic)
-            # unitMode follows the consumer: the internal producer reuses the consumer's client config,
-            # and without it the redelivered messages would lose the unit flag.
-            client.send_message(MixAll.CLIENT_INNER_PRODUCER_GROUP, new_msg, mq, 3000,
-                                unit_mode=self.unit_mode)
+            self._send_retry_message(msg, self._orderly_max_reconsume_times())
             return True
         except Exception as e:  # noqa: BLE001
             logger.debug("orderly send message back failed, group=%s msg=%s: %s",
                          self.consumer_group, msg.msg_id, e)
             return False
+
+    def _send_retry_message(self, msg: MessageExt, max_reconsume_times: int) -> None:
+        """Send a failed delivery as a normal message to ``%RETRY%<group>`` through the internal producer."""
+        client = self._require_client()
+        new_msg = _build_retry_message(msg, self.consumer_group, max_reconsume_times)
+        publish = client.get_topic_publish_info(new_msg.topic, is_default=True)
+        mq = publish.select_one_message_queue() if publish is not None else None
+        if mq is None:
+            raise MQClientException("no writable queue for retry topic %s" % new_msg.topic)
+        # unitMode follows the consumer: the internal producer reuses the consumer's client config,
+        # and without it the redelivered messages would lose the unit flag.
+        client.send_message(MixAll.CLIENT_INNER_PRODUCER_GROUP, new_msg, mq, 3000,
+                            unit_mode=self.unit_mode)
 
     def _advance_consume_offset(self, key: str, batch: List[MessageExt],
                                 floor: Optional[int] = None,
@@ -4201,33 +4213,49 @@ class DefaultMQPushConsumer:
 
     def send_message_back(self, msg: MessageExt, delay_level: int,
                           broker_name: Optional[str] = None) -> None:
-        """Message redelivery: send CONSUMER_SEND_MSG_BACK(36) to have the broker redirect it to the retry topic."""
+        """Message redelivery: send CONSUMER_SEND_MSG_BACK(36) to have the broker redirect it to the retry topic.
+
+        The address goes through the publish table (master only) and a missing master is reported as
+        "Broker[X] master node does not exist" (the error string is matched by callers). Either failure --
+        the missing address, a transport error or a refused answer -- degrades to re-sending the message as
+        a normal message to `%RETRY%<group>` through the internal producer, so the redelivery is not lost;
+        only when that send fails too does the original error reach the caller.
+        """
         client = self._require_client()
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
         from remoting.protocol.remoting_command import RemotingCommand
         if broker_name is None:
             broker_name = msg.broker_name
-        # The address goes through find_broker_address_in_publish (master only),
-        # and failure reports "Broker[X] master node does not exist" (the error string is matched by callers);
-        # slaves do not accept CONSUMER_SEND_MSG_BACK.
-        addr = client.find_broker_address_in_publish(broker_name)
-        if addr is None:
-            raise MQClientException("Broker[%s] master node does not exist" % broker_name)
         # When max_reconsume_times == -1, pass 16 to the broker (exceeding the limit is moved to %DLQ% by the broker)
         max_reconsume = 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
-        header = ConsumerSendMsgBackRequestHeader()
-        header.offset = msg.commit_log_offset
-        header.group = self.consumer_group
-        header.delay_level = delay_level
-        header.origin_msg_id = msg.msg_id
-        header.origin_topic = msg.topic
-        header.unit_mode = self.unit_mode
-        header.max_reconsume_times = max_reconsume
-        request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
-        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
-        client._check_response(response)
+        try:
+            # Slaves do not accept CONSUMER_SEND_MSG_BACK, so only the publish (master) address is used.
+            addr = client.find_broker_address_in_publish(broker_name)
+            if addr is None:
+                raise MQClientException("Broker[%s] master node does not exist" % broker_name)
+            header = ConsumerSendMsgBackRequestHeader()
+            header.offset = msg.commit_log_offset
+            header.group = self.consumer_group
+            header.delay_level = delay_level
+            header.origin_msg_id = msg.msg_id
+            header.origin_topic = msg.topic
+            header.unit_mode = self.unit_mode
+            header.max_reconsume_times = max_reconsume
+            request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
+            # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
+            response = client._invoke_sync(client.vip_addr(addr), request, 5000)
+            client._check_response(response)
+        except BaseException as e:
+            logger.error("Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %s; "
+                         "fallback to normal send",
+                         self.consumer_group, broker_name, msg.msg_id, e)
+            try:
+                self._send_retry_message(msg, max_reconsume)
+            except BaseException as fallback_error:
+                logger.error("Fallback normal send failed, consumerGroup=%s, msg=%s: %s",
+                             self.consumer_group, msg.msg_id, fallback_error)
+                raise e
 
 
 class PullCallback:
@@ -4266,6 +4294,9 @@ class DefaultMQPullConsumer:
         # nsd=true / ns=<value>, see the NamespaceRpcHook in remoting/rpchook.py.
         self.namespace_v2 = ""
         self.message_model = message_model
+        # Retry ceiling reported with message redelivery. Pull mode's own default is 16, and -1
+        # ("unlimited") is reported as 16 as well so the broker's own retryMaxTimes still decides.
+        self.max_reconsume_times = 16
         self.broker_suspend_max_time_millis = 20000
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         self.consumer_pull_timeout_millis = 10000
@@ -4312,6 +4343,13 @@ class DefaultMQPullConsumer:
         self._pull_callback_executor: Optional[ConsumeExecutor] = None
         self._async_pull_lock = threading.Lock()
         self._pull_executors_closed = False
+
+    def set_max_reconsume_times(self, max_reconsume_times: int) -> None:
+        """Set the retry ceiling reported with message redelivery (default 16, -1 means unlimited)."""
+        self.max_reconsume_times = int(max_reconsume_times)
+
+    def get_max_reconsume_times(self) -> int:
+        return self.max_reconsume_times
 
     # ---------------- Pre-delivery filter hooks ----------------
     def register_filter_message_hook(self, hook: FilterMessageHook) -> None:
@@ -4852,37 +4890,55 @@ class DefaultMQPullConsumer:
     def send_message_back(self, msg: MessageExt, delay_level: int) -> None:
         """Message redelivery (CONSUMER_SEND_MSG_BACK 36).
 
-        Two points to note (stepped on live systems):
-        1. The address is reverse-looked-up via `find_broker_address_in_publish(msg.broker_name)` in the **publish address table**
-           (master only), so the caller must have accessed that topic with this consumer first.
-        2. On failure, **no silent fallback**: some implementations swallow the exception on redelivery failure and use the internal default producer to send the message
-           directly to `%RETRY%group`. This port does not fall back to that path -- on redelivery failure it throws, letting the caller see it,
-           rather than silently resending via a different path.
+        The address is reverse-looked-up via `find_broker_address_in_publish(msg.broker_name)` in the
+        **publish address table** (master only), so the caller must have accessed that topic with this
+        consumer first. A refused bounce -- a missing master, a transport error or a non-success answer --
+        degrades to re-sending the message as a normal message to `%RETRY%<group>` through the internal
+        producer; only when that send fails too does the original error reach the caller.
         """
         client = self._require_client()
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import ConsumerSendMsgBackRequestHeader
         from remoting.protocol.remoting_command import RemotingCommand
-        # Slaves do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 is recognized here
-        addr = client.find_broker_address_in_publish(msg.broker_name or "")
-        if addr is None:
-            raise MQClientException("Broker[%s] master node does not exist" % msg.broker_name)
-        header = ConsumerSendMsgBackRequestHeader()
-        header.offset = msg.commit_log_offset
-        header.group = self.consumer_group
-        header.delay_level = delay_level
-        header.origin_msg_id = msg.msg_id
-        header.origin_topic = msg.topic
-        header.unit_mode = self.unit_mode
-        # WARNING: the configured max_reconsume_times (default -1) **cannot** be passed directly here:
-        # after client version >= V3_4_9 the broker adopts that field unconditionally, and -1 would make
-        # reconsumeTimes(0) >= -1 hold, putting the message directly into %DLQ%. Leave None to the subscription group's
-        # retryMaxTimes judgment.
-        header.max_reconsume_times = None
-        request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
-        # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
-        response = client._invoke_sync(client.vip_addr(addr), request, 5000)
-        client._check_response(response)
+        max_reconsume = 16 if self.max_reconsume_times == -1 else self.max_reconsume_times
+        try:
+            # Slaves do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 is recognized here
+            addr = client.find_broker_address_in_publish(msg.broker_name or "")
+            if addr is None:
+                raise MQClientException("Broker[%s] master node does not exist" % msg.broker_name)
+            header = ConsumerSendMsgBackRequestHeader()
+            header.offset = msg.commit_log_offset
+            header.group = self.consumer_group
+            header.delay_level = delay_level
+            header.origin_msg_id = msg.msg_id
+            header.origin_topic = msg.topic
+            header.unit_mode = self.unit_mode
+            header.max_reconsume_times = max_reconsume
+            request = RemotingCommand.create_request_command(RequestCode.CONSUMER_SEND_MSG_BACK, header)
+            # SEND_MESSAGE_BACK is one of the VIP-wrapped RPCs and always goes to the master address.
+            response = client._invoke_sync(client.vip_addr(addr), request, 3000)
+            client._check_response(response)
+        except BaseException as e:
+            logger.error("Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %s; "
+                         "fallback to normal send",
+                         self.consumer_group, msg.broker_name, msg.msg_id, e)
+            try:
+                self._send_retry_message(msg, max_reconsume)
+            except BaseException as fallback_error:
+                logger.error("Fallback normal send failed, consumerGroup=%s, msg=%s: %s",
+                             self.consumer_group, msg.msg_id, fallback_error)
+                raise e
+
+    def _send_retry_message(self, msg: MessageExt, max_reconsume_times: int) -> None:
+        """Send a failed delivery as a normal message to ``%RETRY%<group>`` through the internal producer."""
+        client = self._require_client()
+        new_msg = _build_retry_message(msg, self.consumer_group, max_reconsume_times)
+        publish = client.get_topic_publish_info(new_msg.topic, is_default=True)
+        mq = publish.select_one_message_queue() if publish is not None else None
+        if mq is None:
+            raise MQClientException("no writable queue for retry topic %s" % new_msg.topic)
+        client.send_message(MixAll.CLIENT_INNER_PRODUCER_GROUP, new_msg, mq, 3000,
+                            unit_mode=self.unit_mode)
 
     def create_topic(self, key: str, new_topic: str, queue_num: int = 4,
                      topic_sys_flag: int = 0) -> None:

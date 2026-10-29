@@ -85,6 +85,10 @@ public:
     int32_t heartbeatBrokerIntervalMillis() const { return heartbeatBrokerIntervalMillis_; }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
     const std::string& messageModel() const { return messageModel_; }
+    // Retry ceiling carried by a send-back and written onto the retry copy; default 16. -1 reads as 16,
+    // the point at which the broker moves the message to %DLQ%.
+    void setMaxReconsumeTimes(int32_t times) { maxReconsumeTimes_ = times; }
+    int32_t maxReconsumeTimes() const { return maxReconsumeTimes_; }
     // Queue listeners are told only when fetchMessageQueuesInBalance hands out a view whose queue set
     // moved for that topic: a re-ordering is not a change, a same-count swap to another broker is.
     // The topic-keyed listener wins for its own topic; the single listener is the sink for the rest.
@@ -230,6 +234,7 @@ private:
     int32_t concurrentHeartbeatThreadPoolSize_ =
         MQClientInstance::defaultConcurrentHeartbeatThreadPoolSize();
     std::string messageModel_ = MessageModel::CLUSTERING;
+    int32_t maxReconsumeTimes_ = 16;
 
     int32_t brokerSuspendMaxTimeMillis_ = 20000;
     int32_t consumerPullTimeoutMillis_ = 10000;

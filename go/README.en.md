@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 865 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 867 unit tests
 
 ## Prerequisites
 
@@ -646,7 +646,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   77 test files, 865 test functions
+│   └── *_test.go                   77 test files, 867 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

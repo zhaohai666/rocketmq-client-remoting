@@ -5441,7 +5441,9 @@ fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> 
     ms.clamp(10, 30000) as u64
 }
 
-/// Return the message to the broker's retry queue (CONSUMER_SEND_MSG_BACK=36).
+/// Return the message to the broker's retry queue (CONSUMER_SEND_MSG_BACK=36). On failure the
+/// message degrades to an ordinary send to `%RETRY%group` (the broker then redelivers it by delay
+/// level); when that fails too, the original send-back error is returned.
 async fn send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
@@ -5454,25 +5456,90 @@ async fn send_message_back(
         .map(str::to_string)
         .or_else(|| msg.broker_name.clone())
         .unwrap_or_default();
-    let addr = client
-        .find_broker_address_in_publish(&broker)
-        .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
     let max_reconsume = if cfg.max_reconsume_times == -1 {
         16
     } else {
         cfg.max_reconsume_times
     };
+    let primary: Result<()> = match client.find_broker_address_in_publish(&broker) {
+        Some(addr) => {
+            client
+                .consumer_send_msg_back(
+                    &cfg.consumer_group,
+                    msg,
+                    delay_level,
+                    Some(max_reconsume),
+                    3_000,
+                    &addr,
+                    cfg.unit_mode,
+                )
+                .await
+        }
+        None => Err(Error::client(format!(
+            "Broker[{broker}] master node does not exist"
+        ))),
+    };
+    match primary {
+        Ok(()) => Ok(()),
+        Err(original) => {
+            rmq_error!(
+                "Failed to send message back, consumerGroup={}, brokerName={}, msg={}, fallback to normal send: {}",
+                cfg.consumer_group,
+                broker,
+                msg.msg_id.as_deref().unwrap_or(""),
+                original
+            );
+            match send_retry_copy(
+                &client,
+                &cfg.consumer_group,
+                msg,
+                max_reconsume,
+                cfg.unit_mode,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(fallback_error) => {
+                    rmq_error!(
+                        "Failed to send message back as normal message, consumerGroup={}, msg={}: {}",
+                        cfg.consumer_group,
+                        msg.msg_id.as_deref().unwrap_or(""),
+                        fallback_error
+                    );
+                    Err(original)
+                }
+            }
+        }
+    }
+}
+
+/// The ordinary-send leg a failed send-back degrades to: the retry copy goes out through the
+/// internal producer to `%RETRY%group` and the broker redelivers it by its delay level.
+pub(crate) async fn send_retry_copy(
+    client: &MQClientInstance,
+    consumer_group: &str,
+    msg: &MessageExt,
+    max_reconsume_times: i32,
+    unit_mode: bool,
+) -> Result<()> {
+    let mut new_msg = build_retry_message(consumer_group, msg, max_reconsume_times);
+    let publish = client.get_topic_publish_info(&new_msg.topic, true).await?;
+    let mq = publish
+        .select_one_message_queue(&[])?
+        .ok_or_else(|| Error::client(format!("no writable queue for {}", new_msg.topic)))?;
     client
-        .consumer_send_msg_back(
-            &cfg.consumer_group,
-            msg,
-            delay_level,
-            Some(max_reconsume),
-            3_000,
-            &addr,
-            cfg.unit_mode,
+        .send_message(
+            MixAll::CLIENT_INNER_PRODUCER_GROUP,
+            &mut PublishMessage::Single(&mut new_msg),
+            &mq,
+            3000,
+            0,
+            unit_mode,
+            MixAll::DEFAULT_TOPIC,
+            MixAll::DEFAULT_TOPIC_QUEUE_NUMS,
         )
-        .await
+        .await?;
+    Ok(())
 }
 
 /// Orderly-consumed messages keep retrying in place in the local queue and the broker never counts redeliveries,
@@ -5514,7 +5581,7 @@ async fn orderly_send_message_back(
 ) -> bool {
     let outcome: Result<()> = async {
         let client = require_client_for_send_back(inner)?;
-        let mut new_msg = build_retry_message(cfg, msg, max_times);
+        let mut new_msg = build_retry_message(&cfg.consumer_group, msg, max_times);
         let publish = client.get_topic_publish_info(&new_msg.topic, true).await?;
         let mq = publish
             .select_one_message_queue(&[])?
@@ -5546,9 +5613,9 @@ async fn orderly_send_message_back(
     }
 }
 
-fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -> Message {
+fn build_retry_message(consumer_group: &str, msg: &MessageExt, max_times: i32) -> Message {
     let mut new_msg = Message::new(
-        MixAll::get_retry_topic(&cfg.consumer_group).as_str(),
+        MixAll::get_retry_topic(consumer_group).as_str(),
         msg.body.as_deref(),
     );
     new_msg.properties = msg.properties.clone();
@@ -8525,7 +8592,11 @@ mod tests {
             m.put_property(PROPERTY_KEYS, "k7");
             m
         };
-        let new_msg = build_retry_message(&cfg, &poison, orderly_max_reconsume_times(&cfg));
+        let new_msg = build_retry_message(
+            &cfg.consumer_group,
+            &poison,
+            orderly_max_reconsume_times(&cfg),
+        );
         assert_eq!(new_msg.topic, "%RETRY%G", "orderly send-back goes to %RETRY%<group>");
         assert_eq!(new_msg.body, poison.body);
         assert_eq!(new_msg.get_property(PROPERTY_KEYS), Some("k7"));

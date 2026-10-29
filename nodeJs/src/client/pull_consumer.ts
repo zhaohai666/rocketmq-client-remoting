@@ -26,6 +26,8 @@ import { ConsumerSendMsgBackRequestHeader } from '../remoting/headers.ts';
 import { Validators } from '../common/validators.ts';
 import { MQBrokerException, MQClientException } from '../remoting/exception.ts';
 import type { TopicRouteData } from '../remoting/route.ts';
+import type { DefaultMQProducer } from './producer.ts';
+import { buildRetryMessage } from './retry_message.ts';
 import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.pull_consumer');
@@ -69,7 +71,9 @@ export class DefaultMQPullConsumer {
 
   pullBatchSize = DEFAULT_PULL_BATCH_SIZE;
   pullTimeoutMillis = DEFAULT_PULL_TIMEOUT_MILLIS;
-  maxReconsumeTimes = -1;
+  // Retry ceiling reported with message redelivery: pull mode's own default is
+  // 16, and -1 ("unlimited") is reported as 16 as well.
+  maxReconsumeTimes = 16;
   // Offset flush period (default 5000 ms): applied to
   // the shared MQClient instance when THIS facade creates it (first creator's
   // config wins). The instance-level persistAllConsumerOffset sweep is what
@@ -95,6 +99,9 @@ export class DefaultMQPullConsumer {
   // comment).
   private balancedQueues = new Map<string, MessageQueue[]>();
   started = false;
+  // The internal producer the send-back fallback sends through; built lazily on
+  // the first refused bounce and torn down with the consumer.
+  private _producer: DefaultMQProducer | null = null;
 
   constructor(consumerGroup = 'DEFAULT_CONSUMER') {
     this.consumerGroup = consumerGroup || 'DEFAULT_CONSUMER';
@@ -256,6 +263,12 @@ export class DefaultMQPullConsumer {
       // it hits zero (when other facades share the same clientId, the instance
       // and its background timers keep running).
       MQClientManager.getInstance().unregisterClient(this.mqClient.clientId, this.mqClient);
+    }
+    // The lazily built fallback producer owns its own client slot, so it is
+    // torn down explicitly rather than left to the manager's refcount.
+    if (this._producer) {
+      try { await this._producer.shutdown(); } catch (e) { /* ignore */ }
+      this._producer = null;
     }
     this.started = false;
   }
@@ -486,25 +499,69 @@ export class DefaultMQPullConsumer {
 
   // sendMessageBack redelivers one message via CONSUMER_SEND_MSG_BACK(36).
   // `offset` is the message's commitLogOffset, NOT its queueOffset.
+  //
+  // A refused bounce — a missing master, a transport error or a non-success
+  // answer — degrades to re-sending the message as a normal message to
+  // %RETRY%<group> through the internal producer, so the redelivery is not
+  // lost; only when that send fails too does the original error reach the
+  // caller.
   async sendMessageBack(msg: MessageExt, delayLevel = 0): Promise<void> {
     if (!this.mqClient) throw new Error('consumer not started');
-    const addr = this.mqClient.findBrokerAddressInPublish(msg.getBrokerName());
-    if (!addr) throw new Error(`Broker[${msg.getBrokerName()}] master node does not exist`);
-    const h = new ConsumerSendMsgBackRequestHeader();
-    h.offset = msg.getCommitLogOffset();
-    h.group = this.consumerGroup;
-    h.delayLevel = delayLevel;
-    h.originMsgId = msg.getMsgId();
-    h.originTopic = msg.getTopic();
-    h.unitMode = this.unitMode;
-    h.maxReconsumeTimes = this.maxReconsumeTimes === -1 ? 16 : this.maxReconsumeTimes;
-    const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
-    const response = await this.mqClient.remotingClient.invokeSync(this.mqClient.vipChannel(addr), request, 5000);
-    if (response.code !== ResponseCode.SUCCESS) {
-      // Same rule as the pull kernel: the broker code rides on the typed
-      // exception, so a caller can branch on it instead of parsing the text.
-      throw new MQBrokerException(response.code,
-        `sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`, addr);
+    const maxReconsume = this.maxReconsumeTimes === -1 ? 16 : this.maxReconsumeTimes;
+    try {
+      const addr = this.mqClient.findBrokerAddressInPublish(msg.getBrokerName());
+      if (!addr) throw new Error(`Broker[${msg.getBrokerName()}] master node does not exist`);
+      const h = new ConsumerSendMsgBackRequestHeader();
+      h.offset = msg.getCommitLogOffset();
+      h.group = this.consumerGroup;
+      h.delayLevel = delayLevel;
+      h.originMsgId = msg.getMsgId();
+      h.originTopic = msg.getTopic();
+      h.unitMode = this.unitMode;
+      h.maxReconsumeTimes = maxReconsume;
+      const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);
+      const response = await this.mqClient.remotingClient.invokeSync(this.mqClient.vipChannel(addr), request, 3000);
+      if (response.code !== ResponseCode.SUCCESS) {
+        // Same rule as the pull kernel: the broker code rides on the typed
+        // exception, so a caller can branch on it instead of parsing the text.
+        throw new MQBrokerException(response.code,
+          `sendMessageBack failed: CODE ${response.code} ${response.remark || ''}`, addr);
+      }
+    } catch (e) {
+      logger.error('Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %s; fallback to normal send',
+        this.consumerGroup, msg.getBrokerName(), msg.getMsgId(), (e as Error).message);
+      try {
+        await this._sendRetryMessage(msg, maxReconsume);
+      } catch (fallbackError) {
+        logger.error('Fallback normal send failed, consumerGroup=%s, msg=%s: %s',
+          this.consumerGroup, msg.getMsgId(), (fallbackError as Error).message);
+        throw e;
+      }
+    }
+  }
+
+  // _sendRetryMessage sends a failed delivery as a normal message to
+  // %RETRY%<group> through the internal producer.
+  private async _sendRetryMessage(msg: MessageExt, maxReconsume: number): Promise<void> {
+    const producer = await this._innerProducer();
+    if (!producer) throw new Error('inner producer is not available');
+    await producer.sendBySelector(buildRetryMessage(this.consumerGroup, msg, maxReconsume), undefined);
+  }
+
+  // _innerProducer lazily builds the CLIENT_INNER_PRODUCER the send-back
+  // fallback sends through.
+  private async _innerProducer(): Promise<DefaultMQProducer | null> {
+    if (this._producer) return this._producer;
+    try {
+      const { DefaultMQProducer: P } = await import('./producer.ts');
+      const producer = new P(MixAll.CLIENT_INNER_PRODUCER_GROUP || 'CLIENT_INNER_PRODUCER');
+      producer.setNamesrvAddr(this.nameServerAddr);
+      await producer.start();
+      this._producer = producer;
+      return producer;
+    } catch (e) {
+      logger.debug('inner producer start failed: %s', (e as Error).message);
+      return null;
     }
   }
 }

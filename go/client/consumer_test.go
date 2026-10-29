@@ -62,6 +62,9 @@ type consumerBroker struct {
 	pullArrivals []int64
 	commits      []consumerCommit
 	sendBacks    []*remoting.ConsumerSendMsgBackRequestHeader
+	// sendBackCode, when non-zero, makes CONSUMER_SEND_MSG_BACK(36) answer that
+	// code instead of success, so a test can drive the caller's fallback path.
+	sendBackCode int32
 	lockBodies   []*remoting.LockBatchRequestBody
 	unlockBodies []*remoting.UnlockBatchRequestBody
 	searchTS     []int64
@@ -152,6 +155,14 @@ func (b *consumerBroker) forcePullAnswers(code int32, count int) {
 	defer b.mu.Unlock()
 	b.pullCode = code
 	b.pullForcedLeft = count
+}
+
+// failSendBack makes every CONSUMER_SEND_MSG_BACK(36) answer code instead of
+// success, so a test can observe what the client does with a refused bounce.
+func (b *consumerBroker) failSendBack(code int32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sendBackCode = code
 }
 
 func commitKey(group, topic string, queueID int32) string {
@@ -305,7 +316,11 @@ func (b *consumerBroker) answer(req *remoting.RemotingCommand) *remoting.Remotin
 		header.FromExtFields(req.ExtFields())
 		b.mu.Lock()
 		b.sendBacks = append(b.sendBacks, header)
+		failCode := b.sendBackCode
 		b.mu.Unlock()
+		if failCode != 0 {
+			return remoting.CreateResponseCommand(failCode, "scripted send-back failure")
+		}
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	case remoting.ReqLockBatchMQ, remoting.ReqUnlockBatchMQ:
 		return b.answerBatchLock(req)
@@ -664,6 +679,53 @@ func (b *consumerBroker) traceSends(traceTopic string) []consumerSend {
 		}
 	}
 	return out
+}
+
+// sendsTo keeps the SEND_MESSAGE_V2 rounds addressed to exactly one topic.
+func (b *consumerBroker) sendsTo(topic string) []consumerSend {
+	var out []consumerSend
+	for _, s := range b.sendSnapshot() {
+		if s.topic == topic {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// assertRetryNormalSend checks one SEND_MESSAGE_V2 against the retry-message
+// contract: the %RETRY% topic, the copied body, the bookkeeping properties the
+// broker would have written itself and the cleared half-message marker.
+func assertRetryNormalSend(t *testing.T, send consumerSend, originTopic, group, body string) {
+	t.Helper()
+	if want := common.GetRetryTopic(group); send.topic != want {
+		t.Fatalf("retry send topic = %q, want %q", send.topic, want)
+	}
+	if send.body != body {
+		t.Errorf("retry body = %q, want %q", send.body, body)
+	}
+	props := common.String2MessageProperties(send.props)
+	get := func(key string) string {
+		v, _ := props.Get(key)
+		return v
+	}
+	if got := get(common.PropertyRetryTopic); got != originTopic {
+		t.Errorf("RETRY_TOPIC = %q, want %q", got, originTopic)
+	}
+	if got := get(common.PropertyReconsumeTime); got != "1" {
+		t.Errorf("RECONSUME_TIME = %q, want 1", got)
+	}
+	if got := get(common.PropertyMaxReconsumeTimes); got != "16" {
+		t.Errorf("MAX_RECONSUME_TIMES = %q, want 16", got)
+	}
+	if got := get(common.PropertyDelayTimeLevel); got != "3" {
+		t.Errorf("DELAY_TIME_LEVEL = %q, want 3", got)
+	}
+	if get(common.PropertyOriginMessageID) == "" {
+		t.Errorf("ORIGIN_MESSAGE_ID is missing: %q", send.props)
+	}
+	if props.ContainsKey(common.PropertyTransactionPrepared) {
+		t.Errorf("TRAN_MSG survived the retry rewrite: %q", send.props)
+	}
 }
 
 // setClientIDs replaces the group membership the broker reports.
@@ -1272,6 +1334,33 @@ func TestConsumerReconsumeLaterSendsBackAndHoldsOffset(t *testing.T) {
 	if commit, ok := f.broker.lastCommit(topic, 0); ok && commit.offset > 0 {
 		t.Errorf("committed offset advanced to %d after RECONSUME_LATER; want it held at 0", commit.offset)
 	}
+}
+
+// A refused CONSUMER_SEND_MSG_BACK must not lose the redelivery: the message
+// is re-sent as a normal message to %RETRY%<group>, carrying the retry
+// bookkeeping the broker would have written itself.
+func TestConsumerSendBackFailureFallsBackToNormalSend(t *testing.T) {
+	topic := uniqueTopic("GoConsumerSendBackFallback", t)
+	const group = "GID_go_sendback_fallback"
+
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.routeBodies.set(common.GetRetryTopic(group), consumerRouteBody("b1", f.brokerSrv.addr, 1))
+	f.broker.failSendBack(remoting.RespSystemError)
+	f.broker.add(topic, 0, "bounce-me")
+	listener := newRecordingListener()
+	listener.setStatus(ReconsumeLater)
+	c := f.newConsumer(t, group, listener, withConsumeFromWhere(ConsumeFromWhereFirstOffset))
+	startConsumer(t, c, topic, "*")
+
+	waitFor(t, "send-back attempt", func() bool { return len(f.broker.sendBackSnapshot()) > 0 })
+	retryTopic := common.GetRetryTopic(group)
+	waitFor(t, "fallback normal send", func() bool { return len(f.broker.sendsTo(retryTopic)) > 0 })
+
+	sends := f.broker.sendsTo(retryTopic)
+	if len(sends) != 1 {
+		t.Fatalf("retry sends = %d, want 1", len(sends))
+	}
+	assertRetryNormalSend(t, sends[0], topic, group, "bounce-me")
 }
 
 // The batch is taken by hand rather than by the dispatcher because the pull loop

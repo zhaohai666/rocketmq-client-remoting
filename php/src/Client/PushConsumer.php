@@ -508,6 +508,16 @@ final class DefaultMQPushConsumer
         $this->messageModel = $model;
     }
 
+    public function setMaxReconsumeTimes(int $n): void
+    {
+        $this->maxReconsumeTimes = $n;
+    }
+
+    public function getMaxReconsumeTimes(): int
+    {
+        return $this->maxReconsumeTimes;
+    }
+
     public function setConsumeFromWhere(string $where): void
     {
         $this->consumeFromWhere = $where;
@@ -2870,25 +2880,88 @@ final class DefaultMQPushConsumer
     public function sendMessageBack(MessageExt $msg, int $delayLevel, ?string $brokerName = null): void
     {
         $client = $this->requireClient();
-        $brokerName = $brokerName ?? (string) $msg->brokerName;
-        $addr = $client->findBrokerAddressInPublish($brokerName);
-        if ($addr === null || $addr === '') {
-            throw new MQClientException("Broker[$brokerName] master node does not exist");
-        }
         $maxReconsume = $this->effectiveMaxReconsumeTimes();
-        $header = new ConsumerSendMsgBackRequestHeader();
-        $header->offset = $msg->commitLogOffset;
-        $header->group = $this->consumerGroup;
-        $header->delayLevel = $delayLevel;
-        $header->originMsgId = (string) $msg->msgId;
-        $header->originTopic = $msg->topic;
-        $header->unitMode = $this->unitMode;
-        $header->maxReconsumeTimes = $maxReconsume;
-        $request = RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, $header);
-        $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
-        if ($response->code !== ResponseCode::SUCCESS) {
-            throw new MQBrokerException($response->code, $response->remark ?? '');
+        try {
+            $brokerName = $brokerName ?? (string) $msg->brokerName;
+            $addr = $client->findBrokerAddressInPublish($brokerName);
+            if ($addr === null || $addr === '') {
+                throw new MQClientException("Broker[$brokerName] master node does not exist");
+            }
+            $header = new ConsumerSendMsgBackRequestHeader();
+            $header->offset = $msg->commitLogOffset;
+            $header->group = $this->consumerGroup;
+            $header->delayLevel = $delayLevel;
+            $header->originMsgId = (string) $msg->msgId;
+            $header->originTopic = $msg->topic;
+            $header->unitMode = $this->unitMode;
+            $header->maxReconsumeTimes = $maxReconsume;
+            $request = RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, $header);
+            $response = $client->remotingClient->invokeSync($client->vipAddrFor($addr), $request, 5000);
+            if ($response->code !== ResponseCode::SUCCESS) {
+                throw new MQBrokerException($response->code, $response->remark ?? '');
+            }
+        } catch (\Throwable $e) {
+            // A refused bounce (missing master, transport error, non-success answer) degrades to
+            // a normal send to %RETRY%<group>, so the redelivery is not lost; only when that send
+            // fails too does the ORIGINAL error reach the caller.
+            Logger::error(sprintf(
+                'Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %s; fallback to normal send',
+                $this->consumerGroup,
+                (string) $msg->brokerName,
+                (string) $msg->msgId,
+                $e->getMessage(),
+            ));
+            try {
+                $this->sendRetryMessage($msg, $maxReconsume);
+            } catch (\Throwable $fallbackError) {
+                Logger::error(sprintf(
+                    'Fallback normal send failed, consumerGroup=%s, msg=%s: %s',
+                    $this->consumerGroup,
+                    (string) $msg->msgId,
+                    $fallbackError->getMessage(),
+                ));
+                throw $e;
+            }
         }
+    }
+
+    // buildRetryMessage is the normal message that carries a failed delivery to
+    // %RETRY%<group>: body and properties copied, the origin id falling back to the
+    // message id, the retry bookkeeping written, and the half-message marker cleared
+    // so the broker does not treat the copy as a transaction check-back message
+    // all over again.
+    private function buildRetryMessage(MessageExt $msg, int $maxReconsumeTimes): Message
+    {
+        $newMsg = new Message(MixAll::getRetryTopic($this->consumerGroup), $msg->body);
+        // PHP copies the array on assignment, so clearing a property below never
+        // touches the source message.
+        $newMsg->properties = $msg->properties;
+        $newMsg->flag = $msg->flag;
+        $originMsgId = MessageAccessor::getOriginMessageId($msg) ?? $msg->msgId;
+        if ($originMsgId !== null && $originMsgId !== '') {
+            MessageAccessor::setOriginMessageId($newMsg, $originMsgId);
+        }
+        MessageAccessor::putProperty($newMsg, MessageConst::PROPERTY_RETRY_TOPIC, $msg->topic);
+        MessageAccessor::setReconsumeTime($newMsg, $msg->getReconsumeTimes() + 1);
+        MessageAccessor::setMaxReconsumeTimes($newMsg, $maxReconsumeTimes);
+        MessageAccessor::clearProperty($newMsg, MessageConst::PROPERTY_TRANSACTION_PREPARED);
+        $newMsg->setDelayTimeLevel(3 + $msg->getReconsumeTimes());
+        return $newMsg;
+    }
+
+    // sendRetryMessage sends a failed delivery as a normal message to
+    // %RETRY%<group> through the internal producer.
+    private function sendRetryMessage(MessageExt $msg, int $maxReconsumeTimes): void
+    {
+        $client = $this->requireClient();
+        $newMsg = $this->buildRetryMessage($msg, $maxReconsumeTimes);
+        $publish = $client->getTopicPublishInfo($newMsg->topic, true);
+        $mq = $publish->selectOneMessageQueue();
+        if ($mq === null) {
+            throw new MQClientException("no writable queue for retry topic $newMsg->topic");
+        }
+        // unitMode follows the consumer: without it, sent-back messages lose their unitization mark.
+        $client->sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, $newMsg, $mq, 3000, 0, $this->unitMode);
     }
 
     // ---------------- Orderly consumption's retry counting and send-back ----------------
@@ -2938,27 +3011,7 @@ final class DefaultMQPushConsumer
     private function orderlySendMessageBack(MessageExt $msg): bool
     {
         try {
-            $client = $this->requireClient();
-            $newMsg = new Message(MixAll::getRetryTopic($this->consumerGroup), $msg->body);
-            $newMsg->properties = $msg->properties;
-            $newMsg->flag = $msg->flag;
-            $originMsgId = MessageAccessor::getOriginMessageId($msg) ?? $msg->msgId;
-            if ($originMsgId !== null && $originMsgId !== '') {
-                MessageAccessor::setOriginMessageId($newMsg, $originMsgId);
-            }
-            MessageAccessor::putProperty($newMsg, MessageConst::PROPERTY_RETRY_TOPIC, $msg->topic);
-            MessageAccessor::setReconsumeTime($newMsg, $msg->getReconsumeTimes() + 1);
-            MessageAccessor::setMaxReconsumeTimes($newMsg, $this->orderlyMaxReconsumeTimes());
-            // The half-message mark must be cleared, otherwise the broker will treat it as a transaction check-back message again
-            MessageAccessor::clearProperty($newMsg, MessageConst::PROPERTY_TRANSACTION_PREPARED);
-            $newMsg->setDelayTimeLevel(3 + $msg->getReconsumeTimes());
-            $publish = $client->getTopicPublishInfo($newMsg->topic, true);
-            $mq = $publish !== null ? $publish->selectOneMessageQueue() : null;
-            if ($mq === null) {
-                throw new MQClientException("no writable queue for retry topic $newMsg->topic");
-            }
-            // unitMode follows the consumer: without it, sent-back messages lose their unitization mark.
-            $client->sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, $newMsg, $mq, 3000, 0, $this->unitMode);
+            $this->sendRetryMessage($msg, $this->orderlyMaxReconsumeTimes());
             return true;
         } catch (\Throwable $e) {
             Logger::debug(sprintf(

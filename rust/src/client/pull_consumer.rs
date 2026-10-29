@@ -28,9 +28,10 @@ use crate::client::allocate_strategy::{
 use crate::client::consumer::{
     changed_topics, client_side_tag_filter, consume_timestamp_millis, default_consume_timestamp,
     is_flow_control_warn_trip, mq_key, mq_sort_key, plan_initial_offset, queues_by_topic,
-    read_local_offset, sort_mqs, uses_local_offset_store, write_local_offsets, MessageQueueListener,
-    MessageSelector, StartOffsetPlan, CACHE_SIZE_GATE_MIB, DEFAULT_INSTANCE_NAME,
-    PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL,
+    read_local_offset, send_retry_copy, sort_mqs, uses_local_offset_store, write_local_offsets,
+    MessageQueueListener, MessageSelector, StartOffsetPlan, CACHE_SIZE_GATE_MIB,
+    DEFAULT_INSTANCE_NAME, PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL,
+    PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL,
 };
 use crate::client::hook::{FilterMessageHook, FilterMessageHookList};
 use crate::client::mq_client::{
@@ -294,6 +295,9 @@ pub struct PullConsumerConfig {
     pub enable_concurrent_heartbeat: bool,
     /// Concurrent heartbeat pool size (default: available processors).
     pub concurrent_heartbeat_thread_pool_size: usize,
+    /// Retry ceiling carried by a send-back and written onto the retry copy; default 16.
+    /// `-1` reads as 16, the point at which the broker moves the message to `%DLQ%`.
+    pub max_reconsume_times: i32,
 }
 
 impl Default for PullConsumerConfig {
@@ -322,6 +326,7 @@ impl Default for PullConsumerConfig {
             mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
             enable_concurrent_heartbeat: false,
             concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
+            max_reconsume_times: 16,
         }
     }
 }
@@ -1147,25 +1152,68 @@ impl DefaultMQPullConsumer {
             .await
     }
 
+    /// `CONSUMER_SEND_MSG_BACK`(36) with the retry ceiling from the config; a failed bounce degrades
+    /// to an ordinary send of a `%RETRY%` copy, and only when both legs fail is the bounce error reported.
     pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
         let client = self.require_client()?;
-        let group = self.consumer_group();
+        let cfg = self.config();
         let broker = msg.broker_name.clone().unwrap_or_default();
+        let max_reconsume = if cfg.max_reconsume_times == -1 {
+            16
+        } else {
+            cfg.max_reconsume_times
+        };
         // Slave nodes do not accept CONSUMER_SEND_MSG_BACK (master only), so only brokerId=0 is considered here
-        let addr = client
-            .find_broker_address_in_publish(&broker)
-            .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
-        client
-            .consumer_send_msg_back(
-                &group,
-                msg,
-                delay_level,
-                None,
-                5_000,
-                &addr,
-                self.unit_mode(),
-            )
-            .await
+        let primary: Result<()> = match client.find_broker_address_in_publish(&broker) {
+            Some(addr) => {
+                client
+                    .consumer_send_msg_back(
+                        &cfg.consumer_group,
+                        msg,
+                        delay_level,
+                        Some(max_reconsume),
+                        3_000,
+                        &addr,
+                        cfg.unit_mode,
+                    )
+                    .await
+            }
+            None => Err(Error::client(format!(
+                "Broker[{broker}] master node does not exist"
+            ))),
+        };
+        match primary {
+            Ok(()) => Ok(()),
+            Err(original) => {
+                rmq_error!(
+                    "Failed to send message back, consumerGroup={}, brokerName={}, msg={}, fallback to normal send: {}",
+                    cfg.consumer_group,
+                    broker,
+                    msg.msg_id.as_deref().unwrap_or(""),
+                    original
+                );
+                match send_retry_copy(
+                    &client,
+                    &cfg.consumer_group,
+                    msg,
+                    max_reconsume,
+                    cfg.unit_mode,
+                )
+                .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(fallback_error) => {
+                        rmq_error!(
+                            "Failed to send message back as normal message, consumerGroup={}, msg={}: {}",
+                            cfg.consumer_group,
+                            msg.msg_id.as_deref().unwrap_or(""),
+                            fallback_error
+                        );
+                        Err(original)
+                    }
+                }
+            }
+        }
     }
 
     pub async fn create_topic(
@@ -5088,6 +5136,7 @@ mod tests {
         opaque: i32,
         serialize_type_current_rpc: i32,
         ext_fields: crate::remoting::protocol::ext_fields::ExtFields,
+        body: Vec<u8>,
     }
 
     impl ReqSnapshot {
@@ -5097,6 +5146,7 @@ mod tests {
                 opaque: request.opaque,
                 serialize_type_current_rpc: request.serialize_type_current_rpc,
                 ext_fields: request.ext_fields().clone(),
+                body: request.body().unwrap_or_default().to_vec(),
             }
         }
 
@@ -5118,6 +5168,9 @@ mod tests {
 
     /// One received request: request code + extFields snapshot.
     type RecordedRequest = (i32, Vec<(String, String)>);
+
+    /// One received message send: request code, extFields snapshot and body.
+    type RecordedSend = (i32, Vec<(String, String)>, Vec<u8>);
 
     /// One scripted PULL_MESSAGE reply.
     struct ScriptedPull {
@@ -5150,6 +5203,12 @@ mod tests {
         /// Scripted GET_MIN_OFFSET / GET_MAX_OFFSET answers `(min, max)`; `(0, 0)` by default,
         /// which is also what an empty queue reports.
         offset_bounds: Arc<Mutex<(i64, i64)>>,
+        /// Scripted CONSUMER_SEND_MSG_BACK reply codes (FIFO); once drained, SUCCESS.
+        bounce_scripts: Arc<Mutex<VecDeque<i32>>>,
+        /// Scripted message-send reply codes (FIFO); once drained, SUCCESS.
+        send_scripts: Arc<Mutex<VecDeque<i32>>>,
+        /// Every received send request `(code, extFields, body)`, in arrival order.
+        sends: Arc<Mutex<Vec<RecordedSend>>>,
     }
 
     impl FakeBroker {
@@ -5166,6 +5225,9 @@ mod tests {
                 pull_scripts: Arc::new(Mutex::new(VecDeque::new())),
                 cid_list: Arc::new(Mutex::new(Vec::new())),
                 offset_bounds: Arc::new(Mutex::new((0, 0))),
+                bounce_scripts: Arc::new(Mutex::new(VecDeque::new())),
+                send_scripts: Arc::new(Mutex::new(VecDeque::new())),
+                sends: Arc::new(Mutex::new(Vec::new())),
             });
             let inner = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -5245,6 +5307,29 @@ mod tests {
                                 let mut response = answer_for(&snapshot, response_code::SUCCESS);
                                 response.add_ext_field("offset", &offset.to_string());
                                 response
+                            } else if snapshot.code == request_code::CONSUMER_SEND_MSG_BACK {
+                                // The bounced round is scripted by code: a case can make the broker
+                                // refuse it without touching the transport underneath.
+                                let code = lock(&inner.bounce_scripts)
+                                    .pop_front()
+                                    .unwrap_or(response_code::SUCCESS);
+                                answer_for(&snapshot, code)
+                            } else if snapshot.code == request_code::SEND_MESSAGE
+                                || snapshot.code == request_code::SEND_MESSAGE_V2
+                            {
+                                lock(&inner.sends).push((
+                                    snapshot.code,
+                                    snapshot
+                                        .ext_fields
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                        .collect(),
+                                    snapshot.body.clone(),
+                                ));
+                                let code = lock(&inner.send_scripts)
+                                    .pop_front()
+                                    .unwrap_or(response_code::SUCCESS);
+                                answer_for(&snapshot, code)
                             } else {
                                 answer_for(&snapshot, response_code::SUCCESS)
                             };
@@ -5370,6 +5455,37 @@ mod tests {
                 body,
                 gate,
             });
+        }
+
+        /// Script the CONSUMER_SEND_MSG_BACK reply codes (FIFO; drained means SUCCESS).
+        fn script_bounce(&self, codes: &[i32]) {
+            lock(&self.bounce_scripts).extend(codes.iter().copied());
+        }
+
+        /// Script the message-send reply codes (FIFO; drained means SUCCESS).
+        fn script_send(&self, codes: &[i32]) {
+            lock(&self.send_scripts).extend(codes.iter().copied());
+        }
+
+        /// The extFields of every received CONSUMER_SEND_MSG_BACK, in arrival order.
+        fn bounces(&self) -> Vec<Vec<(String, String)>> {
+            lock(&self.requests)
+                .iter()
+                .filter(|(code, _)| *code == request_code::CONSUMER_SEND_MSG_BACK)
+                .map(|(_, ext)| ext.clone())
+                .collect()
+        }
+
+        /// The `(code, extFields, body)` of every received message send, in arrival order.
+        fn sends(&self) -> Vec<RecordedSend> {
+            lock(&self.sends).clone()
+        }
+
+        fn count_code(&self, code: i32) -> usize {
+            lock(&self.requests)
+                .iter()
+                .filter(|(c, _)| *c == code)
+                .count()
         }
     }
 
@@ -5730,6 +5846,214 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // -------------------------------------------- Pull send-back (36) and its retry-copy fallback
+
+    const PROP_NAME_VALUE_SEPARATOR: char = '\u{1}';
+    const PROP_SEPARATOR: char = '\u{2}';
+
+    /// A delivered message: the identity fields a send-back carries plus a half-message flag the retry
+    /// copy must drop.
+    fn delivered_message(topic: &str, reconsume_times: i32) -> MessageExt {
+        let mut m = msg(topic, "broker-a", 0, 0, "payload");
+        m.msg_id = Some("MSG-ORIGIN-ID".to_string());
+        m.commit_log_offset = 4242;
+        m.reconsume_times = reconsume_times;
+        m.put_property(
+            crate::common::message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+            "UNIQ-1",
+        );
+        m.put_property(
+            crate::common::message_const::PROPERTY_TRANSACTION_PREPARED,
+            "true",
+        );
+        m
+    }
+
+    /// One property out of a send request's `i` field (`k\x01v\x02...`).
+    fn wire_property(ext: &[(String, String)], name: &str) -> Option<String> {
+        let raw = ext.iter().find(|(k, _)| k == "i").map(|(_, v)| v.as_str())?;
+        raw.split(PROP_SEPARATOR).find_map(|segment| {
+            let (k, v) = segment.split_once(PROP_NAME_VALUE_SEPARATOR)?;
+            (k == name).then(|| v.to_string())
+        })
+    }
+
+    fn field<'a>(ext: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        ext.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    /// An accepted bounce is the whole story: the header carries the message identity and the default
+    /// retry ceiling, and no ordinary send follows.
+    #[tokio::test]
+    async fn pull_send_back_accepted_bounce_carries_the_header_and_sends_nothing_else() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_ok", "PG_PullBackOk", &cluster, "T").await;
+        c.send_message_back(&delivered_message("T", 1), 4)
+            .await
+            .expect("the broker accepts the bounce");
+
+        let bounces = cluster.master.bounces();
+        assert_eq!(bounces.len(), 1, "one 36 reaches the master");
+        let ext = &bounces[0];
+        assert_eq!(field(ext, "group"), Some("PG_PullBackOk"));
+        assert_eq!(field(ext, "offset"), Some("4242"));
+        assert_eq!(field(ext, "delayLevel"), Some("4"));
+        assert_eq!(field(ext, "originMsgId"), Some("MSG-ORIGIN-ID"));
+        assert_eq!(field(ext, "originTopic"), Some("T"));
+        assert_eq!(field(ext, "unitMode"), Some("false"));
+        assert_eq!(
+            field(ext, "maxReconsumeTimes"),
+            Some("16"),
+            "the retry ceiling defaults to 16"
+        );
+        assert!(
+            cluster.master.sends().is_empty(),
+            "an accepted bounce needs no ordinary send"
+        );
+        c.shutdown();
+    }
+
+    /// A refused bounce degrades to an ordinary send of the `%RETRY%` copy: internal producer group,
+    /// retry topic, and the property set that makes the broker redeliver it by delay level.
+    #[tokio::test]
+    async fn pull_send_back_refused_bounce_falls_back_to_a_retry_send() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_fb", "PG_PullBackFb", &cluster, "T").await;
+        cluster
+            .master
+            .script_bounce(&[response_code::SYSTEM_ERROR]);
+        c.send_message_back(&delivered_message("T", 1), 4)
+            .await
+            .expect("the fallback carries the message");
+
+        assert_eq!(cluster.master.bounces().len(), 1);
+        let sends = cluster.master.sends();
+        assert_eq!(sends.len(), 1, "exactly one retry copy goes out");
+        let (code, ext, body) = &sends[0];
+        assert_eq!(*code, request_code::SEND_MESSAGE_V2);
+        assert_eq!(field(ext, "a"), Some(MixAll::CLIENT_INNER_PRODUCER_GROUP));
+        assert_eq!(field(ext, "b"), Some("%RETRY%PG_PullBackFb"));
+        assert_eq!(field(ext, "k"), Some("false"), "unitMode rides on the send");
+        assert_eq!(body.as_slice(), b"payload");
+        assert_eq!(wire_property(ext, "RETRY_TOPIC").as_deref(), Some("T"));
+        assert_eq!(wire_property(ext, "RECONSUME_TIME").as_deref(), Some("2"));
+        assert_eq!(
+            wire_property(ext, "MAX_RECONSUME_TIMES").as_deref(),
+            Some("16")
+        );
+        assert_eq!(
+            wire_property(ext, "ORIGIN_MESSAGE_ID").as_deref(),
+            Some("MSG-ORIGIN-ID")
+        );
+        assert_eq!(wire_property(ext, "DELAY").as_deref(), Some("4"));
+        assert_eq!(
+            wire_property(ext, "TRAN_MSG"),
+            None,
+            "the retry copy must not look like a half message"
+        );
+        c.shutdown();
+    }
+
+    /// Both legs failing reports the bounce error: hiding it behind the fallback's error would point
+    /// the operator at the wrong broker call.
+    #[tokio::test]
+    async fn pull_send_back_double_failure_reports_the_bounce_error() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_both", "PG_PullBackBoth", &cluster, "T").await;
+        cluster
+            .master
+            .script_bounce(&[response_code::SYSTEM_ERROR]);
+        cluster
+            .master
+            .script_send(&[response_code::SYSTEM_ERROR]);
+        let err = c
+            .send_message_back(&delivered_message("T", 1), 4)
+            .await
+            .expect_err("both legs refused it");
+        assert_eq!(
+            err.response_code(),
+            Some(response_code::SYSTEM_ERROR),
+            "the reported error is the bounce's"
+        );
+        assert_eq!(cluster.master.bounces().len(), 1);
+        assert_eq!(cluster.master.sends().len(), 1);
+        c.shutdown();
+    }
+
+    /// The ceiling knob rides on both legs: the bounce header and the retry copy's MAX_RECONSUME_TIMES.
+    #[tokio::test]
+    async fn pull_send_back_ceiling_knob_rides_on_both_legs() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_ceiling", "PG_PullBackCeil", &cluster, "T").await;
+        c.update_config(|cfg| cfg.max_reconsume_times = 5);
+        cluster
+            .master
+            .script_bounce(&[response_code::SYSTEM_ERROR]);
+        c.send_message_back(&delivered_message("T", 2), 3)
+            .await
+            .expect("the fallback carries the message");
+
+        assert_eq!(
+            field(&cluster.master.bounces()[0], "maxReconsumeTimes"),
+            Some("5")
+        );
+        let sends = cluster.master.sends();
+        let ext = &sends[0].1;
+        assert_eq!(
+            wire_property(ext, "MAX_RECONSUME_TIMES").as_deref(),
+            Some("5")
+        );
+        assert_eq!(wire_property(ext, "RECONSUME_TIME").as_deref(), Some("3"));
+        assert_eq!(wire_property(ext, "DELAY").as_deref(), Some("5"));
+        c.shutdown();
+    }
+
+    /// `-1` is "no explicit ceiling from the caller": both legs then carry 16, the limit at which the
+    /// broker moves the message to `%DLQ%`.
+    #[tokio::test]
+    async fn pull_send_back_unlimited_sentinel_reads_as_sixteen() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_unlimited", "PG_PullBackUnl", &cluster, "T").await;
+        c.update_config(|cfg| cfg.max_reconsume_times = -1);
+        cluster
+            .master
+            .script_bounce(&[response_code::SYSTEM_ERROR]);
+        c.send_message_back(&delivered_message("T", 0), 3)
+            .await
+            .expect("the fallback carries the message");
+
+        assert_eq!(
+            field(&cluster.master.bounces()[0], "maxReconsumeTimes"),
+            Some("16")
+        );
+        let sends = cluster.master.sends();
+        assert_eq!(
+            wire_property(&sends[0].1, "MAX_RECONSUME_TIMES").as_deref(),
+            Some("16")
+        );
+        c.shutdown();
+    }
+
+    /// A broker the route does not know never even gets the bounce: the copy is what carries the message.
+    #[tokio::test]
+    async fn pull_send_back_without_a_master_still_falls_back() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_nomaster", "PG_PullBackNoMaster", &cluster, "T").await;
+        let mut m = delivered_message("T", 1);
+        m.broker_name = Some("broker-absent".to_string());
+        c.send_message_back(&m, 4)
+            .await
+            .expect("the fallback carries the message");
+
+        assert_eq!(
+            cluster.master.count_code(request_code::CONSUMER_SEND_MSG_BACK),
+            0,
+            "an unknown master is refused before the wire"
+        );
+        assert_eq!(cluster.master.sends().len(), 1);
+        c.shutdown();
     }
 
     #[test]

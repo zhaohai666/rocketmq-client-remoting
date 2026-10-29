@@ -24,7 +24,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1770 passed, 4 skipped（150.2s）
+.venv/bin/python -m pytest tests/ -q           # 1777 passed, 4 skipped（149.1s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 

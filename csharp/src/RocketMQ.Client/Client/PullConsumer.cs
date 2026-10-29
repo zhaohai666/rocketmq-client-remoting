@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 
 using RocketMQ.Common;
@@ -1018,26 +1019,59 @@ public sealed class DefaultMQPullConsumer
         return ExtInt(response, "timestamp", 0);
     }
 
+    /// <summary>The retry ceiling sent on a send-back and written onto the retry copy;
+    /// 16 when untouched. <c>-1</c> is reported as 16, the point at which the broker moves
+    /// the message to %DLQ%.</summary>
+    public int MaxReconsumeTimes { get; set; } = 16;
+
+    // Send-back: a refused bounce (no master, transport failure, non-success answer)
+    // degrades to a normal send to %RETRY%<group> so the redelivery is not lost; only when
+    // that send fails too does the ORIGINAL error reach the caller.
     public void SendMessageBack(MessageExt msg, int delayLevel)
     {
         MQClientInstance c = RequireClient();
-        string addr = c.FindBrokerAddressInPublish(msg.BrokerName);
-        if (addr.Length == 0)
+        int maxReconsume = MaxReconsumeTimes == -1 ? 16 : MaxReconsumeTimes;
+        try
         {
-            throw new MQClientException("Broker[" + msg.BrokerName + "] master node does not exist");
-        }
+            string addr = c.FindBrokerAddressInPublish(msg.BrokerName);
+            if (addr.Length == 0)
+            {
+                throw new MQClientException("Broker[" + msg.BrokerName + "] master node does not exist");
+            }
 
-        var header = new ConsumerSendMsgBackRequestHeader
+            var header = new ConsumerSendMsgBackRequestHeader
+            {
+                Offset = msg.CommitLogOffset,
+                Group = _consumerGroup,
+                DelayLevel = delayLevel,
+                OriginMsgId = msg.MsgId,
+                OriginTopic = msg.Topic,
+                UnitMode = _unitMode,
+                MaxReconsumeTimes = maxReconsume,
+            };
+            c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 3000);
+        }
+        catch (Exception e)
         {
-            Offset = msg.CommitLogOffset,
-            Group = _consumerGroup,
-            DelayLevel = delayLevel,
-            OriginMsgId = msg.MsgId,
-            OriginTopic = msg.Topic,
-            UnitMode = _unitMode,
-            MaxReconsumeTimes = null,
-        };
-        c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
+            ClientLog.Error("Failed to send message back, consumerGroup=" + _consumerGroup
+                            + ", brokerName=" + msg.BrokerName + ", msg=" + msg.MsgId
+                            + ": " + e.Message + "; fallback to normal send");
+            try
+            {
+                Message newMsg = RetryMessageFactory.Build(_consumerGroup, msg, maxReconsume);
+                TopicPublishInfo publish = c.GetTopicPublishInfo(newMsg.Topic, isDefault: true);
+                // unitMode follows the consumer: without it, sent-back messages lose their unitization mark.
+                c.SendMessage(MixAll.ClientInnerProducerGroup, newMsg, publish.SelectOneMessageQueue(),
+                    3000, unitMode: _unitMode);
+            }
+            catch (Exception fallbackError)
+            {
+                ClientLog.Error("Fallback normal send failed, consumerGroup=" + _consumerGroup
+                                + ", msg=" + msg.MsgId + ": " + fallbackError.Message);
+                ExceptionDispatchInfo.Capture(e).Throw();
+                throw;  // ExceptionDispatchInfo.Throw never returns
+            }
+        }
     }
 
     public void CreateTopic(string key, string newTopic, int queueNum = 4)

@@ -571,30 +571,96 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     return extInt(response, "timestamp", 0);
 }
 
+namespace {
+
+// The retry copy a failed send-back degrades to: the original body and properties, re-addressed to
+// %RETRY%group with the redelivery counters bumped and the delay gradient the retry topic expects.
+Message buildRetryCopy(const std::string& consumerGroup, const MessageExt& msg,
+                       int32_t maxReconsumeTimes) {
+    Message newMsg(MixAll::getRetryTopic(consumerGroup), msg.body);
+    newMsg.properties = msg.properties;
+    newMsg.flag = msg.flag;
+    std::string originMsgId = msg.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID);
+    if (originMsgId.empty()) originMsgId = msg.msgId;
+    if (!originMsgId.empty()) {
+        newMsg.putProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, originMsgId);
+    }
+    newMsg.putProperty(MessageConst::PROPERTY_RETRY_TOPIC, msg.topic);
+    newMsg.putProperty(MessageConst::PROPERTY_RECONSUME_TIME,
+                       std::to_string(msg.reconsumeTimes + 1));
+    newMsg.putProperty(MessageConst::PROPERTY_MAX_RECONSUME_TIMES,
+                       std::to_string(maxReconsumeTimes));
+    // A redelivery must not carry TRAN_MSG, otherwise the broker handles it as a check-back message again
+    newMsg.properties.erase(MessageConst::PROPERTY_TRANSACTION_PREPARED);
+    newMsg.putProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL,
+                       std::to_string(3 + msg.reconsumeTimes));
+    if (newMsg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).empty()) {
+        newMsg.putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+                           InnerIdGenerator::createUniqId());
+    }
+    return newMsg;
+}
+
+}  // namespace
+
 void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    const std::string addr = mqClient_->findBrokerAddressInPublish(msg.brokerName);
-    if (addr.empty()) {
-        throw MQClientException("Broker[" + msg.brokerName + "] master node does not exist");
+    const int32_t maxReconsume = maxReconsumeTimes_ == -1 ? 16 : maxReconsumeTimes_;
+    std::exception_ptr original;
+    try {
+        const std::string addr = mqClient_->findBrokerAddressInPublish(msg.brokerName);
+        if (addr.empty()) {
+            throw MQClientException("Broker[" + msg.brokerName + "] master node does not exist");
+        }
+        auto header = std::make_shared<ConsumerSendMsgBackRequestHeader>();
+        header->offset = msg.commitLogOffset;
+        header->group = consumerGroup_;
+        header->delayLevel = delayLevel;
+        header->originMsgId = msg.msgId;
+        header->originTopic = msg.topic;
+        header->unitMode = unitMode_;
+        header->maxReconsumeTimes = maxReconsume;
+        RemotingCommand request =
+            RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
+        // CONSUMER_SEND_MSG_BACK is a broker write the VIP switch rewrites; applied per request here,
+        // the shifted address is never cached.
+        const RemotingCommand response = mqClient_->remotingClient().invokeSync(
+            MixAll::brokerVipChannel(mqClient_->isVipChannelEnabled(), addr), request, 3000);
+        if (response.code != ResponseCode::SUCCESS) {
+            throw MQBrokerException(response.code, response.remark);
+        }
+        return;
+    } catch (const std::exception& e) {
+        original = std::current_exception();
+        logger_error("Failed to send message back, consumerGroup=" + consumerGroup_
+                     + ", brokerName=" + msg.brokerName + ", msg=" + msg.msgId
+                     + ", fallback to normal send: " + e.what());
+    } catch (...) {
+        original = std::current_exception();
+        logger_error("Failed to send message back, consumerGroup=" + consumerGroup_
+                     + ", brokerName=" + msg.brokerName + ", msg=" + msg.msgId
+                     + ", fallback to normal send: unknown error");
     }
-    auto header = std::make_shared<ConsumerSendMsgBackRequestHeader>();
-    header->offset = msg.commitLogOffset;
-    header->group = consumerGroup_;
-    header->delayLevel = delayLevel;
-    header->originMsgId = msg.msgId;
-    header->originTopic = msg.topic;
-    header->unitMode = unitMode_;
-    header->maxReconsumeTimes = std::nullopt;
-    RemotingCommand request =
-        RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
-    // CONSUMER_SEND_MSG_BACK is a broker write the VIP switch rewrites; applied per request here,
-    // the shifted address is never cached.
-    const RemotingCommand response = mqClient_->remotingClient().invokeSync(
-        MixAll::brokerVipChannel(mqClient_->isVipChannelEnabled(), addr), request, 5000);
-    if (response.code != ResponseCode::SUCCESS) {
-        throw MQBrokerException(response.code, response.remark);
+    try {
+        // Degrade to an ordinary send to %RETRY%group: the broker then redelivers the message by
+        // its delay level, so a broken send-back request does not lose the message.
+        Message newMsg = buildRetryCopy(consumerGroup_, msg, maxReconsume);
+        std::shared_ptr<TopicPublishInfo> publish =
+            mqClient_->getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
+        if (publish == nullptr || publish->msgQueueList.empty()) {
+            throw MQClientException("no writable message queue for topic " + newMsg.topic);
+        }
+        // The retry copy leaves through the instance's internal producer, configured from this
+        // consumer; unitMode is passed explicitly so the redelivery keeps its unit marker.
+        mqClient_->sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg,
+                               publish->selectOneMessageQueue(), 3000, /*sysFlag=*/0,
+                               unitMode_);
+    } catch (const std::exception& fallbackError) {
+        logger_error("Failed to send message back as normal message, consumerGroup="
+                     + consumerGroup_ + ", msg=" + msg.msgId + ": " + fallbackError.what());
+        std::rethrow_exception(original);
     }
 }
 

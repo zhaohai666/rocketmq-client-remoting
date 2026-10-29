@@ -407,6 +407,18 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
             }
             return RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
 
+        case RequestCode::SEND_MESSAGE:
+        case RequestCode::SEND_MESSAGE_V2: {
+            // The send-back fallback goes out through the client-inner producer. Keep that leg
+            // failing too, so the rejected FTopic send-backs never turn into a successful retry.
+            // V2 carries the same fields under compact single-letter keys (a=producerGroup).
+            $producerGroup = (string) ($ext['producerGroup'] ?? $ext['a'] ?? '');
+            if ($producerGroup === MixAll::CLIENT_INNER_PRODUCER_GROUP) {
+                return RemotingCommand::createResponseCommand(ResponseCode::SYSTEM_ERROR, 'inner producer unavailable');
+            }
+            return RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
+        }
+
         case RequestCode::LOCK_BATCH_MQ:
         case RequestCode::UNLOCK_BATCH_MQ: {
             $reqBody = (array) (json_decode($cmd->body ?? '{}', true) ?: []);
@@ -1343,13 +1355,13 @@ final class RunClientConsumer
         $this->checkSame(0, $c->minOffset($mq), 'minOffset=0');
         $this->checkSame(1234567890000, $c->earliestMsgStoreTime($mq), 'earliestMsgStoreTime');
 
-        // send-back: delayLevel specified by the caller; maxReconsumeTimes left null for the subscription group (deliberate difference).
+        // send-back: delayLevel specified by the caller; the default retry ceiling (16) rides along.
         $c->sendMessageBack($r->msgFoundList[0], 2);
         $this->loadLog(getenv('RMQ_LOG'));
         $backs = $this->logWhere(RequestCode::CONSUMER_SEND_MSG_BACK, null, 'GID-P-CONS');
         $this->checkSame(1, count($backs), 'pull sendMessageBack called once');
         $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), 'send-back delayLevel=2');
-        $this->checkSame(null, $backs[0]['maxReconsumeTimes'] ?? null, 'pull send-back does not send maxReconsumeTimes');
+        $this->checkSame(16, $backs[0]['maxReconsumeTimes'] ?? null, 'pull send-back carries the default retry ceiling 16');
 
         // fetchMessageQueuesInBalance: pull mode has no background rebalance, so compute this instance's
         // queues on the spot with the same formula as rebalanceByTopic.

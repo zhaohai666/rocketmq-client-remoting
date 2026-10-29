@@ -481,3 +481,9 @@ add_test(NAME shutdown_drain_ceiling COMMAND rmq_test_shutdown_drain_ceiling)
 add_executable(rmq_test_client_config_switches test_client_config_switches.cpp)
 target_link_libraries(rmq_test_client_config_switches PRIVATE rocketmq::remoting)
 add_test(NAME client_config_switches COMMAND rmq_test_client_config_switches)
+
+# Pull send-back: a refused CONSUMER_SEND_MSG_BACK degrades to an ordinary %RETRY% send (properties,
+# delay gradient, retry ceiling), and a doubly-failed send-back reports the original error.
+add_executable(rmq_test_send_back_fallback test_send_back_fallback.cpp)
+target_link_libraries(rmq_test_send_back_fallback PRIVATE rocketmq::remoting)
+add_test(NAME send_back_fallback COMMAND rmq_test_send_back_fallback)

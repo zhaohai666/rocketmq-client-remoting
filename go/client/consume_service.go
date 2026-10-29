@@ -214,18 +214,39 @@ func (c *DefaultMQPushConsumer) sendBackBatch(mq common.MessageQueue, batch []*c
 	return failed
 }
 
-// sendMessageBack is DefaultMQPushConsumerImpl#sendMessageBack: broker-side
-// redelivery via CONSUMER_SEND_MSG_BACK(36).
+// concurrentMaxReconsumeTimes is the maxReconsumeTimes the concurrent path
+// reports to the broker: the broker's own default retryMaxTimes when the
+// consumer is configured as unlimited. Orderly consumption has its own reading
+// of -1 (see orderlyMaxReconsumeTimes).
+func (c *DefaultMQPushConsumer) concurrentMaxReconsumeTimes() int32 {
+	if c.maxReconsumeTimes == -1 {
+		return 16
+	}
+	return c.maxReconsumeTimes
+}
+
+// sendMessageBack is the concurrent path's broker-side redelivery via
+// CONSUMER_SEND_MSG_BACK(36). A failed request degrades to re-sending the
+// message as a normal message to %RETRY%<group>; only when that fails too does
+// the error reach the caller (which then keeps the entry for a local retry).
+// A logical-queue mock broker has no real master to answer the request, so that
+// case skips the request and goes straight to the normal send.
 func (c *DefaultMQPushConsumer) sendMessageBack(msg *common.MessageExt, delayLevel int32) error {
 	inst := c.instance
 	if inst == nil {
 		return common.ClientError("consumer not started")
 	}
-	maxReconsume := int32(16)
-	if c.maxReconsumeTimes != -1 {
-		maxReconsume = c.maxReconsumeTimes
+	maxReconsume := c.concurrentMaxReconsumeTimes()
+	if isLogicalQueueMockBrokerName(msg.BrokerName) {
+		return c.sendRetryMessage(msg, maxReconsume)
 	}
-	return inst.sendMessageBack(c.consumerGroup, msg, delayLevel, maxReconsume, c.unitMode, 5000)
+	err := inst.sendMessageBack(c.consumerGroup, msg, delayLevel, maxReconsume, c.unitMode, 5000)
+	if err == nil {
+		return nil
+	}
+	common.LogErrorf("Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %v; fallback to normal send",
+		c.consumerGroup, msg.BrokerName, msg.MsgID, err)
+	return c.sendRetryMessage(msg, maxReconsume)
 }
 
 // ---------------------------------------------------------------- orderly
@@ -387,38 +408,24 @@ func (c *DefaultMQPushConsumer) orderlySendMessageBack(msg *common.MessageExt) b
 }
 
 func (c *DefaultMQPushConsumer) doOrderlySendMessageBack(msg *common.MessageExt) error {
+	return c.sendRetryMessage(msg, c.orderlyMaxReconsumeTimes())
+}
+
+// sendRetryMessage sends a retry message built by buildRetryMessage through the
+// internal producer.
+func (c *DefaultMQPushConsumer) sendRetryMessage(msg *common.MessageExt, maxReconsume int32) error {
 	producer, err := c.innerProducer()
 	if err != nil {
 		return err
 	}
-	retryTopic := common.GetRetryTopic(c.consumerGroup)
-	newMsg := common.NewMessage(retryTopic, append([]byte(nil), msg.GetBody()...))
-	if msg.Properties != nil {
-		newMsg.SetProperties(msg.Properties.Clone())
-	}
-	newMsg.Flag = msg.Flag
-	originMsgID := msg.MsgID
-	if v, ok := msg.GetProperty(common.PropertyOriginMessageID); ok && v != "" {
-		originMsgID = v
-	}
-	if originMsgID != "" {
-		newMsg.PutProperty(common.PropertyOriginMessageID, originMsgID)
-	}
-	newMsg.PutProperty(common.PropertyRetryTopic, msg.Topic)
-	newMsg.PutProperty(common.PropertyReconsumeTime, i32Text(msg.ReconsumeTimes+1))
-	newMsg.PutProperty(common.PropertyMaxReconsumeTimes, i32Text(c.orderlyMaxReconsumeTimes()))
-	// The half-message marker must go, else the broker treats it as a
-	// transaction check-back message all over again.
-	newMsg.RemoveProperty(common.PropertyTransactionPrepared)
-	newMsg.SetDelayTimeLevel(3 + msg.ReconsumeTimes)
-
-	info, err := c.instance.GetTopicPublishInfo(retryTopic, true)
+	newMsg := buildRetryMessage(msg, c.consumerGroup, maxReconsume)
+	info, err := c.instance.GetTopicPublishInfo(newMsg.Topic, true)
 	if err != nil {
 		return err
 	}
 	mq, ok, err := info.SelectOneMessageQueue(nil)
 	if err != nil || !ok {
-		return common.ClientError(fmt.Sprintf("no writable queue for retry topic %s", retryTopic))
+		return common.ClientError(fmt.Sprintf("no writable queue for retry topic %s", newMsg.Topic))
 	}
 	_, err = producer.SendToQueue(newMsg, mq)
 	return err

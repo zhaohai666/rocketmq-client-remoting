@@ -129,6 +129,14 @@ type DefaultMQPullConsumer struct {
 	offsetStore OffsetStore
 	pullAPI     *pullAPI
 
+	// producerMu/producer back the send-back fallback: a failed
+	// CONSUMER_SEND_MSG_BACK is re-sent as a normal message to %RETRY%<group>
+	// through a CLIENT_INNER_PRODUCER built from this consumer's config (the
+	// same internal producer the push path uses). Built lazily on the first
+	// failed send-back and torn down in Shutdown.
+	producerMu sync.Mutex
+	producer   *DefaultMQProducer
+
 	// pullAsyncPool / pullCallbackPool back PullAsync (see pull_async.go):
 	// the first runs the RPC off the caller's goroutine, the second delivers
 	// the user callback. Built in Start, torn down in Shutdown — the same
@@ -741,8 +749,15 @@ func (c *DefaultMQPullConsumer) Shutdown() {
 	c.started = false
 	instance := c.instance
 	group := c.consumerGroup
+	producer := c.producer
+	c.producer = nil
 	c.mu.Unlock()
 
+	// The lazily built send-back fallback producer owns its own client slot, so
+	// it is torn down explicitly before the shared instance goes away.
+	if producer != nil {
+		producer.Shutdown()
+	}
 	if instance != nil {
 		instance.UnregisterClientAllBrokers("", group)
 		instance.UnregisterConsumer(group)
@@ -1318,10 +1333,9 @@ func (c *DefaultMQPullConsumer) PulledQueues() []common.MessageQueue {
 //  1. the address comes from the PUBLISH table (master only), so the caller must
 //     have pulled the topic through THIS consumer first — a queue reached
 //     through another instance is not in this instance's route cache;
-//  2. a pull consumer owns no internal producer, so a failed bounce is never
-//     re-sent to %RETRY%group behind the caller's back: this client reports the failure
-//     instead of silently switching transports — a bounce that failed is
-//     something the caller needs to see.
+//  2. a failed bounce degrades to re-sending the message as a normal message to
+//     %RETRY%<group> through the internal producer. Only when that fails too is
+//     the error reported to the caller.
 func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLevel int32, brokerName string) error {
 	instance, err := c.requireClient()
 	if err != nil {
@@ -1336,6 +1350,8 @@ func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLev
 	maxReconsume := c.maxReconsumeTimes
 	namespace := c.namespace
 	c.mu.Unlock()
+	// The topic is un-wrapped even when the send threw (finally semantics).
+	defer func() { msg.Topic = common.WithoutNamespace(msg.Topic, namespace) }()
 
 	dest := brokerName
 	if dest == "" {
@@ -1344,15 +1360,94 @@ func (c *DefaultMQPullConsumer) SendMessageBack(msg *common.MessageExt, delayLev
 	addr, ok := instance.FindBrokerAddressInPublish(dest)
 	if !ok || addr == "" {
 		// The error string is a fixed contract wording for "no master".
-		return common.ClientError(fmt.Sprintf("Broker[%s] master node does not exist", dest))
+		err = common.ClientError(fmt.Sprintf("Broker[%s] master node does not exist", dest))
+	} else {
+		err = instance.sendMessageBack(group, msg, delayLevel, maxReconsume, unitMode,
+			defaultPullSendBackTimeoutMillis)
 	}
-	if err := instance.sendMessageBack(group, msg, delayLevel, maxReconsume, unitMode,
-		defaultPullSendBackTimeoutMillis); err != nil {
+	if err == nil {
+		return nil
+	}
+	common.LogErrorf("Failed to send message back, consumerGroup=%s, brokerName=%s, msg=%s: %v; fallback to normal send",
+		group, dest, msg.MsgID, err)
+	return c.sendRetryMessage(msg, group, maxReconsume)
+}
+
+// sendRetryMessage re-sends a failed send-back as a normal message to
+// %RETRY%<group>, carrying the retry bookkeeping properties the broker would
+// have written itself.
+func (c *DefaultMQPullConsumer) sendRetryMessage(msg *common.MessageExt, group string, maxReconsume int32) error {
+	producer, err := c.innerProducer()
+	if err != nil {
 		return err
 	}
-	// The topic is un-wrapped even when the send threw (finally semantics).
-	msg.Topic = common.WithoutNamespace(msg.Topic, namespace)
-	return nil
+	newMsg := buildRetryMessage(msg, group, maxReconsume)
+	publish, err := c.instance.GetTopicPublishInfo(newMsg.Topic, true)
+	if err != nil {
+		return err
+	}
+	mq, ok, err := publish.SelectOneMessageQueue(nil)
+	if err != nil || !ok {
+		return common.ClientError(fmt.Sprintf("no writable queue for retry topic %s", newMsg.Topic))
+	}
+	_, err = producer.SendToQueue(newMsg, mq)
+	return err
+}
+
+// buildRetryMessage constructs the normal message that carries a failed
+// delivery to %RETRY%<group> for the given consumer group.
+func buildRetryMessage(msg *common.MessageExt, group string, maxReconsume int32) *common.Message {
+	newMsg := common.NewMessage(common.GetRetryTopic(group), append([]byte(nil), msg.GetBody()...))
+	if msg.Properties != nil {
+		newMsg.SetProperties(msg.Properties.Clone())
+	}
+	newMsg.Flag = msg.Flag
+	originMsgID := msg.MsgID
+	if v, ok := msg.GetProperty(common.PropertyOriginMessageID); ok && v != "" {
+		originMsgID = v
+	}
+	if originMsgID != "" {
+		newMsg.PutProperty(common.PropertyOriginMessageID, originMsgID)
+	}
+	newMsg.PutProperty(common.PropertyRetryTopic, msg.Topic)
+	newMsg.PutProperty(common.PropertyReconsumeTime, i32Text(msg.ReconsumeTimes+1))
+	newMsg.PutProperty(common.PropertyMaxReconsumeTimes, i32Text(maxReconsume))
+	// The half-message marker must go, else the broker treats it as a
+	// transaction check-back message all over again.
+	newMsg.RemoveProperty(common.PropertyTransactionPrepared)
+	newMsg.SetDelayTimeLevel(3 + msg.ReconsumeTimes)
+	return newMsg
+}
+
+func (c *DefaultMQPullConsumer) innerProducer() (*DefaultMQProducer, error) {
+	c.producerMu.Lock()
+	defer c.producerMu.Unlock()
+	if c.producer != nil {
+		return c.producer, nil
+	}
+	c.mu.Lock()
+	addrs := append([]string(nil), c.nameServerAddrs...)
+	unitName := c.unitName
+	unitMode := c.unitMode
+	stream := c.streamRequest
+	tls := c.tlsEnable
+	c.mu.Unlock()
+	producer, err := NewDefaultMQProducer(common.ClientInnerProducerGroup)
+	if err != nil {
+		return nil, err
+	}
+	producer.SetNameServerAddresses(addrs)
+	producer.SetUnitName(unitName)
+	producer.SetUnitMode(unitMode)
+	producer.SetEnableStreamRequestType(stream)
+	if tls != nil {
+		producer.SetTLSEnable(*tls)
+	}
+	if err := producer.Start(); err != nil {
+		return nil, err
+	}
+	c.producer = producer
+	return producer, nil
 }
 
 // CreateTopic creates a topic on every broker in `key`'s route

@@ -24,6 +24,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
 
@@ -5654,44 +5655,12 @@ public sealed class DefaultMQPushConsumer
     }
 
     /// <summary>
-    /// The two newMsg constructors of <c>sendMessageBackAsNormalMessage</c>
-    /// and <c>sendMessageBack</c> (the orderly chain) are LINE-BY-LINE
-    /// IDENTICAL (only maxReconsumeTimes calls its own getter each), so they
-    /// are extracted into one function to avoid the two places' property
-    /// setting drifting apart.
+    /// Every retry copy this consumer builds (the concurrent send-back fallback and the
+    /// orderly chain) comes from the one shared builder, so the two paths' property
+    /// setting cannot drift apart.
     /// </summary>
     private Message BuildRetryMessage(MessageExt msg, int maxReconsumeTimes)
-    {
-        var newMsg = new Message(MixAll.GetRetryTopic(ConsumerGroup), msg.Body);
-        newMsg.Properties = new PropertyMap(msg.Properties);
-        newMsg.Flag = msg.Flag;
-        string originMsgId = msg.GetProperty(MessageConst.PropertyOriginMessageId);
-        if (string.IsNullOrEmpty(originMsgId))
-        {
-            originMsgId = msg.MsgId;
-        }
-
-        if (!string.IsNullOrEmpty(originMsgId))
-        {
-            newMsg.PutProperty(MessageConst.PropertyOriginMessageId, originMsgId);
-        }
-
-        newMsg.PutProperty(MessageConst.PropertyRetryTopic, msg.Topic);
-        newMsg.PutProperty(MessageConst.PropertyReconsumeTime,
-            (msg.ReconsumeTimes + 1).ToString(CultureInfo.InvariantCulture));
-        newMsg.PutProperty(MessageConst.PropertyMaxReconsumeTimes,
-            maxReconsumeTimes.ToString(CultureInfo.InvariantCulture));
-        // Half-message send-back must not carry TRAN_MSG, otherwise the
-        // broker treats it as a check-back message again
-        newMsg.RemoveProperty(MessageConst.PropertyTransactionPrepared);
-        newMsg.DelayTimeLevel = 3 + msg.ReconsumeTimes;
-        if (string.IsNullOrEmpty(newMsg.GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx)))
-        {
-            MessageClientIDSetter.SetUniqId(newMsg);
-        }
-
-        return newMsg;
-    }
+        => RetryMessageFactory.Build(ConsumerGroup, msg, maxReconsumeTimes);
 
     /// <summary>
     /// Advance the offset to the largest queueOffset+1 in the batch; when
@@ -7428,43 +7397,78 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
-    // Message send-back (sendMessageBack): failure throws MQBrokerException,
-    // success returns true
+    // Message send-back (sendMessageBack): success returns true. A refused bounce
+    // (no master, transport failure, non-success answer) degrades to a normal send to
+    // %RETRY%<group> so the redelivery is not lost; only when that send fails too does
+    // the ORIGINAL error reach the caller.
     public bool SendMessageBack(MessageExt msg, int delayLevel, string? brokerNameIn = null)
     {
         MQClientInstance c = Client();
-        string brokerName = string.IsNullOrEmpty(brokerNameIn) ? msg.BrokerName : brokerNameIn!;
-        // Use findBrokerAddressInPublish (master only, does not refresh
-        // routes); when unavailable report "Broker[X] master node does not
-        // exist"; slaves do not accept CONSUMER_SEND_MSG_BACK.
-        string addr = c.FindBrokerAddressInPublish(brokerName);
-        if (addr.Length == 0)
+        int maxReconsume = MaxReconsumeTimesOrDefault();
+        try
         {
-            throw new MQClientException("Broker[" + brokerName + "] master node does not exist");
-        }
+            string brokerName = string.IsNullOrEmpty(brokerNameIn) ? msg.BrokerName : brokerNameIn!;
+            // Use findBrokerAddressInPublish (master only, does not refresh
+            // routes); when unavailable report "Broker[X] master node does not
+            // exist"; slaves do not accept CONSUMER_SEND_MSG_BACK.
+            string addr = c.FindBrokerAddressInPublish(brokerName);
+            if (addr.Length == 0)
+            {
+                throw new MQClientException("Broker[" + brokerName + "] master node does not exist");
+            }
 
-        var header = new ConsumerSendMsgBackRequestHeader
+            var header = new ConsumerSendMsgBackRequestHeader
+            {
+                Offset = msg.CommitLogOffset,
+                Group = ConsumerGroup,
+                DelayLevel = delayLevel,
+                OriginMsgId = msg.MsgId,
+                OriginTopic = msg.Topic,
+                // ⚠ Deliberately beyond protocol requirements:
+                // consumerSendMessageBack protocol-wise only fills
+                // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName,
+                // never writes unitMode, the field is always false. The broker
+                // side does read it (its sys-flag builder receives
+                // (false, true)), so it is reported truthfully here
+                // per the consumer config, and only then does the unitized retry
+                // topic carry the UNIT_SUB flag.
+                UnitMode = _unitMode,
+                // maxReconsumeTimes == -1 is passed to the broker as 16 (the
+                // broker moves to %DLQ% once exceeded)
+                MaxReconsumeTimes = maxReconsume,
+            };
+            c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
+            return true;
+        }
+        catch (Exception e)
         {
-            Offset = msg.CommitLogOffset,
-            Group = ConsumerGroup,
-            DelayLevel = delayLevel,
-            OriginMsgId = msg.MsgId,
-            OriginTopic = msg.Topic,
-            // ⚠ Deliberately beyond protocol requirements:
-            // consumerSendMessageBack protocol-wise only fills
-            // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName,
-            // never writes unitMode, the field is always false. The broker
-            // side does read it (its sys-flag builder receives
-            // (false, true)), so it is reported truthfully here
-            // per the consumer config, and only then does the unitized retry
-            // topic carry the UNIT_SUB flag.
-            UnitMode = _unitMode,
-            // maxReconsumeTimes == -1 is passed to the broker as 16 (the
-            // broker moves to %DLQ% once exceeded)
-            MaxReconsumeTimes = MaxReconsumeTimesOrDefault(),
-        };
-        c.InvokeSync(c.VipAddr(addr), RequestCode.ConsumerSendMsgBack, header.ToExtFields(), null, false, 5000);
-        return true;
+            ClientLog.Error("Failed to send message back, consumerGroup=" + ConsumerGroup
+                            + ", brokerName=" + msg.BrokerName + ", msg=" + msg.MsgId
+                            + ": " + e.Message + "; fallback to normal send");
+            try
+            {
+                SendRetryMessage(msg, maxReconsume, c);
+                return true;
+            }
+            catch (Exception fallbackError)
+            {
+                ClientLog.Error("Fallback normal send failed, consumerGroup=" + ConsumerGroup
+                                + ", msg=" + msg.MsgId + ": " + fallbackError.Message);
+                ExceptionDispatchInfo.Capture(e).Throw();
+                throw;  // ExceptionDispatchInfo.Throw never returns
+            }
+        }
+    }
+
+    // SendRetryMessage delivers a failed delivery as a normal message to
+    // %RETRY%<group> through the internal producer.
+    private void SendRetryMessage(MessageExt msg, int maxReconsumeTimes, MQClientInstance c)
+    {
+        Message newMsg = BuildRetryMessage(msg, maxReconsumeTimes);
+        TopicPublishInfo publish = c.GetTopicPublishInfo(newMsg.Topic, isDefault: true);
+        // unitMode follows the consumer: without it, sent-back messages lose their unitization mark.
+        c.SendMessage(MixAll.ClientInnerProducerGroup, newMsg, publish.SelectOneMessageQueue(),
+            3000, unitMode: _unitMode);
     }
 
     // ---------------- Internal utilities ----------------

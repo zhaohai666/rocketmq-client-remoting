@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **65** 个模块并依次跑 **49** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-28 实测 **ALL GREEN**，其中 44 套逐条计出 **1585** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **50** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-29 实测 **ALL GREEN**，其中 45 套逐条计出 **1688** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -410,7 +410,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 49 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 50 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

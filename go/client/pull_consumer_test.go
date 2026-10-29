@@ -388,6 +388,39 @@ func TestPullConsumerSendMessageBackUsesThePullCeiling(t *testing.T) {
 	}
 }
 
+// A refused CONSUMER_SEND_MSG_BACK hands the message to the internal producer:
+// SendMessageBack still reports success because the normal send to
+// %RETRY%<group> carries the redelivery instead.
+func TestPullConsumerSendMessageBackFallsBackToNormalSend(t *testing.T) {
+	const topic = "PullSendBackFallbackTopic"
+	const group = "GID_pull_sendback_fallback"
+	f := newClusterFixture(t, map[string]int{topic: 1})
+	f.routeBodies.set(common.GetRetryTopic(group), consumerRouteBody("b1", f.brokerSrv.addr, 1))
+	f.broker.failSendBack(remoting.RespSystemError)
+	msgs := f.broker.add(topic, 0, "bounce-me")
+	c := newPullConsumer(t, f, group)
+	startPullConsumer(t, c)
+
+	if _, err := c.Pull(pullTopicMQ(topic), "*", 0, 32); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	msg := msgs[0]
+	msg.BrokerName = "b1"
+	// A pulled message carries the id the broker assigned at store time; the
+	// fallback copies it into ORIGIN_MESSAGE_ID.
+	msg.MsgID = "0A0B0C0D0000000000000000000EA7"
+	requireNoError(t, "send back fallback", c.SendMessageBack(msg, 3, "b1"))
+
+	if got := len(f.broker.sendBackSnapshot()); got != 1 {
+		t.Fatalf("send-back attempts = %d, want 1 (the refused bounce)", got)
+	}
+	sends := f.broker.sendsTo(common.GetRetryTopic(group))
+	if len(sends) != 1 {
+		t.Fatalf("retry sends = %d, want 1", len(sends))
+	}
+	assertRetryNormalSend(t, sends[0], topic, group, "bounce-me")
+}
+
 // TestPullConsumerRejectsBadArguments covers pullSyncImpl:232-244. These are
 // caller errors, reported before anything reaches the wire.
 func TestPullConsumerRejectsBadArguments(t *testing.T) {
