@@ -1,5 +1,7 @@
 // Unit tests for the lightweight pull consumer (DefaultLitePullConsumer) and the
 // 220/221/309 bodies (covering the main pull flow and the core offset table scenarios).
+using System.Reflection;
+
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -48,6 +50,13 @@ public class LitePullTests
 
         return null;
     }
+
+    /// <summary>Pushes one heartbeat now. The background loop's 5s period would otherwise
+    /// turn "what does the rebuilt set announce" into a wait on the clock.</summary>
+    private static void SendHeartbeatNow(DefaultLitePullConsumer c) =>
+        typeof(DefaultLitePullConsumer)
+            .GetMethod("SendHeartbeatToAllBroker", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .Invoke(c, null);
 
     // ---------------------------------------------- Pure state behaviour before start
 
@@ -560,6 +569,152 @@ public class LitePullTests
             Assert.Equal(ExpressionType.TAG, pull.Ext["expressionType"]);
             Assert.Equal("TagA", pull.Ext["subscription"]);
             Assert.Equal("0", pull.Ext["subVersion"]);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void LitePullRequest_CarriesTheConfiguredSuspendBudget()
+    {
+        using var cluster = MockCluster.Start(1);
+        var mq = new MessageQueue("LiteSuspendTopic", MockCluster.BrokerName(0), 0);
+        var c = new DefaultLitePullConsumer("GID_LiteSuspend");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-suspend");
+        c.SetBrokerSuspendMaxTimeMillis(7000);
+        c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+        c.SetAutoCommit(false);
+        c.SetSubExpressionForAssign(mq.Topic, "TagA");
+        c.Assign(new[] { mq });
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => cluster.CountRequests(RequestCode.LitePullMessage) > 0),
+                "the assigned queue is pulled");
+            WireRecord pull = cluster.Records().Last(r => r.Code == RequestCode.LitePullMessage);
+            // The poll stays short because this loop must answer its caller; the field still
+            // reports the budget the consumer was configured with, not a constant.
+            Assert.Equal("7000", pull.Ext["suspendTimeoutMillis"]);
+            Assert.Equal(0, int.Parse(pull.Ext["sysFlag"]) & PullSysFlag.FlagSuspend);
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void Heartbeat_CarriesTheBuiltSubscriptionSetBeyondRebalanceSubscriptions()
+    {
+        using var cluster = MockCluster.Start(1);
+        var mq = new MessageQueue("LiteBuiltHbTopic", MockCluster.BrokerName(0), 0);
+        var c = new DefaultLitePullConsumer("GID_LiteBuiltHb");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-built-hb");
+        c.SetConsumeFromWhere(ConsumeFromWhere.ConsumeFromFirstOffset);
+        c.SetAutoCommit(false);
+        c.SetSubExpressionForAssign(mq.Topic, "AssignOnly");
+        c.Assign(new[] { mq });
+        c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+        {
+            ["LiteHelpTag"] = MessageSelector.ByTag("TagA"),
+            ["LiteHelpSql"] = MessageSelector.BySql("a > 1"),
+        });
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => LastHeartbeatFor(cluster, c.ConsumerGroup) is not null),
+                "the assign-mode heartbeat reached the broker");
+            Dictionary<string, SubscriptionData> subs = LastHeartbeatFor(cluster, c.ConsumerGroup)!
+                .ConsumerDataSet.SelectMany(d => d.SubscriptionDataSet)
+                .ToDictionary(s => s.Topic, StringComparer.Ordinal);
+            Assert.Equal(new[] { "LiteHelpSql", "LiteHelpTag" },
+                subs.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal(ExpressionType.TAG, subs["LiteHelpTag"].ExpressionType);
+            Assert.Equal("TagA", subs["LiteHelpTag"].SubString);
+            Assert.Equal(ExpressionType.Sql92, subs["LiteHelpSql"].ExpressionType);
+            Assert.Equal("a > 1", subs["LiteHelpSql"].SubString);
+            Assert.DoesNotContain(mq.Topic, subs.Keys);
+
+            // A rebuild replaces the whole set: the topic left out stops being announced.
+            c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+            {
+                ["LiteHelpTag"] = MessageSelector.ByTag("*"),
+            });
+            Assert.Single(c.GetSubscriptionsForHeartbeat());
+            SendHeartbeatNow(c);
+            subs = LastHeartbeatFor(cluster, c.ConsumerGroup)!
+                .ConsumerDataSet.SelectMany(d => d.SubscriptionDataSet)
+                .ToDictionary(s => s.Topic, StringComparer.Ordinal);
+            Assert.Equal(new[] { "LiteHelpTag" }, subs.Keys);
+            Assert.Equal("*", subs["LiteHelpTag"].SubString);
+
+            // A rejected selector leaves the previous set intact; a null map clears it.
+            Assert.Throws<ArgumentException>(() =>
+                c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+                {
+                    ["LiteBadSql"] = new MessageSelector { Type = ExpressionType.Sql92, Expression = "" },
+                }));
+            Assert.Equal("LiteHelpTag", Assert.Single(c.GetSubscriptionsForHeartbeat()).Topic);
+            Assert.Throws<ArgumentException>(() =>
+                c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+                {
+                    [""] = MessageSelector.ByTag("TagA"),
+                }));
+            Assert.Equal("LiteHelpTag", Assert.Single(c.GetSubscriptionsForHeartbeat()).Topic);
+            c.BuildSubscriptionsForHeartbeat(null);
+            Assert.Empty(c.GetSubscriptionsForHeartbeat());
+        }
+        finally
+        {
+            c.Shutdown();
+        }
+    }
+
+    [Fact]
+    public void BuiltSubscriptionSet_IsNamespacedAndSorted()
+    {
+        var c = new DefaultLitePullConsumer("GID_LiteBuiltNamespace");
+        c.SetNamespace("NSX");
+        c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+        {
+            ["TopicB"] = MessageSelector.ByTag("TagA"),
+            ["TopicA"] = MessageSelector.ByTag("TagB"),
+        });
+        Assert.Equal(new[] { "NSX%TopicA", "NSX%TopicB" },
+            c.GetSubscriptionsForHeartbeat().Select(s => s.Topic));
+
+        c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+        {
+            ["NSX%TopicA"] = MessageSelector.ByTag("TagB"),
+        });
+        Assert.Equal("NSX%TopicA", Assert.Single(c.GetSubscriptionsForHeartbeat()).Topic);
+    }
+
+    [Fact]
+    public void BuiltSubscriptionSet_YieldsToTheRebalanceSubscription()
+    {
+        using var cluster = MockCluster.Start(1);
+        const string topic = "LiteBuiltPrecedenceTopic";
+        var c = new DefaultLitePullConsumer("GID_LiteBuiltPrecedence");
+        c.SetNamesrvAddr(cluster.NamesrvAddr);
+        c.SetInstanceName("lite-built-precedence");
+        c.Subscribe(topic, "TagA");
+        c.BuildSubscriptionsForHeartbeat(new Dictionary<string, MessageSelector>
+        {
+            [topic] = MessageSelector.ByTag("TagZ"),
+        });
+        c.Start();
+        try
+        {
+            Assert.True(WaitFor(() => LastHeartbeatFor(cluster, c.ConsumerGroup) is not null));
+            SubscriptionData sub = Assert.Single(
+                LastHeartbeatFor(cluster, c.ConsumerGroup)!.ConsumerDataSet.SelectMany(d => d.SubscriptionDataSet),
+                s => s.Topic == topic);
+            Assert.Equal("TagA", sub.SubString);
         }
         finally
         {

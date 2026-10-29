@@ -65,6 +65,9 @@ class MockClient:
         # The subVersion of every pull: a TAG subscription carries none, a broker-evaluated
         # expression carries the version its subscription data was registered with.
         self.pull_sub_versions: List[int] = []
+        # The broker-suspend budget of every pull: the knob has to reach the wire, not just
+        # pass the start-up validation.
+        self.pull_suspend_timeouts: List[int] = []
 
     def start(self) -> None:
         pass
@@ -129,6 +132,7 @@ class MockClient:
         self.pull_expression_types.append(expression_type)
         self.pull_subscriptions.append(subscription)
         self.pull_sub_versions.append(sub_version)
+        self.pull_suspend_timeouts.append(suspend_timeout_millis)
         if self.scripted:
             entry = self.scripted.pop(0)
             # The callable runs "in the middle of a request": it simulates a concurrent seek / queue withdrawal
@@ -1201,3 +1205,73 @@ def test_unsubscribe_revokes_the_topics_queues_and_state():
     # A blank topic is a no-op, not a namespace-wrapped key.
     g.unsubscribe("   ")
     assert g._assign_sub_expr == {"T": "TagA"}
+
+
+def test_lite_pull_request_carries_the_configured_suspend_budget():
+    """The broker-suspend budget is a live knob: the LITE_PULL request has to carry the
+    configured value. A fixed wire constant would pass the start-up validation and then
+    ignore the setting for the life of the consumer."""
+    c = _Lite("LiteSuspend_UT", _store=STORE)
+    c.set_namesrv_addr("127.0.0.1:9876")
+    c.set_auto_commit(False)
+    c.set_broker_suspend_max_time_millis(8000)
+    c.set_consumer_timeout_millis_when_suspend(20000)
+    c.assign([MessageQueue("T", "broker-a", 0)])
+    c.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not c._mock.pull_requests and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert c._mock.pull_requests, "no lite pull went out"
+        assert c._mock.pull_suspend_timeouts[0] == 8000, \
+            "the pull carried %d, want the configured 8000" % c._mock.pull_suspend_timeouts[0]
+        assert not PullSysFlag.has_suspend_flag(c._mock.pull_sys_flags[0]), \
+            "the suspend bit stays off: a synchronous lite loop asks for a short poll"
+    finally:
+        c.shutdown()
+
+
+def test_heartbeat_carries_the_built_subscription_set():
+    """An assign-mode consumer has no topic-wide subscription, so the built set is how it
+    announces the filters its queues need; every build replaces the whole set, and a
+    refused build leaves the previous one in place."""
+    c = DefaultLitePullConsumer("G_lite_hb_built")
+    c.assign([MessageQueue("A", "broker-a", 0), MessageQueue("B", "broker-a", 0)])
+    c.build_subscriptions_for_heartbeat({
+        "A": MessageSelector.by_tag("TagA"),
+        "B": MessageSelector.by_sql("a > 1"),
+    })
+    cd = list(c._build_heartbeat().consumer_data_set)[0]
+    subs = {sub.topic: sub for sub in cd.subscription_data_set}
+    assert subs["A"].sub_string == "TagA"
+    assert subs["A"].tags_set == {"TagA"}, "a TAG selector still fills the tag set"
+    assert subs["B"].sub_string == "a > 1"
+    assert subs["B"].expression_type == ExpressionType.SQL92
+    assert [s.topic for s in c.get_subscriptions_for_heartbeat()] == ["A", "B"]
+
+    # A rebuild replaces the whole set: B is not announced any more.
+    c.build_subscriptions_for_heartbeat({"A": MessageSelector.by_tag("TagB")})
+    cd = list(c._build_heartbeat().consumer_data_set)[0]
+    assert [sub.topic for sub in cd.subscription_data_set] == ["A"]
+    assert list(cd.subscription_data_set)[0].sub_string == "TagB"
+
+    # A refused build must not damage the set already in place.
+    with pytest.raises(ValueError):
+        c.build_subscriptions_for_heartbeat({"": MessageSelector.by_tag("TagA")})
+    with pytest.raises(ValueError):
+        c.build_subscriptions_for_heartbeat({"A": MessageSelector(ExpressionType.SQL92, "")})
+    assert [s.topic for s in c.get_subscriptions_for_heartbeat()] == ["A"]
+
+
+def test_built_set_yields_to_the_rebalance_subscription():
+    """A topic the rebalance subscriptions cover keeps their expression: the built set
+    only fills the topics they do not."""
+    c = DefaultLitePullConsumer("G_lite_hb_both")
+    c.subscribe("T", "TagA")
+    c.build_subscriptions_for_heartbeat({"T": MessageSelector.by_tag("TagZ")})
+    cd = list(c._build_heartbeat().consumer_data_set)[0]
+    subs = list(cd.subscription_data_set)
+    assert len(subs) == 1, "one entry per topic, the rebalance one"
+    assert subs[0].sub_string == "TagA"
+    assert len(c.get_subscriptions_for_heartbeat()) == 1, \
+        "the built set keeps what the application added for its own diagnostics"

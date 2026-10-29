@@ -328,6 +328,7 @@ function consRespond(RemotingCommand $cmd): ?RemotingCommand
                 'queueId' => (int) ($ext['queueId'] ?? 0),
                 'queueOffset' => (int) ($ext['queueOffset'] ?? 0),
                 'sysFlag' => (int) ($ext['sysFlag'] ?? 0),
+                'suspendTimeoutMillis' => (int) ($ext['suspendTimeoutMillis'] ?? 0),
                 'group' => (string) ($ext['consumerGroup'] ?? ''),
                 // The subscription the caller reported: expression text, expression type and the
                 // version stamp are the three cells a selector-driven pull is judged on.
@@ -1826,6 +1827,116 @@ final class RunClientConsumer
             'a stopped consumer refuses to report a committed offset, even one it still holds in memory');
     }
 
+    // ================================================================ 5c. lite suspend budget + heartbeat set
+
+    /**
+     * The two knobs the lite surface owns beyond its subscriptions:
+     *   - the LITE_PULL request is a short poll, but the suspend field must carry the budget
+     *     the consumer was configured with, not a constant;
+     *   - an assign-mode expression is not a topic-wide subscription, so the only way a topic
+     *     reaches the group's heartbeat is the set the application builds -- which replaces
+     *     wholesale and never overrides a rebalance subscription.
+     */
+    private function testLitePullSuspendBudgetAndHeartbeatSet(ConsFakeBroker $broker): void
+    {
+        // ---- the lite pull carries the configured budget ----
+        $c = new DefaultLitePullConsumer('GID-T-CONS');
+        $c->setInstanceName('CONS-T');
+        $c->setNamesrvAddr($broker->addr);
+        $c->brokerSuspendMaxTimeMillis = 7000;
+        $c->setSubExpressionForAssign('LTopic', 'TagA');
+        $c->assign([new MessageQueue('LTopic', 'b-cons', 0)]);
+        $c->start();
+        $c->tick();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $row = $this->lastPullRow(RequestCode::LITE_PULL_MESSAGE, 'LTopic', 'GID-T-CONS');
+        $this->checkSame(7000, (int) ($row['suspendTimeoutMillis'] ?? -1),
+            'the lite pull carries the configured broker-suspend budget');
+        $this->checkSame(0, (int) ($row['sysFlag'] ?? -1) & PullSysFlag::FLAG_SUSPEND,
+            'the lite pull stays a short poll whatever the budget');
+        $this->cleanup($c);
+
+        // ---- the built set is what an assign-mode heartbeat announces ----
+        $hbC = new DefaultLitePullConsumer('GID-U-CONS');
+        $hbC->setInstanceName('CONS-U');
+        $hbC->setNamesrvAddr($broker->addr);
+        $hbC->setSubExpressionForAssign('LTopic', 'AssignOnly');
+        $hbC->assign([new MessageQueue('LTopic', 'b-cons', 0)]);
+        $hbC->buildSubscriptionsForHeartbeat([
+            'LHelpTopic' => MessageSelector::byTag('TagA'),
+            'LSqlHelp' => MessageSelector::bySql('a > 1'),
+        ]);
+        $hbC->start();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $subs = $this->heartbeatSubs('GID-U-CONS');
+        $topics = array_keys($subs);
+        sort($topics);
+        $this->checkSame(['LHelpTopic', 'LSqlHelp'], $topics,
+            'the built set is what an assign-mode heartbeat announces');
+        $this->checkSame(['TagA', ExpressionType::TAG],
+            [$subs['LHelpTopic']['subString'] ?? null, $subs['LHelpTopic']['expressionType'] ?? null],
+            'a built tag selector travels as a tag subscription');
+        $this->checkSame(['a > 1', ExpressionType::SQL92],
+            [$subs['LSqlHelp']['subString'] ?? null, $subs['LSqlHelp']['expressionType'] ?? null],
+            'a built SQL92 selector travels as SQL92');
+        $this->check(!in_array('LTopic', $topics, true),
+            'the assign expression is still not announced on its own');
+
+        // Rebuilding replaces the whole set: the topic left out stops being announced.
+        $hbC->buildSubscriptionsForHeartbeat(['LHelpTopic' => MessageSelector::byTag('*')]);
+        $this->checkSame(1, count($hbC->getSubscriptionsForHeartbeat()), 'a rebuild replaces the whole set');
+        $this->litePrivateMethod($hbC, 'sendHeartbeatToAllBroker');
+        $this->loadLog(getenv('RMQ_LOG'));
+        $subs = $this->heartbeatSubs('GID-U-CONS');
+        $this->checkSame(['LHelpTopic'], array_keys($subs), 'a topic left out of the rebuild is no longer announced');
+        $this->checkSame('*', $subs['LHelpTopic']['subString'] ?? null, 'the rebuilt expression is the one on the wire');
+
+        // A rejected selector leaves the previous set intact; an empty map clears it.
+        $before = $hbC->getSubscriptionsForHeartbeat();
+        $message = null;
+        try {
+            $hbC->buildSubscriptionsForHeartbeat(['LBad' => new MessageSelector(ExpressionType::SQL92, '')]);
+        } catch (\ValueError $e) {
+            $message = $e->getMessage();
+        }
+        $this->checkSame("Expression can't be null! SQL92", $message,
+            'a built selector without an expression is refused');
+        $this->checkSame($before, $hbC->getSubscriptionsForHeartbeat(),
+            'a refused build leaves the previous set intact');
+        $missing = null;
+        try {
+            $hbC->buildSubscriptionsForHeartbeat(['' => MessageSelector::byTag('TagA')]);
+        } catch (\InvalidArgumentException $e) {
+            $missing = $e->getMessage();
+        }
+        $this->checkSame('Topic can not be null or empty.', $missing, 'a built set refuses an empty topic');
+        $this->checkSame($before, $hbC->getSubscriptionsForHeartbeat(),
+            'a refused empty topic also leaves the previous set intact');
+        $nsC = new DefaultLitePullConsumer('GID-W-CONS', namespace: 'NSX');
+        $nsC->buildSubscriptionsForHeartbeat(['Topic' => MessageSelector::byTag('TagA')]);
+        $this->checkSame('NSX%Topic', $nsC->getSubscriptionsForHeartbeat()[0]->topic ?? null,
+            'a built topic is namespaced like the other subscription tables');
+        $nsC->buildSubscriptionsForHeartbeat(['NSX%Topic' => MessageSelector::byTag('TagA')]);
+        $this->checkSame('NSX%Topic', $nsC->getSubscriptionsForHeartbeat()[0]->topic ?? null,
+            'an already-namespaced built topic is not wrapped twice');
+        $hbC->buildSubscriptionsForHeartbeat([]);
+        $this->checkSame([], $hbC->getSubscriptionsForHeartbeat(), 'an empty map clears the built set');
+        $this->cleanup($hbC);
+
+        // ---- a rebalance subscription keeps its own expression ----
+        $prec = new DefaultLitePullConsumer('GID-V-CONS');
+        $prec->setInstanceName('CONS-V');
+        $prec->setNamesrvAddr($broker->addr);
+        $prec->subscribe('LTagTopic', 'TagA');
+        $prec->buildSubscriptionsForHeartbeat(['LTagTopic' => MessageSelector::byTag('TagZ')]);
+        $prec->start();
+        $this->loadLog(getenv('RMQ_LOG'));
+        $subs = $this->heartbeatSubs('GID-V-CONS');
+        $this->checkSame('TagA', $subs['LTagTopic']['subString'] ?? null,
+            'a topic the rebalance subscriptions cover keeps their expression');
+        $this->cleanup($prec);
+    }
+
     // ================================================================ 6. Shutdown drain (awaitTerminationMillisWhenShutdown)
 
     /**
@@ -2026,6 +2137,7 @@ final class RunClientConsumer
             $this->testLitePull($broker);
             $this->testLitePullSelectorWire($broker);
             $this->testLitePullRevocationHeartbeatAndStoppedCommit($broker);
+            $this->testLitePullSuspendBudgetAndHeartbeatSet($broker);
             $this->testShutdownDrain($broker);
         } finally {
             $broker->stop();

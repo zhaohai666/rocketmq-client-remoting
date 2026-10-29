@@ -1106,3 +1106,123 @@ func TestLitePullHeartbeatAdvertisesOnlyRebalanceSubscriptions(t *testing.T) {
 		return false
 	})
 }
+
+// beatTopics maps topic -> subString for the newest captured HEARTBEAT; a topic
+// the beat did not announce is absent.
+func beatTopics(b *consumerBroker) map[string]string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]string{}
+	if len(b.heartbeats) == 0 {
+		return out
+	}
+	for _, cd := range b.heartbeats[len(b.heartbeats)-1].ConsumerDataSet {
+		for _, sub := range cd.SubscriptionDataSet {
+			out[sub.Topic] = sub.SubString
+		}
+	}
+	return out
+}
+
+// The broker-suspend budget must reach the wire. A fixed constant passes the
+// start-up validation and then ignores the knob for the life of the consumer.
+func TestLitePullRequestCarriesTheConfiguredSuspendBudget(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"T": 1})
+	c := newLiteConsumer(t, f, "GID_lite_suspend_knob")
+	c.SetBrokerSuspendMaxTimeMillis(8000)
+	c.SetConsumerTimeoutMillisWhenSuspend(20000)
+	c.SetConsumeFromWhere(ConsumeFromWhereFirstOffset)
+	requireNoError(t, "assign", c.Assign([]common.MessageQueue{
+		{Topic: "T", BrokerName: "b1", QueueID: 0},
+	}))
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	waitFor(t, "the first lite pull", func() bool { return len(f.broker.pullsFor("T", 0)) > 0 })
+	pull := f.broker.pullsFor("T", 0)[0]
+	if got := derefI64(pull.SuspendTimeoutMillis); got != 8000 {
+		t.Errorf("suspendTimeoutMillis = %d, want the configured 8000", got)
+	}
+	if common.HasSuspendFlag(derefI32(pull.SysFlag)) {
+		t.Error("the suspend bit must stay off: a synchronous lite loop asks for a short poll")
+	}
+}
+
+// An assign-mode consumer has no topic-wide subscription, so the built set is how
+// it announces the filters its queues need; each build replaces the whole set.
+func TestLitePullHeartbeatCarriesTheBuiltSubscriptionSet(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"A": 1, "B": 1})
+	c := newLiteConsumer(t, f, "GID_lite_beat_built")
+	requireNoError(t, "assign", c.Assign([]common.MessageQueue{
+		{Topic: "A", BrokerName: "b1", QueueID: 0},
+		{Topic: "B", BrokerName: "b1", QueueID: 0},
+	}))
+	requireNoError(t, "build", c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
+		"A": {Expression: "TagA"},
+		"B": {Expression: "a > 1", Type: remoting.ExpressionTypeSQL92},
+	}))
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	waitFor(t, "a beat announcing both built topics", func() bool {
+		topics := beatTopics(f.broker)
+		return topics["A"] != "" && topics["B"] != ""
+	})
+	if got := beatTopics(f.broker)["A"]; got != "TagA" {
+		t.Errorf("A announced %q, want TagA", got)
+	}
+	if got := beatTopics(f.broker)["B"]; got != "a > 1" {
+		t.Errorf("B announced %q, want the SQL92 expression", got)
+	}
+	if got := c.SubscriptionsForHeartbeat(); len(got) != 2 || got[0].Topic != "A" || got[1].Topic != "B" {
+		t.Errorf("built set = %v, want A then B", got)
+	}
+
+	// A rebuild replaces the whole set: B is not announced any more, and A carries
+	// its new expression.
+	requireNoError(t, "rebuild", c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
+		"A": {Expression: "*"},
+	}))
+	c.sendHeartbeatToAllBrokers()
+	waitFor(t, "the rebuilt beat dropping B", func() bool {
+		topics := beatTopics(f.broker)
+		_, hasB := topics["B"]
+		return !hasB && topics["A"] == "*"
+	})
+
+	// A refused build must not damage the set that is already in place.
+	if err := c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
+		"": {Expression: "TagA"},
+	}); err == nil {
+		t.Error("a build with an empty topic was accepted")
+	}
+	if err := c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
+		"A": {Type: remoting.ExpressionTypeSQL92},
+	}); err == nil {
+		t.Error("a SQL92 selector with no expression was accepted")
+	}
+	if got := c.SubscriptionsForHeartbeat(); len(got) != 1 || got[0].Topic != "A" {
+		t.Errorf("a refused build changed the set: %v", got)
+	}
+}
+
+// A topic the rebalance subscriptions cover keeps their expression: the built set
+// only fills the topics they do not.
+func TestLitePullBuiltSetYieldsToTheRebalanceSubscription(t *testing.T) {
+	f := newClusterFixture(t, map[string]int{"T": 1})
+	c := newLiteConsumer(t, f, "GID_lite_beat_both")
+	requireNoError(t, "subscribe", c.Subscribe("T", "TagA"))
+	requireNoError(t, "build", c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
+		"T": {Expression: "TagZ"},
+	}))
+	requireNoError(t, "start", c.Start())
+	t.Cleanup(c.Shutdown)
+
+	waitFor(t, "a beat announcing T", func() bool { return beatTopics(f.broker)["T"] != "" })
+	if got := beatTopics(f.broker)["T"]; got != "TagA" {
+		t.Errorf("T announced %q, want the rebalance expression TagA", got)
+	}
+	if got := len(c.SubscriptionsForHeartbeat()); got != 1 {
+		t.Errorf("built set holds %d entries, want the one the application added", got)
+	}
+}

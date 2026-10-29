@@ -1010,6 +1010,14 @@ final class DefaultLitePullConsumer
     public array $subscription = [];
     /** @var array<string,SubscriptionData> */
     public array $subscriptionData = [];
+    /**
+     * Extra subscriptions the application announces in the heartbeat ({@see buildSubscriptionsForHeartbeat()}).
+     * This is what lets an assign-mode consumer register its topics: those expressions are not
+     * topic-wide subscriptions, so they are never announced on their own.
+     *
+     * @var array<string,SubscriptionData> key = namespaced topic
+     */
+    private array $heartbeatSubscriptions = [];
     /** Tag filter expression for the specified topic in assign mode. */
     private array $assignSubExpr = [];
     /**
@@ -1506,6 +1514,51 @@ final class DefaultLitePullConsumer
     }
 
     /**
+     * Replaces the subscriptions this consumer announces in its heartbeat beyond its rebalance
+     * subscriptions. An assign-mode expression filters only the queues this instance was handed,
+     * so it is never announced on its own; this set is how the application opts a topic in.
+     *
+     * Every call replaces the whole set: a topic left out of the map stops being announced on the
+     * next beat. A topic the rebalance subscriptions already cover keeps that expression -- this
+     * set only fills the ones they do not. An empty array clears the set. A rejected selector
+     * leaves the previous set intact.
+     *
+     * @param array<string,MessageSelector> $selectors key = topic
+     */
+    public function buildSubscriptionsForHeartbeat(array $selectors): void
+    {
+        $built = [];
+        foreach ($selectors as $topic => $selector) {
+            if (trim((string) $topic) === '') {
+                throw new \InvalidArgumentException('Topic can not be null or empty.');
+            }
+            if (!$selector instanceof MessageSelector) {
+                throw new \InvalidArgumentException('Selector can not be null.');
+            }
+            $ns = $this->withNamespace((string) $topic);
+            $built[$ns] = build_selector_subscription_data($ns, $selector);
+        }
+        $this->heartbeatSubscriptions = $built;
+    }
+
+    /**
+     * The built set, sorted by topic. A snapshot: changing it does not change what the heartbeat
+     * announces.
+     *
+     * @return list<SubscriptionData>
+     */
+    public function getSubscriptionsForHeartbeat(): array
+    {
+        $topics = array_keys($this->heartbeatSubscriptions);
+        sort($topics, SORT_STRING);
+        $out = [];
+        foreach ($topics as $topic) {
+            $out[] = $this->heartbeatSubscriptions[$topic];
+        }
+        return $out;
+    }
+
+    /**
      * assign mode: queues are specified explicitly, no rebalance.
      *
      * @param list<MessageQueue> $messageQueues
@@ -1703,12 +1756,17 @@ final class DefaultLitePullConsumer
             $this->consumeFromWhere,
         );
         $cd->unitMode = $this->unitMode;
-        // Only rebalance subscriptions are announced. An assign-mode expression filters the queues
-        // this instance was handed; advertising it would make the broker treat the group as a
-        // subscriber of the whole topic.
+        // Rebalance subscriptions plus the set the application built for the heartbeat. A rebalance
+        // topic keeps its own expression; an assign-mode expression is not a topic-wide
+        // subscription, so it is announced only through that built set.
         foreach (array_keys($this->subscription) as $topic) {
             if (isset($this->subscriptionData[$topic])) {
                 $cd->subscriptionDataSet[] = $this->subscriptionData[$topic];
+            }
+        }
+        foreach ($this->heartbeatSubscriptions as $topic => $sub) {
+            if (!isset($this->subscription[$topic])) {
+                $cd->subscriptionDataSet[] = $sub;
             }
         }
         $hb->consumerDataSet[] = $cd;
@@ -1834,7 +1892,9 @@ final class DefaultLitePullConsumer
         try {
             $sub = $this->subscriptionDataFor($mq->topic);
             // Short polling (suspend=False); lite_pull=True sets FLAG_LITE_PULL_MESSAGE,
-            // switching the request code to LITE_PULL_MESSAGE(361).
+            // switching the request code to LITE_PULL_MESSAGE(361). The suspend field still
+            // carries the configured broker-suspend budget: the poll is short because this
+            // tick must answer its caller, not because the budget is a constant.
             $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false, true);
             $result = $this->requireClient()->pullMessage(
                 $this->consumerGroup,
@@ -1848,7 +1908,7 @@ final class DefaultLitePullConsumer
                 $sub->expressionType,
                 timeoutMillis: 30000,
                 maxMsgBytes: -1,
-                suspendTimeoutMillis: 15000,
+                suspendTimeoutMillis: $this->brokerSuspendMaxTimeMillis,
             );
         } catch (\Throwable $e) {
             Logger::debug("lite pull_one failed for $mq->topic@$mq->queueId: " . $e->getMessage());

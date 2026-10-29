@@ -31,6 +31,7 @@
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/common/subscription_data.h"
+#include "rocketmq/common/sysflag.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/heartbeat.h"
@@ -227,6 +228,23 @@ public:
         return heartbeats_.size();
     }
 
+    // The ConsumerData this group announced in the most recent heartbeat that mentions it.
+    bool lastConsumerData(const std::string& group, ConsumerData& out) {
+        std::lock_guard<std::mutex> lk(state_);
+        for (size_t round = heartbeats_.size(); round > 0; --round) {
+            JsonValue v;
+            if (!jsonParse(heartbeats_[round - 1], v, nullptr)) continue;
+            const HeartbeatData hb = HeartbeatData::fromJson(v);
+            for (const ConsumerData& cd : hb.consumerDataSet) {
+                if (cd.groupName == group) {
+                    out = cd;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     bool lastHeartbeatSubscription(const std::string& topic, SubscriptionData& out) {
         std::lock_guard<std::mutex> lk(state_);
         for (size_t round = heartbeats_.size(); round > 0; --round) {
@@ -401,6 +419,23 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     return fn();
+}
+
+bool hasSubscription(const ConsumerData& cd, const std::string& topic) {
+    for (const SubscriptionData& sub : cd.subscriptionDataSet) {
+        if (sub.topic == topic) return true;
+    }
+    return false;
+}
+
+bool findSubscription(const ConsumerData& cd, const std::string& topic, SubscriptionData& out) {
+    for (const SubscriptionData& sub : cd.subscriptionDataSet) {
+        if (sub.topic == topic) {
+            out = sub;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- 1. FilterAPI: the two shapes
@@ -606,6 +641,98 @@ void testLitePullHeartbeatRegistersTheSelector(FakeCluster& cluster) {
     t.shutdown();
 }
 
+// ---------------------------------------------------------------- 4. lite poll budget + built heartbeat set
+
+// The lite poll stays short (suspend bit clear) because the tick must answer its caller, but the
+// budget on the wire is the configured broker suspend ceiling: a hardcoded value would make the
+// configured knob dead and hide a mismatch between what start() accepted and what the broker sees.
+void testLitePullCarriesTheSuspendBudget(FakeCluster& cluster) {
+    DefaultLitePullConsumer c("LitePG_SuspendBudget");
+    c.setNamesrvAddr(cluster.address());
+    c.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+    c.setBrokerSuspendMaxTimeMillis(7000);
+    c.setSubExpressionForAssign(kTopic, kTagExpr);
+    c.assign({queue0()});
+    c.start();
+    expect(waitFor([&] { return cluster.pullCount() >= 1; }), "suspend budget: a pull reached the broker");
+    expectStr(cluster.pullField(0, "suspendTimeoutMillis"), "7000",
+              "suspend.suspendTimeoutIsTheConfiguredBudget");
+    const int64_t sysFlag = cluster.pullIntField(0, "sysFlag", -1);
+    expect((sysFlag & PullSysFlag::FLAG_SUSPEND) == 0, "suspend.thePollStaysShort");
+    c.shutdown();
+}
+
+// The built set is how an assign-mode consumer tells the broker about topics it only filters
+// locally (the assign expression is not a topic-wide subscription). Both halves matter: the extra
+// topics reach the beat, and a rebuild replaces the set instead of piling entries on top.
+void testLiteHeartbeatAnnouncesTheBuiltSet(FakeCluster& cluster) {
+    DefaultLitePullConsumer c("LitePG_BuiltSet");
+    c.setNamesrvAddr(cluster.address());
+    c.setSubExpressionForAssign(kTopic, "AssignOnly");
+    c.assign({queue0()});
+    std::map<std::string, MessageSelector> built{
+        {"LiteHelperTag", MessageSelector::byTag("TagA")},
+        {"LiteHelperSql", MessageSelector::bySql(kSqlExpr)},
+    };
+    c.buildSubscriptionsForHeartbeat(built);
+    c.start();
+    expect(waitFor([&] { return cluster.heartbeatCount() >= 1; }), "built set: a beat reached the broker");
+    ConsumerData cd;
+    expect(cluster.lastConsumerData("LitePG_BuiltSet", cd), "built set: the beat names this group");
+    expect(!hasSubscription(cd, kTopic), "built set: an assign-only topic is not announced on its own");
+    SubscriptionData tagSub;
+    expect(findSubscription(cd, "LiteHelperTag", tagSub), "built set: the tag helper is announced");
+    expectStr(tagSub.expressionType, "TAG", "built.tag.expressionType");
+    expectInt(static_cast<long long>(tagSub.tagsSet.count("TagA")), 1,
+              "built.tag.carriesTheParsedTag");
+    SubscriptionData sqlSub;
+    expect(findSubscription(cd, "LiteHelperSql", sqlSub), "built set: the SQL92 helper is announced");
+    expectStr(sqlSub.expressionType, "SQL92", "built.sql.expressionType");
+    expectStr(sqlSub.subString, kSqlExpr, "built.sql.expressionVerbatim");
+
+    // A rebuild replaces the whole set: the topic it leaves out stops being announced on the next beat.
+    c.buildSubscriptionsForHeartbeat({{"LiteHelperTag", MessageSelector::byTag("*")}});
+    // A beat may already be in flight when the rebuild lands, so wait for a beat that reflects it
+    // rather than for the next beat after a count snapshot.
+    const auto rebuiltSeen = [&cluster] {
+        ConsumerData latest;
+        return cluster.lastConsumerData("LitePG_BuiltSet", latest) &&
+               !hasSubscription(latest, "LiteHelperSql") &&
+               hasSubscription(latest, "LiteHelperTag");
+    };
+    expect(waitFor(rebuiltSeen, 8000), "built set: a beat with the rebuilt set arrived");
+    ConsumerData rebuiltCd;
+    expect(cluster.lastConsumerData("LitePG_BuiltSet", rebuiltCd),
+           "built set: the rebuilt beat names this group");
+    expect(!hasSubscription(rebuiltCd, "LiteHelperSql"), "a rebuild drops the topic it left out");
+    SubscriptionData rebuiltSub;
+    expect(findSubscription(rebuiltCd, "LiteHelperTag", rebuiltSub),
+           "the kept topic is still announced");
+    expectStr(rebuiltSub.subString, "*", "the kept topic carries the rebuilt expression");
+    c.shutdown();
+}
+
+// A topic both sides cover is announced once, with the rebalance expression: the built entry is a
+// gap filler, so it must never override what the pull path actually filters with.
+void testLiteBuiltSetYieldsToTheRebalanceSubscription(FakeCluster& cluster) {
+    DefaultLitePullConsumer p("LitePG_BuiltSetPrecedence");
+    p.setNamesrvAddr(cluster.address());
+    p.subscribe(kTopic, "TagA");
+    p.buildSubscriptionsForHeartbeat({{kTopic, MessageSelector::byTag("TagZ")}});
+    p.start();
+    expect(waitFor([&] { return cluster.heartbeatCount() >= 1; }), "precedence: a beat reached the broker");
+    ConsumerData cd;
+    expect(cluster.lastConsumerData("LitePG_BuiltSetPrecedence", cd),
+           "precedence: the beat names this group");
+    expectInt(static_cast<long long>(cd.subscriptionDataSet.size()), 1,
+              "precedence: the topic is announced once");
+    SubscriptionData kept;
+    expect(findSubscription(cd, kTopic, kept), "precedence: the topic is announced");
+    expectInt(static_cast<long long>(kept.tagsSet.count("TagA")), 1,
+              "precedence: the rebalance expression wins over the built one");
+    p.shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -639,6 +766,21 @@ int main() {
         FakeCluster cluster;
         cluster.addRoute(kTopic, routeMaster(cluster.address()));
         testLitePullHeartbeatRegistersTheSelector(cluster);
+    }
+    {
+        FakeCluster cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        testLitePullCarriesTheSuspendBudget(cluster);
+    }
+    {
+        FakeCluster cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        testLiteHeartbeatAnnouncesTheBuiltSet(cluster);
+    }
+    {
+        FakeCluster cluster;
+        cluster.addRoute(kTopic, routeMaster(cluster.address()));
+        testLiteBuiltSetYieldsToTheRebalanceSubscription(cluster);
     }
     std::printf("pull_selector: %d checks, %d failed\n", checks, fails);
     return fails == 0 ? 0 : 1;

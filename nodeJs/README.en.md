@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **66** modules under `src/` and then runs the **50** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-29, **1692** individually counted checks across 45 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **66** modules under `src/` and then runs the **51** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-29, **1705** individually counted checks across 46 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -50,6 +50,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/initial_offset_policy_smoke.ts` (start position: broadcasting / TIMESTAMP / %RETRY% / SQL92) | 44 passed / 0 failed |
 | `test/lite_surface_guards_smoke.ts` (misuse guards on the lite surface: a blank topic, an empty queue list, setting the assign expression once running, poll / committed / queue lookup on a consumer that never started, and a negative timeout behind the state check) | 48 passed / 0 failed |
 | `test/lite_topic_queue_change_smoke.ts` | 25 passed / 0 failed |
+| `test/lite_wire_contract_smoke.ts` (lite wire contract: the short-poll LITE_PULL carries the configured broker suspend budget in `suspendTimeoutMillis` while the suspend bit stays clear; `buildSubscriptionsForHeartbeat` replaces the whole set, an empty map clears it, a rejected entry leaves the previous set intact, a rebalance subscription wins and the built set only fills gaps, a topic is namespaced exactly once, and a plain assign-mode heartbeat announces nothing) | 13 passed / 0 failed |
 | `test/mq_client_manager_smoke.ts` | 52 passed / 0 failed |
 | `test/namespace_rpc_smoke.ts` | 7 check groups passed |
 | `test/ns_failover_smoke.ts` | 12 checks passed |
@@ -413,7 +414,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 50 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 51 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

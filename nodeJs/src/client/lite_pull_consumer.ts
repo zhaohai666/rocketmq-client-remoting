@@ -23,6 +23,7 @@ import { AllocateMessageQueueAveragely } from './allocate.ts';
 import type { AllocateMessageQueueStrategy } from './allocate.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { FilterAPI, SubscriptionData } from '../common/subscriptionData.ts';
+import type { MessageSelector } from './consumer_result.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
 import { RequestCode, ResponseCode } from '../remoting/codes.ts';
 import { MQBrokerException } from '../remoting/exception.ts';
@@ -92,12 +93,19 @@ export class DefaultLitePullConsumer {
   messageModel: string = MessageModel.CLUSTERING;
   // wire fields read by MQClient.buildHeartbeatData:
   consumeType: string = ConsumeType.CONSUME_ACTIVELY;
-  // ASSIGN mode registers no subscription with the broker: the queues were named
-  // explicitly, so there is nothing to rebalance and nothing to advertise. Only
-  // the subscribe() mode's topics ride the heartbeat.
+  // The topics assigned in ASSIGN mode are not a topic-wide subscription, so they
+  // register with the broker only when the application opts in through
+  // buildSubscriptionsForHeartbeat(); subscribe() mode's topics always ride the
+  // heartbeat, and a topic both cover keeps the rebalance expression.
   get subscriptionDataSet(): SubscriptionData[] {
-    return this.mode === 'assign' ? [] : [...this.subscription.values()];
+    const subs: SubscriptionData[] = [...this.subscription.values()];
+    for (const [topic, sub] of this.heartbeatSubscriptions) {
+      if (!this.subscription.has(topic)) subs.push(sub);
+    }
+    return subs;
   }
+  // The extra set announced on top of the rebalance subscriptions.
+  private heartbeatSubscriptions = new Map<string, SubscriptionData>();
   unitMode = false;
   // instanceName / unitName / enableStreamRequestType: lite pull turns the stream
   // marker on by default — `@STREAM` is appended to the clientId and every
@@ -344,6 +352,33 @@ export class DefaultLitePullConsumer {
     this.claimMode('assign');
     this.assignSubscription.set(topic, FilterAPI.buildSubscriptionData(topic, subExpression));
     return this;
+  }
+
+  // buildSubscriptionsForHeartbeat replaces the topics this consumer announces in
+  // its heartbeat beyond the rebalance subscriptions. An assign-mode consumer has
+  // no topic-wide subscription of its own, yet the broker filters the group's
+  // pulls by the expression it was last told, so this is how such an application
+  // announces the filters its queues need.
+  //
+  // Every call replaces the whole set (a topic left out stops being announced),
+  // a nil or empty map clears it, a topic the rebalance subscriptions cover keeps
+  // their expression, and a rejected selector leaves the previous set intact.
+  buildSubscriptionsForHeartbeat(selectors: Map<string, MessageSelector> | null): this {
+    const built = new Map<string, SubscriptionData>();
+    for (const [topic, selector] of selectors ?? new Map<string, MessageSelector>()) {
+      if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
+      built.set(topic, FilterAPI.build(topic,
+        selector.getExpression(), selector.getType()));
+    }
+    this.heartbeatSubscriptions = built;
+    return this;
+  }
+
+  // getSubscriptionsForHeartbeat returns the built set, sorted by topic; a
+  // snapshot, not a live view.
+  getSubscriptionsForHeartbeat(): SubscriptionData[] {
+    return [...this.heartbeatSubscriptions.keys()].sort()
+      .map((topic) => this.heartbeatSubscriptions.get(topic)!);
   }
 
   // assign switches to MANUAL mode: the given queues are polled directly.
@@ -727,7 +762,8 @@ export class DefaultLitePullConsumer {
         // lite-pull bit set in sysFlag.
         const sysFlag = PullSysFlag.buildSysFlag(false, false, true, false, true);
         let result = await this.pullAPI.pullKernelLite(mq, offset, sub, sysFlag,
-          this.pullBatchSize - out.length, Math.max(1, deadline - Date.now()));
+          this.pullBatchSize - out.length, this.brokerSuspendMaxTimeMillis,
+          Math.max(1, deadline - Date.now()));
         result = this.pullAPI.processPullResult(mq, result, sub);
         this.pullCursor.set(key, result.nextBeginOffset);
         if (result.status === PullStatus.FOUND && result.msgFoundList.length > 0) {

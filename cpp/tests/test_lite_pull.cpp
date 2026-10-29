@@ -288,6 +288,66 @@ static void testLitePullAutoCommitIntervalFloor() {
              "a rejected setting leaves the accepted interval running");
 }
 
+// The heartbeat's extra subscription set: validated before anything is applied, replaced whole on
+// every call, namespaced once and sorted. The wire-side announcement is pinned by the fake-broker
+// selector suite.
+static void testBuiltSubscriptionsForHeartbeatSurface() {
+    DefaultLitePullConsumer c("LiteBuiltSetGroup");
+    CHECK_EQ(c.getSubscriptionsForHeartbeat().size(), static_cast<size_t>(0),
+             "the built set starts empty");
+
+    std::map<std::string, MessageSelector> set{
+        {"HelpTag", MessageSelector::byTag("TagA")},
+        {"HelpSql", MessageSelector::bySql("a > 1")},
+    };
+    c.buildSubscriptionsForHeartbeat(set);
+    const std::vector<SubscriptionData> got = c.getSubscriptionsForHeartbeat();
+    CHECK_EQ(got.size(), static_cast<size_t>(2), "both built entries are kept");
+    CHECK_EQ(got[0].topic, std::string("HelpSql"), "the snapshot is sorted by topic");
+    CHECK_EQ(got[1].topic, std::string("HelpTag"), "the snapshot is sorted by topic (2)");
+    CHECK_EQ(got[0].expressionType, std::string(ExpressionType::SQL92),
+             "the SQL92 entry carries its own expression type");
+    CHECK_EQ(got[0].subString, std::string("a > 1"), "the SQL92 expression travels verbatim");
+    CHECK_EQ(got[1].expressionType, std::string(ExpressionType::TAG), "the tag entry carries TAG");
+    CHECK_EQ(got[1].tagsSet.size(), static_cast<size_t>(1),
+             "the tag entry carries the parsed tag set");
+
+    // Validation runs before anything is applied: a rejected entry leaves the previous set intact.
+    CHECK(refusedWith(threwMessage([&] {
+                          c.buildSubscriptionsForHeartbeat(
+                              {{"  ", MessageSelector::byTag("TagA")}});
+                      }),
+                      "Topic can not be null or empty."),
+          "a blank topic is refused");
+    CHECK(refusedWith(threwMessage([&] {
+                          c.buildSubscriptionsForHeartbeat(
+                              {{"HelpSql", MessageSelector::bySql("")}});
+                      }),
+                      "Expression can't be null! SQL92"),
+          "a blank non-TAG expression is refused instead of asking the broker to filter with nothing");
+    CHECK_EQ(c.getSubscriptionsForHeartbeat().size(), static_cast<size_t>(2),
+             "a refused entry leaves the previous set intact");
+
+    // An empty map is the documented way to clear the set.
+    c.buildSubscriptionsForHeartbeat({});
+    CHECK_EQ(c.getSubscriptionsForHeartbeat().size(), static_cast<size_t>(0),
+             "an empty map clears the set");
+
+    // Every key is namespaced exactly once: a key already carrying the prefix is not wrapped twice.
+    DefaultLitePullConsumer ns("LiteBuiltSetNsGroup");
+    ns.setNamespace("NSX");
+    std::map<std::string, MessageSelector> mixed{
+        {"TopicB", MessageSelector::byTag("TagA")},
+        {"NSX%TopicA", MessageSelector::byTag("TagA")},
+    };
+    ns.buildSubscriptionsForHeartbeat(mixed);
+    const std::vector<SubscriptionData> wrapped = ns.getSubscriptionsForHeartbeat();
+    CHECK_EQ(wrapped.size(), static_cast<size_t>(2), "both namespaced entries are kept");
+    CHECK_EQ(wrapped[0].topic, std::string("NSX%TopicA"),
+             "an already-namespaced key is not wrapped twice");
+    CHECK_EQ(wrapped[1].topic, std::string("NSX%TopicB"), "a bare key is namespaced");
+}
+
 // ---------------------------------------------------------------- start state machine
 // Only CREATE_JUST may start. A second start must name the state it observed (RUNNING after a
 // successful start, START_FAILED after a refused one, SHUTDOWN_ALREADY after shutdown) instead of
@@ -400,6 +460,7 @@ int main() {
     testLitePullOffsetTable();
     testLitePullConsumeTimestamp();
     testLitePullAutoCommitIntervalFloor();
+    testBuiltSubscriptionsForHeartbeatSurface();
     testLiteStartStateMachine();
     testGetConsumerStatusBodyWireShape();
     testConsumeMessageDirectlyResult();

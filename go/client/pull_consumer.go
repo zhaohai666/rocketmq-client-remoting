@@ -887,28 +887,39 @@ func buildPullSelectorSubscription(mq common.MessageQueue, selector MessageSelec
 	if mq.Topic == "" {
 		return nil, common.ClientError("mq is null")
 	}
-	expr := selector.Expression
-	if expr == "" {
-		expr = "*"
+	return buildSelectorSubscription(mq.Topic, selector)
+}
+
+// buildSelectorSubscription builds the subscription a selector stands for, for
+// a topic that is not tied to a queue.
+func buildSelectorSubscription(topic string, selector MessageSelector) (*remoting.SubscriptionData, error) {
+	if topic == "" {
+		return nil, common.ClientError("topic is empty")
 	}
 	exprType := selector.Type
 	if exprType == "" {
 		exprType = remoting.ExpressionTypeTag
 	}
-	sub := remoting.NewSubscriptionData(mq.Topic, expr)
-	sub.ExpressionType = exprType
+	expr := selector.Expression
 	if exprType == remoting.ExpressionTypeTag {
-		built, err := remoting.FilterAPI{}.BuildSubscriptionData(mq.Topic, expr)
+		if expr == "" {
+			expr = "*"
+		}
+		built, err := remoting.FilterAPI{}.BuildSubscriptionData(topic, expr)
 		if err != nil {
 			return nil, common.ClientError(fmt.Sprintf("parse subscription error: %v", err))
 		}
-		sub.TagsSet = built.TagsSet
-		sub.CodeSet = built.CodeSet
-		sub.SubString = built.SubString
-		sub.ClassFilterMode = built.ClassFilterMode
-	} else {
-		sub.ClassFilterMode = exprType == remoting.ExpressionTypeClassFilter
+		return built, nil
 	}
+	// Any other language is passed through verbatim, so an empty expression would
+	// ask the broker to filter with nothing at all -- refuse instead of silently
+	// widening it to every message.
+	if expr == "" {
+		return nil, common.ClientError(fmt.Sprintf("expression can not be null at this type %s", exprType))
+	}
+	sub := remoting.NewSubscriptionData(topic, expr)
+	sub.ExpressionType = exprType
+	sub.ClassFilterMode = exprType == remoting.ExpressionTypeClassFilter
 	return sub, nil
 }
 

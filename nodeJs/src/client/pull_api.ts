@@ -186,14 +186,17 @@ export class PullAPI {
   // pullKernelLite is the LITE_PULL_MESSAGE(361) flavour the lite pull
   // consumer uses: identical header and response shape, and the caller has
   // already set the FLAG_LITE_PULL_MESSAGE bit in sysFlag. The pull is always
-  // a SHORT poll with no inline offset commit, so commitOffset is fixed at 0
-  // and the suspend window we ask for at 15s.
+  // a SHORT poll with no inline offset commit, so commitOffset is fixed at 0.
+  // The suspend field still carries the consumer's configured broker-suspend
+  // budget: the request is a short poll because this loop is synchronous and
+  // must answer its caller, not because the budget is a constant.
   //
   // A TAG expression travels with subVersion 0: the broker re-derives the filter
   // from the expression in the same request instead of matching it against a
   // previously registered version. SQL92 keeps its own version.
   async pullKernelLite(mq: MessageQueue, offset: number, sub: SubscriptionData,
-    sysFlag: number, maxMsgNums: number, timeoutMillis: number): Promise<PullResult> {
+    sysFlag: number, maxMsgNums: number, suspendTimeoutMillis: number,
+    timeoutMillis: number): Promise<PullResult> {
     let wireSub = sub;
     if ((sub.expressionType || ExpressionType.TAG) === ExpressionType.TAG && sub.subVersion !== 0) {
       wireSub = new SubscriptionData(sub.topic, sub.subString);
@@ -202,7 +205,7 @@ export class PullAPI {
       wireSub.expressionType = sub.expressionType;
       wireSub.subVersion = 0;
     }
-    return this.pullKernel(mq, offset, wireSub, sysFlag, 0, maxMsgNums, 15000, timeoutMillis,
+    return this.pullKernel(mq, offset, wireSub, sysFlag, 0, maxMsgNums, suspendTimeoutMillis, timeoutMillis,
       RequestCode.LITE_PULL_MESSAGE);
   }
 

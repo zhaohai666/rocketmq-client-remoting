@@ -1379,7 +1379,9 @@ pub struct LitePullConsumerConfig {
     /// `consumer_timeout_millis_when_suspend` = 30000: lite always short-polls, so only the
     /// start-time validation of the long-polling ratio reads it.
     pub consumer_timeout_millis_when_suspend: i64,
-    /// `broker_suspend_max_time_millis` = 20000: same as above, read only by that validation.
+    /// `broker_suspend_max_time_millis` = 20000: the suspend budget carried by every pull request
+    /// (the lite poll itself stays short; see its own `suspend` flag), read by the start-time
+    /// validation of the long-polling ratio.
     pub broker_suspend_max_time_millis: i64,
     /// `pull_interval_millis` = 50: backoff when the queue tail is empty (`max(0, ms)`).
     pub pull_interval_millis: i64,
@@ -1709,6 +1711,9 @@ struct LiteState {
     subscription: BTreeMap<String, String>,
     /// The subscription set carried into heartbeats.
     subscription_data: BTreeMap<String, SubscriptionData>,
+    /// Extra subscriptions announced in the heartbeat beyond `subscription_data`
+    /// (see `build_subscriptions_for_heartbeat`), keyed by namespaced topic.
+    heartbeat_subscriptions: BTreeMap<String, SubscriptionData>,
     /// Tag expressions in assign mode.
     assign_sub_expr: BTreeMap<String, String>,
     /// Whether a mode was claimed at all: the first subscribe/assign call pins it, and a later
@@ -1734,6 +1739,7 @@ impl Default for LiteState {
         LiteState {
             subscription: BTreeMap::new(),
             subscription_data: BTreeMap::new(),
+            heartbeat_subscriptions: BTreeMap::new(),
             assign_sub_expr: BTreeMap::new(),
             mode_claimed: false,
             assign_mode: false,
@@ -2477,6 +2483,43 @@ impl DefaultLitePullConsumer {
             }
         }
         Ok(())
+    }
+
+    /// Replaces the subscriptions this consumer announces in its heartbeat beyond its rebalance
+    /// subscriptions. An assign-mode expression filters only the queues this instance was handed,
+    /// so it is never announced on its own; this set is how the application opts a topic in.
+    ///
+    /// Every call replaces the whole set: a topic left out of the map stops being announced on the
+    /// next beat. A topic the rebalance subscriptions already cover keeps that expression -- this
+    /// set only fills the ones they do not. An empty map clears the set. A rejected selector
+    /// leaves the previous set intact.
+    pub fn build_subscriptions_for_heartbeat(
+        &self,
+        selectors: &BTreeMap<String, MessageSelector>,
+    ) -> Result<()> {
+        // Build the whole set first: a rejected entry must leave the previous set intact rather
+        // than replace it with a half-built one.
+        let namespace = self.config().namespace;
+        let mut built = BTreeMap::new();
+        for (topic, selector) in selectors {
+            if topic.trim().is_empty() {
+                return Err(Error::client("Topic can not be null or empty."));
+            }
+            let topic = with_namespace(&namespace, topic);
+            built.insert(topic.clone(), pull_selector_subscription(&topic, selector)?);
+        }
+        lock(&self.inner.state).heartbeat_subscriptions = built;
+        Ok(())
+    }
+
+    /// The built set, sorted by topic. A snapshot: changing it does not change what the heartbeat
+    /// announces.
+    pub fn get_subscriptions_for_heartbeat(&self) -> Vec<SubscriptionData> {
+        lock(&self.inner.state)
+            .heartbeat_subscriptions
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Switch to assign mode (no rebalance).
@@ -3645,7 +3688,7 @@ impl DefaultLitePullConsumer {
                 &expression_type,
                 LITE_PULL_TIMEOUT_MILLIS,
                 -1,
-                PULL_SUSPEND_TIMEOUT_MILLIS,
+                cfg.broker_suspend_max_time_millis,
                 None,
                 0,
                 None,
@@ -3811,14 +3854,22 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     );
     cd.subscription_data_set = {
         let state = lock(&inner.state);
-        // Only rebalance subscriptions are announced. An assign-mode expression filters the queues
-        // this instance was handed; advertising it would make the broker treat the group as a
-        // subscriber of the whole topic.
-        state
+        // Only rebalance subscriptions are announced on their own. An assign-mode expression filters
+        // the queues this instance was handed; advertising it would make the broker treat the group
+        // as a subscriber of the whole topic.
+        let mut subs: Vec<SubscriptionData> = state
             .subscription
             .keys()
             .filter_map(|topic| state.subscription_data.get(topic).cloned())
-            .collect()
+            .collect();
+        // The built set fills the gaps only: a topic the rebalance subscriptions already carry keeps
+        // that expression, since that is the one the pull path actually filters with.
+        for (topic, sub) in &state.heartbeat_subscriptions {
+            if !state.subscription.contains_key(topic) {
+                subs.push(sub.clone());
+            }
+        }
+        subs
     };
     cd.unit_mode = cfg.unit_mode;
     hb.consumer_data_set.push(cd);
@@ -6405,8 +6456,204 @@ mod tests {
         plain.shutdown();
     }
 
-    // ---------------------- The pull cursor follows nextBeginOffset (#105)
+    // ---------------- Lite poll budget + built heartbeat set
 
+    /// The subscription set a group announced in its most recent heartbeat (`None` before the
+    /// first beat mentioning the group).
+    fn last_group_subscriptions(
+        cluster: &FakePullCluster,
+        group: &str,
+    ) -> Option<Vec<SubscriptionData>> {
+        cluster
+            .master
+            .heartbeats()
+            .iter()
+            .rev()
+            .find_map(|hb| {
+                hb.consumer_data_set
+                    .iter()
+                    .find(|cd| cd.group_name == group)
+                    .map(|cd| cd.subscription_data_set.clone())
+            })
+    }
+
+    #[test]
+    fn lite_built_subscriptions_replace_the_whole_set() {
+        let c = DefaultLitePullConsumer::new("LitePG_BuiltSet").unwrap();
+        assert!(c.get_subscriptions_for_heartbeat().is_empty());
+
+        let mut set = BTreeMap::new();
+        set.insert("HelpTag".to_string(), MessageSelector::by_tag("TagA"));
+        set.insert("HelpSql".to_string(), MessageSelector::by_sql("a > 1"));
+        c.build_subscriptions_for_heartbeat(&set).unwrap();
+        let got = c.get_subscriptions_for_heartbeat();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].topic, "HelpSql", "the snapshot is sorted by topic");
+        assert_eq!(got[1].topic, "HelpTag");
+        assert_eq!(got[0].expression_type, "SQL92");
+        assert_eq!(got[0].sub_string, "a > 1", "the SQL92 expression travels verbatim");
+        assert_eq!(got[1].expression_type, "TAG");
+        assert_eq!(got[1].tags_set.len(), 1, "the tag entry carries the parsed tag set");
+
+        // Validation runs before anything is applied: a rejected entry leaves the previous set intact.
+        let blank_topic = BTreeMap::from([("  ".to_string(), MessageSelector::by_tag("TagA"))]);
+        let err = c
+            .build_subscriptions_for_heartbeat(&blank_topic)
+            .expect_err("a blank topic is refused")
+            .to_string();
+        assert!(err.contains("Topic can not be null or empty."), "{err}");
+        let blank_sql = BTreeMap::from([("HelpSql".to_string(), MessageSelector::by_sql(""))]);
+        let err = c
+            .build_subscriptions_for_heartbeat(&blank_sql)
+            .expect_err("a blank non-TAG expression is refused")
+            .to_string();
+        assert!(err.contains("Expression can't be null! SQL92"), "{err}");
+        assert_eq!(
+            c.get_subscriptions_for_heartbeat().len(),
+            2,
+            "a refused entry leaves the previous set intact"
+        );
+
+        // An empty map is the documented way to clear.
+        c.build_subscriptions_for_heartbeat(&BTreeMap::new()).unwrap();
+        assert!(c.get_subscriptions_for_heartbeat().is_empty());
+
+        // Namespaced exactly once: an already-wrapped key is not wrapped a second time.
+        let ns = DefaultLitePullConsumer::new("LitePG_BuiltSetNs").unwrap();
+        ns.set_namespace("NSX");
+        let mut mixed = BTreeMap::new();
+        mixed.insert("TopicB".to_string(), MessageSelector::by_tag("TagA"));
+        mixed.insert("NSX%TopicA".to_string(), MessageSelector::by_tag("TagA"));
+        ns.build_subscriptions_for_heartbeat(&mixed).unwrap();
+        let topics: Vec<String> = ns
+            .get_subscriptions_for_heartbeat()
+            .into_iter()
+            .map(|s| s.topic)
+            .collect();
+        assert_eq!(topics, vec!["NSX%TopicA", "NSX%TopicB"]);
+    }
+
+    #[tokio::test]
+    async fn lite_pull_carries_the_configured_suspend_budget() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let c = DefaultLitePullConsumer::new("LitePG_SuspendBudget").unwrap();
+        c.set_instance_name("lite_suspend_budget");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c.update_config(|cfg| cfg.broker_suspend_max_time_millis = 7_000);
+        c.assign(std::slice::from_ref(&q)).unwrap();
+        c.start().await.expect("start must succeed");
+        cluster.set_cid_list(&[c.client_id().as_str()]);
+
+        wait_until(
+            || !cluster.master.pull_ext_values("suspendTimeoutMillis").is_empty(),
+            "lite's first pull",
+        )
+        .await;
+        assert_eq!(
+            cluster
+                .master
+                .pull_ext_values("suspendTimeoutMillis")
+                .last(),
+            Some(&"7000".to_string()),
+            "the configured broker suspend ceiling rides the request"
+        );
+        for f in cluster.master.pull_sys_flags() {
+            assert!(
+                !PullSysFlag::has_suspend_flag(f),
+                "the lite poll itself stays short: {f:#x}"
+            );
+        }
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn lite_heartbeat_announces_the_built_set_and_yields_to_rebalance() {
+        let cluster = FakePullCluster::start().await;
+        let q = queue("T", "broker-a", 0);
+        let c = DefaultLitePullConsumer::new("LitePG_BuiltSetHb").unwrap();
+        c.set_instance_name("lite_built_set_hb");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
+        c.set_sub_expression_for_assign("T", "AssignOnly").unwrap();
+        c.assign(std::slice::from_ref(&q)).unwrap();
+        let mut built = BTreeMap::new();
+        built.insert("LiteHelperTag".to_string(), MessageSelector::by_tag("TagA"));
+        built.insert("LiteHelperSql".to_string(), MessageSelector::by_sql("a > 1"));
+        c.build_subscriptions_for_heartbeat(&built).unwrap();
+        c.start().await.expect("start must succeed");
+        cluster.set_cid_list(&[c.client_id().as_str()]);
+
+        wait_until(
+            || last_group_subscriptions(&cluster, "LitePG_BuiltSetHb").is_some(),
+            "start's beat reaches the broker",
+        )
+        .await;
+        let subs = last_group_subscriptions(&cluster, "LitePG_BuiltSetHb").unwrap();
+        assert!(
+            subs.iter().all(|s| s.topic != "T"),
+            "an assign-only topic is not announced on its own: {subs:?}"
+        );
+        let tag = subs
+            .iter()
+            .find(|s| s.topic == "LiteHelperTag")
+            .expect("the tag helper is announced");
+        assert_eq!(tag.expression_type, "TAG");
+        assert_eq!(tag.tags_set.len(), 1);
+        let sql = subs
+            .iter()
+            .find(|s| s.topic == "LiteHelperSql")
+            .expect("the SQL92 helper is announced");
+        assert_eq!(sql.expression_type, "SQL92");
+        assert_eq!(sql.sub_string, "a > 1");
+
+        // A rebuild replaces the whole set: the topic it leaves out stops being announced.
+        let rebuilt = BTreeMap::from([("LiteHelperTag".to_string(), MessageSelector::by_tag("*"))]);
+        c.build_subscriptions_for_heartbeat(&rebuilt).unwrap();
+        c.send_heartbeat_to_all_broker().await;
+        wait_until(
+            || {
+                matches!(
+                    last_group_subscriptions(&cluster, "LitePG_BuiltSetHb").as_deref(),
+                    Some([only]) if only.topic == "LiteHelperTag" && only.sub_string == "*"
+                )
+            },
+            "a beat with the rebuilt set",
+        )
+        .await;
+        c.shutdown();
+
+        // A topic both sides cover keeps the rebalance expression: the built entry is a gap filler,
+        // so it must never override what the pull path actually filters with.
+        let other = FakePullCluster::start().await;
+        let p = DefaultLitePullConsumer::new("LitePG_BuiltSetPrecedence").unwrap();
+        p.set_instance_name("lite_built_set_precedence");
+        p.set_namesrv_addr(&other.namesrv_addr);
+        p.subscribe("T", "TagA").unwrap();
+        p.build_subscriptions_for_heartbeat(&BTreeMap::from([(
+            "T".to_string(),
+            MessageSelector::by_tag("TagZ"),
+        )]))
+        .unwrap();
+        p.start().await.expect("start must succeed");
+        other.set_cid_list(&[p.client_id().as_str()]);
+        wait_until(
+            || last_group_subscriptions(&other, "LitePG_BuiltSetPrecedence").is_some(),
+            "the precedence consumer's beat",
+        )
+        .await;
+        let subs = last_group_subscriptions(&other, "LitePG_BuiltSetPrecedence").unwrap();
+        assert_eq!(subs.len(), 1, "the topic is announced once: {subs:?}");
+        assert_eq!(subs[0].topic, "T");
+        assert!(
+            subs[0].tags_set.contains(&"TagA".to_string()),
+            "the rebalance expression wins over the built one: {subs:?}"
+        );
+        p.shutdown();
+    }
+
+    // ---------------------- The pull cursor follows nextBeginOffset (#105)
     /// Start a lite-pull consumer against the fake cluster (assign + FIRST_OFFSET: the start point is the literal 0, so no
     /// start-offset query RPC is made and the first PULL_MESSAGE deterministically lands at `queueOffset=0`).
     async fn started_lite(

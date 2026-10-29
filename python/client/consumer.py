@@ -5117,6 +5117,9 @@ class DefaultLitePullConsumer:
         self.subscription: Dict[str, str] = {}
         # The SubscriptionData for subscriptions (with tagsSet), used for the heartbeat sent to the broker for tag filter registration
         self.subscription_data: Dict[str, SubscriptionData] = {}
+        # The extra set the application announces on top of the rebalance
+        # subscriptions (empty until it opts in).
+        self.heartbeat_subscriptions: Dict[str, SubscriptionData] = {}
         # Expression type per subscribed topic (TAG / SQL92 / ...): the pull request must carry the
         # same type as the subscription data registered by the heartbeat, otherwise a SQL92
         # expression would be evaluated by the broker as a tag string and silently match nothing.
@@ -5489,6 +5492,40 @@ class DefaultLitePullConsumer:
                 self._seek_offset.pop(mq, None)
                 self._drop_queue_cache(mq)
 
+    def build_subscriptions_for_heartbeat(self, selectors: Dict[str, "MessageSelector"]) -> None:
+        """Replace the extra set announced in the heartbeat beyond the rebalance subscriptions.
+
+        An assign-mode consumer has no topic-wide subscription of its own, yet the
+        broker filters the group's pulls by the expression it was last told, so
+        this is how such an application announces the filters its queues need.
+        Every call replaces the whole set (a topic left out stops being announced),
+        a topic the rebalance subscriptions cover keeps their expression, and a
+        rejected selector leaves the previous set intact.
+        """
+        built: Dict[str, SubscriptionData] = {}
+        for topic, selector in (selectors or {}).items():
+            if not topic or not topic.strip():
+                raise ValueError("Topic can not be null or empty.")
+            selector_type = getattr(selector, "type", ExpressionType.TAG) or ExpressionType.TAG
+            expression = getattr(selector, "expression", None)
+            ns = self._with_namespace(topic)
+            if selector_type == ExpressionType.TAG:
+                built[ns] = FilterAPI.build_subscription_data(ns, expression or "*")
+                continue
+            if not expression:
+                raise ValueError("Expression can't be null! %s" % selector_type)
+            sub = SubscriptionData(topic=ns, sub_string=expression)
+            sub.expression_type = selector_type
+            built[ns] = sub
+        self.heartbeat_subscriptions = built
+
+    def get_subscriptions_for_heartbeat(self) -> List[SubscriptionData]:
+        """The built set, sorted by topic; a snapshot, not a live view."""
+        # Bind the dict once: a rebuild on the caller's thread swaps the attribute, so
+        # sorting one dict and indexing another could miss a topic.
+        built = self.heartbeat_subscriptions
+        return [built[t] for t in sorted(built)]
+
     def set_sub_expression_for_assign(self, topic: str, sub_expression: str) -> None:
         """Specify a tag filter expression for a topic's queues in assign mode (setSubExpressionForAssign).
 
@@ -5690,13 +5727,19 @@ class DefaultLitePullConsumer:
         # Writing PASSIVELY would misalign both.
         # See the same-named comment on the push consumer's _build_heartbeat
         cd.unit_mode = self.unit_mode
-        # Only rebalance subscriptions are announced. An assign-mode expression filters
-        # the queues this instance was handed; advertising it would make the broker treat
-        # the group as a subscriber of the whole topic.
+        # Rebalance subscriptions plus the set the application built for the
+        # heartbeat. An assign-mode expression is not a topic-wide subscription, so
+        # it is announced only when the application opts in; a topic both cover
+        # keeps the rebalance expression.
         for topic in self.subscription:
             sub = self.subscription_data.get(topic)
             if sub is not None:
                 cd.subscription_data_set.add(sub)
+        built = self.heartbeat_subscriptions
+        for topic in sorted(built):
+            if topic in self.subscription:
+                continue
+            cd.subscription_data_set.add(built[topic])
         hb.consumer_data_set.add(cd)
         return hb
 
@@ -5834,7 +5877,7 @@ class DefaultLitePullConsumer:
                 self.consumer_group, mq, offset, self.pull_batch_size,
                 sys_flag, 0, sub, sub_version, exp_type,
                 timeout_millis=30000, max_msg_bytes=-1,
-                suspend_timeout_millis=15000)
+                suspend_timeout_millis=self.broker_suspend_max_time_millis)
         except MQBrokerException as e:
             # A broker FLOW_CONTROL(215) answer is not an error on this path: it is transient
             # producer-side throttling, so **this queue's** next round waits the short broker delay

@@ -208,6 +208,9 @@ type DefaultLitePullConsumer struct {
 	// subscriptionData feeds the self-heartbeat (both modes register here:
 	// assign mode needs the broker-side filter just as much).
 	subscriptionData map[string]*remoting.SubscriptionData
+	// heartbeatSubscriptions is the extra set the application announces on top of
+	// the rebalance subscriptions (empty until it opts in).
+	heartbeatSubscriptions map[string]*remoting.SubscriptionData
 	// assignSubExpr is the per-topic TAG expression for assign mode.
 	assignSubExpr          map[string]string
 	mode                   int
@@ -275,6 +278,7 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		allocateStrategy:                 AllocateMessageQueueAveragely{},
 		subscription:                     map[string]string{},
 		subscriptionData:                 map[string]*remoting.SubscriptionData{},
+		heartbeatSubscriptions:           map[string]*remoting.SubscriptionData{},
 		assignSubExpr:                    map[string]string{},
 		assigned:                         map[common.MessageQueue]struct{}{},
 		nextOffset:                       map[common.MessageQueue]int64{},
@@ -939,6 +943,45 @@ func (c *DefaultLitePullConsumer) Subscriptions() []*remoting.SubscriptionData {
 	defer c.mu.Unlock()
 	out := make([]*remoting.SubscriptionData, 0, len(c.subscriptionData))
 	for _, sub := range c.subscriptionData {
+		out = append(out, sub)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
+	return out
+}
+
+// BuildSubscriptionsForHeartbeat replaces the topics this consumer announces in
+// its heartbeat beyond its rebalance subscriptions. An assign-mode consumer has
+// no topic-wide subscription of its own, yet the broker filters the group's
+// pulls by the expression it was last told, so this is how such an application
+// announces the filters its queues need.
+//
+// Every call replaces the whole set: a topic left out of the map stops being
+// announced on the next beat. A topic the rebalance subscriptions already cover
+// keeps that expression — this set only fills the ones they do not. A nil or
+// empty map clears the set. A rejected selector leaves the previous set intact.
+func (c *DefaultLitePullConsumer) BuildSubscriptionsForHeartbeat(
+	selectors map[string]MessageSelector) error {
+	built := make(map[string]*remoting.SubscriptionData, len(selectors))
+	for topic, selector := range selectors {
+		sub, err := buildSelectorSubscription(topic, selector)
+		if err != nil {
+			return err
+		}
+		built[topic] = sub
+	}
+	c.mu.Lock()
+	c.heartbeatSubscriptions = built
+	c.mu.Unlock()
+	return nil
+}
+
+// SubscriptionsForHeartbeat returns the built set, sorted by topic. It is a
+// snapshot: changing it does not change what the heartbeat announces.
+func (c *DefaultLitePullConsumer) SubscriptionsForHeartbeat() []*remoting.SubscriptionData {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*remoting.SubscriptionData, 0, len(c.heartbeatSubscriptions))
+	for _, sub := range c.heartbeatSubscriptions {
 		out = append(out, sub)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
@@ -1842,14 +1885,20 @@ func (c *DefaultLitePullConsumer) sendHeartbeatToAllBrokers() int {
 	hb := remoting.NewHeartbeatData(c.clientID)
 	cd := remoting.NewConsumerData(c.consumerGroup, ConsumeTypeActively, c.messageModel, c.consumeFromWhere)
 	cd.UnitMode = c.unitMode
-	// Only rebalance subscriptions are advertised. An assign-mode expression names
-	// the filter for the queues this instance was handed, not a topic-wide
-	// subscription, so announcing it would make the broker treat the group as a
-	// subscriber of the whole topic.
+	// Rebalance subscriptions plus the set the application built for the
+	// heartbeat. An assign-mode expression is not a topic-wide subscription, so it
+	// is announced only when the application opts in through the built set; a
+	// topic both cover keeps the rebalance expression.
 	for topic := range c.subscription {
 		if sub, ok := c.subscriptionData[topic]; ok {
 			cd.AddSubscriptionData(sub)
 		}
+	}
+	for topic, sub := range c.heartbeatSubscriptions {
+		if _, ok := c.subscription[topic]; ok {
+			continue
+		}
+		cd.AddSubscriptionData(sub)
 	}
 	hb.AddConsumerData(cd)
 	addrs := c.instance.GetAllBrokerAddrs()
@@ -2008,7 +2057,8 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 	// the LITE bit tags the request as lite traffic.
 	sysFlag := common.BuildSysFlag(false, false, true, false, true)
 
-	result, err := api.pullKernelLite(group, mq, offset, sub, sysFlag, batchSize, litePullTimeoutMillis)
+	result, err := api.pullKernelLite(group, mq, offset, sub, sysFlag, batchSize,
+		c.BrokerSuspendMaxTimeMillis(), litePullTimeoutMillis)
 	if err != nil {
 		common.LogDebugf("lite pull failed for %v@%d: %v", mq, offset, err)
 		// The broker's own throttle (FLOW_CONTROL 215) is not a failure of the

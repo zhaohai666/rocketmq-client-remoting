@@ -269,6 +269,36 @@ void DefaultLitePullConsumer::setSubExpressionForAssign(const std::string& topic
     }
 }
 
+void DefaultLitePullConsumer::buildSubscriptionsForHeartbeat(
+    const std::map<std::string, MessageSelector>& selectors) {
+    // Build the whole set first: a rejected entry must leave the previous set intact rather than
+    // replace it with a half-built one.
+    std::map<std::string, SubscriptionData> built;
+    for (const auto& kv : selectors) {
+        if (UtilAll::isBlank(kv.first)) {
+            throw MQClientException("Topic can not be null or empty.");
+        }
+        if (kv.second.type != ExpressionType::TAG && UtilAll::isBlank(kv.second.expression)) {
+            // Any other language is passed through verbatim, so an empty expression would ask
+            // the broker to filter with nothing at all -- refuse instead of widening it.
+            throw MQClientException("Expression can't be null! " + kv.second.type);
+        }
+        const std::string ns = withNamespace(kv.first);
+        built[ns] = FilterAPI::buildSubscriptionData(ns, kv.second.expression, kv.second.type);
+    }
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    heartbeatSubscriptions_ = std::move(built);
+}
+
+std::vector<SubscriptionData> DefaultLitePullConsumer::getSubscriptionsForHeartbeat() const {
+    std::lock_guard<std::mutex> lk(stateMutex_);
+    std::vector<SubscriptionData> out;
+    out.reserve(heartbeatSubscriptions_.size());
+    // std::map iterates in topic order, so the snapshot is sorted without a second sort.
+    for (const auto& kv : heartbeatSubscriptions_) out.push_back(kv.second);
+    return out;
+}
+
 void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQueues) {
     if (messageQueues.empty()) {
         // Taken literally an empty list revokes every queue this consumer holds, which is
@@ -620,7 +650,7 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
                                         FilterAPI::pullExpression(subData),
                                         FilterAPI::pullSubVersionOf(subData), subData.expressionType,
                                         /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
-                                        /*suspendTimeoutMillis=*/15000);
+                                        /*suspendTimeoutMillis=*/brokerSuspendMaxTimeMillis_);
     } catch (const MQBrokerException& e) {
         // MQBrokerException is a sibling of RemotingTimeoutException under std::runtime_error, so
         // catching it before catch(...) is live code and unmapped broker codes reach the mapping.
@@ -1418,6 +1448,13 @@ HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     for (const auto& kv : subscription_) {
         auto it = subscriptionData_.find(kv.first);
         if (it != subscriptionData_.end()) cd.subscriptionDataSet.push_back(it->second);
+    }
+    // The built set fills the gaps only: a topic the rebalance subscriptions already carry keeps
+    // that expression, since that is the one the pull path actually filters with.
+    for (const auto& kv : heartbeatSubscriptions_) {
+        if (subscription_.find(kv.first) == subscription_.end()) {
+            cd.subscriptionDataSet.push_back(kv.second);
+        }
     }
     hb.consumerDataSet.push_back(cd);
     return hb;

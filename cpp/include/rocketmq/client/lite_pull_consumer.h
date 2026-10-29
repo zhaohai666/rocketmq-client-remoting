@@ -181,6 +181,18 @@ public:
     // Assign mode with a selector: the pull of the assigned queues carries the selector's expression
     // type and version exactly as the subscribe path does.
     void setSubExpressionForAssign(const std::string& topic, const MessageSelector& selector);
+    // Replaces the subscriptions this consumer announces in its heartbeat beyond its rebalance
+    // subscriptions. An assign-mode expression filters only the queues this instance was handed,
+    // so it is never announced on its own; this set is how the application opts a topic in.
+    //
+    // Every call replaces the whole set: a topic left out of the map stops being announced on the
+    // next beat. A topic the rebalance subscriptions already cover keeps that expression -- this
+    // set only fills the ones they do not. An empty map clears the set. A rejected selector
+    // leaves the previous set intact.
+    void buildSubscriptionsForHeartbeat(const std::map<std::string, MessageSelector>& selectors);
+    // The built set, sorted by topic. A snapshot: changing it does not change what the heartbeat
+    // announces.
+    std::vector<SubscriptionData> getSubscriptionsForHeartbeat() const;
     // Assign mode: queues are given explicitly, no rebalance involved.
     void assign(const std::vector<MessageQueue>& messageQueues);
     // Drops a topic's subscription AND its assigned queues at once, without waiting
@@ -357,6 +369,9 @@ private:
     std::map<std::string, SubscriptionData> subscriptionData_;
     // Assign mode: topic -> tag filter expression (passed through to pull)
     std::map<std::string, std::string> assignSubExpr_;
+    // Extra subscriptions announced in the heartbeat beyond subscription_ (see
+    // buildSubscriptionsForHeartbeat), keyed by namespaced topic; guarded by stateMutex_.
+    std::map<std::string, SubscriptionData> heartbeatSubscriptions_;
     // Assign and subscribe modes are mutually exclusive; the pull thread reads this every round while the
     // setter runs on the caller thread, so it is atomic rather than a plain bool under stateMutex_ (many read sites, not worth locking).
     std::atomic<bool> assignMode_{false};

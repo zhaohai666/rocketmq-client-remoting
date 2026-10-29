@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **50** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-29 实测 **ALL GREEN**，其中 45 套逐条计出 **1692** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **51** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-29 实测 **ALL GREEN**，其中 46 套逐条计出 **1705** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -48,8 +48,9 @@ node --experimental-strip-types selfcheck.ts
 | `test/heartbeat_v2_beat_smoke.ts` | 28 通过 / 0 失败 |
 | `test/heartbeat_v2_smoke.ts` | 30 通过 / 0 失败 |
 | `test/initial_offset_policy_smoke.ts`（初始位点：广播 / TIMESTAMP / %RETRY% / SQL92） | 44 通过 / 0 失败 |
-| `test/lite_surface_guards_smoke.ts`（lite 表面的误用闸门：空白 topic、空队列列表的 assign、已经在跑之后再设指派表达式、没启动就 poll / committed / 取队列，负超时排在状态检查之后；subscribe 与 assign 互斥且先到者定形，assign 模式心跳不带任何订阅项；assign 收窄与 unsubscribe 都把被撤销队列的光标、park、暂停位与缓冲一起丢掉；seek 依次判「是否持有」（按模式区分文案）→ 是否运行 → [minOffset, maxOffset] 区间，committed 的 broker 读失败报错而不是回 -1） | 48 通过 / 0 失败 |
+| `test/lite_surface_guards_smoke.ts`（lite 表面的误用闸门：空白 topic、空队列列表的 assign、已经在跑之后再设指派表达式、没启动就 poll / committed / 取队列，负超时排在状态检查之后；subscribe 与 assign 互斥且先到者定形，assign 模式本身不把指派队列写进心跳（要发必须走显式 built set）；assign 收窄与 unsubscribe 都把被撤销队列的光标、park、暂停位与缓冲一起丢掉；seek 依次判「是否持有」（按模式区分文案）→ 是否运行 → [minOffset, maxOffset] 区间，committed 的 broker 读失败报错而不是回 -1） | 48 通过 / 0 失败 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
+| `test/lite_wire_contract_smoke.ts`（lite 线上契约：短轮询的 LITE_PULL 把 `suspendTimeoutMillis` 填成配置的 broker 挂起预算而 sysFlag 不置挂起位；`buildSubscriptionsForHeartbeat` 整组替换、空表清空、拒绝项让旧集合原样保留、rebalance 订阅优先只补空缺，topic 键只包一层命名空间，默认 assign 心跳不带订阅项） | 13 通过 / 0 失败 |
 | `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
 | `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
@@ -410,7 +411,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 50 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 51 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

@@ -52,6 +52,10 @@ public sealed class DefaultLitePullConsumer
     private readonly Dictionary<string, SubscriptionData> _subscriptionData = new(StringComparer.Ordinal);
     // assign mode: topic -> tag filter expression (passed through to pull)
     private readonly Dictionary<string, string> _assignSubExpr = new(StringComparer.Ordinal);
+    // Extra subscriptions the application announces in the heartbeat
+    // (BuildSubscriptionsForHeartbeat). An assign-mode expression is not a topic-wide
+    // subscription, so this is the only way a topic reaches the group's heartbeat.
+    private readonly Dictionary<string, SubscriptionData> _heartbeatSubscriptions = new(StringComparer.Ordinal);
     // Expression type per topic for the selector-flavoured subscriptions (real topic ->
     // TAG/SQL92/CLASS_FILTER). A topic missing from this table is a plain TAG subscription,
     // which is exactly what every string-based subscription is today.
@@ -671,6 +675,54 @@ public sealed class DefaultLitePullConsumer
             {
                 _subscriptionData.Remove(ns);
             }
+        }
+    }
+
+    /// <summary>Replaces the subscriptions this consumer announces in its heartbeat beyond
+    /// its rebalance subscriptions. An assign-mode expression filters only the queues this
+    /// instance was handed, so it is never announced on its own; this set is how the
+    /// application opts a topic in.
+    /// Every call replaces the whole set: a topic left out of the map stops being announced
+    /// on the next beat. A topic the rebalance subscriptions already cover keeps their
+    /// expression -- this set only fills the ones they do not. A null or empty map clears
+    /// the set. A rejected selector leaves the previous set intact.</summary>
+    public void BuildSubscriptionsForHeartbeat(IReadOnlyDictionary<string, MessageSelector>? selectors)
+    {
+        var built = new Dictionary<string, SubscriptionData>(StringComparer.Ordinal);
+        if (selectors is not null)
+        {
+            foreach (KeyValuePair<string, MessageSelector> kv in selectors)
+            {
+                if (string.IsNullOrWhiteSpace(kv.Key))
+                {
+                    throw new ArgumentException("Topic can not be null or empty.");
+                }
+
+                ArgumentNullException.ThrowIfNull(kv.Value);
+                string ns = WithNamespace(kv.Key);
+                built[ns] = SubscriptionSelectors.Build(ns, kv.Value);
+            }
+        }
+
+        lock (_lock)
+        {
+            _heartbeatSubscriptions.Clear();
+            foreach (KeyValuePair<string, SubscriptionData> kv in built)
+            {
+                _heartbeatSubscriptions[kv.Key] = kv.Value;
+            }
+        }
+    }
+
+    /// <summary>The built set, sorted by topic. A snapshot: changing it does not change
+    /// what the heartbeat announces.</summary>
+    public IReadOnlyList<SubscriptionData> GetSubscriptionsForHeartbeat()
+    {
+        lock (_lock)
+        {
+            var subs = new List<SubscriptionData>(_heartbeatSubscriptions.Values);
+            subs.Sort((a, b) => string.CompareOrdinal(a.Topic, b.Topic));
+            return subs;
         }
     }
 
@@ -1346,9 +1398,12 @@ public sealed class DefaultLitePullConsumer
         PullResult result;
         try
         {
+            // Short poll, but the suspend field still carries the configured broker-suspend
+            // budget: the request is short because this loop must answer its caller, not
+            // because the budget is a constant.
             result = RequireClient().PullMessage(_consumerGroup, mq, offset, _pullBatchSize, sysFlag, 0,
                 sub, subVersion, exprType, /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
-                /*suspendTimeoutMillis=*/15000);
+                /*suspendTimeoutMillis=*/_brokerSuspendMaxTimeMillis);
         }
         catch (MQBrokerException e)
         {
@@ -2234,12 +2289,20 @@ public sealed class DefaultLitePullConsumer
         };
         lock (_lock)
         {
-            // Assigned queues are a local decision: nothing about them is a broker-side
-            // subscription, so an assign-mode heartbeat advertises no subscription entries
-            // at all. Subscribe mode still sends every current subscription.
-            if (_mode != ModeAssign)
+            // Rebalance subscriptions plus the set the application built for the heartbeat.
+            // An assign-mode expression is not a topic-wide subscription, so it is announced
+            // only through that built set; a topic both cover keeps the rebalance expression.
+            foreach (string topic in _subscription.Keys)
             {
-                foreach (KeyValuePair<string, SubscriptionData> kv in _subscriptionData)
+                if (_subscriptionData.TryGetValue(topic, out SubscriptionData? sub) && sub is not null)
+                {
+                    cd.AddSubscriptionData(sub);
+                }
+            }
+
+            foreach (KeyValuePair<string, SubscriptionData> kv in _heartbeatSubscriptions)
+            {
+                if (!_subscription.ContainsKey(kv.Key))
                 {
                     cd.AddSubscriptionData(kv.Value);
                 }
