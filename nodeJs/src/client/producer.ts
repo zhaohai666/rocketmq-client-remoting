@@ -124,6 +124,10 @@ export class DefaultMQProducer {
   createTopicKey: string;
   defaultTopicQueueNums: number;
   sendMsgTimeout: number;
+  // Cap on a single attempt's timeout while retries remain (-1 = no cap). Every
+  // attempt draws on the caller's one budget, so without a cap a slow first
+  // broker can consume all of it and leave the retry no time to answer.
+  sendMsgMaxTimeoutPerRequest: number;
   compressMsgBodyOverHowmuch: number;
   maxMessageSize: number;
   retryTimesWhenSendFailed: number;
@@ -219,6 +223,7 @@ export class DefaultMQProducer {
     this.createTopicKey = MixAll.DEFAULT_TOPIC;
     this.defaultTopicQueueNums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS;
     this.sendMsgTimeout = 3000;
+    this.sendMsgMaxTimeoutPerRequest = -1;
     this.compressMsgBodyOverHowmuch = 4 * 1024;
     this.maxMessageSize = 4 * 1024 * 1024;
     this.retryTimesWhenSendFailed = 2;
@@ -317,6 +322,8 @@ export class DefaultMQProducer {
   setSocksProxyConfig(config: SocksProxyConfig | null): this { this.socksProxyConfig = config; return this; }
   getSocksProxyConfig(): SocksProxyConfig | null { return this.socksProxyConfig; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
+  setSendMsgMaxTimeoutPerRequest(ms: number): this { this.sendMsgMaxTimeoutPerRequest = ms; return this; }
+  getSendMsgMaxTimeoutPerRequest(): number { return this.sendMsgMaxTimeoutPerRequest; }
   setEnableTrace(enable: boolean): this { this.enableTrace = enable; return this; }
   // Heartbeat V2 switch. A broker that does
   // not answer the V2 ext fields keeps receiving subscription-carrying bodies, so
@@ -730,6 +737,9 @@ export class DefaultMQProducer {
     communicationMode: number,
     sendCallback: SendCallback | null,
     tpInfo: TopicPublishInfo,
+    // The caller's remaining budget for THIS attempt, not the producer default:
+    // the retry loop subtracts what earlier attempts already spent.
+    timeoutMillis: number = this.sendMsgTimeout,
   ): Promise<SendResult | null> {
     if (this.client == null) throw new MQClientException('producer not started');
     // 1) compression already applied by caller (tryToCompressMessage); ensure sysFlag present.
@@ -768,11 +778,11 @@ export class DefaultMQProducer {
     }
 
     if (communicationMode === CommunicationMode.SYNC) {
-      return this.client.sendMessage(addr, request, mq, this.sendMsgTimeout, msg);
+      return this.client.sendMessage(addr, request, mq, timeoutMillis, msg);
     } else if (communicationMode === CommunicationMode.ASYNC) {
       // The ASYNC path owns its own retry chain (retryTimesWhenSendAsyncFailed,
       // shared time budget, re-select a queue that avoids the failed broker).
-      this._sendAsyncKernel(msg, mq, tpInfo, sendCallback, request, addr);
+      this._sendAsyncKernel(msg, mq, tpInfo, sendCallback, request, addr, timeoutMillis);
       return null;
     } else {
       await this.client.sendMessageOneway(addr, request);
@@ -798,6 +808,7 @@ export class DefaultMQProducer {
     sendCallback: SendCallback | null,
     request: RemotingCommand,
     addr: string,
+    timeoutMillis: number,
   ): void {
     void addr; // kept for signature symmetry with sendKernelImpl
     const timesTotal = Math.max(0, this.retryTimesWhenSendAsyncFailed);
@@ -854,7 +865,7 @@ export class DefaultMQProducer {
         onExceptionImpl(e as Error, true, false);
       }
     };
-    attempt(mq.getBrokerName(), mq, this.sendMsgTimeout);
+    attempt(mq.getBrokerName(), mq, timeoutMillis);
   }
 
   // Wrap SendMessageHook around the kernel send.
@@ -864,6 +875,7 @@ export class DefaultMQProducer {
     communicationMode: number,
     sendCallback: SendCallback | null,
     tpInfo: TopicPublishInfo,
+    timeoutMillis: number = this.sendMsgTimeout,
   ): Promise<SendResult | null> {
     const ctx = new SendMessageContext(this.producerGroup, msg, mq, communicationMode, this.client!.publishAddrFor(mq));
     // This port's SendMessageHook registry is global, not per producer.
@@ -874,7 +886,7 @@ export class DefaultMQProducer {
     for (const hook of sendHooks) hook.sendMessageBefore(ctx);
     let sendResult: SendResult | null = null;
     try {
-      sendResult = await this.sendKernelImpl(msg, mq, communicationMode, sendCallback, tpInfo);
+      sendResult = await this.sendKernelImpl(msg, mq, communicationMode, sendCallback, tpInfo, timeoutMillis);
       ctx.sendResult = sendResult;
       ctx.exception = null;
     } catch (e) {
@@ -932,13 +944,29 @@ export class DefaultMQProducer {
     // (_sendAsyncKernel, retryTimesWhenSendAsyncFailed); ONEWAY never retries.
     const maxTimes = communicationMode === CommunicationMode.SYNC
       ? this.retryTimesWhenSendFailed + 1 : 1;
+    // One budget for the whole call: every attempt is charged the time already
+    // spent (route lookup, selector, earlier attempts) and only gets what is
+    // left, so a caller-supplied timeout is a ceiling on the call, not on each try.
+    const beginTimestampFirst = Date.now();
+    let callTimeout = false;
     for (let times = 0; times < maxTimes; times++) {
       const mq = this._selectOneMessageQueue(tpInfo, lastBrokerName);
       if (mq == null) continue;
       lastBrokerName = mq.getBrokerName();
       try {
         this.tryToCompressMessage(msg);
-        sendResult = await this._sendWithHooks(msg, mq, communicationMode, sendCallback, tpInfo);
+        const costTime = Date.now() - beginTimestampFirst;
+        if (timeoutMillis < costTime) {
+          callTimeout = true;
+          break;
+        }
+        let curTimeout = timeoutMillis - costTime;
+        const canRetryAgain = times + 1 < maxTimes;
+        if (this.sendMsgMaxTimeoutPerRequest > -1 && canRetryAgain
+          && curTimeout > this.sendMsgMaxTimeoutPerRequest) {
+          curTimeout = this.sendMsgMaxTimeoutPerRequest;
+        }
+        sendResult = await this._sendWithHooks(msg, mq, communicationMode, sendCallback, tpInfo, curTimeout);
         // ASYNC / ONEWAY succeed as soon as no exception was
         // thrown (sendKernelImpl returns null for both); only SYNC uses the
         // SendResult as the retry-driving value.
@@ -986,6 +1014,9 @@ export class DefaultMQProducer {
       }
     }
     if (sendResult == null) {
+      // The budget ran out before an attempt could be issued: that is a
+      // timeout, not "retries exhausted", and callers branch on the type.
+      if (callTimeout) throw new RemotingTooMuchRequestException('sendDefaultImpl call timeout');
       // Surface the broker's own answer (response code + remark) when every
       // attempt was rejected BY THE BROKER — a generic "retries exhausted"
       // would erase the reason (e.g. ACL NO_PERMISSION 16) that the caller
@@ -1084,6 +1115,7 @@ export class DefaultMQProducer {
     sendCallback: SendCallback | null,
     timeoutMillis: number,
   ): Promise<SendResult | null> {
+    const beginTimestamp = Date.now();
     // sendSelectImpl validates via Validators.checkMessage before the route
     // lookup.
     Validators.checkMessage(msg, this.maxMessageSize);
@@ -1097,8 +1129,11 @@ export class DefaultMQProducer {
     }
     const mq = selector.select(msg, tpInfo.msgQueueList, arg);
     if (mq == null) throw new MQClientException('failed to select a message queue');
+    // Route lookup and the selector are part of the caller's budget too.
+    const costTime = Date.now() - beginTimestamp;
+    if (timeoutMillis < costTime) throw new RemotingTooMuchRequestException('sendSelectImpl call timeout');
     this.tryToCompressMessage(msg);
-    const r = await this._sendWithHooks(msg, mq, communicationMode, sendCallback, tpInfo);
+    const r = await this._sendWithHooks(msg, mq, communicationMode, sendCallback, tpInfo, timeoutMillis - costTime);
     if (communicationMode === CommunicationMode.SYNC) {
       if (r == null) throw new MQClientException('null send result');
       return r;
@@ -1374,7 +1409,7 @@ export class DefaultMQProducer {
         } else {
           future.setSendRequestOk(true);
         }
-      }, null as unknown as TopicPublishInfo);
+      }, null as unknown as TopicPublishInfo, timeoutMillis);
       return await this._waitResponse(msg, timeoutMillis, future, Date.now() - begin);
     } finally {
       REQUEST_FUTURE_HOLDER.removeRequest(correlationId);
@@ -1482,7 +1517,7 @@ export class DefaultMQProducer {
         } else {
           future.setSendRequestOk(true);
         }
-      }, null as unknown as TopicPublishInfo);
+      }, null as unknown as TopicPublishInfo, timeoutMillis);
     } catch (e) {
       future.setCause(e as Error);
       this._requestFail(correlationId);

@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **66** modules under `src/` and then runs the **51** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-29, **1705** individually counted checks across 46 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **66** modules under `src/` and then runs the **52** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-30, **1717** individually counted checks across 47 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -70,6 +70,8 @@ node --experimental-strip-types selfcheck.ts
 | `test/pull_schedule_smoke.ts` | 43 passed / 0 failed |
 | `test/pull_stats_contract_smoke.ts` (pull-path PULL_RT/PULL_TPS booking: only FOUND rounds book latency — NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL / error / timeout rounds book nothing; throughput is fed the post-filter (second tag pass + FilterMessageHook) row count, and a FOUND round whose rows are all dropped books RT with zero TPS) | 28 checks passed |
 | `test/rebalance_change_smoke.ts` (a rebalance round whose per-topic assignment set moved pays, in order: only the moved topics get a fresh subscription version → the topic budgets are divided over the queues this round owns → one immediate heartbeat → the queue listener fires for the moved topics only; an unchanged round and a self-heal rebuild owe nothing) | 32 checks passed |
+| `test/send_back_fallback_smoke.ts` (send-back fallback: a refused CONSUMER_SEND_MSG_BACK degrades to a plain send to `%RETRY%<group>` through the internal producer — the retry copy carries RETRY_TOPIC / RECONSUME_TIME / MAX_RECONSUME_TIMES / ORIGIN_MESSAGE_ID / DELAY, drops the half-message marker and leaves the source untouched; on push a refused answer, a transport error and a missing master each fall back to exactly one retry send, -1 reports 16 on the wire and the RPC keeps its 5000 ms budget; a fallback that fails too reports the original error; the orderly path sends the same copy; on pull the refused answer takes a 3000 ms RPC and the `maxReconsumeTimes` knob moves what the request carries; pull shutdown tears the lazily built fallback producer down) | 103 passed / 0 failed |
+| `test/send_timeout_contract_smoke.ts` (send timeout: one caller budget per call, each attempt charges the time already spent; an exhausted budget throws `sendDefaultImpl call timeout` and a selector that overran it throws `sendSelectImpl call timeout`, neither sending anything; `sendMsgMaxTimeoutPerRequest` caps only an attempt that still has a retry behind it, never the last one, and defaults to -1; the explicit timeout reaches the transport) | 12 passed / 0 failed |
 | `test/smoke.ts` (frame / transport / ACL signing) | 6 check groups passed |
 | `test/socks_smoke.ts` (SOCKS proxy handshake + proxied connect) | 51 passed / 0 failed |
 | `test/static_topic_smoke.ts` | 29 passed / 0 failed |
@@ -414,7 +416,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 51 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 52 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

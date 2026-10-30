@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **51** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-29 实测 **ALL GREEN**，其中 46 套逐条计出 **1705** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **52** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-30 实测 **ALL GREEN**，其中 47 套逐条计出 **1717** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -70,6 +70,8 @@ node --experimental-strip-types selfcheck.ts
 | `test/pull_schedule_smoke.ts` | 43 通过 / 0 失败 |
 | `test/pull_stats_contract_smoke.ts`（pull 路径 PULL_RT/PULL_TPS 记账：只有 FOUND 轮计入延迟——NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL / 报错 / 超时轮什么都不记；吞吐只按交付前过滤（二次 tag + FilterMessageHook）改写后的行数计，全部被滤掉的 FOUND 轮记 RT 而 TPS 为零） | 28 项检查通过 |
 | `test/rebalance_change_smoke.ts`（分配集合改变的轮次按序补齐：只给变动的 topic 重打订阅版本 → 再把 topic 预算除以本轮自有队列数 → 立刻心跳 → 只向变动的 topic 触发队列监听；集合未变与自愈重建轮什么都不欠） | 32 项检查通过 |
+| `test/send_back_fallback_smoke.ts`（送回兜底：被拒的 CONSUMER_SEND_MSG_BACK 降级为经内部生产者发往 `%RETRY%<group>` 的普通发送，retry 副本带 RETRY_TOPIC / RECONSUME_TIME / MAX_RECONSUME_TIMES / ORIGIN_MESSAGE_ID / DELAY，丢掉半消息标记且不动源消息；push 的被拒应答 / 传输错误 / 缺 master 各降级为一次重试发送，-1 在线上报 16、RPC 仍是 5000ms；兜底也失败时报最初错误；顺序消费走同一个副本；pull 的拒绝应答按 3000ms RPC、`maxReconsumeTimes` 旋钮改请求携带值；pull 停机拆掉惰性兜底生产者） | 103 通过 / 0 失败 |
+| `test/send_timeout_contract_smoke.ts`（发送超时：每次调用一条预算，逐次尝试扣掉已花时间；预算耗尽抛 `sendDefaultImpl call timeout`、选择器耗时超预算抛 `sendSelectImpl call timeout`，两者都不再发出请求；`sendMsgMaxTimeoutPerRequest` 只收紧还剩重试的那次尝试、末次不受限，默认 -1 不设上限；显式超时一路传到传输层） | 12 通过 / 0 失败 |
 | `test/smoke.ts`（协议帧/传输/ACL 签名） | 6 组检查通过 |
 | `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
 | `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
@@ -411,7 +413,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 51 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 52 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 
