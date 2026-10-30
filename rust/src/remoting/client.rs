@@ -229,6 +229,10 @@ impl Connection {
     }
 }
 
+/// Called once for every NEWLY established connection, with the address it was opened to.
+/// A reused connection does not fire it again.
+pub type ChannelListener = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct Inner {
     config: RemotingClientConfig,
     state: Mutex<State>,
@@ -236,6 +240,7 @@ struct Inner {
     connect_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     hooks: RwLock<Vec<Arc<dyn RPCHook>>>,
     processors: RwLock<HashMap<i32, Arc<dyn RequestProcessor>>>,
+    channel_listeners: RwLock<Vec<ChannelListener>>,
     running: AtomicBool,
     /// tokio handle bound only when a spawn is first needed (`None` means not bound yet).
     /// `RemotingClient` may be constructed outside a tokio runtime,
@@ -284,6 +289,7 @@ impl RemotingClient {
                 connect_gates: Mutex::new(HashMap::new()),
                 hooks: RwLock::new(Vec::new()),
                 processors: RwLock::new(HashMap::new()),
+                channel_listeners: RwLock::new(Vec::new()),
                 running: AtomicBool::new(true),
                 handle: OnceLock::new(),
                 channel_idle_timeout_ms: AtomicI64::new(channel_idle_timeout_ms),
@@ -387,6 +393,23 @@ impl RemotingClient {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&request_code)
+    }
+
+    /// Registers a callback fired once per newly established connection.
+    pub fn register_channel_listener(&self, listener: ChannelListener) {
+        self.inner
+            .channel_listeners
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(listener);
+    }
+
+    pub fn channel_listener_count(&self) -> usize {
+        self.inner
+            .channel_listeners
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     pub async fn invoke_sync(
@@ -908,7 +931,28 @@ async fn get_or_create(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>
     inserted.touch();
     drop(state);
     ensure_sweeper(inner);
+    // Fired only for the task that inserted the connection, and after the connect gate is
+    // released: a listener that sends through this transport re-enters `get_or_create` for
+    // the same address and would otherwise wait on a gate held by its own task.
+    drop(_guard);
+    fire_channel_active(inner, addr);
     Ok(inserted)
+}
+
+/// Runs every registered listener on a fresh connection. A listener that panics or blocks is the
+/// listener's own problem: the connection is already usable and the send path must not see it.
+fn fire_channel_active(inner: &Arc<Inner>, addr: &str) {
+    let listeners = inner
+        .channel_listeners
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for listener in listeners {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(addr)));
+        if result.is_err() {
+            rmq_warn!("channel listener for {} panicked", addr);
+        }
+    }
 }
 
 fn connect_gate(inner: &Arc<Inner>, addr: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1646,6 +1690,102 @@ mod tests {
         client.shutdown();
     }
 
+
+    #[tokio::test]
+    async fn channel_listener_fires_once_per_new_connection() {
+        let (addr, _server) = echo_server().await;
+        let client = RemotingClient::new();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        client.register_channel_listener(Arc::new(move |addr: &str| {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(addr.to_string())
+        }));
+        assert_eq!(client.channel_listener_count(), 1);
+
+        let mut first = request(request_code::SEND_MESSAGE, "first");
+        client
+            .invoke_sync(&addr, &mut first, Some(3000))
+            .await
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![addr.clone()],
+            "a new connection reports its own address exactly once"
+        );
+
+        let mut second = request(request_code::SEND_MESSAGE, "second");
+        client
+            .invoke_sync(&addr, &mut second, Some(3000))
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "a reused connection does not fire the event again"
+        );
+
+        client.close_channel(&addr);
+        let mut third = request(request_code::SEND_MESSAGE, "third");
+        client
+            .invoke_sync(&addr, &mut third, Some(3000))
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            2,
+            "reconnecting opens a new connection and reports it"
+        );
+        client.shutdown();
+    }
+
+    /// The dial gate means concurrent first sends share one connection, so they must share one event.
+    #[tokio::test]
+    async fn concurrent_first_sends_report_one_connection() {
+        let (addr, _server) = echo_server().await;
+        let client = RemotingClient::new();
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        client.register_channel_listener(Arc::new(move |_: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let client = client.clone();
+            let addr = addr.clone();
+            handles.push(tokio::spawn(async move {
+                let mut cmd = request(request_code::SEND_MESSAGE, &format!("n{i}"));
+                client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        client.shutdown();
+    }
+
+    /// A listener that panics or blocks is the listener's own problem: the send already has its
+    /// connection, and every other listener still runs.
+    #[tokio::test]
+    async fn channel_listener_failure_does_not_fail_the_send() {
+        let (addr, _server) = echo_server().await;
+        let client = RemotingClient::new();
+        client.register_channel_listener(Arc::new(|_: &str| panic!("listener exploded")));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        client.register_channel_listener(Arc::new(move |_: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let mut cmd = request(request_code::SEND_MESSAGE, "survives");
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(3000))
+            .await
+            .unwrap();
+        assert_eq!(response.code, response_code::SUCCESS);
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "later listeners still run");
+        client.shutdown();
+    }
 
     /// Polls until the condition holds, at most 5s; panics on timeout (panicking is acceptable in tests).
     async fn wait_until(cond: impl Fn() -> bool, what: &str) {

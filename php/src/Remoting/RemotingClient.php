@@ -104,6 +104,9 @@ final class RemotingClient
     /** @var list<RPCHook> */
     private array $rpcHooks = [];
 
+    /** @var list<callable(string): void> called once per newly established connection */
+    private array $channelListeners = [];
+
     /** @var list<string> namesrv address list (round-robin / failover) */
     private array $nameServerList = [];
     private int $nameServerIndex = 0;
@@ -202,7 +205,30 @@ final class RemotingClient
         $this->conns[$addr] = $conn;
         $this->inBuffers[$addr] = '';
         $this->lastActivityMillis[$addr] = self::monoMillis();
+        $this->fireChannelActive($addr);
         return $conn;
+    }
+
+    /**
+     * Register a callback invoked once for every NEWLY established connection, with the
+     * address it was opened to. Reused connections do not fire it again.
+     *
+     * @param callable(string): void $listener
+     */
+    public function registerChannelListener(callable $listener): void
+    {
+        $this->channelListeners[] = $listener;
+    }
+
+    private function fireChannelActive(string $addr): void
+    {
+        foreach ($this->channelListeners as $listener) {
+            try {
+                $listener($addr);
+            } catch (\Throwable $e) {
+                Logger::warning(sprintf('channel listener for %s raised: %s', $addr, $e->getMessage()));
+            }
+        }
     }
 
     /**

@@ -575,6 +575,9 @@ func TestHeartbeatFanOutToMasterAndSlave(t *testing.T) {
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 	defer inst.Shutdown()
 	warmRoute(t, inst, "Tt")
+	// This test counts one beat per broker; the channel-active listener would
+	// add one re-registration beat when a first connection opens.
+	inst.SetEnableHeartbeatChannelEventListener(false)
 
 	stub := &stubConsumer{group: "CG", subs: []*remoting.SubscriptionData{
 		{Topic: "Tt", SubString: "*", ExpressionType: remoting.ExpressionTypeTag},

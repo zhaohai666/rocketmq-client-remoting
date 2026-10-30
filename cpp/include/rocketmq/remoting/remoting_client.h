@@ -64,6 +64,12 @@ public:
     using RequestProcessor = std::function<std::optional<RemotingCommand>(
         const RemotingCommand&, const std::string&)>;
 
+    // Told when a connection has just been established, so a caller can re-register
+    // per-connection broker state (a consumer group's heartbeat) without waiting for the next
+    // periodic round. The broker drops a consumer group when the last channel of that group
+    // closes, so after a reconnect the group is unknown to it again until the next heartbeat.
+    using ChannelListener = std::function<void(const std::string& addr)>;
+
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
     // A connection that has carried neither a read nor a write for this long is closed by the
@@ -102,6 +108,10 @@ public:
 
     bool registerRPCHook(std::shared_ptr<RPCHook> hook);
     void unregisterRPCHook();
+
+    // Register a channel listener (see ChannelListener). Listeners are fired outside the
+    // connection lock: one that sends a request takes the same lock through the send path.
+    void registerChannelListener(ChannelListener listener);
 
     void setTlsEnable(bool enable);
     bool tlsEnable() const;

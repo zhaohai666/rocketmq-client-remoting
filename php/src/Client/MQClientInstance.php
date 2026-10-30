@@ -278,6 +278,15 @@ class MQClientInstance
      */
     public bool $enableConcurrentHeartbeat = false;
 
+    /**
+     * Channel-active re-registration (default true). When a new connection to a known broker is
+     * established, the instance beats that broker immediately so the broker's ConsumerManager
+     * learns this clientId's groups again after a reconnect, then wakes every consumer's
+     * rebalance. The broker drops a group when its last channel closes; without this the group
+     * stays unknown there until the next periodic beat.
+     */
+    public bool $enableHeartbeatChannelEventListener = true;
+
     /** Worker count of the concurrent heartbeat pool, default = available processors. */
     public int $concurrentHeartbeatThreadPoolSize;
 
@@ -474,6 +483,11 @@ class MQClientInstance
             RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
             \Closure::fromCallable([$this, 'processNotifyConsumerIdsChanged']),
         );
+        // Channel-active re-registration: a reconnect must restore this clientId's groups at
+        // the broker before the next periodic beat (see onChannelActive).
+        $this->remotingClient->registerChannelListener(
+            \Closure::fromCallable([$this, 'onChannelActive']),
+        );
 
         // Dynamic name server (DefaultTopAddressing pulls the address list by domain). When
         // ROCKETMQ_NAMESRV_DOMAIN is not configured, wsAddr is an empty string -> fetch is a no-op.
@@ -567,6 +581,39 @@ class MQClientInstance
     public function isCloseChannelOnSyncTimeout(): bool
     {
         return $this->closeChannelOnSyncTimeout;
+    }
+
+    /** Turn channel-active re-registration on or off (see the field's contract). */
+    public function setEnableHeartbeatChannelEventListener(bool $enable): void
+    {
+        $this->enableHeartbeatChannelEventListener = $enable;
+    }
+
+    public function isEnableHeartbeatChannelEventListener(): bool
+    {
+        return $this->enableHeartbeatChannelEventListener;
+    }
+
+    /**
+     * A connection to $addr has just been established. Re-send this instance's registration to
+     * the broker when the address is one it knows, then wake every registered consumer's
+     * rebalance. Unknown addresses, an empty consumer table and the switch off all make it a
+     * no-op.
+     */
+    public function onChannelActive(string $addr): void
+    {
+        if (!$this->enableHeartbeatChannelEventListener) {
+            return;
+        }
+        if ($this->consumerTable === [] || !in_array($addr, $this->getAllBrokerAddrs(), true)) {
+            return;
+        }
+        try {
+            $this->sendHeartbeat($addr, $this->buildHeartbeatData());
+        } catch (\Throwable $e) {
+            Logger::debug(sprintf('channel-active heartbeat to %s failed: %s', $addr, $e->getMessage()));
+        }
+        $this->rebalanceImmediately();
     }
 
     /** Resize the concurrently dispatching heartbeat pool when it already exists. */

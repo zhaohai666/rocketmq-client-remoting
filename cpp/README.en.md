@@ -54,15 +54,15 @@ This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq
 
 ```
 100% tests passed out of 74
-Total Test time (real) = 197.80 sec   # ctest --output-on-failure, serial
+Total Test time (real) = 158.86 sec   # ctest --output-on-failure, serial
 ```
 
 The 74 cases are the 73 test binaries plus 1 codec-interop case. Assertions are summed from
 each binary's own summary line (the wording differs per binary — `N checks, M failures`,
 `N passed, M failed`, `PASS=n FAIL=m`, `[PASS] n checks, [FAIL] m`, `checks=n fails=m`,
 `ALL PASS (n checks)` and a few more variants): running all 73
-serially gives **8,549 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
-**8,622 assertions in total**.
+serially gives **8,567 checks, 0 failures**; `tests/interop_check.py` adds **73 PASS** —
+**8,640 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -545,6 +545,13 @@ reader thread and the caller's writing thread overlap on the same SSL session).
   connection event; and a synchronous invoke that runs out of time closes the connection it went
   out on unless `setCloseSocketOnSyncTimeout(false)` turns that off, while a send that fails
   outright always closes regardless of the switch
+- ✅ Consumer re-registration: as soon as a connection to a broker in the route table is newly
+  established, the instance sends one heartbeat over it right away to re-file every consumer
+  group's subscriptions under this clientId, and wakes a rebalance round. Switch
+  `setEnableHeartbeatChannelEventListener()` (default on); off, registration only happens on the
+  periodic heartbeat round. A name-server connection, an address absent from the route table, and an
+  instance holding no consumer group each send nothing, and cases pin the re-registration, those
+  three exclusions and the silence when the switch is off
 - ✅ TLS: test mode, strict CA verification, mTLS
 - ✅ Producer: normal / FIFO (selector and pinned) / delayed and timer / transactional / batch /
   oneway / true async / async back pressure / automatic batching / request-reply / timer recall /

@@ -200,6 +200,13 @@ public sealed class MQClientInstance : IDisposable
 
     private int _concurrentHeartbeatThreadPoolSize = Environment.ProcessorCount;
 
+    /// <summary>Whether a newly established connection to a known broker immediately re-sends
+    /// the consumer heartbeat and wakes rebalance (default on). The broker drops a consumer
+    /// group once its last channel closes, so after a reconnect the group is unknown to that
+    /// broker until the next heartbeat arrives; without this the pull loop answers
+    /// SUBSCRIPTION_NOT_EXIST for up to a full heartbeat interval.</summary>
+    public bool EnableHeartbeatChannelEventListener { get; set; } = true;
+
     /// <summary>Page size sent as maxTopicNum / maxGroupNum by the admin paging loops.
     /// Default 2000.</summary>
     public int MaxPageSizeInGetMetadata
@@ -306,6 +313,8 @@ public sealed class MQClientInstance : IDisposable
         // ProcessNotifyUnsubscribeLite).
         _remotingClient.RegisterProcessor(RequestCode.NotifyUnsubscribeLite,
             ProcessNotifyUnsubscribeLite);
+
+        _remotingClient.RegisterChannelListener(OnChannelActive);
     }
 
     /// <summary>
@@ -369,6 +378,95 @@ public sealed class MQClientInstance : IDisposable
                 ClientLog.Warn("rebalanceImmediately failed: " + e.Message);
             }
         }
+    }
+
+    // Per-group "re-register with one broker" callbacks, provided by the consumers that
+    // hold a registration with the shared instance (see OnChannelActive).
+    private readonly object _consumerHeartbeatLock = new();
+    private readonly Dictionary<string, Func<string, int>> _consumerHeartbeats = new(StringComparer.Ordinal);
+
+    public void RegisterConsumerHeartbeat(string group, Func<string, int> heartbeat)
+    {
+        lock (_consumerHeartbeatLock)
+        {
+            _consumerHeartbeats[group] = heartbeat;
+        }
+    }
+
+    public void UnregisterConsumerHeartbeat(string group)
+    {
+        lock (_consumerHeartbeatLock)
+        {
+            _consumerHeartbeats.Remove(group);
+        }
+    }
+
+    /// <summary>A connection to <paramref name="addr"/> has just been established: re-register
+    /// every consumer group with that broker. The broker drops a consumer group when the last
+    /// channel of that group closes, so after a reconnect the group is unknown there until the
+    /// next heartbeat; without this the pull loop would answer SUBSCRIPTION_NOT_EXIST for up to
+    /// a full heartbeat interval. The reaction runs on a background thread so the caller that
+    /// just opened the connection is not held up.</summary>
+    private void OnChannelActive(string addr)
+    {
+        if (!EnableHeartbeatChannelEventListener)
+        {
+            return;
+        }
+
+        if (!IsKnownBrokerAddr(addr))
+        {
+            return;
+        }
+
+        var thread = new Thread(() => ReRegisterOnChannelActive(addr))
+        {
+            IsBackground = true,
+            Name = "rmq-channel-active-" + addr,
+        };
+        thread.Start();
+    }
+
+    private bool IsKnownBrokerAddr(string addr)
+    {
+        lock (_routeLock)
+        {
+            foreach (SortedDictionary<long, string> brokerAddrs in _brokerAddrTable.Values)
+            {
+                foreach (string one in brokerAddrs.Values)
+                {
+                    if (string.Equals(one, addr, StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void ReRegisterOnChannelActive(string addr)
+    {
+        Func<string, int>[] heartbeats;
+        lock (_consumerHeartbeatLock)
+        {
+            heartbeats = _consumerHeartbeats.Values.ToArray();
+        }
+
+        foreach (Func<string, int> heartbeat in heartbeats)
+        {
+            try
+            {
+                heartbeat(addr);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Debug("channel-active heartbeat to " + addr + " failed: " + e.Message);
+            }
+        }
+
+        RebalanceImmediately();
     }
 
     public RemotingCommand? ProcessNotifyConsumerIdsChanged(RemotingCommand cmd, string addr)

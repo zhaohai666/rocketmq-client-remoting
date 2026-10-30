@@ -24,11 +24,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # 顶层包：client / common / remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1780 passed, 4 skipped（148.0s）
+.venv/bin/python -m pytest tests/ -q           # 1787 passed, 4 skipped（151.12s）
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` 收集 1784 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
+- `pytest` 收集 1791 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
   `tests/test_protocol_alignment.py`（可选的协议常量比对守卫，默认不启用）。
 - `selfcheck.py` 是 7 项协议编解码回环自检（JSON 头 / 二进制头 / V2 短字段头 /
   17 段存储格式 / 长 topic V2 magic / 6 段批量格式 / ACL 签名注入），无需集群；
@@ -380,6 +380,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 | 压缩三后端：zlib（标准库）/ LZ4 / ZSTD | ✅ |
 | TLS（含 mTLS、严格 CA 校验） | ✅ |
 | 连接生命周期：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`is_channel_writable` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有发送缓冲塞满的活连接才报不可写；清扫线程关掉既没有成功读、也没有完成写、静默严格超过 `channel_not_active_interval_millis`（默认 120000；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步调用等满自己的超时后，`enable_close_channel_on_sync_timeout` 开着（默认 true）就关掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论旋钮开合一律关通道 | ✅ |
+| 消费者重注册：向路由表里的某个 Broker 新建一条连接后，实例立刻顺着这条连接补发一次心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮 rebalance；开关 `set_enable_heartbeat_channel_event_listener()`（默认开），关掉后只按周期心跳注册。名字服务的连接、不在路由表里的地址、没有消费组的实例三种情况一条都不补发；用例分别钉住补发本身、这三条排除，以及关掉开关后的静默 | ✅ |
 | SOCKS 代理（SOCKS4/5、用户名密码子协商、CONNECT 隧道，TLS 可叠加） | ✅ |
 | 动态 NameServer 取址（`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`） | ✅ |
 | 发送延迟故障规避（`set_send_latency_fault_enable`）与主从切换 | ✅ |
@@ -517,7 +518,7 @@ python/
 ├── rocketmq_logging.py     日志桥接
 ├── selfcheck.py            无集群的协议编解码回环自检（7 项）
 ├── __main__.py             命令行入口（python -m selfcheck）
-├── tests/                  1784 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
+├── tests/                  1791 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
 ├── verify_*_live.py        真机联调脚本（见「真实集群联调」）
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  联调辅助脚本
 ├── pyproject.toml          零运行时依赖；requires-python >= 3.8

@@ -487,6 +487,11 @@ void DefaultMQPushConsumer::start() {
     // Instead each consumer registers a "wake up" callback with the instance, which fans it out on receipt.
     // The callback runs on the remoting read thread and only sets a flag + notifies; it issues no RPC.
     mqClient_->registerRebalanceWakeup(consumerGroup_, [this] { this->wakeRebalanceLoop(); });
+    // The broker drops this group when the last channel of it closes, so a reconnect must
+    // re-register at once instead of waiting for the next heartbeat round.
+    mqClient_->setEnableHeartbeatChannelEventListener(enableHeartbeatChannelEventListener_);
+    mqClient_->registerConsumerHeartbeat(
+        consumerGroup_, [this](const std::string& addr) { return this->sendHeartbeatToBroker(addr); });
 
     // GET_CONSUMER_RUNNING_INFO(307):
     // admin / broker queries this consumer's running info; replies with a ConsumerRunningInfo JSON body.
@@ -747,6 +752,7 @@ void DefaultMQPushConsumer::shutdown() {
         // The wake-up callback captured this: consume threads are all joined, so remove the callback first; during what
         // remains (unregister client, close connections) a broker push of code 40 can no longer call into a half-dead thread.
         mqClient_->unregisterRebalanceWakeup(consumerGroup_);
+        mqClient_->unregisterConsumerHeartbeat(consumerGroup_);
         // Same rule as the wake-up callback: these four handlers capture this, and a
         // broker request landing after the consume threads are joined would otherwise
         // call into a half-dead consumer. Only this group's entries go, so a sibling
@@ -4099,6 +4105,37 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq) {
 }
 
 // ---------------------------------------------------------------- Heartbeat
+HeartbeatData DefaultMQPushConsumer::buildHeartbeat() const {
+    HeartbeatData hb(clientId_);
+    ConsumerData cd;
+    cd.groupName = consumerGroup_;
+    cd.consumeType = ConsumeType::CONSUME_PASSIVELY;
+    cd.messageModel = messageModel_;
+    cd.consumeFromWhere = consumeFromWhere_;
+    // The heartbeat's ConsumerData carries unitMode (the setUnitMode semantics):
+    // the broker uses it to decide whether the %RETRY% topic it creates gets the UNIT_SUB flag
+    cd.unitMode = unitMode_;
+    {
+        std::lock_guard<std::mutex> lk(lock_);
+        for (const auto& kv : subscriptionData_) {
+            cd.addSubscriptionData(kv.second);
+        }
+    }
+    // Keep fingerprint = 0 so the broker takes the V1 registration path (registers the full subscriptionDataSet);
+    // withoutSub is only read on the V2 path (fingerprint != 0), so its default false is fine here.
+    hb.heartbeatFingerprint = 0;
+    hb.addConsumerData(cd);
+    return hb;
+}
+
+int32_t DefaultMQPushConsumer::sendHeartbeatToBroker(const std::string& addr) {
+    if (mqClient_ == nullptr) {
+        return 0;
+    }
+    mqClient_->sendHeartbeat(addr, buildHeartbeat());
+    return 1;
+}
+
 int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     if (mqClient_ == nullptr) {
         return 0;
@@ -4121,26 +4158,7 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
         return 0;
     }
 
-    HeartbeatData hb(clientId_);
-    ConsumerData cd;
-    cd.groupName = consumerGroup_;
-    cd.consumeType = ConsumeType::CONSUME_PASSIVELY;
-    cd.messageModel = messageModel_;
-    cd.consumeFromWhere = consumeFromWhere_;
-    // The heartbeat's ConsumerData carries unitMode (the setUnitMode semantics):
-    // the broker uses it to decide whether the %RETRY% topic it creates gets the UNIT_SUB flag
-    cd.unitMode = unitMode_;
-    {
-        std::lock_guard<std::mutex> lk(lock_);
-        for (const auto& kv : subscriptionData_) {
-            cd.addSubscriptionData(kv.second);
-        }
-    }
-    // Keep fingerprint = 0 so the broker takes the V1 registration path (registers the full subscriptionDataSet);
-    // withoutSub is only read on the V2 path (fingerprint != 0), so its default false is fine here.
-    hb.heartbeatFingerprint = 0;
-    hb.addConsumerData(cd);
-
+    HeartbeatData hb = buildHeartbeat();
     int32_t okCount = 0;
     if (mqClient_->isEnableConcurrentHeartbeat()) {
         okCount = mqClient_->sendHeartbeatConcurrently(hb);

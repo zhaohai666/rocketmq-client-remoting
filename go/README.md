@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 871 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 15 个真机联调工具与 875 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 540 | 53.7s |
-| `common` | 135 | 3.6s |
-| `remoting` | 196 | 4.9s |
-| **合计** | **871**（78 个 `*_test.go`） | ~62s |
+| `client` | 542 | 53.7s |
+| `common` | 135 | 3.8s |
+| `remoting` | 198 | 4.9s |
+| **合计** | **875**（80 个 `*_test.go`） | ~62s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -436,8 +436,9 @@ producer.SetTLSEnable(true)
 - ✅ 线协议：JSON 与私有二进制双序列化（`ROCKETMQ_SERIALIZE_TYPE`）、17 段存储格式与
   6 段批量格式、V2 单字母短键 header、心跳与订阅关系、请求码 / 响应码 / 语言码常量
 - ✅ 传输：长连接复用、半包粘包重组、opaque 匹配、超时、连接断开即在途请求判死、
-  `GO_AWAY`、同步 / 异步 / 单向、TLS
-- ✅ 连接生命周期，每条规则都有只跑本机回环 socket 的离线用例：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`IsChannelWritable` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有写请求因为塞不下而卡住的活连接才算不可写；清扫线程关掉既没读也没写、静默严格超过 `ClientConfig.ChannelIdleTimeoutSeconds`（默认 120；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步调用等满自己的超时后，`ClientConfig.CloseChannelOnSyncTimeout` 开着（默认 true）就丢掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留。写本身失败则无论旋钮开合，连接一律关掉
+  `GO_AWAY`、同步 / 异步 / 单向、TLS、新连接逐条通知（`RegisterChannelListener`）
+- ✅ 连接生命周期，每条规则都有只跑本机回环 socket 的离线用例：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`IsChannelWritable` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有写请求因为塞不下而卡住的活连接才算不可写；清扫线程关掉既没读也没写、静默严格超过 `ClientConfig.ChannelIdleTimeoutSeconds`（默认 120；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步调用等满自己的超时后，`ClientConfig.CloseChannelOnSyncTimeout` 开着（默认 true）就丢掉它发出去的那条连接——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留。写本身失败则无论旋钮开合，连接一律关掉；每新建一条连接就按地址逐个通知一次连接监听器——已有连接上的后续请求不再重复通知，断开重连会再通知一次，监听器里抛出的 panic 被就地兜住并记一条点名地址的 WARN，既不会把发出这条连接的那次调用打成错误，也不会无声无息
+- ✅ 消费者重注册：向路由表里的某个 Broker 新建一条连接后，实例立刻顺着这条连接补发一次心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮 rebalance；开关 `EnableHeartbeatChannelEventListener`（默认开，`SetEnableHeartbeatChannelEventListener` 可改），关掉后只按周期心跳注册。名字服务的连接、不在路由表里的地址、没有消费组的实例三种情况一条都不补发；用例分别钉住补发本身、这三条排除，以及关掉开关后的静默
 - ✅ 安全与多租：ACL 签名（`HmacSHA1`，标准库）、两套命名空间、单元化
   （`SetUnitName` / `SetUnitMode`）、`CheckForbiddenHook`
 - ✅ 压缩：ZLIB、LZ4、ZSTD 三型可发可收；ZSTD 解码是完整格式（含 FSE + Huffman），
@@ -548,7 +549,7 @@ go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk 
 - `OFFSET_ILLEGAL` 冻结重建、每队列三条拉取流控闸门（度量该队列持有的全部消息：未派发缓冲 +
   已交给监听器但尚未结算的批次；条数 / 消息体字节整除 MiB / 位点跨度都严格大于才停、阈值不做
   下限钳制、也没有「填 0 就关掉」，合法范围由启动校验把关；顺序消费完全不判跨度；topic 预算
-  在重平衡时摊到每队列）、POP 的待 ack 欠账闸门（严格大于 `PopThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）、心跳全景、六个分配策略目前只有单测与进程内假集群
+  在重平衡时摊到每队列）、POP 的待 ack 欠账闸门（严格大于 `PopThresholdForQueue`，默认 96，命中记进拉取路径同一个流控计数与告警节奏）、心跳全景（含新连接上补发的那一次重注册）、六个分配策略目前只有单测与进程内假集群
   覆盖，`examples/` 里还没有对应的真机工具。
 
 ## 目录结构
@@ -579,7 +580,7 @@ go/
 │   ├── inline_key_json_encode.go   允许内联对象做 map key 的出站 JSON 写器
 │   ├── bodies.go · common_bodies.go · consumer_bodies.go · admin_bodies.go · pop_bodies.go
 │   ├── client_info_bodies.go · subscription.go · heartbeat.go
-│   ├── client.go                   长连接传输：同步 / 异步 / 单向 + 半包 + TLS + 判死
+│   ├── client.go                   长连接传输：同步 / 异步 / 单向 + 半包 + TLS + 判死 + 新连接监听器
 │   └── acl.go · rpchooks.go · errors.go
 ├── client/                     SDK 层
 │   ├── instance.go                 客户端实例：路由发现、全部 RPC、心跳、周期任务
@@ -593,7 +594,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   78 个测试文件，871 个测试函数
+│   └── *_test.go                   80 个测试文件，875 个测试函数
 └── examples/                   17 个可执行工具（见「真实集群联调」）
 ```
 

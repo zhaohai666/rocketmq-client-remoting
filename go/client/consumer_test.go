@@ -975,6 +975,17 @@ func (f *clusterFixture) newConsumer(t *testing.T, group string, listener any, o
 	return f.newConsumerWithInstance(t, group, f.instName, listener, opts...)
 }
 
+// quietChannelReRegistration pre-creates this fixture's instance with the
+// channel-active re-registration switched off. Tests that hand a started
+// consumer a process queue the instance itself does not know about need it:
+// the re-registration beat also wakes rebalance, and that round drops the
+// hand-made queue as unassigned.
+func (f *clusterFixture) quietChannelReRegistration(t *testing.T) {
+	t.Helper()
+	CreateOrGetInstance(f.clientID, []string{f.nserver.addr}, testConfig()).
+		SetEnableHeartbeatChannelEventListener(false)
+}
+
 // newConsumerWithInstance is newConsumer with an explicit instance name — for
 // tests that need two consumers inside one group.
 func (f *clusterFixture) newConsumerWithInstance(t *testing.T, group, instanceName string,
@@ -1418,6 +1429,9 @@ func TestConsumerPartialAckCommitsWholeBatch(t *testing.T) {
 	const group = "GID_go_ack_index"
 
 	f := newClusterFixture(t, map[string]int{topic: 1, unpulled: 1})
+	// The batch below lives in a process queue the instance never assigned, so no
+	// unsolicited rebalance round may run while it is being consumed.
+	f.quietChannelReRegistration(t)
 	msgs := f.broker.add(topic, 0, "ack-0", "ack-1", "ack-2")
 	mq := common.NewMessageQueue(topic, "b1", 0)
 

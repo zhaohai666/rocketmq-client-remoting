@@ -152,6 +152,25 @@ public:
                                                              const RemotingCommand& cmd,
                                                              const std::string& addr);
     void rebalanceImmediately();
+    // A connection to this address has just been established: re-register every consumer group
+    // with that broker and wake rebalance. The broker drops a consumer group when the last
+    // channel of that group closes, so after a reconnect the group is unknown there until the
+    // next heartbeat; without this the pull loop answers SUBSCRIPTION_NOT_EXIST for up to a
+    // full heartbeat interval. Runs on the thread that opened the connection and does nothing
+    // for an address that is not a known broker or when the switch is off.
+    void onChannelActive(const std::string& addr);
+    // Per-group "re-register with one broker" callbacks, provided by the consumers that hold a
+    // registration with this instance (removed when the consumer shuts down).
+    void registerConsumerHeartbeat(const std::string& group,
+                                   std::function<int32_t(const std::string&)> heartbeat);
+    void unregisterConsumerHeartbeat(const std::string& group);
+    // Default on; see onChannelActive.
+    void setEnableHeartbeatChannelEventListener(bool enable) {
+        enableHeartbeatChannelEventListener_ = enable;
+    }
+    bool isEnableHeartbeatChannelEventListener() const {
+        return enableHeartbeatChannelEventListener_;
+    }
     // How many broker code-40 notifications have been received. Reverse requests can only be sent
     // by the broker and tests cannot inject one, so the counter is the only live assertion point.
     size_t consumerIdsChangedCount() const { return consumerIdsChangedCount_.load(); }
@@ -484,6 +503,10 @@ private:
     // group -> consumer "wakeup" callback (removed when the consumer shuts down, to avoid a dangling this)
     std::mutex rebalanceWakeupLock_;
     std::map<std::string, std::function<void()>> rebalanceWakeups_;
+    // group -> "send my heartbeat to one broker" callback (same lifetime rule as the wakeups)
+    std::mutex consumerHeartbeatLock_;
+    std::map<std::string, std::function<int32_t(const std::string&)>> consumerHeartbeats_;
+    std::atomic<bool> enableHeartbeatChannelEventListener_{true};
     // code -> (group -> handler). Same lifetime rule as the wakeups above: a consumer
     // removes its own entries at shutdown, and the instance clears the whole table.
     std::mutex consumerProcessorLock_;

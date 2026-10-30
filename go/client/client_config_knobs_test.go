@@ -92,6 +92,9 @@ func TestConcurrentHeartbeatDispatchUsesThePoolAndTheSerialControlDoesNot(t *tes
 		})))
 		inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, testConfig())
 		warmRoute(t, inst, "Tt")
+		// The channel-active listener would add one re-registration beat when
+		// the first connection opens; this test counts dispatch, not that.
+		inst.SetEnableHeartbeatChannelEventListener(false)
 		inst.RegisterConsumer("CG", &stubConsumer{group: "CG", subs: []*remoting.SubscriptionData{
 			{Topic: "Tt", SubString: "*", ExpressionType: remoting.ExpressionTypeTag},
 		}})

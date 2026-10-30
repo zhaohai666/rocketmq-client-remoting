@@ -458,3 +458,60 @@ def test_sync_timeout_keeps_the_connection_when_the_knob_is_off(caplog):
     finally:
         client.shutdown()
         peer.stop()
+
+
+# ---------- channel-active listeners ----------
+class _ChannelRecorder:
+    def __init__(self):
+        self.addrs: list = []
+
+    def on_channel_active(self, addr):
+        self.addrs.append(addr)
+
+
+def test_channel_active_fires_once_per_new_connection_and_again_after_a_reconnect():
+    """The event marks "this connection just came up", so a listener can restore the
+    per-connection broker state (a consumer group's heartbeat) without waiting for the next
+    periodic round. Reusing a live connection is not a new one and must not fire."""
+    peer = ScriptedPeer(mode="reply")
+    client = RemotingClient()
+    recorder = _ChannelRecorder()
+    client.register_channel_listener(recorder)
+    try:
+        client.invoke_sync(peer.addr, _request(), 2000)
+        assert recorder.addrs == [peer.addr]
+        # Reusing the live connection is not a new connection (the scripted peer answers one
+        # frame per connection, so ask the table directly instead of sending a second request).
+        client._get_or_create_conn(peer.addr)
+        assert recorder.addrs == [peer.addr], \
+            "an address that already has a live connection has nothing to announce"
+        assert peer.connect_count == 1
+
+        client.close_channel(peer.addr)
+        client.invoke_sync(peer.addr, _request(), 2000)
+        assert recorder.addrs == [peer.addr, peer.addr], \
+            "a reconnect is a new connection and has to be announced again"
+        assert peer.connect_count == 2
+    finally:
+        client.shutdown()
+        peer.stop()
+
+
+def test_a_raising_channel_listener_does_not_break_the_invoke(caplog):
+    peer = ScriptedPeer(mode="reply")
+    client = RemotingClient()
+
+    class _Broken:
+        def on_channel_active(self, addr):
+            raise RuntimeError("listener exploded")
+
+    client.register_channel_listener(_Broken())
+    try:
+        with caplog.at_level(logging.WARNING):
+            response = client.invoke_sync(peer.addr, _request(), 2000)
+        assert response.code == ResponseCode.SUCCESS, "the request still completes"
+        assert "channel listener" in _messages(caplog, logging.WARNING), \
+            "the listener failure is reported instead of swallowed"
+    finally:
+        client.shutdown()
+        peer.stop()

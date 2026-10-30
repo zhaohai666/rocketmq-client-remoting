@@ -789,4 +789,81 @@ public class TransportContractTests
         Assert.False(justAbove.Alive, "one millisecond above the floor is a close, not a keep");
         Assert.Equal(1, justAbove.CloseWarns);
     }
+
+    // ------------------------------------------------------------------ channel listeners
+
+    /// <summary>
+    /// A channel listener is a "this connection is new" event, not a "this address is used"
+    /// event: reusing a live connection must not fire it again, and a reconnect must. That
+    /// distinction is what keeps a re-registration reaction to one heartbeat per reconnect
+    /// instead of one per request.
+    /// </summary>
+    [Fact]
+    public void ChannelListenerFiresOncePerNewConnectionAndAgainAfterAReconnect()
+    {
+        using var peer = new Peer(PeerMode.Echo);
+        using var client = new RemotingClient(ConnectTimeoutMillis, InvokeTimeoutMillis);
+        var seen = new List<string>();
+        client.RegisterChannelListener(addr =>
+        {
+            lock (seen)
+            {
+                seen.Add(addr);
+            }
+        });
+
+        Assert.Equal(ResponseCode.Success, client.InvokeSync(peer.Address, HeartBeat()).Code);
+        WaitUntil(() =>
+        {
+            lock (seen)
+            {
+                return seen.Count == 1;
+            }
+        });
+        lock (seen)
+        {
+            Assert.Equal(new[] { peer.Address }, seen.ToArray());
+        }
+
+        // The same live connection: the second request reuses it and fires nothing.
+        Assert.Equal(ResponseCode.Success, client.InvokeSync(peer.Address, HeartBeat()).Code);
+        Assert.Equal(1, peer.Connections);
+        Assert.Single(seen);
+
+        // A closed connection forces a reconnect, and the listener fires for it.
+        client.CloseChannel(peer.Address);
+        Assert.Equal(ResponseCode.Success, client.InvokeSync(peer.Address, HeartBeat()).Code);
+        WaitUntil(() =>
+        {
+            lock (seen)
+            {
+                return seen.Count == 2;
+            }
+        });
+        lock (seen)
+        {
+            Assert.Equal(2, seen.Count);
+        }
+
+        Assert.Equal(2, peer.Connections);
+    }
+
+    /// <summary>A listener is an observer: its failure is logged and the invoke that opened the
+    /// connection still succeeds.</summary>
+    [Fact]
+    public void AThrowingChannelListenerDoesNotBreakTheInvoke()
+    {
+        using var peer = new Peer(PeerMode.Echo);
+        using var client = new RemotingClient(ConnectTimeoutMillis, InvokeTimeoutMillis);
+        client.RegisterChannelListener(addr =>
+            throw new InvalidOperationException("listener blew up for " + addr));
+
+        using var log = new LogCapture("channel_listener");
+        Assert.Equal(ResponseCode.Success, client.InvokeSync(peer.Address, HeartBeat()).Code);
+        WaitUntil(() => log.LinesWith("channel listener", peer.Address).Count == 1);
+
+        List<string> lines = log.LinesWith("channel listener", peer.Address);
+        Assert.Single(lines);
+        Assert.Contains("listener blew up", lines[0]);
+    }
 }

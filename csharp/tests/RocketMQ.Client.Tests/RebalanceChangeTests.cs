@@ -167,6 +167,11 @@ public class RebalanceChangeTests
             c.PullThresholdSizeForTopic = -1;
             Cluster.SetReplyBody(RequestCode.GetConsumerListByGroup, _ =>
                 CidBody(new[] { c.ClientId }.Concat(rivalCids).ToArray()));
+            // Every case here counts the beats of one round it triggers itself. Opening a
+            // connection re-registers the group and wakes a round of its own, which would pay
+            // its beat between the pin and the assert; the switch's own contract belongs to the
+            // re-registration suite, not to this file.
+            c.EnableHeartbeatChannelEventListener = false;
             c.Start();
             return c;
         }

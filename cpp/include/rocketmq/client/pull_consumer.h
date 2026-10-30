@@ -141,6 +141,15 @@ public:
     void shutdown();
 
     int32_t sendHeartbeatToAllBroker();
+    // Re-register with one broker when a connection to it has just been established (public for tests).
+    int32_t sendHeartbeatToBroker(const std::string& addr);
+    // Default on: re-register with a broker as soon as a connection to it comes up.
+    void setEnableHeartbeatChannelEventListener(bool enable) {
+        enableHeartbeatChannelEventListener_ = enable;
+    }
+    bool isEnableHeartbeatChannelEventListener() const {
+        return enableHeartbeatChannelEventListener_;
+    }
 
     std::vector<MessageQueue> fetchSubscribeMessageQueues(const std::string& topic);
 
@@ -269,6 +278,7 @@ private:
 
     bool heartbeatEnabled_ = true;
     int32_t heartbeatBrokerIntervalMillis_ = 30000;
+    bool enableHeartbeatChannelEventListener_ = true;
     std::atomic<int32_t> heartbeatCount_{0};
     std::atomic<bool> heartbeatStop_{false};
     std::thread heartbeatThread_;

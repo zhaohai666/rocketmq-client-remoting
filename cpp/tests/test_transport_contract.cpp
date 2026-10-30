@@ -2,7 +2,7 @@
 //
 //   ctest -R transport_contract
 //
-// Five behaviours, each measured on a real socket this process owns, and each asserted on two
+// Seven behaviours, each measured on a real socket this process owns, and each asserted on two
 // things at once: the connection table afterwards, and the log line that has to explain it.
 // "The frame vanished and nothing was said" is the defect under test here, so a leg that only
 // checks the table proves half of it.
@@ -21,6 +21,9 @@
 //      sweep off, because the sweep is always installed.
 //   T5 a synchronous wait that runs out closes the connection it went out on by default and
 //      keeps it when that is turned off; an expired in-flight entry logs one line per entry.
+//   T6 the close-on-timeout floors: a zero budget keeps the socket, one millisecond above closes.
+//   T7 a channel listener is told once per connection that comes up, again after a reconnect,
+//      and a listener that throws neither fails the invoke nor goes unmentioned in the log.
 //
 // Every wait has an explicit bound, and every peer thread exits within 100 ms of the stop flag
 // (polling select rather than a bare blocking call), so a parked leg shows up as a FAIL line
@@ -34,6 +37,7 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -714,6 +718,68 @@ void testSyncTimeoutCloseRuleFloors() {
     CHECK(justAbove.closeWarns == 1, "T6 floor: and the close is logged once");
 }
 
+// ------------------------------------------------------------------ T7
+// A channel listener is told once per connection that comes up -- not once per request on a
+// connection that already existed -- and a listener that throws must not fail the invoke that
+// opened the connection.
+void invokeOnce(RemotingClient& client, const std::string& addr) {
+    RemotingCommand req = heartBeat();
+    client.invokeSync(addr, req, kInvokeTimeoutMs);
+}
+
+void testChannelListenerPerConnection() {
+    std::cout << "[contract] T7 channel listener\n";
+    Peer peer(PeerMode::Echo);
+    RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
+
+    std::mutex lock;
+    std::vector<std::string> seen;
+    client.registerChannelListener([&](const std::string& addr) {
+        std::lock_guard<std::mutex> lk(lock);
+        seen.push_back(addr);
+    });
+    auto events = [&]() {
+        std::lock_guard<std::mutex> lk(lock);
+        return seen;
+    };
+
+    invokeOnce(client, peer.address());
+    invokeOnce(client, peer.address());
+    CHECK(events().size() == 1, "T7: the first connection fires the listener exactly once");
+    CHECK(peer.connections() == 1, "T7: the second request reused the connection");
+
+    client.closeChannel(peer.address());
+    CHECK(waitFor([&]() { return peer.clientCloses() >= 1; }, 5000),
+          "T7: the close reaches the peer before the reconnect is asserted");
+    invokeOnce(client, peer.address());
+    CHECK(events().size() == 2, "T7: a new connection after a close fires the listener again");
+    CHECK(peer.connections() == 2, "T7: and that really was a second connection");
+    CHECK(!events().empty() && events().back() == peer.address(),
+          "T7: the listener is told which address came up");
+    client.shutdown();
+}
+
+void testThrowingChannelListenerDoesNotBreakTheInvoke() {
+    std::cout << "[contract] T7 throwing listener\n";
+    Peer peer(PeerMode::Echo);
+    RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
+    client.registerChannelListener([](const std::string&) {
+        throw std::runtime_error("listener blew up");
+    });
+
+    resetLogCapture("t7");
+    RemotingCommand req = heartBeat();
+    bool answered = false;
+    try {
+        answered = client.invokeSync(peer.address(), req, kInvokeTimeoutMs).isResponseType();
+    } catch (const std::exception&) {
+    }
+    const auto warns = linesWith({"WARN", "channel listener", peer.address(), "listener blew up"});
+    CHECK(answered, "T7: a throwing listener does not fail the invoke that opened the connection");
+    CHECK(warns.size() == 1, "T7: the throw is reported once, naming the address and the reason");
+    client.shutdown();
+}
+
 }  // namespace
 
 int main() {
@@ -727,6 +793,8 @@ int main() {
     testExpiredEntriesWarnOneEach();
     testSyncTimeoutClosesTheConnection();
     testSyncTimeoutCloseRuleFloors();
+    testChannelListenerPerConnection();
+    testThrowingChannelListenerDoesNotBreakTheInvoke();
     setLogFile("");  // back to the default target once the legs are done
 
     std::cout << "\ntransport contract: " << g_pass << " checks, " << g_fail << " failed\n";

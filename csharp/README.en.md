@@ -14,7 +14,7 @@ It talks straight to the NameServer (route discovery, dynamic addressing) and to
 - One library covers the producer, the Push / Pull / LitePull consumers, the admin client,
   message tracing, ACL and TLS.
 - Every capability is verified against a real RocketMQ 5.5.1 cluster (namesrv 9876 + broker 10911);
-  offline behaviour is pinned by 1176 unit tests.
+  offline behaviour is pinned by 1182 unit tests.
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Measured on this machine:
 | Command | Result |
 | --- | --- |
 | `dotnet build --no-incremental` | `0 Warning(s)` / `0 Error(s)`, elapsed `00:00:17.94` |
-| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1176, Skipped:     0, Total:  1176, Duration: 5 m 30 s` |
+| `dotnet test tests/RocketMQ.Client.Tests` | `Passed! - Failed:     0, Passed:  1182, Skipped:     0, Total:  1182, Duration: 5 m 15 s` |
 
 `Directory.Build.props` turns `TreatWarningsAsErrors=true` on globally, so "builds" means "builds with
 zero warnings". The test summary line follows the machine locale — grep for `Passed!` / `Failed:` when
@@ -547,6 +547,13 @@ connection.
   it keeps it only when the budget left at the deadline is neither above 100ms nor above a quarter
   of that timeout — while a send that fails outright closes the connection whatever the switch
   says
+- ✅ Consumer re-registration: as soon as a connection to a broker in the route table is newly
+  established, the instance sends one heartbeat over it right away to re-file every consumer group's
+  subscriptions under this clientId, and wakes a rebalance round. Switch
+  `EnableHeartbeatChannelEventListener` (default on); off, registration only happens on the periodic
+  heartbeat round. A name-server connection, an address absent from the route table, and an instance
+  holding no consumer group each send nothing, and cases pin the re-registration, those three
+  exclusions and the silence when the switch is off
 - ✅ Sending: sync / pinned / selector / batch (320) / auto-batching / one-way / async (sender pool +
   fair semaphores) / transactions (two-phase + broker check-back) / delayed and timed /
   recall (`recallMessage`) / request-reply
@@ -588,7 +595,7 @@ connection.
   FilterMessage hooks, ACL signing, dynamic NameServer addressing, fault-avoiding queue selection
 - ✅ Compression: zlib / LZ4 / ZSTD; TLS: `SslStream`, test-mode plus strict verification / mTLS
 - ✅ Client logging: size-based rotation, dual output to stderr and file
-- ✅ 1176 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
+- ✅ 1182 unit tests; 40 live-cluster subcommands in `rmq` (master/slave, fault injection,
   compression interoperability matrix)
 
 ## Client Logging
@@ -748,7 +755,7 @@ csharp/
 │       ├── BackPressure.cs  Latency.cs  ConsumeExecutor.cs
 │       ├── TopAddressing.cs        # dynamic NameServer addressing
 │       ├── ConsumerStats.cs  Validators.cs  ClientException.cs
-├── tests/RocketMQ.Client.Tests/    # xunit, 1176 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
+├── tests/RocketMQ.Client.Tests/    # xunit, 1182 tests (codec/route/logging/transport/tracing/async/flow control/offsets…)
 └── examples/RocketMQ.Examples/     # the rmq live-cluster tool (see above)
 ```
 

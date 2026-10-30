@@ -414,11 +414,13 @@ public class ProducerUnregisterTests
         consumer.Start();
         try
         {
-            Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat));
-            // The point of this case: a fan-out implementation that only hits the master necessarily scores 0 here
-            Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat));
-            Frame onSlave = Assert.Single(cluster.Frames(RequestCode.HeartBeat),
-                f => f.Addr == cluster.SlaveAddr);
+            // At least once per broker: opening the connection during startup also triggers the
+            // channel-active re-registration beat, so a start can beat a broker more than once.
+            // The subject here is that the slave is included at all -- a master-only fan-out
+            // necessarily scores 0 on the slave.
+            Assert.True(cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat) >= 1);
+            Assert.True(cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat) >= 1);
+            Frame onSlave = cluster.Frames(RequestCode.HeartBeat).Last(f => f.Addr == cluster.SlaveAddr);
             // What the slave gets must be the report **carrying the consumer group** (it builds its own ConsumerGroupInfo from that)
             Assert.True(HeartbeatData.Decode(onSlave.Body, out HeartbeatData hb));
             Assert.Contains(Group, hb.ConsumerDataSet.Select(cd => cd.GroupName));

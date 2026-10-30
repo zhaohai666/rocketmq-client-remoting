@@ -15,7 +15,7 @@ rebalance, pull loops and offset commits are handled by periodic goroutines insi
 - Layers: `remoting` (wire protocol + long-connection transport) → `common` (message model,
   codecs, compression, constants) → `client` (Producer / Push / Pull / LitePull / Admin /
   transaction / trace)
-- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 871 unit tests
+- Verified against a **RocketMQ 5.5.1** cluster: 15 live tools plus 875 unit tests
 
 ## Prerequisites
 
@@ -55,10 +55,10 @@ Measured result of `go test ./... -count=1` (all three test packages `ok`):
 
 | Package | Test functions | Time |
 | --- | --- | --- |
-| `client` | 540 | 53.7s |
-| `common` | 135 | 3.6s |
-| `remoting` | 196 | 4.9s |
-| **Total** | **871** (78 `*_test.go` files) | ~62s |
+| `client` | 542 | 53.7s |
+| `common` | 135 | 3.8s |
+| `remoting` | 198 | 4.9s |
+| **Total** | **875** (80 `*_test.go` files) | ~62s |
 
 To count them yourself: `go test ./client/ -list '.*' | grep -c '^Test'`. Concurrency
 regression on its own:
@@ -460,7 +460,7 @@ to get full verification.
   heartbeat and subscription data, request / response / language code constants
 - ✅ Transport: connection reuse, half-packet and sticky-packet reassembly, opaque matching,
   timeouts, in-flight requests marked dead the moment the connection dies, `GO_AWAY`, sync /
-  async / one-way, TLS
+  async / one-way, TLS, one `RegisterChannelListener` notice per newly opened connection
 - ✅ Connection lifecycle, every rule measured offline against a loopback socket this suite owns:
   a frame that cannot be decoded logs one ERROR naming the peer and takes that connection down (a
   length prefix outside the accepted range is the same event one level earlier, reported once at
@@ -475,7 +475,18 @@ to get full verification.
   sync invoke whose own wait expired drops the connection it went out on when
   `ClientConfig.CloseChannelOnSyncTimeout` is on (default true) — it keeps it only when the budget
   left at the deadline is neither above 100ms nor above a quarter of that timeout. A write that
-  fails outright closes the channel whatever the knobs say.
+  fails outright closes the channel whatever the knobs say; a connection that has just come up
+  tells each channel listener its address exactly once — later requests on a connection that
+  already exists tell it nothing, a reconnect tells it again — while a listener that panics is
+  recovered where it ran and logged in one WARN naming its address, so it neither turns the call
+  that opened the connection into an error nor goes unreported.
+- ✅ Consumer re-registration: as soon as a connection to a broker in the route table is newly
+  established, the instance sends one heartbeat over it right away to re-file every consumer group's
+  subscriptions under this clientId, and wakes a rebalance round. Switch
+  `EnableHeartbeatChannelEventListener` (default on, changed with `SetEnableHeartbeatChannelEventListener`);
+  off, registration only happens on the periodic heartbeat round. A name-server connection, an
+  address absent from the route table, and an instance holding no consumer group each send nothing,
+  and cases pin the re-registration, those three exclusions and the silence when the switch is off
 - ✅ Security and multi-tenancy: ACL signing (`HmacSHA1`, standard library), both namespace
   schemes, unit mode (`SetUnitName` / `SetUnitMode`), `CheckForbiddenHook`
 - ✅ Compression: ZLIB, LZ4 and ZSTD all send and receive; ZSTD decoding covers the full
@@ -601,8 +612,9 @@ already receiving before producing; to read history explicitly, call
   ordered consumption; topic budgets divided over the owned queues at rebalance), POP's
   outstanding-ACK gate (strictly above `PopThresholdForQueue`, default 96, a trip counted on
   the pull path's one client-wide flow-control total and warn cadence), the full heartbeat
-  surface and the six allocation strategies are currently covered by unit tests and the
-  in-process fake cluster only — there is no matching tool in `examples/` yet.
+  surface (the channel-active re-registration beat included) and the six allocation
+  strategies are currently covered by unit tests and the in-process fake cluster only
+  — there is no matching tool in `examples/` yet.
 
 ## Repository Layout
 
@@ -632,7 +644,7 @@ go/
 │   ├── inline_key_json_encode.go   outbound JSON writer that allows inline objects as map keys
 │   ├── bodies.go · common_bodies.go · consumer_bodies.go · admin_bodies.go · pop_bodies.go
 │   ├── client_info_bodies.go · subscription.go · heartbeat.go
-│   ├── client.go                   long-connection transport: sync / async / one-way + half-packet + TLS + mark-dead
+│   ├── client.go                   long-connection transport: sync / async / one-way + half-packet + TLS + mark-dead + per-connection listener
 │   └── acl.go · rpchooks.go · errors.go
 ├── client/                     SDK layer
 │   ├── instance.go                 client instance: route discovery, all RPCs, heartbeat, periodic tasks
@@ -646,7 +658,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   78 test files, 871 test functions
+│   └── *_test.go                   80 test files, 875 test functions
 └── examples/                   17 executables (see "Live Cluster Verification")
 ```
 

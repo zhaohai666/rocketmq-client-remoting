@@ -162,6 +162,9 @@ func newV2Cluster(t *testing.T, useV2, withSlave bool) *v2Cluster {
 	inst := CreateOrGetInstance(uniqueClientID(t), []string{ns.addr}, cfg)
 	t.Cleanup(inst.Shutdown)
 	warmRoute(t, inst, "V2Topic")
+	// This fixture counts beats per address; the channel-active listener would
+	// add one re-registration beat when the first connection opens.
+	inst.SetEnableHeartbeatChannelEventListener(false)
 
 	c := &v2Cluster{
 		inst: inst, master: master, slave: slave,

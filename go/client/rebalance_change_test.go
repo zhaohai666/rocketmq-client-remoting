@@ -110,6 +110,22 @@ func rcHasPullState(c *DefaultMQPushConsumer, mq common.MessageQueue) bool {
 	return ok
 }
 
+// rcPinSettledOnWire makes a pinned version safe to assert on the wire: a beat built
+// before the pin can still be on its way to the broker, and "the newest beat" would
+// then report the subscribe-time version. Ask for a beat and wait until the newest
+// one carries the pinned value, which also means every older beat has landed.
+func rcPinSettledOnWire(t *testing.T, c *DefaultMQPushConsumer, broker *consumerBroker,
+	stale int64, topics ...string) {
+	t.Helper()
+	for _, topic := range topics {
+		requireNoError(t, "beat after the pin", c.sendHeartbeatNow())
+		waitFor(t, "the pinned version of "+topic+" on the wire", func() bool {
+			versions := broker.beatSubVersions(topic)
+			return len(versions) > 0 && versions[len(versions)-1] == stale
+		})
+	}
+}
+
 // A changed round re-shares the version and spends exactly one broker beat; the beat
 // carries the fresh version. An unchanged round spends neither, so the pinned version
 // is still there and the wire still shows it.
@@ -126,6 +142,7 @@ func TestRebalanceChangeRestampsVersionAndBeatsOnlyWhenQueuesMove(t *testing.T) 
 	// must not beat — otherwise every 20 s round would re-send the subscriptions of
 	// a consumer whose queues never moved.
 	stale := rcStaleVersion(c, topic)
+	rcPinSettledOnWire(t, c, f.broker, stale, topic)
 	before := rcHeartbeats(f)
 	requireNoError(t, "unchanged rebalance", c.doRebalance())
 	if got := rcSubVersion(c, topic); got != stale {
@@ -184,6 +201,7 @@ func TestRebalanceChangeRestampsOnlyTheTopicThatMoved(t *testing.T) {
 	})
 
 	stale := rcStaleVersion(c, moved, still)
+	rcPinSettledOnWire(t, c, f.broker, stale, moved, still)
 	f.scaleTopic(t, moved, 2)
 	ttRefreshRoute(t, c, moved)
 	requireNoError(t, "rebalance after the grow", c.doRebalance())

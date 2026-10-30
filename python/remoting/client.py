@@ -27,7 +27,7 @@ import ssl
 import struct
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from .exception import (RemotingConnectException, RemotingSendRequestException,
                         RemotingTimeoutException)
@@ -277,6 +277,14 @@ class RemotingClient:
         self._running = True
         self._closed = False
         self.rpc_hooks = []
+        # Channel listeners: each one is told when a connection has just been established, so a
+        # caller can re-register per-connection broker state (a consumer group's heartbeat) without
+        # waiting for the next periodic round. A broker drops a consumer group when the last channel
+        # of that group closes, so after a reconnect the group is unknown to it again until the next
+        # heartbeat arrives. Notified after the connection is in the table (never under ``_lock``:
+        # a listener that sends a request would otherwise re-enter the table).
+        self._channel_listeners: List = []
+        self._channel_listeners_lock = threading.Lock()
         # Per-connection reader thread
         self._reader_threads: Dict[str, threading.Thread] = {}
         # Per-connection "should exit" flag: the reader thread uses it to wind down and
@@ -291,6 +299,20 @@ class RemotingClient:
         self._processors: Dict[int, Callable] = {}
 
     # ---------- connection management ----------
+    def register_channel_listener(self, listener) -> None:
+        """Register an object whose ``on_channel_active(addr)`` runs after a new connection is up."""
+        with self._channel_listeners_lock:
+            self._channel_listeners.append(listener)
+
+    def _fire_channel_active(self, addr: str) -> None:
+        with self._channel_listeners_lock:
+            listeners = list(self._channel_listeners)
+        for listener in listeners:
+            try:
+                listener.on_channel_active(addr)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("remoting: channel listener for %s raised: %s", addr, e)
+
     def _get_or_create_conn(self, addr: str) -> socket.socket:
         # Idle connections are reclaimed by the sweep thread, and a connection can also be
         # created by a purely synchronous call, so the thread is started here rather than only
@@ -310,7 +332,10 @@ class RemotingClient:
             # wait until the first request has been written, see the notes in _write.
             if not isinstance(sock, ssl.SSLSocket):
                 self._spawn_reader(addr, sock, stop)
-            return sock
+        # Outside ``_lock``: a listener typically sends a request on the new connection, which
+        # takes the same lock through this method again.
+        self._fire_channel_active(addr)
+        return sock
 
     def _spawn_reader(self, addr: str, sock: socket.socket,
                       stop: threading.Event) -> None:

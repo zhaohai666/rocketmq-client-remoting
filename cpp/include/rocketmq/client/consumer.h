@@ -543,6 +543,16 @@ public:
                          const std::string& brokerName = std::string());
     // Send one heartbeat to every known broker (sendHeartbeatToAllBrokerWithLock)
     int32_t sendHeartbeatToAllBroker();
+    // Re-register with one broker: the instance calls this when a connection to that broker has
+    // just been established. Public so a unit test can drive the re-registration directly.
+    int32_t sendHeartbeatToBroker(const std::string& addr);
+    // Default on: re-register with a broker as soon as a connection to it comes up.
+    void setEnableHeartbeatChannelEventListener(bool enable) {
+        enableHeartbeatChannelEventListener_ = enable;
+    }
+    bool isEnableHeartbeatChannelEventListener() const {
+        return enableHeartbeatChannelEventListener_;
+    }
 
     // ---------------- Drive consume dispatch directly from tests (no network) ----------------
     // The ackIndex semantics of the classic consume path fail very quietly (the tail is dropped
@@ -914,6 +924,7 @@ private:
     void lockLoop();
     bool isOrderly() const;
     void maybeSendHeartbeat();
+    HeartbeatData buildHeartbeat() const;
     // Immediate action after the subscription table grows or changes (the
     // sendHeartbeatToAllBrokerWithLock at the end of subscribe): register the route refresh plus push one synchronous heartbeat round. unsubscribe does not call this.
     void notifySubscriptionChanged(const std::string& topic);
@@ -1109,6 +1120,7 @@ private:
 
     bool heartbeatEnabled_ = true;
     int32_t heartbeatIntervalMillis_ = 30000;
+    bool enableHeartbeatChannelEventListener_ = true;
 
     std::vector<std::string> nameServerAddrs_;
     mutable std::mutex lock_;

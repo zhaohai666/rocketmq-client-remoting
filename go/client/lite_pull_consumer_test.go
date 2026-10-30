@@ -1124,6 +1124,30 @@ func beatTopics(b *consumerBroker) map[string]string {
 	return out
 }
 
+// beatCount is how many HEARTBEATs the mock has decoded so far.
+func beatCount(b *consumerBroker) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.heartbeats)
+}
+
+// beatTopicsAt maps topic -> subString for the i-th captured HEARTBEAT and says
+// whether that beat has been decoded yet.
+func beatTopicsAt(b *consumerBroker, i int) (map[string]string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := map[string]string{}
+	if i >= len(b.heartbeats) {
+		return out, false
+	}
+	for _, cd := range b.heartbeats[i].ConsumerDataSet {
+		for _, sub := range cd.SubscriptionDataSet {
+			out[sub.Topic] = sub.SubString
+		}
+	}
+	return out, true
+}
+
 // The broker-suspend budget must reach the wire. A fixed constant passes the
 // start-up validation and then ignores the knob for the life of the consumer.
 func TestLitePullRequestCarriesTheConfiguredSuspendBudget(t *testing.T) {
@@ -1179,15 +1203,25 @@ func TestLitePullHeartbeatCarriesTheBuiltSubscriptionSet(t *testing.T) {
 	}
 
 	// A rebuild replaces the whole set: B is not announced any more, and A carries
-	// its new expression.
+	// its new expression. The mock decodes each request in its own goroutine, so a
+	// beat still in flight from the start-up round can be recorded after the one
+	// sent here — the rebuilt announcement is looked for among the beats captured
+	// after this point instead of only in the newest one.
+	from := beatCount(f.broker)
 	requireNoError(t, "rebuild", c.BuildSubscriptionsForHeartbeat(map[string]MessageSelector{
 		"A": {Expression: "*"},
 	}))
 	c.sendHeartbeatToAllBrokers()
-	waitFor(t, "the rebuilt beat dropping B", func() bool {
-		topics := beatTopics(f.broker)
-		_, hasB := topics["B"]
-		return !hasB && topics["A"] == "*"
+	waitFor(t, "a beat after the rebuild that drops B", func() bool {
+		for i := from; ; i++ {
+			topics, arrived := beatTopicsAt(f.broker, i)
+			if !arrived {
+				return false
+			}
+			if _, hasB := topics["B"]; !hasB && topics["A"] == "*" {
+				return true
+			}
+		}
 	})
 
 	// A refused build must not damage the set that is already in place.

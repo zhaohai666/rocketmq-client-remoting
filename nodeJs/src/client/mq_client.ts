@@ -209,6 +209,11 @@ export class MQClient {
   // off — V2 always wins) one heartbeat per broker is fanned out over a
   // fixed-size pool created when the instance starts.
   enableConcurrentHeartbeat: boolean;
+  // Re-register the instance's consumer groups whenever a new connection to a
+  // known broker is established (see onChannelActive). On by default: the
+  // broker drops a group when its last channel closes, so a reconnect must
+  // restore the registration before the next periodic beat.
+  enableHeartbeatChannelEventListener: boolean;
   concurrentHeartbeatThreadPoolSize: number;
   _heartbeatExecutor: FixedTaskExecutor | null;
   // Page size of the paged metadata admin calls (GET_ALL_TOPIC_CONFIG /
@@ -268,6 +273,7 @@ export class MQClient {
     this.mqClientApiTimeout = 3000;
     this.decodeReadBody = true;
     this.enableConcurrentHeartbeat = false;
+    this.enableHeartbeatChannelEventListener = true;
     this.concurrentHeartbeatThreadPoolSize = DEFAULT_CONCURRENT_HEARTBEAT_THREAD_POOL_SIZE;
     this._heartbeatExecutor = null;
     this.maxPageSizeInGetMetadata = 2000;
@@ -803,6 +809,38 @@ export class MQClient {
     return this;
   }
 
+  // Channel-active re-registration switch (default on; see onChannelActive).
+  setEnableHeartbeatChannelEventListener(enable: boolean): this {
+    this.enableHeartbeatChannelEventListener = enable === true;
+    return this;
+  }
+
+  getEnableHeartbeatChannelEventListener(): boolean {
+    return this.enableHeartbeatChannelEventListener;
+  }
+
+  // A connection to addr has just been established. A broker drops a consumer
+  // group when its last channel closes, so after a reconnect the group is
+  // unknown there until the next periodic beat; beat the broker right away,
+  // then wake every consumer's rebalance. Nothing happens for an address that
+  // is not a known broker, when no consumer is registered, or with the switch
+  // off.
+  async onChannelActive(addr: string): Promise<void> {
+    if (!this.enableHeartbeatChannelEventListener) return;
+    if (!this.getAllBrokerAddrEntries().some((entry) => entry.addr === addr)) return;
+    if (this.consumerTable.size === 0) return;
+    try {
+      await this.sendHeartbeat(addr);
+    } catch (e) {
+      logger.debug('channel-active heartbeat to %s failed: %s', addr, (e as Error).message);
+    }
+    for (const consumer of this.consumerTable.values()) {
+      if (consumer != null && typeof consumer.rebalanceImmediately === 'function') {
+        try { consumer.rebalanceImmediately(); } catch (e) { /* best effort per consumer */ }
+      }
+    }
+  }
+
   // Pool size of the concurrent heartbeat round. Rebuilds the pool when one is
   // already alive (a round in flight settles; its queued submissions are
   // refused and counted as unsuccessful waits).
@@ -1224,6 +1262,7 @@ export class MQClient {
   start(): void {
     if (this._running) return;
     this._running = true;
+    this._registerChannelListener();
     this._ensureHeartbeatExecutor();
     this._registerTransactionCheckProcessor();
     this._registerReplyMessageProcessor();
@@ -1235,6 +1274,16 @@ export class MQClient {
     // The stats manager's own start() is empty (sampling hangs off each
     // StatsItem's scheduler); the unified sampler timer starts here.
     this.consumerStatsManager.start();
+  }
+
+  private _registerChannelListener(): void {
+    // A transport that does not report connection events (a plain invoker)
+    // never triggers re-registration; a real RemotingClient always reports.
+    const remoting: any = this.remotingClient;
+    if (typeof remoting.registerChannelListener !== 'function') return;
+    remoting.registerChannelListener((addr: string) => {
+      void this.onChannelActive(addr);
+    });
   }
 
   // The TopAddressing branch runs ONLY when no name server address was

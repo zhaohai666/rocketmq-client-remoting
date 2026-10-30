@@ -481,6 +481,11 @@ void DefaultLitePullConsumer::start() {
     }
     // Register the tag subscription with the broker (heartbeat) before background pulling starts, so the first pull round cannot lose messages because the broker does not know the subscription.
     sendHeartbeatToAllBroker();
+    // The broker drops this group when the last channel of it closes, so a reconnect must
+    // re-register at once instead of waiting for the next heartbeat round.
+    mqClient_->setEnableHeartbeatChannelEventListener(enableHeartbeatChannelEventListener_);
+    mqClient_->registerConsumerHeartbeat(
+        consumerGroup_, [this](const std::string& addr) { return this->sendHeartbeatToBroker(addr); });
     // running_ must be set before the heartbeat thread starts: heartbeatLoop loops on it, so a thread that
     // starts first sees false and exits, and this instance never heartbeats again (the broker drops it after 120s).
     running_ = true;
@@ -520,6 +525,7 @@ void DefaultLitePullConsumer::shutdown() {
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
     if (metadataThread_.joinable()) metadataThread_.join();
     if (mqClient_ != nullptr) {
+        mqClient_->unregisterConsumerHeartbeat(consumerGroup_);
         mqClient_->shutdown();
         mqClient_.reset();
     }
@@ -1458,6 +1464,12 @@ HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     }
     hb.consumerDataSet.push_back(cd);
     return hb;
+}
+
+int32_t DefaultLitePullConsumer::sendHeartbeatToBroker(const std::string& addr) {
+    if (mqClient_ == nullptr) return 0;
+    mqClient_->sendHeartbeat(addr, buildHeartbeat());
+    return 1;
 }
 
 int32_t DefaultLitePullConsumer::sendHeartbeatToAllBroker() {

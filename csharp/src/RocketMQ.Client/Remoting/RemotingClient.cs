@@ -114,6 +114,44 @@ public sealed class RemotingClient : IDisposable
     private readonly object _hookLock = new();
     private IRpcHook? _rpcHook;
 
+    // Channel listeners: each one is told when a connection has just been established, so a
+    // caller can re-register per-connection broker state (a consumer group's heartbeat)
+    // without waiting for the next periodic round. A broker drops a consumer group when the
+    // last channel of that group closes, so after a reconnect the group is unknown to it
+    // again until the next heartbeat arrives. Fired outside _connMutex: a listener that
+    // sends a request takes the same lock through GetOrCreateConnection.
+    private readonly object _channelListenerLock = new();
+    private readonly List<Action<string>> _channelListeners = new();
+
+    public void RegisterChannelListener(Action<string> listener)
+    {
+        lock (_channelListenerLock)
+        {
+            _channelListeners.Add(listener);
+        }
+    }
+
+    private void FireChannelActive(string addr)
+    {
+        Action<string>[] listeners;
+        lock (_channelListenerLock)
+        {
+            listeners = _channelListeners.ToArray();
+        }
+
+        foreach (Action<string> listener in listeners)
+        {
+            try
+            {
+                listener(addr);
+            }
+            catch (Exception e)
+            {
+                ClientLog.Warn("remoting: channel listener for " + addr + " raised: " + e.Message);
+            }
+        }
+    }
+
     public bool RegisterRpcHook(IRpcHook hook)
     {
         lock (_hookLock)
@@ -619,6 +657,10 @@ public sealed class RemotingClient : IDisposable
         {
             _threads.Add((conn, reader));
         }
+
+        // Outside _connMutex: a listener typically sends a request on the new connection,
+        // which takes the same lock through this method again.
+        FireChannelActive(addr);
 
         return conn;
     }

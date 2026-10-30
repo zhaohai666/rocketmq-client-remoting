@@ -146,6 +146,13 @@ class MQClientInstance:
         self.enable_concurrent_heartbeat = bool(enable_concurrent_heartbeat)
         self.concurrent_heartbeat_thread_pool_size = max(
             1, int(concurrent_heartbeat_thread_pool_size or (os.cpu_count() or 1)))
+        # Whether a newly established connection to a known broker immediately re-sends the
+        # consumer heartbeat and wakes rebalance (default on). The broker drops a consumer group
+        # once its last channel closes, so after a reconnect the group is unregistered there
+        # until the next heartbeat; without this the pull loop answers SUBSCRIPTION_NOT_EXIST
+        # for up to a full heartbeat interval. Only reachable through the transport's
+        # channel-active event, see RemotingClient.register_channel_listener.
+        self.enable_heartbeat_channel_event_listener = True
         self._heartbeat_executor: Optional[ThreadPoolExecutor] = None
         # Heartbeat V2 per-stream state (the set of brokers known to speak V2 plus the
         # broker addr -> fingerprint table); the facades decide whether to use it, see
@@ -156,6 +163,7 @@ class MQClientInstance:
                                               socks_proxy_config=socks_proxy_config,
                                               channel_not_active_interval_millis=channel_not_active_interval_millis)
         self.remoting_client.register_rpc_hook(NamespaceRpcHook(self.namespace_v2))
+        self.remoting_client.register_channel_listener(self)
         if enable_stream_request_type:
             self.remoting_client.register_rpc_hook(StreamTypeRPCHook())
         self.topic_route_table: Dict[str, TopicRouteData] = {}
@@ -300,6 +308,44 @@ class MQClientInstance:
                 wake()
             except Exception as e:
                 logger.warning("rebalance_immediately failed: %s", e)
+
+    # ---------------- channel-active re-registration ----------------
+    def on_channel_active(self, addr: str) -> None:
+        """A connection to ``addr`` has just been established: re-register the consumer groups.
+
+        The transport calls this right after the connection enters the table. A broker forgets a
+        consumer group when that group's last channel closes, so a reconnect (a sync timeout takes
+        the channel down, see RemotingClient) is followed by pulls the broker rejects with
+        SUBSCRIPTION_NOT_EXIST until the next heartbeat round. Sending one heartbeat now keeps the
+        gap to a round trip instead of a whole heartbeat interval.
+
+        Runs on a background thread: the caller is usually the pull loop that just reconnected,
+        and the heartbeat must do its own round trip without holding up that loop.
+        """
+        if not self.enable_heartbeat_channel_event_listener:
+            return
+        if not self._is_known_broker_addr(addr):
+            return
+        threading.Thread(target=self._re_register_on_channel_active, args=(addr,),
+                         name="rmq-channel-active-%s" % addr, daemon=True).start()
+
+    def _is_known_broker_addr(self, addr: str) -> bool:
+        for broker_addrs in list(self.broker_addr_table.values()):
+            if addr in broker_addrs.values():
+                return True
+        return False
+
+    def _re_register_on_channel_active(self, addr: str) -> None:
+        for group, consumer in list(self._consumer_table.items()):
+            heartbeat = getattr(consumer, "heartbeat_to_broker", None)
+            if heartbeat is None:
+                continue
+            try:
+                heartbeat(addr)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("channel-active heartbeat for group %s to %s failed: %s",
+                             group, addr, e)
+        self.rebalance_immediately()
 
     def _process_notify_consumer_ids_changed(self, cmd: RemotingCommand,
                                              addr: str) -> Optional[RemotingCommand]:

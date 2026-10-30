@@ -91,6 +91,13 @@ public:
         return concurrentHeartbeatThreadPoolSize_;
     }
     void setMessageModel(const std::string& model) { messageModel_ = model; }
+    // Default on: re-register with a broker as soon as a connection to it comes up.
+    void setEnableHeartbeatChannelEventListener(bool enable) {
+        enableHeartbeatChannelEventListener_ = enable;
+    }
+    bool isEnableHeartbeatChannelEventListener() const {
+        return enableHeartbeatChannelEventListener_;
+    }
     void setNamespace(const std::string& ns) { namespace_ = ns; }
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
     const std::string& namespaceV2() const { return namespaceV2_; }
@@ -320,6 +327,8 @@ private:
     // Heartbeat (registers the tag subscriptions with the broker)
     HeartbeatData buildHeartbeat() const;
     int32_t sendHeartbeatToAllBroker();
+    // Re-register with one broker when a connection to it has just been established.
+    int32_t sendHeartbeatToBroker(const std::string& addr);
     void heartbeatLoop();
     void pullServiceLoop();
 
@@ -337,6 +346,7 @@ private:
     bool decodeReadBody_ = true;
     int32_t mqClientApiTimeout_ = MQClientInstance::kMqClientApiTimeoutMillis;
     bool enableConcurrentHeartbeat_ = false;
+    bool enableHeartbeatChannelEventListener_ = true;
     int32_t concurrentHeartbeatThreadPoolSize_ =
         MQClientInstance::defaultConcurrentHeartbeatThreadPoolSize();
     std::string messageModel_ = MessageModel::CLUSTERING;

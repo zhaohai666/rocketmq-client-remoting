@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **53** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-30 实测 **ALL GREEN**，其中 48 套逐条计出 **1814** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **54** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-30 实测 **ALL GREEN**，其中 49 套逐条计出 **1836** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -38,6 +38,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/backpressure_smoke.ts`（异步公平信号量闸门：等待、拒绝、回滚、文案） | 119 通过 / 0 失败 |
 | `test/batch_schedule_guard_smoke.ts`（批量发送拒绝携带延迟/定时属性的成员） | 23 通过 / 0 失败 |
 | `test/body_crc_smoke.ts`（存储体 BODYCRC 掩码形式） | 18 通过 / 0 失败 |
+| `test/channel_active_reregistration_smoke.ts`（消费者重注册：向路由表里的某个 broker 新建一条连接后，实例立刻顺着这条连接补发一次心跳、把本 clientId 名下每个消费组的订阅重新递交并叫醒一轮 rebalance；名字服务的连接、不在路由表里的地址、没有消费组的实例三种情况一条都不补发；关掉开关后只按周期心跳注册） | 22 通过 / 0 失败 |
 | `test/classic_namespace_smoke.ts`（经典命名空间与 recall：命名空间设置后，broker 侧看到的生产/消费组、业务主题、重试主题 `%RETRY%<ns>%<group>` 全部带前缀，而调用方与交付出去的消息保持裸名；包裹幂等、系统资源不动、RETRY/DLQ 前缀留在命名空间之前；`recallMessage(topic, handle)` 校验主题、拒绝 RETRY/DLQ、预热路由、柄内 broker 缺失时回落到主题发布者、用发送预算、返回撤回消息 id，非成功应答转成带 `responseCode` 的 MQBrokerException） | 97 通过 / 0 失败 |
 | `test/client_config_gaps_smoke.ts`（客户端配置旋钮） | 44 通过 / 0 失败 |
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
@@ -332,6 +333,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ 协议层：`RemotingCommand` 帧、JSON + RocketMQ 二进制双序列化、V2 短键 header、容错解析、消息 17/6 段编解码
 - ✅ 传输层：长连接惰性建连复用、同步/异步/单向、半包重组、opaque 匹配、GO_AWAY 重发一次、断连在途请求判死
 - ✅ 连接生命周期：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 和地址的 WARN，连接照旧留着；每个过期的在途请求各有一条自己的 WARN；`isChannelWritable()` 回答的是 socket 发送缓冲，不是有没有连接——没有活连接的地址照样可写（下一次发送自己建连），只有发送缓冲塞满的活连接才报 false；一个 unref() 过的清扫定时器（不会把测试进程吊活）关掉既没读也没写、静默严格超过 `maxIdleTimeMillis`（默认 120000；配非正数恢复默认，而不是把清扫关掉）的连接，每个地址一条 WARN；同步等待超时后，`closeSocketOnSyncTimeout` 开着（默认 true）就销毁它发出去的那条 socket——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论旋钮开合连接一律拆掉
+- ✅ 消费者重注册：向路由表里的某个 Broker 新建一条连接后，实例立刻顺着这条连接补发一次心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮 rebalance；开关 `setEnableHeartbeatChannelEventListener()`（默认开），关掉后只按周期心跳注册。名字服务的连接、不在路由表里的地址、没有消费组的实例三种情况一条都不补发；用例分别钉住补发本身、这三条排除，以及关掉开关后的静默
 - ✅ Producer：同步 / 批量 / 单向 / 异步（公平信号量背压）/ 队列选择器 / 顺序 / 延迟与 5.x 定时 / 事务两阶段 + 回查 / Request-Reply（326 接收闭环）/ recallMessage / VIP channel（port-2）
 - ✅ PushConsumer：并发 / 顺序 / 广播、长轮询、位点持久化、流控阈值（每队列只判它「持有」的一切：未派发缓冲 + 已交给监听但尚未结算的批次；严格大于才停，阈值不 clamp、0 不是「关闭」，字节按消息体整 MiB 取整而不是 storeSize，跨度闸门不作用于顺序消费；topic 预算在重平衡改变分配时除以自有队列数，不在拉取时累计兄弟队列）、分配集合变化的重平衡轮按序补齐（只给变动的 topic 重打订阅版本 → 除预算 → 立刻心跳 → 只向变动的 topic 触发队列监听）、307/220/221 应答、RETRY 还原、suspend/resume、核心线程数在线调整、失败轮重问的通用退避是一个可配旋钮 `pullRetryDelayMillis`（默认 1000ms，`get/setPullRetryDelayMillis`，队列循环建立时取值，启动后再改不影响已在跑的循环；broker 215 的 20ms、本队列缓存闸门 50ms、暂停 1000ms 三条另有定值，不随这个旋钮动）；轮间节奏由 `pullInterval`（默认 0）管，且只管「真正交出消息」的那一轮——FOUND 且经客户端 tag 复查与 FilterMessageHook 改写之后仍然非空的批次等 `pullInterval`（为 0 就立刻重拉），空手而归的一轮（FOUND 回空、被过滤清空、NO_NEW_MSG、NO_MATCHED_MSG）什么都不等：这条节奏管的是交付出的那一次，本地再压一段只会推迟下一轮取消息
 - ✅ PullConsumer / LitePullConsumer：短/长轮询、assign+seek+commitSync、自动提交、topic 队列变更监听；LitePull 的 `poll()` 就地拉取、没有本地预取缓冲也没有后台拉取任务，因此每队列缓存闸门（条数 / 消息体整 MiB / 位点跨度 / 整个缓冲条数）无对象可判——该路径的退避按队列停在 broker 的 `FLOW_CONTROL`(215)：`litePullParkMillisFor` 把 215 映射成 20ms（`PULL_TIME_DELAY_MILLS_WHEN_BROKER_FLOW_CONTROL`）、其余错误码不 park，`setPullParkUntil` / `getPullParkUntil` 记录并读回每个队列的 park 截止时刻，兄弟队列不受影响；broker 的拒绝码以 `MQBrokerException.responseCode` 交给调用方
@@ -414,7 +416,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 53 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 54 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

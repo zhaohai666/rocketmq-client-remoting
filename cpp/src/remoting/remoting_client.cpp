@@ -205,6 +205,29 @@ struct RemotingClient::Impl {
     std::mutex hookMutex;
     std::shared_ptr<RPCHook> rpcHook;
 
+    // Channel listeners (see RemotingClient::ChannelListener). Fired outside connMutex: a
+    // listener that sends a request takes the same lock through getOrCreateConnection.
+    std::mutex channelListenerMutex;
+    std::vector<ChannelListener> channelListeners;
+
+    void fireChannelActive(const std::string& addr) {
+        std::vector<ChannelListener> snapshot;
+        {
+            std::lock_guard<std::mutex> lk(channelListenerMutex);
+            snapshot = channelListeners;
+        }
+        for (const auto& listener : snapshot) {
+            if (!listener) continue;
+            try {
+                listener(addr);
+            } catch (const std::exception& e) {
+                logger_warn("remoting: channel listener for " + addr + " raised: " + e.what());
+            } catch (...) {
+                logger_warn("remoting: channel listener for " + addr + " raised unknown exception");
+            }
+        }
+    }
+
     std::shared_ptr<RPCHook> currentHook() {
         std::lock_guard<std::mutex> lk(hookMutex);
         return rpcHook;
@@ -318,6 +341,9 @@ struct RemotingClient::Impl {
             std::lock_guard<std::mutex> lk(threadMutex);
             threads.emplace_back(conn, std::move(reader));
         }
+        // Outside connMutex: a listener typically sends a request on the new connection,
+        // which takes the same lock through this method again.
+        fireChannelActive(addr);
         return conn;
     }
 
@@ -1102,6 +1128,11 @@ bool RemotingClient::registerRPCHook(std::shared_ptr<RPCHook> hook) {
 void RemotingClient::unregisterRPCHook() {
     std::lock_guard<std::mutex> lk(impl_->hookMutex);
     impl_->rpcHook.reset();
+}
+
+void RemotingClient::registerChannelListener(ChannelListener listener) {
+    std::lock_guard<std::mutex> lk(impl_->channelListenerMutex);
+    impl_->channelListeners.push_back(std::move(listener));
 }
 
 void RemotingClient::setTlsEnable(bool enable) {

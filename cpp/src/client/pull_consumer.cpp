@@ -142,6 +142,11 @@ void DefaultMQPullConsumer::start() {
     mqClient_->start();
     createAsyncExecutors();
     refreshRouteForHeartbeat();
+    // The broker drops this group when the last channel of it closes, so a reconnect must
+    // re-register at once instead of waiting for the next heartbeat round.
+    mqClient_->setEnableHeartbeatChannelEventListener(enableHeartbeatChannelEventListener_);
+    mqClient_->registerConsumerHeartbeat(
+        consumerGroup_, [this](const std::string& addr) { return this->sendHeartbeatToBroker(addr); });
     started_ = true;
     try {
         sendHeartbeatToAllBroker();
@@ -175,6 +180,7 @@ void DefaultMQPullConsumer::shutdown() {
     heartbeatCv_.notify_all();
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
     if (mqClient_ != nullptr) {
+        mqClient_->unregisterConsumerHeartbeat(consumerGroup_);
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
         } catch (const std::exception& e) {
@@ -711,6 +717,14 @@ HeartbeatData DefaultMQPullConsumer::buildHeartbeat() const {
     }
     hb.addConsumerData(cd);
     return hb;
+}
+
+int32_t DefaultMQPullConsumer::sendHeartbeatToBroker(const std::string& addr) {
+    if (mqClient_ == nullptr) {
+        return 0;
+    }
+    mqClient_->sendHeartbeat(addr, buildHeartbeat());
+    return 1;
 }
 
 int32_t DefaultMQPullConsumer::sendHeartbeatToAllBroker() {

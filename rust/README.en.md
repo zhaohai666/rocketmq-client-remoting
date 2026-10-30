@@ -31,7 +31,7 @@ code-generation step.
 ```bash
 cd rust
 cargo build --all-targets                       # lib + 42 examples
-cargo test --quiet                              # 1187 passed; 0 failed; 0 ignored (~60s)
+cargo test --quiet                              # 1193 passed; 0 failed; 0 ignored (10.09s on the default thread pool, 61.21s with --test-threads=1)
 cargo clippy --all-targets --all-features -- -D warnings  # zero warnings is a hard gate
 ```
 
@@ -287,6 +287,15 @@ verification); for production set it to `false` and configure the system trust c
   `close_socket_on_sync_timeout` is on (default true) — it keeps the socket only when the budget
   left at the deadline was neither above 100ms nor above a quarter of that timeout; and a write
   that fails outright takes the connection down, knob or no knob.
+- ✅ Consumer re-registration: as soon as a connection to a broker in the route table is newly
+  established, the instance spawns one heartbeat over it to re-file every consumer group's
+  subscriptions under this clientId, and wakes a rebalance round. Switch
+  `enable_heartbeat_channel_event_listener` (default on, changed with
+  `set_enable_heartbeat_channel_event_listener()`); off, registration only happens on the periodic
+  heartbeat round. A name-server connection, an address absent from the route table, and an instance
+  holding no consumer group each send nothing, and cases pin the re-registration, those three
+  exclusions, one fire per new connection (concurrent first sends included) and that a panicking
+  listener never breaks the send path
 - ✅ Producer: all nine send shapes in the table above
 - ✅ PushConsumer: long polling + POP (`POP_CK` / ACK / CHANGE_INVISIBLE), ordering,
   broadcasting, retry / dead-letter, offset persistence, pull-stall self-healing, POP's

@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -745,6 +746,63 @@ void testAdminPaging() {
     admin.shutdown();
 }
 
+// A connection coming up re-registers the groups this instance hosts with that broker and wakes
+// rebalance -- but only for a known broker address and only while the switch is on. A group whose
+// callback throws must not stop the others or the rebalance.
+void testChannelActiveReregistration() {
+    RecordingBroker broker;
+    broker.setHandler([](const RecordedRequest&) { return BrokerReply{}; });
+    MQClientInstance instance("cid@channel-active", std::vector<std::string>{broker.address()});
+    MQClientInstanceTestAccess::seedBrokerAddr(instance, "broker-a", MixAll::MASTER_ID,
+                                               broker.address());
+
+    std::mutex lock;
+    std::vector<std::string> beats;
+    instance.registerConsumerHeartbeat("GID_Channel", [&](const std::string& addr) {
+        std::lock_guard<std::mutex> lk(lock);
+        beats.push_back(addr);
+        return 1;
+    });
+    std::atomic<int> rebalances{0};
+    instance.registerRebalanceWakeup("GID_Channel", [&] { ++rebalances; });
+    auto beatCount = [&] {
+        std::lock_guard<std::mutex> lk(lock);
+        return beats.size();
+    };
+
+    instance.onChannelActive(broker.address());
+    expectInt(static_cast<long long>(beatCount()), 1,
+              "channel active: the registered group re-registers with the broker");
+    expect(!beats.empty() && beats[0] == broker.address(),
+           "channel active: the callback is told which broker came up");
+    expectInt(rebalances.load(), 1, "channel active: rebalance is woken");
+
+    instance.onChannelActive("127.0.0.1:1");
+    expectInt(static_cast<long long>(beatCount()), 1,
+              "channel active: an address that is not a known broker re-registers nothing");
+    expectInt(rebalances.load(), 1, "channel active: and wakes no rebalance");
+
+    instance.setEnableHeartbeatChannelEventListener(false);
+    instance.onChannelActive(broker.address());
+    expectInt(static_cast<long long>(beatCount()), 1,
+              "channel active: the switch off suppresses the re-registration");
+    expectInt(rebalances.load(), 1, "channel active: and the rebalance with it");
+    instance.setEnableHeartbeatChannelEventListener(true);
+
+    instance.registerConsumerHeartbeat("GID_Bad", [](const std::string&) -> int32_t {
+        throw std::runtime_error("group blew up");
+    });
+    instance.onChannelActive(broker.address());
+    expectInt(static_cast<long long>(beatCount()), 2,
+              "channel active: a throwing group does not stop the next one");
+    expectInt(rebalances.load(), 2, "channel active: nor does it stop the rebalance");
+
+    instance.unregisterConsumerHeartbeat("GID_Channel");
+    instance.onChannelActive(broker.address());
+    expectInt(static_cast<long long>(beatCount()), 2,
+              "channel active: an unregistered group is no longer re-registered");
+}
+
 }  // namespace
 
 int main() {
@@ -752,6 +810,7 @@ int main() {
     testHeartbeatTimeout();
     testConcurrentHeartbeat();
     testAdminPaging();
+    testChannelActiveReregistration();
     std::printf("%d checks, %d failures\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

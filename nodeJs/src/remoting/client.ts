@@ -37,6 +37,10 @@ interface ResponseFuture {
 //     chain to that CA and the hostname/SAN must match (host is used by default; serverName can override);
 //     not given → test-mode: trust self-signed (rejectUnauthorized=false, historical behavior).
 //   - clientCert/clientKey → mTLS client certificate.
+// Called once for every NEWLY established connection, with the address it was
+// opened to. Reused connections do not fire it again.
+export type ChannelListener = (addr: string) => void;
+
 export interface TlsOptions {
   caCert?: string;
   clientCert?: string;
@@ -62,6 +66,7 @@ export class RemotingClient {
   private buffers = new Map<string, Buffer>();
   private responseTable = new Map<number, ResponseFuture>();
   private rpcHooks: any[] = [];
+  private channelListeners: ChannelListener[] = [];
   private processors = new Map<number, (cmd: RemotingCommand, addr: string) => RemotingCommand | null | Promise<RemotingCommand | null>>();
   private running = true;
   private connectPromises = new Map<string, Promise<any>>();
@@ -177,6 +182,9 @@ export class RemotingClient {
       sock.on('data', (chunk: Buffer) => this._onData(addr, sock, chunk));
       sock.on('close', () => this._onClose(addr, sock));
       sock.on('error', (e: Error) => { logger.debug('socket error %s: %s', addr, (e as Error).message); });
+      // Fired here, inside the single dial, so concurrent callers waiting on
+      // the same promise still see exactly one event per connection.
+      this._fireChannelActive(addr);
       return sock;
     })();
     this.connectPromises.set(addr, p);
@@ -312,6 +320,24 @@ export class RemotingClient {
     if (!this.rpcHooks.length || request == null) return;
     for (const hook of this.rpcHooks.slice()) {
       try { hook.doAfterResponse(addr, request, response); } catch (e) { /* swallow */ }
+    }
+  }
+
+  // ---------------- connection events ----------------
+  registerChannelListener(listener: ChannelListener) { this.channelListeners.push(listener); }
+
+  private _fireChannelActive(addr: string) {
+    for (const listener of this.channelListeners.slice()) {
+      try {
+        const r: unknown = listener(addr);
+        if (r != null && typeof (r as Promise<void>).then === 'function') {
+          (r as Promise<void>).catch((e: Error) => {
+            logger.warn('channel listener for %s failed: %s', addr, e.message);
+          });
+        }
+      } catch (e) {
+        logger.warn('channel listener for %s raised: %s', addr, (e as Error).message);
+      }
     }
   }
 

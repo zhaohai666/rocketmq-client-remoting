@@ -428,6 +428,10 @@ pub struct MQClientInstanceConfig {
     pub enable_concurrent_heartbeat: bool,
     /// Worker count of the concurrent heartbeat pool (default: available processors).
     pub concurrent_heartbeat_thread_pool_size: usize,
+    /// Channel-active re-registration switch (default true). When a new connection to a known
+    /// broker is established, the instance re-sends its heartbeat there so the groups this
+    /// clientId owns are registered again before the next periodic round, and wakes rebalance.
+    pub enable_heartbeat_channel_event_listener: bool,
 }
 
 pub(crate) fn default_concurrent_heartbeat_pool_size() -> usize {
@@ -465,6 +469,7 @@ impl Default for MQClientInstanceConfig {
             mq_client_api_timeout_millis: MQ_CLIENT_API_TIMEOUT_MILLIS,
             enable_concurrent_heartbeat: false,
             concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
+            enable_heartbeat_channel_event_listener: true,
         }
     }
 }
@@ -594,6 +599,8 @@ struct Inner {
     use_heartbeat_v2: AtomicBool,
     /// Decode-read-body switch, live for the same reason: the decode happens per pull / POP.
     decode_read_body: AtomicBool,
+    /// Channel-active re-registration switch, live so a facade can flip it after `start()`.
+    enable_heartbeat_channel_event_listener: AtomicBool,
     /// Internal-API timeout, live so a facade can adjust it without rebuilding the instance.
     mq_client_api_timeout_millis: AtomicI64,
     /// Fixed-size worker pool for concurrent heartbeat rounds, created by `start()` and torn
@@ -728,6 +735,7 @@ impl MQClientInstance {
         let vip_channel_enabled = config.vip_channel_enabled;
         let use_heartbeat_v2 = config.use_heartbeat_v2;
         let decode_read_body = config.decode_read_body;
+        let enable_heartbeat_channel_event_listener = config.enable_heartbeat_channel_event_listener;
         let mq_client_api_timeout_millis = config.mq_client_api_timeout_millis;
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),
@@ -760,6 +768,9 @@ impl MQClientInstance {
             vip_channel_enabled: AtomicBool::new(vip_channel_enabled),
             use_heartbeat_v2: AtomicBool::new(use_heartbeat_v2),
             decode_read_body: AtomicBool::new(decode_read_body),
+            enable_heartbeat_channel_event_listener: AtomicBool::new(
+                enable_heartbeat_channel_event_listener,
+            ),
             mq_client_api_timeout_millis: AtomicI64::new(mq_client_api_timeout_millis),
             heartbeat_pool: Mutex::new(None),
             broker_support_v2_heartbeat_set: Mutex::new(HashSet::new()),
@@ -801,6 +812,17 @@ impl MQClientInstance {
                 .remoting_client
                 .register_processor(code, processor.clone());
         }
+        // A broker drops this clientId's groups when its last channel closes, and every pull then
+        // answers SUBSCRIPTION_NOT_EXIST until the next periodic beat. Re-registering on the new
+        // connection restores the groups immediately instead of up to one heartbeat interval later.
+        let weak = Arc::downgrade(&inner);
+        this.inner
+            .remoting_client
+            .register_channel_listener(Arc::new(move |addr: &str| {
+                if let Some(inner) = weak.upgrade() {
+                    MQClientInstance { inner }.on_channel_active(addr);
+                }
+            }));
         MQClientInstance::instance_map()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1775,6 +1797,56 @@ impl MQClientInstance {
 
     pub fn is_decode_read_body(&self) -> bool {
         self.inner.decode_read_body.load(Ordering::Acquire)
+    }
+
+    // ---------------- channel-active re-registration ----------------
+
+    pub fn set_enable_heartbeat_channel_event_listener(&self, enable: bool) {
+        self.inner
+            .enable_heartbeat_channel_event_listener
+            .store(enable, Ordering::Release);
+    }
+
+    pub fn is_enable_heartbeat_channel_event_listener(&self) -> bool {
+        self.inner
+            .enable_heartbeat_channel_event_listener
+            .load(Ordering::Acquire)
+    }
+
+    /// Runs on every newly established connection. Only a known broker address matters (a
+    /// name-server connection carries no registration), and only when this clientId has
+    /// consumer groups to restore. The beat is sent off the caller's task: the listener runs
+    /// inside the dial that opened the connection and must not block it.
+    pub fn on_channel_active(&self, addr: &str) {
+        if !self.is_enable_heartbeat_channel_event_listener() {
+            return;
+        }
+        if !self.get_all_broker_addrs().iter().any(|a| a == addr) {
+            return;
+        }
+        if self
+            .inner
+            .consumer_table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        let Some(handle) = self.inner.remoting_client.runtime_handle() else {
+            rmq_warn!("channel-active heartbeat to {addr} dropped: no tokio runtime in context");
+            return;
+        };
+        let this = self.clone();
+        let addr = addr.to_string();
+        let timeout_millis = this.mq_client_api_timeout_millis();
+        handle.spawn(async move {
+            let data = this.prepare_heartbeat_data();
+            if let Err(e) = this.send_heartbeat(&addr, &data, timeout_millis).await {
+                rmq_warn!("channel-active heartbeat to {addr} failed: {e}");
+            }
+            this.rebalance_immediately();
+        });
     }
 
     /// The timeout the client's own control RPCs use when the caller gave none.
@@ -5605,6 +5677,9 @@ mod tests {
             seed_route(&instance, &sub.topic, BROKER, &broker.addr);
         }
         instance.register_consumer(GROUP, StubConsumer::with_subs(GROUP, subs));
+        // These fixtures count beats per address and fingerprint; the channel-active listener
+        // would add one re-registration beat when the first connection opens.
+        instance.set_enable_heartbeat_channel_event_listener(false);
         instance
     }
 
@@ -5884,6 +5959,9 @@ mod tests {
         let master = MockBroker::start().await;
         let slave = MockBroker::start().await;
         let instance = new_instance();
+        // This test counts one beat per broker; the channel-active listener would add a
+        // re-registration beat when a first connection opens.
+        instance.set_enable_heartbeat_channel_event_listener(false);
         let route = TopicRouteData {
             queue_datas: vec![QueueData::new(
                 BROKER,
@@ -6032,6 +6110,103 @@ mod tests {
             .into_iter()
             .map(|r| HeartbeatData::decode(&r.body).expect("heartbeat body is a HeartbeatData"))
             .collect()
+    }
+
+    /// One instance, one subscribed consumer, and the broker address in the route cache.
+    fn channel_instance(broker: &MockBroker) -> (MQClientInstance, Arc<StubConsumer>) {
+        let instance = new_instance();
+        seed_route(&instance, TOPIC, BROKER, &broker.addr);
+        let stub = StubConsumer::with_subs(GROUP, vec![tag_sub(TOPIC, "*", ExpressionType::TAG)]);
+        instance.register_consumer(GROUP, stub.clone());
+        (instance, stub)
+    }
+
+    /// A broker forgets the groups of a clientId whose last channel closed; the first request on
+    /// the replacement connection must put them back instead of waiting for the next periodic beat.
+    #[tokio::test]
+    async fn channel_active_reregisters_a_known_broker() {
+        let broker = MockBroker::start().await;
+        let (instance, stub) = channel_instance(&broker);
+        assert!(
+            instance.is_enable_heartbeat_channel_event_listener(),
+            "re-registration is on by default"
+        );
+        assert_eq!(
+            instance.remoting_client().channel_listener_count(),
+            1,
+            "the instance wires its handler into the transport"
+        );
+
+        // Warm the connection with the switch off: this test counts the beats the replacement
+        // connection causes, and the dial below is the only connection it may observe.
+        instance.set_enable_heartbeat_channel_event_listener(false);
+        let data = instance.prepare_heartbeat_data();
+        instance
+            .send_heartbeat(&broker.addr, &data, 3000)
+            .await
+            .unwrap();
+        assert_eq!(beaten(&broker).len(), 1);
+        instance.set_enable_heartbeat_channel_event_listener(true);
+
+        instance.remoting_client().close_channel(&broker.addr);
+        let data = instance.prepare_heartbeat_data();
+        instance
+            .send_heartbeat(&broker.addr, &data, 3000)
+            .await
+            .unwrap();
+        assert!(
+            wait_until(|| beaten(&broker).len() >= 3
+                && stub.rebalance_wakeups.load(Ordering::SeqCst) >= 1)
+            .await,
+            "the new connection must produce a re-registration beat and wake rebalance"
+        );
+        let last = beaten(&broker).pop().expect("a beat reached the broker");
+        assert!(
+            last.client_id == instance.client_id(),
+            "the re-registration carries this clientId"
+        );
+        assert!(
+            last.consumer_data_set
+                .iter()
+                .any(|c| c.group_name == GROUP && !c.subscription_data_set.is_empty()),
+            "the re-registration carries the group and its subscriptions"
+        );
+        instance.shutdown();
+    }
+
+    /// Only a broker in the route cache counts: the name-server connection and any other address
+    /// carry no registration, so they must not trigger a beat.
+    #[tokio::test]
+    async fn channel_active_ignores_unknown_addresses() {
+        let broker = MockBroker::start().await;
+        let (instance, stub) = channel_instance(&broker);
+        instance.on_channel_active("127.0.0.1:1");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(beaten(&broker).is_empty());
+        assert_eq!(stub.rebalance_wakeups.load(Ordering::SeqCst), 0);
+        instance.shutdown();
+    }
+
+    /// With nothing registered there is nothing to restore, and with the switch off the client
+    /// keeps the periodic-beat behavior it had before.
+    #[tokio::test]
+    async fn channel_active_respects_the_switch_and_the_consumer_table() {
+        let broker = MockBroker::start().await;
+        let (instance, stub) = channel_instance(&broker);
+
+        instance.set_enable_heartbeat_channel_event_listener(false);
+        instance.on_channel_active(&broker.addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(beaten(&broker).is_empty(), "the switch is off");
+        assert_eq!(stub.rebalance_wakeups.load(Ordering::SeqCst), 0);
+
+        instance.set_enable_heartbeat_channel_event_listener(true);
+        instance.unregister_consumer(GROUP);
+        instance.on_channel_active(&broker.addr);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(beaten(&broker).is_empty(), "no consumer group to register");
+        assert_eq!(stub.rebalance_wakeups.load(Ordering::SeqCst), 0);
+        instance.shutdown();
     }
 
     /// Off (the default) the beat is the legacy one: fingerprint 0 and the subscriptions inline.
@@ -7769,6 +7944,9 @@ mod tests {
             MQClientInstanceConfig {
                 enable_concurrent_heartbeat: true,
                 concurrent_heartbeat_thread_pool_size: 2,
+                // This test counts jobs and beats; the channel-active listener would add a
+                // re-registration beat when a first connection opens.
+                enable_heartbeat_channel_event_listener: false,
                 heartbeat_initial_delay_millis: 3_600_000,
                 route_refresh_interval_millis: 3_600_000,
                 adjust_pool_initial_delay_millis: 3_600_000,
@@ -7820,6 +7998,8 @@ mod tests {
             vec![NAMESRV.to_string()],
             MQClientInstanceConfig {
                 enable_concurrent_heartbeat: false,
+                // The control half counts jobs and beats for the same reason.
+                enable_heartbeat_channel_event_listener: false,
                 heartbeat_initial_delay_millis: 3_600_000,
                 route_refresh_interval_millis: 3_600_000,
                 adjust_pool_initial_delay_millis: 3_600_000,

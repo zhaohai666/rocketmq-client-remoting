@@ -277,6 +277,24 @@ public sealed class DefaultMQPushConsumer
         }
     }
 
+    /// <summary>Re-registers this group with a broker as soon as a new connection to it is
+    /// established (default on). Off, a reconnect leaves the group unknown to that broker
+    /// until the next periodic heartbeat round.</summary>
+    public bool EnableHeartbeatChannelEventListener
+    {
+        get => _enableHeartbeatChannelEventListener;
+        set
+        {
+            _enableHeartbeatChannelEventListener = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.EnableHeartbeatChannelEventListener = value;
+            }
+        }
+    }
+
+    private bool _enableHeartbeatChannelEventListener = true;
+
     /// <summary>Pool size for concurrent heartbeats (default: available processors).</summary>
     public int ConcurrentHeartbeatThreadPoolSize
     {
@@ -1562,6 +1580,7 @@ public sealed class DefaultMQPushConsumer
             _mqClient.EnableConcurrentHeartbeat = _enableConcurrentHeartbeat;
             _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
             _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
+            _mqClient.EnableHeartbeatChannelEventListener = _enableHeartbeatChannelEventListener;
             try
             {
                 _mqClient.Start();
@@ -1611,6 +1630,11 @@ public sealed class DefaultMQPushConsumer
             // registering it would overwrite the others. Instead, register a
             // "wakeup" callback with the instance, which fans out on receipt.
             _mqClient.RegisterRebalanceWakeup(ConsumerGroup, WakeRebalanceLoop);
+
+            // A reconnect to a broker re-registers this group there right away: the broker
+            // drops a group when its last channel closes, and pulls would otherwise answer
+            // SUBSCRIPTION_NOT_EXIST until the next periodic heartbeat.
+            _mqClient.RegisterConsumerHeartbeat(ConsumerGroup, SendHeartbeatToBroker);
 
             // GET_CONSUMER_RUNNING_INFO(307) handling:
             // admin / broker queries this consumer's runtime info, replying
@@ -1818,6 +1842,7 @@ public sealed class DefaultMQPushConsumer
             // All consume threads are joined; remove the 40 "wakeup" callback
             // first (the callback captured this consumer's state)
             _mqClient.UnregisterRebalanceWakeup(ConsumerGroup);
+            _mqClient.UnregisterConsumerHeartbeat(ConsumerGroup);
             try
             {
                 _mqClient.UnregisterClientAllBrokers(_clientId, "", ConsumerGroup);
@@ -7306,6 +7331,28 @@ public sealed class DefaultMQPushConsumer
             return 0;
         }
 
+        HeartbeatData hb = BuildHeartbeat();
+        int okCount = _mqClient.SendHeartbeatToAllBrokers(hb, isRebalance: false, includeSlaves: true);
+        if (okCount > 0)
+        {
+            Interlocked.Add(ref _heartbeatCount, okCount);
+        }
+
+        return okCount;
+    }
+
+    /// <summary>Send this group's heartbeat to one broker and return 1. Used to restore the
+    /// broker-side registration right after a reconnect (the broker drops a group with its
+    /// last channel), instead of waiting for the next periodic round.</summary>
+    public int SendHeartbeatToBroker(string addr)
+    {
+        MQClientInstance c = Client();
+        c.SendHeartbeat(addr, BuildHeartbeat(), _mqClientApiTimeout);
+        return 1;
+    }
+
+    private HeartbeatData BuildHeartbeat()
+    {
         var hb = new HeartbeatData(_clientId);
         var cd = new ConsumerData
         {
@@ -7332,14 +7379,7 @@ public sealed class DefaultMQPushConsumer
         // false here is enough.
         hb.HeartbeatFingerprint = 0;
         hb.AddConsumerData(cd);
-
-        int okCount = _mqClient.SendHeartbeatToAllBrokers(hb, isRebalance: false, includeSlaves: true);
-        if (okCount > 0)
-        {
-            Interlocked.Add(ref _heartbeatCount, okCount);
-        }
-
-        return okCount;
+        return hb;
     }
 
     private void MaybeSendHeartbeat()

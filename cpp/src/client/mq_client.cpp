@@ -316,6 +316,8 @@ MQClientInstance::MQClientInstance(const std::string& clientId,
             this->processNotifyConsumerIdsChanged(cmd, addr);
             return std::optional<RemotingCommand>();
         });
+    remotingClient_->registerChannelListener(
+        [this](const std::string& addr) { this->onChannelActive(addr); });
 }
 
 MQClientInstance::~MQClientInstance() { shutdown(); }
@@ -422,6 +424,10 @@ void MQClientInstance::shutdown() {
     {
         std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
         rebalanceWakeups_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(consumerHeartbeatLock_);
+        consumerHeartbeats_.clear();
     }
     {
         std::lock_guard<std::mutex> lk(consumerProcessorLock_);
@@ -537,6 +543,53 @@ void MQClientInstance::rebalanceImmediately() {
         } catch (...) {
         }
     }
+}
+
+void MQClientInstance::registerConsumerHeartbeat(const std::string& group,
+                                                 std::function<int32_t(const std::string&)> heartbeat) {
+    std::lock_guard<std::mutex> lk(consumerHeartbeatLock_);
+    consumerHeartbeats_[group] = std::move(heartbeat);
+}
+
+void MQClientInstance::unregisterConsumerHeartbeat(const std::string& group) {
+    std::lock_guard<std::mutex> lk(consumerHeartbeatLock_);
+    consumerHeartbeats_.erase(group);
+}
+
+void MQClientInstance::onChannelActive(const std::string& addr) {
+    if (!enableHeartbeatChannelEventListener_.load()) return;
+    bool knownBroker = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(routeLock_);
+        for (const auto& broker : brokerAddrTable_) {
+            for (const auto& idAndAddr : broker.second) {
+                if (idAndAddr.second == addr) {
+                    knownBroker = true;
+                    break;
+                }
+            }
+            if (knownBroker) break;
+        }
+    }
+    if (!knownBroker) return;
+    std::map<std::string, std::function<int32_t(const std::string&)>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(consumerHeartbeatLock_);
+        snapshot = consumerHeartbeats_;
+    }
+    for (const auto& entry : snapshot) {
+        if (!entry.second) continue;
+        try {
+            entry.second(addr);
+        } catch (const std::exception& e) {
+            logger_warn("remoting: channel-active heartbeat for group " + entry.first + " to " +
+                        addr + " threw: " + e.what());
+        } catch (...) {
+            logger_warn("remoting: channel-active heartbeat for group " + entry.first + " to " +
+                        addr + " threw unknown exception");
+        }
+    }
+    rebalanceImmediately();
 }
 
 void MQClientInstance::processNotifyConsumerIdsChanged(const RemotingCommand& cmd,

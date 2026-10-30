@@ -62,6 +62,14 @@ type RPCHook interface {
 // connection runs processors inline.
 type ProcessorFunc func(request *RemotingCommand, addr string, sink *ResponseSink)
 
+// ChannelListener is told once whenever a connection to addr has just been
+// established (not per request on a connection that already existed). The
+// broker drops a consumer group when the last channel of that group closes,
+// so a client uses this to re-register the group immediately after a
+// reconnect instead of waiting for the next heartbeat round. It runs on the
+// caller's goroutine; a panic is recovered and logged.
+type ChannelListener func(addr string)
+
 // ResponseSink writes a reply back to the requester. The framework back-fills
 // the opaque; this path runs no RPC hooks (responses never carry signatures).
 type ResponseSink struct {
@@ -256,6 +264,13 @@ type RemotingClient struct {
 	procMu     sync.RWMutex
 	processors map[int32]ProcessorFunc
 
+	// Channel listeners are told once per connection that comes up (see
+	// RegisterChannelListener). Fired outside the connection lock: a listener
+	// typically sends a request on the new connection, which re-enters
+	// getOrCreateConn.
+	listenerMu       sync.RWMutex
+	channelListeners []ChannelListener
+
 	// Idle sweep: one goroutine per running client, started with the client and
 	// stopped by Shutdown, so no connection outlives the configured idle limit
 	// and no ticker outlives the client.
@@ -312,6 +327,32 @@ func (c *RemotingClient) RpcHookCount() int {
 	c.hooksMu.RLock()
 	defer c.hooksMu.RUnlock()
 	return len(c.hooks)
+}
+
+// RegisterChannelListener adds a listener told once per new connection.
+func (c *RemotingClient) RegisterChannelListener(listener ChannelListener) {
+	c.listenerMu.Lock()
+	c.channelListeners = append(c.channelListeners, listener)
+	c.listenerMu.Unlock()
+}
+
+// fireChannelActive tells every listener that a connection to addr is up. Each
+// listener recovers its own panic: a listener's failure must not turn the
+// request that opened the connection into an error.
+func (c *RemotingClient) fireChannelActive(addr string) {
+	c.listenerMu.RLock()
+	listeners := append([]ChannelListener(nil), c.channelListeners...)
+	c.listenerMu.RUnlock()
+	for _, listener := range listeners {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					common.LogWarnf("remoting: channel listener for %s panicked: %v", addr, r)
+				}
+			}()
+			listener(addr)
+		}()
+	}
 }
 
 func (c *RemotingClient) RegisterProcessor(requestCode int32, processor ProcessorFunc) {
@@ -770,6 +811,9 @@ func (c *RemotingClient) getOrCreateConn(addr string) (*connection, error) {
 	c.conns[addr] = conn
 	c.mu.Unlock()
 	go c.readLoop(conn)
+	// Outside c.mu: a listener typically sends a request on the new connection,
+	// which re-enters this method (and finds the connection above).
+	c.fireChannelActive(addr)
 	return conn, nil
 }
 

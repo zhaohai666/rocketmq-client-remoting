@@ -241,6 +241,24 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
+    /// <summary>Re-registers this group with a broker as soon as a new connection to it is
+    /// established (default on). Off, a reconnect leaves the group unknown to that broker
+    /// until the next periodic heartbeat round.</summary>
+    public bool EnableHeartbeatChannelEventListener
+    {
+        get => _enableHeartbeatChannelEventListener;
+        set
+        {
+            _enableHeartbeatChannelEventListener = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.EnableHeartbeatChannelEventListener = value;
+            }
+        }
+    }
+
+    private bool _enableHeartbeatChannelEventListener = true;
+
     /// <summary>Pool size for concurrent heartbeats (default: available processors).</summary>
     public int ConcurrentHeartbeatThreadPoolSize
     {
@@ -860,6 +878,7 @@ public sealed class DefaultLitePullConsumer
             _mqClient.DecodeReadBody = _decodeReadBody;
             _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
             _mqClient.EnableConcurrentHeartbeat = _enableConcurrentHeartbeat;
+            _mqClient.EnableHeartbeatChannelEventListener = _enableHeartbeatChannelEventListener;
             _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
             _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
             try
@@ -885,6 +904,10 @@ public sealed class DefaultLitePullConsumer
 
             RefreshRouteForHeartbeat();
             SendHeartbeatToAllBroker();
+            // A reconnect to a broker re-registers this group there right away: the broker
+            // drops a group when its last channel closes, and pulls would otherwise answer
+            // SUBSCRIPTION_NOT_EXIST until the next periodic heartbeat.
+            _mqClient.RegisterConsumerHeartbeat(_consumerGroup, SendHeartbeatToBroker);
             _running = true;
             _started = true;
 
@@ -951,6 +974,7 @@ public sealed class DefaultLitePullConsumer
             if (_metadataThread is { IsAlive: true }) _metadataThread.Join(2000);
             if (_mqClient is not null)
             {
+                _mqClient.UnregisterConsumerHeartbeat(_consumerGroup);
                 MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
                 _mqClient = null;
             }
@@ -2375,6 +2399,21 @@ public sealed class DefaultLitePullConsumer
         if (_mqClient is null) return 0;
         HeartbeatData hb = BuildHeartbeat();
         return _mqClient.SendHeartbeatToAllBrokers(hb, isRebalance: false, includeSlaves: true);
+    }
+
+    /// <summary>Send this group's heartbeat to one broker and return 1. Used to restore the
+    /// broker-side registration right after a reconnect (the broker drops a group with its
+    /// last channel), instead of waiting for the next periodic round.</summary>
+    private int SendHeartbeatToBroker(string addr)
+    {
+        MQClientInstance? c = _mqClient;
+        if (c is null || !_started)
+        {
+            return 0;
+        }
+
+        c.SendHeartbeat(addr, BuildHeartbeat(), _mqClientApiTimeout);
+        return 1;
     }
 
     private void HeartbeatLoop()

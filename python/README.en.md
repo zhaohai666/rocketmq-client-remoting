@@ -28,11 +28,11 @@ python3 -m venv .venv
 .venv/bin/pip install -e .                     # top-level packages: client / common / remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1780 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1787 passed, 4 skipped (151.12s)
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` collects 1784 cases and all of them run offline — no cluster needed. The 4 skips all come
+- `pytest` collects 1791 cases and all of them run offline — no cluster needed. The 4 skips all come
   from `tests/test_protocol_alignment.py` (an optional protocol-constant cross-check, off by default).
 - `selfcheck.py` runs 7 encode/decode round-trips of the protocol itself (JSON header / binary header /
   V2 short-field header / 17-segment storage format / long-topic V2 magic / 6-segment batch format /
@@ -395,6 +395,7 @@ third-party dependencies.
 | Three compression backends: zlib (standard library) / LZ4 / ZSTD | ✅ |
 | TLS (mTLS and strict CA verification) | ✅ |
 | Connection lifecycle: an undecodable frame logs one ERROR naming the peer and takes that connection down (an out-of-range length prefix is the same event one level earlier, reported once at the level that caught it); a response no request is waiting on logs one WARN naming its opaque and address and the connection stays up; every expired in-flight request logs its own WARN; `is_channel_writable` answers for the socket's send buffer, not for having a connection — an address with no live connection is writable because the next send connects, only a live socket whose send buffer is full answers false; the sweep thread closes a connection that served neither a read nor a completed write for strictly longer than `channel_not_active_interval_millis` (default 120000; a non-positive value restores the default rather than switching the sweep off) with one WARN per address; a sync wait that runs out closes the connection it went out on when `enable_close_channel_on_sync_timeout` is on (default true) — it keeps it only when the budget left at the deadline is neither above 100ms nor above a quarter of that timeout; a write that fails closes the channel whatever the knobs say | ✅ |
+| Consumer re-registration: as soon as a connection to a broker in the route table is newly established, the instance sends one heartbeat over it right away to re-file every consumer group's subscriptions under this clientId, and wakes a rebalance round. Switch `set_enable_heartbeat_channel_event_listener()` (default on); off, registration only happens on the periodic heartbeat round. A name-server connection, an address absent from the route table, and an instance holding no consumer group each send nothing, and cases pin the re-registration, those three exclusions and the silence when the switch is off | ✅ |
 | SOCKS proxy (SOCKS4/5, username-password sub-negotiation, CONNECT tunnel, TLS stackable) | ✅ |
 | Dynamic NameServer discovery (`DefaultTopAddressing` + `ROCKETMQ_NAMESRV_DOMAIN`) | ✅ |
 | Send-latency fault avoidance (`set_send_latency_fault_enable`) and master/slave switching | ✅ |
@@ -536,7 +537,7 @@ python/
 ├── rocketmq_logging.py     logging bridge
 ├── selfcheck.py            cluster-free protocol round trips (7 checks)
 ├── __main__.py             command entry (python -m selfcheck)
-├── tests/                  1784 offline cases (conftest.py puts python/ on sys.path)
+├── tests/                  1791 offline cases (conftest.py puts python/ on sys.path)
 ├── verify_*_live.py        live-cluster scripts (see Live Cluster Verification)
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  helper scripts
 ├── pyproject.toml          no runtime dependencies; requires-python >= 3.8

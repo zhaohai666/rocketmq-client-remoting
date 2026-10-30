@@ -45,7 +45,7 @@ cd php
 # syntax check of a file after modifying it
 php -l src/Client/Producer.php
 
-# offline self-test entry: static guard + 34 suites run sequentially, no cluster needed
+# offline self-test entry: static guard + 36 suites run sequentially, no cluster needed
 php tests/run_all.php
 
 # a single suite
@@ -59,9 +59,9 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 `tests/run_all.php` is the **offline** suite: before running anything it performs a
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
-the other dies — this guard cannot be skipped), then chains **34** suites — the list is derived
+the other dies — this guard cannot be skipped), then chains **36** suites — the list is derived
 from `tests/Run*.php`, so a new suite cannot silently stay out of the check. Measured today:
-**guard CLEAN, all 5,244 assertions across the 34 suites pass**; any failure exits with a
+**guard CLEAN, all 5,264 assertions across the 36 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -444,6 +444,13 @@ Assigning the public `$client->socksProxy` property works too; all five client f
   synchronous wait that runs out closes the connection it went out on unless
   `setCloseChannelOnSyncTimeout(false)` turns that off, an expired in-flight entry logs one line
   per entry, and a write that fails closes the channel whatever the knobs say
+- ✅ Consumer re-registration: as soon as a connection to a broker in the route table is
+  newly established, the instance sends one heartbeat over it right away to re-file every
+  consumer group's subscriptions under this clientId, and wakes a rebalance round. Switch
+  `setEnableHeartbeatChannelEventListener()` (default on); off, registration only happens
+  on the periodic heartbeat round. A name-server connection, an address absent from the
+  route table, and an instance holding no consumer group each send nothing, and suites pin
+  the re-registration, those three exclusions and the silence when the switch is off
 - ✅ Sending: normal / pinned / queue selector / batch (with `ProduceAccumulator`
   auto-accumulation and two-level fair backpressure) / oneway / async / transactional
   (two-phase + broker check-back) / timed messages and recall / Request-Reply
@@ -506,7 +513,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 34 suites with 5,244 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 36 suites with 5,264 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 14 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,

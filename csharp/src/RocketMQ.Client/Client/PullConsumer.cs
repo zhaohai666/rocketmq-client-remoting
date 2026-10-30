@@ -206,6 +206,24 @@ public sealed class DefaultMQPullConsumer
         }
     }
 
+    /// <summary>Re-registers this group with a broker as soon as a new connection to it is
+    /// established (default on). Off, a reconnect leaves the group unknown to that broker
+    /// until the next periodic heartbeat round.</summary>
+    public bool EnableHeartbeatChannelEventListener
+    {
+        get => _enableHeartbeatChannelEventListener;
+        set
+        {
+            _enableHeartbeatChannelEventListener = value;
+            if (_mqClient is not null)
+            {
+                _mqClient.EnableHeartbeatChannelEventListener = value;
+            }
+        }
+    }
+
+    private bool _enableHeartbeatChannelEventListener = true;
+
     /// <summary>Pool size for concurrent heartbeats (default: available processors).</summary>
     public int ConcurrentHeartbeatThreadPoolSize
     {
@@ -331,6 +349,7 @@ public sealed class DefaultMQPullConsumer
             _mqClient.DecodeReadBody = _decodeReadBody;
             _mqClient.MqClientApiTimeout = _mqClientApiTimeout;
             _mqClient.EnableConcurrentHeartbeat = _enableConcurrentHeartbeat;
+            _mqClient.EnableHeartbeatChannelEventListener = _enableHeartbeatChannelEventListener;
             _mqClient.ConcurrentHeartbeatThreadPoolSize = _concurrentHeartbeatThreadPoolSize;
             _mqClient.MaxPageSizeInGetMetadata = _maxPageSizeInGetMetadata;
             try
@@ -355,6 +374,10 @@ public sealed class DefaultMQPullConsumer
             {
                 ClientLog.Debug("initial heartbeat failed: " + e.Message);
             }
+            // A reconnect to a broker re-registers this group there right away: the broker
+            // drops a group when its last channel closes, and pulls would otherwise answer
+            // SUBSCRIPTION_NOT_EXIST until the next periodic heartbeat.
+            _mqClient.RegisterConsumerHeartbeat(_consumerGroup, SendHeartbeatToBroker);
             StartHeartbeatLoop();
         }
     }
@@ -376,6 +399,7 @@ public sealed class DefaultMQPullConsumer
             }
             if (_mqClient is not null)
             {
+                _mqClient.UnregisterConsumerHeartbeat(_consumerGroup);
                 try
                 {
                     _mqClient.UnregisterClientAllBrokers(_clientId, string.Empty, _consumerGroup);
@@ -513,6 +537,16 @@ public sealed class DefaultMQPullConsumer
         }
 
         return ok;
+    }
+
+    /// <summary>Send this group's heartbeat to one broker and return 1. Used to restore the
+    /// broker-side registration right after a reconnect (the broker drops a group with its
+    /// last channel), instead of waiting for the next periodic round.</summary>
+    public int SendHeartbeatToBroker(string addr)
+    {
+        MQClientInstance c = RequireClient();
+        c.SendHeartbeat(addr, BuildHeartbeat(), _mqClientApiTimeout);
+        return 1;
     }
 
     private void StartHeartbeatLoop()

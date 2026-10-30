@@ -101,6 +101,12 @@ type ClientInstanceConfig struct {
 	// ConcurrentHeartbeatThreadPoolSize is the pool width used by the
 	// concurrent heartbeat round (default: available processors).
 	ConcurrentHeartbeatThreadPoolSize int
+	// EnableHeartbeatChannelEventListener re-registers the instance's consumer
+	// groups with a broker as soon as a connection to that broker comes up.
+	// ON by default: the broker drops a group when the last channel of that
+	// group closes, so without this a reconnect leaves the group unknown there
+	// until the next heartbeat round.
+	EnableHeartbeatChannelEventListener bool
 	// MaxPageSizeInGetMetadata is the page size the admin paging loops send as
 	// maxTopicNum / maxGroupNum (default 2000).
 	MaxPageSizeInGetMetadata int
@@ -121,6 +127,7 @@ func NewClientInstanceConfig() ClientInstanceConfig {
 		MQClientAPITimeoutMillis:            DefaultMQClientAPITimeoutMillis,
 		EnableConcurrentHeartbeat:           false,
 		ConcurrentHeartbeatThreadPoolSize:   runtime.NumCPU(),
+		EnableHeartbeatChannelEventListener: true,
 		MaxPageSizeInGetMetadata:            DefaultMaxPageSizeInGetMetadata,
 	}
 }
@@ -234,6 +241,9 @@ type Instance struct {
 	enableConcurrentHeartbeat   atomic.Bool
 	concurrentHeartbeatPoolSize atomic.Int64
 	maxPageSizeInGetMetadata    atomic.Int64
+	// enableHeartbeatChannelEventListener is the live copy of the config field
+	// of the same name (default on).
+	enableHeartbeatChannelEventListener atomic.Bool
 	heartbeatPoolMu             sync.Mutex
 	concurrentHeartbeatPool     *boundedPool
 
@@ -305,6 +315,7 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 		inst.mqClientAPITimeoutMillis.Store(DefaultMQClientAPITimeoutMillis)
 	}
 	inst.enableConcurrentHeartbeat.Store(config.EnableConcurrentHeartbeat)
+	inst.enableHeartbeatChannelEventListener.Store(config.EnableHeartbeatChannelEventListener)
 	if config.ConcurrentHeartbeatThreadPoolSize > 0 {
 		inst.concurrentHeartbeatPoolSize.Store(int64(config.ConcurrentHeartbeatThreadPoolSize))
 	} else {
@@ -615,6 +626,40 @@ func (i *Instance) RebalanceImmediately() {
 	}
 }
 
+// SetEnableHeartbeatChannelEventListener turns the channel-active
+// re-registration on or off (default on; see OnChannelActive).
+func (i *Instance) SetEnableHeartbeatChannelEventListener(enable bool) {
+	i.enableHeartbeatChannelEventListener.Store(enable)
+}
+
+// IsEnableHeartbeatChannelEventListener reports the switch.
+func (i *Instance) IsEnableHeartbeatChannelEventListener() bool {
+	return i.enableHeartbeatChannelEventListener.Load()
+}
+
+// OnChannelActive runs when a connection to addr has just been established.
+// The broker drops a consumer group when the last channel of that group
+// closes, so after a reconnect the group is unknown there until the next
+// heartbeat round; this re-registers every group this instance hosts with
+// that broker immediately, then wakes rebalance. Nothing happens for an
+// address that is not a known broker or when the switch is off.
+func (i *Instance) OnChannelActive(addr string) {
+	if !i.enableHeartbeatChannelEventListener.Load() {
+		return
+	}
+	if !containsString(i.GetAllBrokerAddrs(), addr) {
+		return
+	}
+	hb := i.PrepareHeartbeatData()
+	if len(hb.ConsumerDataSet) == 0 {
+		return
+	}
+	if err := i.SendHeartbeat(addr, hb, 0); err != nil {
+		common.LogDebugf("channel-active heartbeat to %s failed: %v", addr, err)
+	}
+	i.RebalanceImmediately()
+}
+
 // RegisterTopicInUse marks a topic for the periodic route refresh.
 func (i *Instance) RegisterTopicInUse(topic string) {
 	if topic == "" {
@@ -638,6 +683,7 @@ func (i *Instance) registerClientProcessors() {
 	i.remoting.RegisterProcessor(remoting.ReqConsumeMessageDirectly, i.processConsumeMessageDirectly)
 	i.remoting.RegisterProcessor(remoting.ReqPushReplyMessageToClient, i.processReplyMessage)
 	i.remoting.RegisterProcessor(remoting.ReqNotifyUnsubscribeLite, i.processNotifyUnsubscribeLite)
+	i.remoting.RegisterChannelListener(i.OnChannelActive)
 }
 
 // processNotifyUnsubscribeLite (200073) is registered for exactly one reason:

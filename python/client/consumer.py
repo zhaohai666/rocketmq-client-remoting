@@ -1119,6 +1119,9 @@ class DefaultMQPushConsumer:
         # Concurrent heartbeat: one round fans out over the instance's worker pool and waits
         # for every broker. The pool is created when the client instance starts.
         self.enable_concurrent_heartbeat = False
+        # Mirror of the client instance's switch: re-register with a broker as soon as a new
+        # connection to it is established (default on). See MQClientInstance.on_channel_active.
+        self.enable_heartbeat_channel_event_listener = True
         self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
         self.mq_client_api_timeout = 3000
         # Route refresh interval (``poll_name_server_interval`` defaults to 30000ms).
@@ -1241,6 +1244,16 @@ class DefaultMQPushConsumer:
         self.enable_concurrent_heartbeat = bool(enable)
         if self._mq_client is not None:
             self._mq_client.enable_concurrent_heartbeat = bool(enable)
+
+    def set_enable_heartbeat_channel_event_listener(self, enable: bool) -> None:
+        """Re-register with a broker as soon as a new connection to it is established (default on).
+
+        Off, a reconnect leaves the consumer group unknown to that broker until the next
+        periodic heartbeat round; see ``MQClientInstance.on_channel_active``.
+        """
+        self.enable_heartbeat_channel_event_listener = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_heartbeat_channel_event_listener = bool(enable)
 
     def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
         """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
@@ -1775,6 +1788,8 @@ class DefaultMQPushConsumer:
             self._mq_client.decode_read_body = self.decode_read_body
             self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
             self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+            self._mq_client.enable_heartbeat_channel_event_listener = \
+                self.enable_heartbeat_channel_event_listener
             self._mq_client.concurrent_heartbeat_thread_pool_size = \
                 self.concurrent_heartbeat_thread_pool_size
             if created and self.rpc_hook is not None:
@@ -2069,6 +2084,22 @@ class DefaultMQPushConsumer:
         if ok > 0:
             self._heartbeat_count += 1
         return ok
+
+    def heartbeat_to_broker(self, addr: str) -> int:
+        """Send this group's heartbeat to one broker and return 1.
+
+        Called by the client instance when a connection to that broker has just been re-established:
+        the broker drops the group together with its last channel, so the registration has to be
+        restored before the next pull instead of at the next periodic heartbeat round.
+        """
+        client = self._require_client()
+        hb = self._build_heartbeat()
+        if self.use_heartbeat_v2:
+            client.send_heartbeat_to_broker_v2(
+                addr, hb, self.consumer_group, self.mq_client_api_timeout)
+        else:
+            client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
+        return 1
 
     def heartbeat_count(self) -> int:
         """Number of successful heartbeat rounds (for live verification)."""
@@ -4330,6 +4361,9 @@ class DefaultMQPullConsumer:
         # the headers and leaves every body unset.
         self.decode_read_body = True
         self.enable_concurrent_heartbeat = False
+        # Mirror of the client instance's switch: re-register with a broker as soon as a new
+        # connection to it is established (default on). See MQClientInstance.on_channel_active.
+        self.enable_heartbeat_channel_event_listener = True
         self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
         self.mq_client_api_timeout = 3000
         self._heartbeat_count = 0
@@ -4447,6 +4481,16 @@ class DefaultMQPullConsumer:
         if self._mq_client is not None:
             self._mq_client.enable_concurrent_heartbeat = bool(enable)
 
+    def set_enable_heartbeat_channel_event_listener(self, enable: bool) -> None:
+        """Re-register with a broker as soon as a new connection to it is established (default on).
+
+        Off, a reconnect leaves the consumer group unknown to that broker until the next
+        periodic heartbeat round; see ``MQClientInstance.on_channel_active``.
+        """
+        self.enable_heartbeat_channel_event_listener = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_heartbeat_channel_event_listener = bool(enable)
+
     def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
         """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
         self.concurrent_heartbeat_thread_pool_size = max(1, int(size))
@@ -4558,6 +4602,22 @@ class DefaultMQPullConsumer:
             self._heartbeat_count += 1
         return ok
 
+    def heartbeat_to_broker(self, addr: str) -> int:
+        """Send this group's heartbeat to one broker and return 1.
+
+        Called by the client instance when a connection to that broker has just been re-established:
+        the broker drops the group together with its last channel, so the registration has to be
+        restored before the next pull instead of at the next periodic heartbeat round.
+        """
+        client = self._require_client()
+        hb = self._build_heartbeat()
+        if self.use_heartbeat_v2:
+            client.send_heartbeat_to_broker_v2(
+                addr, hb, self.consumer_group, self.mq_client_api_timeout)
+        else:
+            client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
+        return 1
+
     def heartbeat_count(self) -> int:
         """Number of successful heartbeat rounds (for live verification)."""
         return self._heartbeat_count
@@ -4618,6 +4678,8 @@ class DefaultMQPullConsumer:
         self._mq_client.decode_read_body = self.decode_read_body
         self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
         self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+        self._mq_client.enable_heartbeat_channel_event_listener = \
+            self.enable_heartbeat_channel_event_listener
         self._mq_client.concurrent_heartbeat_thread_pool_size = \
             self.concurrent_heartbeat_thread_pool_size
         if created and self.rpc_hook is not None:
@@ -5172,6 +5234,9 @@ class DefaultLitePullConsumer:
         # the headers and leaves every body unset.
         self.decode_read_body = True
         self.enable_concurrent_heartbeat = False
+        # Mirror of the client instance's switch: re-register with a broker as soon as a new
+        # connection to it is established (default on). See MQClientInstance.on_channel_active.
+        self.enable_heartbeat_channel_event_listener = True
         self.concurrent_heartbeat_thread_pool_size = os.cpu_count() or 1
         self.mq_client_api_timeout = 3000
 
@@ -5301,6 +5366,16 @@ class DefaultLitePullConsumer:
         self.enable_concurrent_heartbeat = bool(enable)
         if self._mq_client is not None:
             self._mq_client.enable_concurrent_heartbeat = bool(enable)
+
+    def set_enable_heartbeat_channel_event_listener(self, enable: bool) -> None:
+        """Re-register with a broker as soon as a new connection to it is established (default on).
+
+        Off, a reconnect leaves the consumer group unknown to that broker until the next
+        periodic heartbeat round; see ``MQClientInstance.on_channel_active``.
+        """
+        self.enable_heartbeat_channel_event_listener = bool(enable)
+        if self._mq_client is not None:
+            self._mq_client.enable_heartbeat_channel_event_listener = bool(enable)
 
     def set_concurrent_heartbeat_thread_pool_size(self, size: int) -> None:
         """Worker count of the concurrent-heartbeat pool; applied when the instance starts."""
@@ -5626,6 +5701,8 @@ class DefaultLitePullConsumer:
         self._mq_client.decode_read_body = self.decode_read_body
         self._mq_client.mq_client_api_timeout = self.mq_client_api_timeout
         self._mq_client.enable_concurrent_heartbeat = self.enable_concurrent_heartbeat
+        self._mq_client.enable_heartbeat_channel_event_listener = \
+            self.enable_heartbeat_channel_event_listener
         self._mq_client.concurrent_heartbeat_thread_pool_size = \
             self.concurrent_heartbeat_thread_pool_size
         if created and self.rpc_hook is not None:
@@ -5766,6 +5843,23 @@ class DefaultLitePullConsumer:
             except Exception as e:  # noqa: BLE001
                 logger.debug("lite heartbeat to %s failed: %s", addr, e)
         return ok
+
+    def heartbeat_to_broker(self, addr: str) -> int:
+        """Send this group's heartbeat to one broker and return 1.
+
+        Called by the client instance when a connection to that broker has just been re-established:
+        the broker drops the group together with its last channel, so the registration has to be
+        restored before the next pull instead of at the next periodic heartbeat round.
+        """
+        if self._mq_client is None:
+            return 0
+        hb = self._build_heartbeat()
+        if self.use_heartbeat_v2:
+            self._mq_client.send_heartbeat_to_broker_v2(
+                addr, hb, self.consumer_group, self.mq_client_api_timeout)
+        else:
+            self._mq_client.send_heartbeat(addr, hb, self.mq_client_api_timeout)
+        return 1
 
     def _start_heartbeat_loop(self) -> None:
         self._heartbeat_thread = threading.Thread(

@@ -40,7 +40,7 @@ cd php
 # 改动后对相关文件做语法检查
 php -l src/Client/Producer.php
 
-# 离线自测入口：静态守卫 + 34 个套件顺序执行，不连真机
+# 离线自测入口：静态守卫 + 36 个套件顺序执行，不连真机
 php tests/run_all.php
 
 # 单个套件
@@ -53,8 +53,8 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 **34** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
-悄悄漏出自检。当前实测：**守卫 CLEAN，34 个套件 5,244 项断言全部通过**，任一失败即以非零码退出。
+守卫不能省），然后串起 **36** 个套件——套件清单由 `tests/Run*.php` 目录树推导，新增套件不会
+悄悄漏出自检。当前实测：**守卫 CLEAN，36 个套件 5,264 项断言全部通过**，任一失败即以非零码退出。
 
 ## 快速上手
 
@@ -395,6 +395,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
 - ✅ 协议 / 传输：`RemotingCommand` JSON + ROCKETMQ 二进制双序列化、17 段存储格式与
   6 段批量消息编解码、sync / async / oneway、opaque 匹配、半包重组、GO_AWAY 换连接重发、TLS
 - ✅ 连接生命周期，每条规则都有测试自己持有的 socket 闸门用例：解不开帧的连接打一条点名对端的 ERROR，连接按对端 EOF 的方式收掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败），对端下一个合法帧在新连接上服务；没人等它的响应被丢弃并打一条点名 opaque 与地址的 WARNING，连接照旧留着；`isChannelWritable()` 回答的是 socket 发送缓冲，不是有没有连接——没有连接即可写（下一次发送自己建连），只有发送缓冲塞满的活连接算不可写，探测本身失败时报可写、交给写路径决定；静默超过 `setChannelIdleTimeoutSeconds()`（默认 120；配非正数恢复默认，而不是把清扫关掉）的连接被回收并每个地址一条 WARNING，读和写都会重打时间戳，回收由客户端自己的泵（`pumpIncoming()` / `waitResponses()`）驱动——单线程进程没有可以托付的后台定时器；同步等待超时后默认关掉它发出去的那条连接，`setCloseChannelOnSyncTimeout(false)` 才留；每个过期在途请求各一条日志；写本身失败则无论旋钮开合都关通道
+- ✅ 消费者重注册：向路由表里的某个 Broker 新建一条连接后，实例立刻顺着这条连接补发一次心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮 rebalance；开关 `setEnableHeartbeatChannelEventListener()`（默认开），关掉后只按周期心跳注册。名字服务的连接、不在路由表里的地址、没有消费组的实例三种情况一条都不补发；套件分别钉住补发本身、这三条排除，以及关掉开关后的静默
 - ✅ 发送：普通 / 定点 / 队列选择器 / 批量（含 `ProduceAccumulator` 自动攒批与两级公平
   背压）/ 单向 / 异步 / 事务（两阶段 + broker 回查）/ 定时消息与撤回 / Request-Reply
 - ✅ 消费：Push（并发 / 顺序 / 广播 / 位点持久化 / 启动期数值校验 / 每队列三条拉取前缓存闸门，
@@ -437,7 +438,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：34 套件 5,244 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：36 套件 5,264 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 14 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP（含 BATCH_ACK 批量确认）/ POP 消费者 / TLS / Request-Reply / 压缩冒烟 / 静态 topic /
   SQL92 过滤 / 单向推送 / 生产端重注册 / 鉴权集群上的全部消息类型收发
