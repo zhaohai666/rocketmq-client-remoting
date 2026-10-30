@@ -2811,7 +2811,13 @@ mod tests {
             "only the quiet connection is reaped",
         )
         .await;
-        assert_eq!(quiet_closes.load(Ordering::SeqCst), 1, "the reap closed the socket");
+        // The close counter is bumped by the peer when it sees EOF, which lands
+        // after the client has already dropped the connection from its table.
+        wait_until(
+            || quiet_closes.load(Ordering::SeqCst) == 1,
+            "the reap closed the socket",
+        )
+        .await;
 
         // Bytes went out a moment ago, so no connection here is past the limit -- however short it is.
         let mut fresh = request(request_code::HEART_BEAT, "fresh");
@@ -2830,7 +2836,11 @@ mod tests {
             "the connection the beats kept alive is reaped once they stop",
         )
         .await;
-        assert_eq!(busy_closes.load(Ordering::SeqCst), 1);
+        wait_until(
+            || busy_closes.load(Ordering::SeqCst) == 1,
+            "the second reap closed its socket",
+        )
+        .await;
 
         for addr in [&quiet_addr, &busy_addr] {
             let lines = tail
