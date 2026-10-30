@@ -14,7 +14,7 @@ import {
 } from '../remoting/route.ts';
 import {
   SendMessageRequestHeader, SendMessageRequestHeaderV2, SendMessageResponseHeader,
-  RecallMessageRequestHeader, EndTransactionRequestHeader,
+  RecallMessageRequestHeader, RecallMessageResponseHeader, EndTransactionRequestHeader,
   QueryConsumerOffsetRequestHeader, QueryConsumerOffsetResponseHeader,
   UpdateConsumerOffsetRequestHeader,
   GetMaxOffsetRequestHeader, GetMinOffsetRequestHeader,
@@ -41,7 +41,6 @@ import { ExpressionType } from '../common/subscriptionData.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
 import { messageProperties2String, decodeMessage, string2MessageProperties } from '../common/messageDecoder.ts';
-import { RecallMessageHandle } from '../common/recall_message_handle.ts';
 import { getLogger } from '../logging.ts';
 import {
   MQClientException, MQBrokerException, RemotingException,
@@ -588,7 +587,6 @@ export class MQClient {
     msg: Message,
     mq: MessageQueue,
     producerGroup: string,
-    namespace: string | null,
   ): RemotingCommand {
     const topic = msg.getTopic();
     const isBatch = msg instanceof MessageBatch;
@@ -716,15 +714,24 @@ export class MQClient {
   }
 
   // ---- recall ----
-  async recallMessage(brokerAddr: string, producerGroup: string, topic: string, recallHandle: string): Promise<SendResult> {
-    const handle = RecallMessageHandle.parseRecallMessageHandle(recallHandle);
+  // RECALL_MESSAGE answers with RecallMessageResponseHeader#msgId — the id of
+  // the message the broker withdrew — NOT a SendResult: a recall parses no
+  // send response fields and must not be pushed through parseSendResponse.
+  async recallMessage(brokerAddr: string, producerGroup: string, topic: string,
+    recallHandle: string, bname: string | null, timeoutMillis: number): Promise<string> {
     const header = new RecallMessageRequestHeader();
     header.producerGroup = producerGroup;
     header.topic = topic;
     header.recallHandle = recallHandle;
-    header.bname = handle.brokerName;
+    header.bname = bname;
     const request = RemotingCommand.createRequestCommand(RequestCode.RECALL_MESSAGE, header);
-    return this.sendMessage(brokerAddr, request, new MessageQueue(topic, handle.brokerName, 0), 3000);
+    const response = await this.remotingClient.invokeSync(brokerAddr, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || '', brokerAddr);
+    }
+    const respHeader = new RecallMessageResponseHeader();
+    respHeader.fromExtFields(response.extFields || {});
+    return respHeader.msgId != null ? respHeader.msgId : '';
   }
 
   // ---- heartbeat ----

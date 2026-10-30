@@ -187,8 +187,29 @@ export class DefaultMQPullConsumer {
   // EMPTY so the client-side tag filter stays off.
   subscribe(topic: string, subExpression: string | MessageSelector = '*'): this {
     if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
+    topic = this._withNamespace(topic);
     this.subscription.set(topic, this._buildSub(topic, subExpression));
     return this;
+  }
+
+  // ---- namespace (client-side prefix) ----
+  // With a namespace set the broker-side name of every resource is the prefixed
+  // one: subscriptions, the group, route lookups and pull requests all use it,
+  // and delivered messages get the bare topic back before the caller sees them.
+  _withNamespace(resource: string): string {
+    return MixAll.wrapNamespace(this.namespace, resource);
+  }
+
+  private _queueWithNamespace(mq: MessageQueue): MessageQueue {
+    if (!this.namespace) return mq;
+    const topic = this._withNamespace(mq.getTopic());
+    return topic === mq.getTopic() ? mq : new MessageQueue(topic, mq.getBrokerName(), mq.getQueueId());
+  }
+
+  private _bareQueue(mq: MessageQueue): MessageQueue {
+    if (!this.namespace) return mq;
+    const topic = MixAll.withoutNamespace(mq.getTopic(), this.namespace);
+    return topic === mq.getTopic() ? mq : new MessageQueue(topic, mq.getBrokerName(), mq.getQueueId());
   }
 
   private _buildSub(topic: string, subExpression: string | MessageSelector): SubscriptionData {
@@ -200,6 +221,9 @@ export class DefaultMQPullConsumer {
 
   async start(): Promise<void> {
     if (this.started) return;
+    // The broker-side group carries the prefix; wrapNamespace is idempotent, so
+    // a restart after shutdown does not stack prefixes.
+    this.consumerGroup = this._withNamespace(this.consumerGroup);
     Validators.checkGroup(this.consumerGroup);
     if (!this.nameServerAddr) throw new Error('name server address is not set');
     // No subscription is required to start: a pull consumer names the topic in
@@ -279,13 +303,18 @@ export class DefaultMQPullConsumer {
   // the two lists differ, and a caller sharding by this list would read queues
   // not assigned to it (or miss the ones that were).
   async fetchPublishMessageQueues(topic: string): Promise<MessageQueue[]> {
-    return (await this.routeOf(topic, 'publish')).getAllMessageQueue(topic);
+    const full = this._withNamespace(topic);
+    return (await this.routeOf(full, 'publish')).getAllMessageQueue(full);
   }
 
   // fetchSubscribeMessageQueues: the SUBSCRIBE view (read perm, readQueueNums,
   // no master filtering). This is the list a puller iterates.
   async fetchSubscribeMessageQueues(topic: string): Promise<MessageQueue[]> {
-    return (await this.routeOf(topic, 'subscribe')).getAllSubscribeMessageQueue(topic);
+    const full = this._withNamespace(topic);
+    const queues = (await this.routeOf(full, 'subscribe')).getAllSubscribeMessageQueue(full);
+    // The queue list is the caller's view: hand back the bare topic, as the
+    // pull/offset APIs accept it and prefix it again internally.
+    return queues.map((mq) => this._bareQueue(mq));
   }
 
   private async routeOf(topic: string, view: 'publish' | 'subscribe'): Promise<TopicRouteData> {
@@ -349,7 +378,8 @@ export class DefaultMQPullConsumer {
     if (!this.started || !this.pullAPI) throw new Error('consumer not started');
     if (offset < 0) throw new MQClientException('offset < 0');
     if (maxNums <= 0) throw new MQClientException('maxNums <= 0');
-    const topic = mq.getTopic();
+    const fullMq = this._queueWithNamespace(mq);
+    const topic = fullMq.getTopic();
     let sub: SubscriptionData;
     if (subExpression == null) {
       const cached = this.subscription.get(topic);
@@ -361,9 +391,15 @@ export class DefaultMQPullConsumer {
     // Pull / lite-pull consumers ALWAYS send the expression (rule #21):
     // subscription bit on.
     const sysFlag = PullSysFlag.buildSysFlag(false, suspend, true, false);
-    let result = await this.pullAPI.pullKernel(mq, offset, sub, sysFlag, 0,
+    let result = await this.pullAPI.pullKernel(fullMq, offset, sub, sysFlag, 0,
       maxNums, suspendTimeoutMillis, timeoutMillis);
-    result = this.pullAPI.processPullResult(mq, result, sub);
+    result = this.pullAPI.processPullResult(fullMq, result, sub);
+    if (this.namespace) {
+      // The caller handed in the bare topic; hand it back on the messages too.
+      for (const msg of result.msgFoundList) {
+        msg.setTopic(MixAll.withoutNamespace(msg.getTopic(), this.namespace));
+      }
+    }
     return result;
   }
 
@@ -371,14 +407,15 @@ export class DefaultMQPullConsumer {
   updateConsumeOffset(mq: MessageQueue, offset: number): void {
     if (!this.offsetStore) throw new Error('consumer not started');
     if (offset < 0) throw new Error(`offset must be >= 0, got ${offset}`);
-    this.offsetStore.updateOffset(mq, offset, true);
+    this.offsetStore.updateOffset(this._queueWithNamespace(mq), offset, true);
   }
 
   // fetchConsumeOffset reads the consumed offset (-1 when unknown).
   async fetchConsumeOffset(mq: MessageQueue, fromStore: boolean): Promise<number> {
     if (!this.offsetStore) throw new Error('consumer not started');
-    if (fromStore) await this._warmQueueRoute(mq.getTopic());
-    return this.offsetStore.readOffset(mq,
+    const fullMq = this._queueWithNamespace(mq);
+    if (fromStore) await this._warmQueueRoute(fullMq.getTopic());
+    return this.offsetStore.readOffset(fullMq,
       fromStore ? ReadOffsetMode.READ_FROM_STORE : ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
   }
 
@@ -423,14 +460,20 @@ export class DefaultMQPullConsumer {
   // the pull schedule context treats that as "start from 0".
   async maxOffset(mq: MessageQueue): Promise<number> {
     if (!this.mqClient) throw new Error('consumer not started');
-    await this._warmQueueRoute(mq.getTopic());
-    const addrs = this.mqClient.getBrokerAddrTable().get(mq.getBrokerName());
+    const fullMq = this._queueWithNamespace(mq);
+    await this._warmQueueRoute(fullMq.getTopic());
+    const addrs = this.mqClient.getBrokerAddrTable().get(fullMq.getBrokerName());
     const addr = addrs != null ? addrs[MixAll.MASTER_ID] : null;
-    if (addr == null) throw new Error(`Broker[${mq.getBrokerName()}] master node does not exist`);
-    return this.mqClient.getMaxOffset(addr, mq.getTopic(), mq.getQueueId());
+    if (addr == null) throw new Error(`Broker[${fullMq.getBrokerName()}] master node does not exist`);
+    return this.mqClient.getMaxOffset(addr, fullMq.getTopic(), fullMq.getQueueId());
   }
 
   async fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {
+    const queues = await this._fetchMessageQueuesInBalance(this._withNamespace(topic));
+    return queues.map((mq) => this._bareQueue(mq));
+  }
+
+  private async _fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {
     if (!this.mqClient) throw new Error('consumer not started');
     const client = this.mqClient;
     const keep = (why: string): MessageQueue[] => {
@@ -516,7 +559,7 @@ export class DefaultMQPullConsumer {
       h.group = this.consumerGroup;
       h.delayLevel = delayLevel;
       h.originMsgId = msg.getMsgId();
-      h.originTopic = msg.getTopic();
+      h.originTopic = this._withNamespace(msg.getTopic());
       h.unitMode = this.unitMode;
       h.maxReconsumeTimes = maxReconsume;
       const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);

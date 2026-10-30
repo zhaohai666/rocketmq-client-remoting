@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **52** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-30 实测 **ALL GREEN**，其中 47 套逐条计出 **1717** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **66** 个模块并依次跑 **53** 套离线冒烟（两份清单都由目录树推导，新增文件不会漏出自检），2026-10-30 实测 **ALL GREEN**，其中 48 套逐条计出 **1814** 项检查，另外 5 套按检查组报告。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -38,6 +38,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/backpressure_smoke.ts`（异步公平信号量闸门：等待、拒绝、回滚、文案） | 119 通过 / 0 失败 |
 | `test/batch_schedule_guard_smoke.ts`（批量发送拒绝携带延迟/定时属性的成员） | 23 通过 / 0 失败 |
 | `test/body_crc_smoke.ts`（存储体 BODYCRC 掩码形式） | 18 通过 / 0 失败 |
+| `test/classic_namespace_smoke.ts`（经典命名空间与 recall：命名空间设置后，broker 侧看到的生产/消费组、业务主题、重试主题 `%RETRY%<ns>%<group>` 全部带前缀，而调用方与交付出去的消息保持裸名；包裹幂等、系统资源不动、RETRY/DLQ 前缀留在命名空间之前；`recallMessage(topic, handle)` 校验主题、拒绝 RETRY/DLQ、预热路由、柄内 broker 缺失时回落到主题发布者、用发送预算、返回撤回消息 id，非成功应答转成带 `responseCode` 的 MQBrokerException） | 97 通过 / 0 失败 |
 | `test/client_config_gaps_smoke.ts`（客户端配置旋钮） | 44 通过 / 0 失败 |
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
 | `test/consumer_heartbeat_registration_smoke.ts`（消费端心跳注册） | 14 通过 / 0 失败 |
@@ -172,7 +173,7 @@ tx.shutdown();
 ```ts
 const answer = await producer.request(new Message('TopicTest', Buffer.from('ping'))); // 应答 Message
 // 应答侧在消费回调里：await producer.reply(requestMsg, Buffer.from('pong'));
-await producer.recallMessage(recallHandle); // 撤回延迟/定时消息，handle 来自发送结果
+await producer.recallMessage('TopicTest', recallHandle); // 撤回延迟/定时消息，handle 来自发送结果；返回被撤回的消息 id
 ```
 
 ### 并发消费 / PushConsumer
@@ -413,7 +414,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、攒批重试、背压闸门、分配、位点、轨迹、统计、命名空间、POP、admin）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 52 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 53 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

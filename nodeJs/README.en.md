@@ -24,7 +24,7 @@ git clone <this repo> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` loads all **66** modules under `src/` and then runs the **52** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-30, **1717** individually counted checks across 47 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
+`selfcheck.ts` loads all **66** modules under `src/` and then runs the **53** offline smoke suites (both lists are derived from the tree, so a new file cannot slip past the check); measured **ALL GREEN** on 2026-10-30, **1814** individually counted checks across 48 of those suites — the other 5 report check groups rather than a number. Run a single suite with `node --experimental-strip-types test/<suite>.ts`; measured results:
 
 | Suite | Measured |
 | --- | --- |
@@ -38,6 +38,7 @@ node --experimental-strip-types selfcheck.ts
 | `test/backpressure_smoke.ts` (the async fair semaphore: waiting, refusal, rollback, wording) | 119 passed / 0 failed |
 | `test/batch_schedule_guard_smoke.ts` (batch send refuses a scheduled member) | 23 passed / 0 failed |
 | `test/body_crc_smoke.ts` (stored-body BODYCRC mask forms) | 18 passed / 0 failed |
+| `test/classic_namespace_smoke.ts` (classic namespace and recall: with a namespace set, every broker-side resource — producer/consumer group, business topic, retry topic `%RETRY%<ns>%<group>` — carries the prefix while callers and delivered messages keep the bare name; wrapping is idempotent, leaves system resources alone and keeps the RETRY/DLQ prefix in front of the namespace; `recallMessage(topic, handle)` validates its topic, refuses retry/DLQ topics, warms the route, falls back from the handle broker to the topic publisher, spends the send budget and answers with the withdrawn message id, while a non-success answer is a typed MQBrokerException carrying `responseCode`) | 97 passed / 0 failed |
 | `test/client_config_gaps_smoke.ts` (client configuration knobs) | 44 passed / 0 failed |
 | `test/compat_contract_smoke.ts` (pinned wire-format / behavior surface) | 10 check groups passed |
 | `test/consumer_heartbeat_registration_smoke.ts` (consumer heartbeat registration) | 14 passed / 0 failed |
@@ -176,7 +177,7 @@ tx.shutdown();
 ```ts
 const answer = await producer.request(new Message('TopicTest', Buffer.from('ping'))); // the reply Message
 // responder side, inside the consume callback: await producer.reply(requestMsg, Buffer.from('pong'));
-await producer.recallMessage(recallHandle); // recall a delayed/timed message; handle comes from the send result
+await producer.recallMessage('TopicTest', recallHandle); // recall a delayed/timed message; handle comes from the send result, returns the recalled message id
 ```
 
 ### Concurrently / PushConsumer
@@ -416,7 +417,7 @@ nodeJs/
 │                        # allocation/offset-store/consume-stats/tracing/back-pressure/traceparent
 ├── examples/            # live real-cluster tools (see "Live Cluster Verification")
 ├── test/                # offline smoke suites (protocol round-trip, auto-batch and retry, the backpressure gate, allocation, offsets, tracing, stats, namespace, POP, admin)
-├── selfcheck.ts         # one-shot offline check (module load + 52 smoke suites)
+├── selfcheck.ts         # one-shot offline check (module load + 53 smoke suites)
 └── package.json         # engines: node >= 22
 ```
 

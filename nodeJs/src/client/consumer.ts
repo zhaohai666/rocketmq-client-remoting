@@ -471,6 +471,10 @@ export class DefaultMQPushConsumer {
   // "*". A selector object {type, expression} selects the expression type.
   subscribe(topic: string, subExpression: string | MessageSelector = '*'): this {
     if (!topic || !topic.trim()) throw new Error('subscription topic is empty');
+    // With a namespace set the broker-side topic is the prefixed name; every
+    // downstream step (route, pull request, heartbeat subscription) reads the
+    // subscription key, and delivery strips the prefix again.
+    topic = MixAll.wrapNamespace(this.namespace, topic);
     let expr: string, exprType: string;
     if (typeof subExpression === 'string') {
       expr = subExpression || '*';
@@ -495,7 +499,7 @@ export class DefaultMQPushConsumer {
   }
 
   unsubscribe(topic: string): void {
-    const existed = this.subscription.delete(topic);
+    const existed = this.subscription.delete(MixAll.wrapNamespace(this.namespace, topic));
     if (existed && this.started) this.rebalanceImmediately();
   }
 
@@ -548,9 +552,7 @@ export class DefaultMQPushConsumer {
     if (this.namespace) {
       // Must run BEFORE the retry topic is derived: the retry topic is
       // %RETRY% + the WRAPPED group name.
-      this.consumerGroup = MixAll.wrapNamespace
-        ? MixAll.wrapNamespace(this.namespace, this.consumerGroup)
-        : this.consumerGroup;
+      this.consumerGroup = MixAll.wrapNamespace(this.namespace, this.consumerGroup);
     }
     Validators.checkGroup(this.consumerGroup);
     if (this.consumerGroup === DEFAULT_CONSUMER_GROUP) {
@@ -1848,9 +1850,7 @@ export class DefaultMQPushConsumer {
         msg.setTopic(retryTopic);
       }
       if (this.namespace) {
-        msg.setTopic(MixAll.withoutNamespace
-          ? MixAll.withoutNamespace(msg.getTopic(), this.namespace)
-          : msg.getTopic());
+        msg.setTopic(MixAll.withoutNamespace(msg.getTopic(), this.namespace));
       }
     }
   }
@@ -2035,7 +2035,9 @@ export class DefaultMQPushConsumer {
       h.group = this.consumerGroup;
       h.delayLevel = delayLevel;
       h.originMsgId = msg.getMsgId();
-      h.originTopic = msg.getTopic();
+      // Delivery hands the listener the bare topic; the broker-side record —
+      // the one this bounce references — lives under the prefixed name.
+      h.originTopic = MixAll.wrapNamespace(this.namespace, msg.getTopic());
       h.unitMode = this.unitMode;
       h.maxReconsumeTimes = maxReconsume;
       const request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, h);

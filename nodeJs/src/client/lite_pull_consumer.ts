@@ -86,6 +86,10 @@ export function litePullParkMillisFor(responseCode?: number): number {
 
 export class DefaultLitePullConsumer {
   consumerGroup: string;
+  // namespace: the client-side prefix (`NS%Topic`). The group, every topic and
+  // every queue this consumer talks to carry it on the wire; delivered messages
+  // and queue-change callbacks hand the bare names back.
+  namespace = '';
   // namespaceV2: the server-side namespace; when non-empty NamespaceRpcHook tags
   // every request with nsd=true / ns=<value>.
   namespaceV2: string | null = null;
@@ -202,6 +206,9 @@ export class DefaultLitePullConsumer {
   }
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
+  // Sets/reads the client-side namespace prefix.
+  setNamespace(ns: string): this { this.namespace = ns || ''; return this; }
+  getNamespace(): string { return this.namespace; }
   // Sets/reads namespaceV2 (read live on every request).
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
@@ -312,29 +319,55 @@ export class DefaultLitePullConsumer {
     if (this.mode !== mode) throw new Error('Subscribe and assign are mutually exclusive.');
   }
 
+  // ---- namespace (client-side prefix) ----
+  private _withNamespace(resource: string): string {
+    return MixAll.wrapNamespace(this.namespace, resource);
+  }
+
+  private _queueWithNamespace(mq: MessageQueue): MessageQueue {
+    if (!this.namespace) return mq;
+    const topic = this._withNamespace(mq.getTopic());
+    return topic === mq.getTopic() ? mq : new MessageQueue(topic, mq.getBrokerName(), mq.getQueueId());
+  }
+
+  private _bareQueue(mq: MessageQueue): MessageQueue {
+    if (!this.namespace) return mq;
+    const topic = MixAll.withoutNamespace(mq.getTopic(), this.namespace);
+    return topic === mq.getTopic() ? mq : new MessageQueue(topic, mq.getBrokerName(), mq.getQueueId());
+  }
+
+  // The caller hands in and gets back bare topics; the broker only knows prefixed
+  // ones, so messages are reset on the way out.
+  private _resetMessagesTopic(msgs: MessageExt[]): void {
+    if (!this.namespace) return;
+    for (const msg of msgs) msg.setTopic(MixAll.withoutNamespace(msg.getTopic(), this.namespace));
+  }
+
   subscribe(topic: string, subExpression = '*'): this {
     if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
     this.claimMode('subscribe');
+    const full = this._withNamespace(topic);
     const expr = subExpression || '*';
-    this.subscription.set(topic, FilterAPI.buildSubscriptionData(topic, expr));
+    this.subscription.set(full, FilterAPI.buildSubscriptionData(full, expr));
     // A subscription added while RUNNING needs its route and a heartbeat now:
     // the rebalance loop only reads the cached route, and the broker learns the
     // expression only from a fresh heartbeat.
     const client = this.mqClient;
     if (this.started && client) {
-      void client.updateTopicRouteInfoFromNameServer(topic, false).catch((e) =>
-        logger.debug('lite subscribe: route refresh for %s failed: %s', topic, (e as Error).message));
+      void client.updateTopicRouteInfoFromNameServer(full, false).catch((e) =>
+        logger.debug('lite subscribe: route refresh for %s failed: %s', full, (e as Error).message));
       void client.sendHeartbeatToAllBrokers().catch(() => {});
     }
     return this;
   }
 
   unsubscribe(topic: string): void {
-    this.subscription.delete(topic);
+    const full = this._withNamespace(topic);
+    this.subscription.delete(full);
     // The topic's queues leave with it, without waiting for the next rebalance,
     // and their per-queue state goes with them — the same revocation path a
     // rebalance that no longer covers them takes.
-    const keep = (mq: MessageQueue) => mq.getTopic() !== topic;
+    const keep = (mq: MessageQueue) => mq.getTopic() !== full;
     for (const mq of this._assignedQueues().filter((mq) => !keep(mq))) this.dropQueueState(mq);
     this.assignedAuto = this.assignedAuto.filter(keep);
     if (this.assignedManual != null) this.assignedManual = this.assignedManual.filter(keep);
@@ -350,7 +383,8 @@ export class DefaultLitePullConsumer {
     if (this.started) throw new Error('setSubExpressionForAssign only can be called before start.');
     if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
     this.claimMode('assign');
-    this.assignSubscription.set(topic, FilterAPI.buildSubscriptionData(topic, subExpression));
+    const full = this._withNamespace(topic);
+    this.assignSubscription.set(full, FilterAPI.buildSubscriptionData(full, subExpression));
     return this;
   }
 
@@ -367,7 +401,8 @@ export class DefaultLitePullConsumer {
     const built = new Map<string, SubscriptionData>();
     for (const [topic, selector] of selectors ?? new Map<string, MessageSelector>()) {
       if (!topic || !topic.trim()) throw new Error('Topic can not be null or empty.');
-      built.set(topic, FilterAPI.build(topic,
+      const full = this._withNamespace(topic);
+      built.set(full, FilterAPI.build(full,
         selector.getExpression(), selector.getType()));
     }
     this.heartbeatSubscriptions = built;
@@ -392,7 +427,8 @@ export class DefaultLitePullConsumer {
     this.claimMode('assign');
     const seen = new Set<string>();
     const kept: MessageQueue[] = [];
-    for (const mq of mqs) {
+    for (const raw of mqs) {
+      const mq = this._queueWithNamespace(raw);
       const key = mqKey(mq);
       if (seen.has(key)) continue;
       seen.add(key);
@@ -435,6 +471,10 @@ export class DefaultLitePullConsumer {
   }
 
   async start(): Promise<void> {
+    // The group is a resource too: on the wire it carries the namespace prefix.
+    // wrapNamespace is idempotent, so a start after a failed start does not stack
+    // prefixes.
+    this.consumerGroup = this._withNamespace(this.consumerGroup);
     switch (this._serviceState) {
       case 'CREATE_JUST':
         // Leave CREATE_JUST before anything can fail, so a failed start is not
@@ -615,14 +655,16 @@ export class DefaultLitePullConsumer {
   // scale-in and the queue-change listener would happily report it as one.
   async fetchMessageQueues(topic: string): Promise<MessageQueue[]> {
     if (!this.mqClient) throw new Error('The consumer not running, please start it first.');
-    await this.mqClient.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
-    const route = this.mqClient.getTopicRouteData(topic);
+    const full = this._withNamespace(topic);
+    await this.mqClient.updateTopicRouteInfoFromNameServer(full, false).catch(() => {});
+    const route = this.mqClient.getTopicRouteData(full);
     if (!route) throw new Error(`Can not find MessageQueue for topic: ${topic}`);
-    const queues = route.getAllSubscribeMessageQueue(topic);
+    const queues = route.getAllSubscribeMessageQueue(full);
     if (queues.length === 0) {
       throw new Error(`Can not find Message Queue for this topic, ${topic} Namesrv return empty`);
     }
-    return queues;
+    // The caller works with the bare names: prefixing happens inside this class.
+    return queues.map((mq) => this._bareQueue(mq));
   }
 
   fetchSubscribeMessageQueues(topic: string): Promise<MessageQueue[]> {
@@ -643,15 +685,18 @@ export class DefaultLitePullConsumer {
     if (!topic || !topic.trim() || listener == null) {
       throw new Error('Topic or listener is null');
     }
-    if (this.topicChangeListeners.has(topic)) {
-      logger.warning('Topic %s had been registered, new listener will overwrite the old one', topic);
+    // Watched under the broker-side name; the snapshot is taken with the same
+    // lookup every later comparison uses.
+    const full = this._withNamespace(topic);
+    if (this.topicChangeListeners.has(full)) {
+      logger.warning('Topic %s had been registered, new listener will overwrite the old one', full);
     }
-    this.topicChangeListeners.set(topic, listener);
+    this.topicChangeListeners.set(full, listener);
     if (!this.started) return;
     try {
-      this.messageQueuesForTopic.set(topic, await this.fetchMessageQueues(topic));
+      this.messageQueuesForTopic.set(full, await this.fetchMessageQueues(full));
     } catch (e) {
-      logger.debug('register listener: fetch queues for %s failed: %s', topic, (e as Error).message);
+      logger.debug('register listener: fetch queues for %s failed: %s', full, (e as Error).message);
     }
   }
 
@@ -792,6 +837,7 @@ export class DefaultLitePullConsumer {
         await this._sleepPollRound(IDLE_POLL_RETRY_DELAY_MILLIS);
       }
     }
+    this._resetMessagesTopic(out);
     return out;
   }
 
@@ -819,7 +865,8 @@ export class DefaultLitePullConsumer {
   // running-state check happens: they are broker RPCs, and a stopped consumer has
   // no broker to ask.
   async seek(mq: MessageQueue, offset: number): Promise<void> {
-    const held = this._assignedQueues().some((q) => mqKey(q) === mqKey(mq));
+    const fullMq = this._queueWithNamespace(mq);
+    const held = this._assignedQueues().some((q) => mqKey(q) === mqKey(fullMq));
     if (!held) {
       throw new Error(this.mode === 'assign'
         ? `The message queue is not in assigned list, message queue: ${mq}`
@@ -830,20 +877,20 @@ export class DefaultLitePullConsumer {
     }
     // A bound the broker could not answer must not become a cursor: a negative
     // cursor would only come back as OFFSET_ILLEGAL on the next poll.
-    const minOffset = await this._boundaryOffset(mq, 'min');
+    const minOffset = await this._boundaryOffset(fullMq, 'min');
     if (minOffset < 0) throw new Error(`Can not get min offset of queue ${mqKey(mq)}`);
-    const maxOffset = await this._boundaryOffset(mq, 'max');
+    const maxOffset = await this._boundaryOffset(fullMq, 'max');
     if (maxOffset < 0) throw new Error(`Can not get max offset of queue ${mqKey(mq)}`);
     if (offset < minOffset || offset > maxOffset) {
       throw new Error(
         `Seek offset illegal, seek offset = ${offset}, min offset = ${minOffset}, max offset = ${maxOffset}`);
     }
-    const key = mqKey(mq);
+    const key = mqKey(fullMq);
     this.pullCursor.set(key, offset);
     // An explicit repositioning lifts a leftover throttle park: it belonged to
     // the position that is being left behind.
     this.pullParkUntil.delete(key);
-    if (this.offsetStore) this.offsetStore.updateOffset(mq, offset, false);
+    if (this.offsetStore) this.offsetStore.updateOffset(fullMq, offset, false);
   }
 
   // assignment(): returns the queues currently assigned.
@@ -895,16 +942,25 @@ export class DefaultLitePullConsumer {
   // which amounts to a silent error.
   async seekToBegin(mq: MessageQueue): Promise<void> {
     if (!this.started) throw new Error('The consumer not running, please start it first.');
-    const begin = await this._boundaryOffset(mq, 'min');
+    const fullMq = this._queueWithNamespace(mq);
+    const begin = await this._boundaryOffset(fullMq, 'min');
     if (begin < 0) throw new Error(`seekToBegin: minOffset unavailable for ${mqKey(mq)}`);
     await this.seek(mq, begin);
   }
 
   async seekToEnd(mq: MessageQueue): Promise<void> {
     if (!this.started) throw new Error('The consumer not running, please start it first.');
-    const end = await this._boundaryOffset(mq, 'max');
+    const fullMq = this._queueWithNamespace(mq);
+    const end = await this._boundaryOffset(fullMq, 'max');
     if (end < 0) throw new Error(`seekToEnd: maxOffset unavailable for ${mqKey(mq)}`);
     await this.seek(mq, end);
+  }
+
+  // offsetForTimestamp: the queue's first offset at or after `timestamp` on the
+  // master broker; -1 when the route or broker is unknown.
+  async offsetForTimestamp(mq: MessageQueue, timestamp: number): Promise<number> {
+    if (!this.started) throw new Error('The consumer not running, please start it first.');
+    return this._boundaryOffset(this._queueWithNamespace(mq), 'search', timestamp);
   }
 
   // committed(mq): the offset last committed for this queue — the in-memory
@@ -915,17 +971,18 @@ export class DefaultLitePullConsumer {
     if (!this.started || !this.offsetStore) {
       throw new Error('The consumer not running, please start it first.');
     }
-    const offset = await this.offsetStore.readOffset(mq, ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
+    const offset = await this.offsetStore.readOffset(this._queueWithNamespace(mq),
+      ReadOffsetMode.READ_FROM_MEMORY_THEN_STORE);
     if (offset === -2) throw new Error('Fetch consume offset from broker exception');
     return offset;
   }
 
   pause(mqs: MessageQueue[]): void {
-    for (const mq of mqs) this.paused.add(mqKey(mq));
+    for (const mq of mqs) this.paused.add(mqKey(this._queueWithNamespace(mq)));
   }
 
   resume(mqs: MessageQueue[]): void {
-    for (const mq of mqs) this.paused.delete(mqKey(mq));
+    for (const mq of mqs) this.paused.delete(mqKey(this._queueWithNamespace(mq)));
   }
 
   // setPullParkUntil makes this queue's next pull wait until `untilMillis` (epoch
@@ -933,7 +990,7 @@ export class DefaultLitePullConsumer {
   // a test) can hold ONE queue back without pausing its siblings. A value not in
   // the future is dropped, and clearing an unknown queue is a no-op.
   setPullParkUntil(mq: MessageQueue, untilMillis: number): void {
-    const key = mqKey(mq);
+    const key = mqKey(this._queueWithNamespace(mq));
     if (!Number.isFinite(untilMillis) || untilMillis <= Date.now()) {
       this.pullParkUntil.delete(key);
       return;
@@ -945,7 +1002,7 @@ export class DefaultLitePullConsumer {
   // nothing holds it back. An already-expired park reads as 0 and is pruned here,
   // so the map cannot drift away from the queues it can actually hold back.
   getPullParkUntil(mq: MessageQueue): number {
-    const key = mqKey(mq);
+    const key = mqKey(this._queueWithNamespace(mq));
     const until = this.pullParkUntil.get(key);
     if (until === undefined) return 0;
     if (until <= Date.now()) {

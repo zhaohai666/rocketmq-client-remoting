@@ -289,9 +289,12 @@ export class DefaultMQProducer {
     return NamespaceUtil.wrapNamespace(this.namespace, resource);
   }
 
-  _withoutNamespace(resource: string): string {
-    if (!this.namespace) return resource;
-    return NamespaceUtil.withoutNamespace(resource, this.namespace);
+  // Every public send-shaped entry applies the namespace to the message topic
+  // BEFORE validation, route lookup or the wire: with a namespace set the topic
+  // the broker stores is the prefixed one. Set in place, so the caller's Message
+  // keeps the wrapped name from then on (idempotent on re-entry).
+  private _wrapMessageTopic(msg: Message): void {
+    msg.setTopic(this._withNamespace(msg.getTopic()));
   }
 
   _checkLegalTopic(topic: string): void {
@@ -509,6 +512,10 @@ export class DefaultMQProducer {
     if (this.producerGroup == null || !String(this.producerGroup).trim()) {
       throw new MQClientException('producer group is blank');
     }
+    // The group is a resource too: with a namespace set, every broker-side
+    // registration (heartbeat, send header, transaction end) must carry the
+    // prefixed name. wrapNamespace is idempotent, so a repeated start is safe.
+    this.producerGroup = this._withNamespace(this.producerGroup);
     Validators.checkGroup(this.producerGroup);
     if (this.producerGroup === MixAll.DEFAULT_PRODUCER_GROUP) {
       throw new MQClientException('producer group can not equal DEFAULT_PRODUCER');
@@ -719,7 +726,7 @@ export class DefaultMQProducer {
       MessageAccessor.putProperty(msg, MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, createUniqID());
     }
     MessageAccessor.setCorrectionBeforePublish(msg, this.producerGroup);
-    return this.client.buildSendRequest(msg, mq, this.producerGroup, this.namespace);
+    return this.client.buildSendRequest(msg, mq, this.producerGroup);
   }
 
   // Every send invoke wraps the address with
@@ -771,7 +778,7 @@ export class DefaultMQProducer {
       injectTraceContext(msg);
     }
 
-    const request = this.client.buildSendRequest(msg, mq, this.producerGroup, this.namespace);
+    const request = this.client.buildSendRequest(msg, mq, this.producerGroup);
     const addr = this._sendAddr(this.client.publishAddrFor(mq));
     if (addr == null) {
       throw new MQClientException(`no broker address for mq ${mq.toString()}`);
@@ -1029,6 +1036,7 @@ export class DefaultMQProducer {
 
   // ---- public send API ----
   async send(msg: Message, timeoutMillis?: number): Promise<SendResult> {
+    this._wrapMessageTopic(msg);
     // autoBatch: a message with no explicit timeout rides a group and this call
     // awaits that group's send. An explicit timeout opts out — the hold timer
     // would add latency the caller already bounded.
@@ -1042,10 +1050,12 @@ export class DefaultMQProducer {
   }
 
   async sendOneway(msg: Message, timeoutMillis?: number): Promise<void> {
+    this._wrapMessageTopic(msg);
     await this._sendDefaultImpl(msg, CommunicationMode.ONEWAY, null, timeoutMillis ?? this.sendMsgTimeout);
   }
 
   async sendAsync(msg: Message, sendCallback: SendCallback, timeoutMillis?: number): Promise<void> {
+    this._wrapMessageTopic(msg);
     // autoBatch takes async sends the same way: join the group, and the group's
     // send settles this callback. Nothing is acquired from the async backpressure
     // semaphores, because the batch leaves through the sync path.
@@ -1147,6 +1157,7 @@ export class DefaultMQProducer {
     arg: any,
     timeoutMillis: number = this.sendMsgTimeout,
   ): Promise<SendResult> {
+    this._wrapMessageTopic(msg);
     return this._sendSelectImpl(msg, selector, arg, CommunicationMode.SYNC, null, timeoutMillis);
   }
 
@@ -1161,6 +1172,7 @@ export class DefaultMQProducer {
   ): Promise<TransactionSendResult> {
     listener = listener ?? (this as any).transactionListener ?? null;
     if (listener == null) throw new MQClientException('tranExecutor is null');
+    this._wrapMessageTopic(msg);
     // A half message is committed exactly as it stands, so no schedule asked for here
     // can be honoured. The key alone decides: a "0" or an empty value asks for nothing
     // yet is still a stamp this path cannot carry, so the map is consulted directly --
@@ -1338,6 +1350,7 @@ export class DefaultMQProducer {
 
   // Sync request: request(msg, timeout) — sendDefaultImpl ASYNC + wait.
   async request(msg: Message, timeoutMillis: number = 3000): Promise<Message> {
+    this._wrapMessageTopic(msg);
     await this._prepareSendRequest(msg, timeoutMillis);
     const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID) as string;
     const future = new RequestResponseFuture(correlationId, msg, timeoutMillis);
@@ -1368,6 +1381,7 @@ export class DefaultMQProducer {
     arg: any,
     timeoutMillis: number = 3000,
   ): Promise<Message> {
+    this._wrapMessageTopic(msg);
     await this._prepareSendRequest(msg, timeoutMillis);
     const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID) as string;
     const future = new RequestResponseFuture(correlationId, msg, timeoutMillis);
@@ -1392,6 +1406,7 @@ export class DefaultMQProducer {
   // Sync request to a pinned queue — sendKernelImpl ASYNC + wait.
   async requestByMq(msg: Message, mq: MessageQueue, timeoutMillis: number = 3000): Promise<Message> {
     if (this.client == null) throw new MQClientException('producer not started');
+    this._wrapMessageTopic(msg);
     await this._prepareSendRequest(msg, timeoutMillis);
     const correlationId = msg.getProperty(MessageConst.PROPERTY_CORRELATION_ID) as string;
     const future = new RequestResponseFuture(correlationId, msg, timeoutMillis);
@@ -1419,6 +1434,7 @@ export class DefaultMQProducer {
   // Async request: request(msg, requestCallback, timeout). The callback
   // fires exactly once: on reply arrival, on the TTL sweep, or on send failure.
   requestAsync(msg: Message, requestCallback: RequestCallbackLike, timeoutMillis: number = 3000): void {
+    this._wrapMessageTopic(msg);
     void this._requestAsyncDefault(msg, requestCallback, timeoutMillis);
   }
 
@@ -1457,6 +1473,7 @@ export class DefaultMQProducer {
     requestCallback: RequestCallbackLike,
     timeoutMillis: number = 3000,
   ): void {
+    this._wrapMessageTopic(msg);
     void this._requestAsyncBySelector(msg, selector, arg, requestCallback, timeoutMillis);
   }
 
@@ -1493,6 +1510,7 @@ export class DefaultMQProducer {
     requestCallback: RequestCallbackLike,
     timeoutMillis: number = 3000,
   ): void {
+    this._wrapMessageTopic(msg);
     void this._requestAsyncByMq(msg, mq, requestCallback, timeoutMillis);
   }
 
@@ -1555,13 +1573,37 @@ export class DefaultMQProducer {
   }
 
   // ---- recall ----
-  async recallMessage(recallHandle: string): Promise<SendResult> {
+  // recallMessage(topic, recallHandle) asks the broker to withdraw a
+  // delayed/timed message and returns the withdrawn message's id.
+  //
+  // The topic is caller-supplied (the handle carries it too, but the broker
+  // compares its request header topic, so it is checked and routed here): it is
+  // validated, retry/DLQ topics are refused, its route is warmed, and the
+  // broker is the handle's own broker with the topic's publisher as fallback.
+  async recallMessage(topic: string, recallHandle: string): Promise<string> {
     if (this.client == null) throw new MQClientException('producer not started');
-    const handle = RecallMessageHandle.parseRecallMessageHandle(recallHandle);
-    const topic = RecallMessageHandle.getOriginTopicFromRecallTopic(handle.topic);
-    const addr = this.client.findBrokerAddressInPublish(handle.brokerName);
-    if (addr == null) throw new MQClientException(`no broker address for ${handle.brokerName}`);
-    return this.client.recallMessage(addr, this.producerGroup, topic, recallHandle);
+    topic = this._withNamespace(topic);
+    Validators.checkTopic(topic);
+    if (MixAll.isRetryTopic(topic) || MixAll.isDlqTopic(topic)) {
+      throw new MQClientException('topic is not supported');
+    }
+    let handle: ReturnType<typeof RecallMessageHandle.parseRecallMessageHandle>;
+    try {
+      handle = RecallMessageHandle.parseRecallMessageHandle(recallHandle);
+    } catch (e) {
+      throw new MQClientException((e as Error).message);
+    }
+    await this._tryToFindTopicPublishInfo(topic);
+    let addr = this.client.findBrokerAddressInPublish(handle.brokerName);
+    // Fallback: the handle's broker may be gone (proxy-less multi-endpoint
+    // setups); the topic's own publisher still knows where it is stored.
+    if (addr == null) addr = this.client.findBrokerAddrByTopic(topic);
+    if (addr == null) {
+      logger.warn(`can't find broker service address. ${handle.brokerName}`);
+      throw new MQClientException('The broker service address not found');
+    }
+    return this.client.recallMessage(addr, this.producerGroup, topic, recallHandle,
+      handle.brokerName, this.sendMsgTimeout);
   }
 
   // ---- topic / offset helpers ----
@@ -1571,6 +1613,8 @@ export class DefaultMQProducer {
   // after start() it is empty and would wrongly report "no broker available".
   async createTopic(topic: string, key: string = this.createTopicKey, queueNums: number = this.defaultTopicQueueNums): Promise<void> {
     if (this.client == null) throw new MQClientException('producer not started');
+    // Only the NEW topic is namespaced; the route key stays the caller's name.
+    topic = this._withNamespace(topic);
     await this.client.updateTopicRouteInfoFromNameServer(key, true);
     const route = this.client.getTopicRouteData(key);
     const brokerDatas: any[] = (route as any)?.brokerDatas || [];
@@ -1594,13 +1638,14 @@ export class DefaultMQProducer {
   }
 
   async maxOffset(topic: string, queueId: number): Promise<number> {
+    topic = this._withNamespace(topic);
     const info = await this._tryToFindTopicPublishInfo(topic);
     if (info == null) throw new MQClientException(`no route for ${topic}`);
     const mq = new MessageQueue(topic, info.msgQueueList.length ? info.msgQueueList[0].getBrokerName() : '', queueId);
     const addr = this.client!.publishAddrFor(mq);
     if (addr == null) throw new MQClientException('no broker address');
     const request = RemotingCommand.createRequestCommand(RequestCode.GET_MAX_OFFSET, null);
-    request.addExtField('topic', this._withoutNamespace(topic));
+    request.addExtField('topic', topic);
     request.addExtField('queueId', String(queueId));
     const resp = await this.client!.remotingClient.invokeSync(addr, request, 3000);
     if (resp.code === ResponseCode.SUCCESS) return resp.extFields['offset'] != null ? parseInt(resp.extFields['offset'], 10) : 0;
