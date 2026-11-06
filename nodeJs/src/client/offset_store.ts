@@ -83,6 +83,13 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
 
   async persistAll(mqs: MessageQueue[]): Promise<void> {
     if (mqs.length === 0) return;
+    // Entries already in the table when the flush started: those not requested
+    // are revoked queues and get dropped (Java persistAll parity). Entries added
+    // DURING the flush — a concurrent callback committing a just-pulled offset —
+    // must survive: dropping them used to lose offsets whenever two
+    // callback-driven flushes overlapped (the second flush then saw an empty
+    // table and silently persisted nothing).
+    const presentAtStart = new Set(this.table.keys());
     let firstErr: Error | null = null;
     for (const mq of mqs) {
       const offset = this.table.get(mqKey(mq));
@@ -96,7 +103,7 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
     const requested = new Set<string>();
     for (const mq of mqs) requested.add(mqKey(mq));
     for (const key of Array.from(this.table.keys())) {
-      if (!requested.has(key)) this.table.delete(key);
+      if (presentAtStart.has(key) && !requested.has(key)) this.table.delete(key);
     }
     if (firstErr) throw firstErr;
   }
