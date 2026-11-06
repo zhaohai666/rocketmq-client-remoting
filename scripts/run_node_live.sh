@@ -32,6 +32,8 @@ case "$WHICH" in
   producer)      EXAMPLE="examples/live_producer.ts"       ;;
   consumer)      EXAMPLE="examples/live_consumer.ts"       ;;
   pull)          EXAMPLE="examples/live_pull.ts"           ;;
+  pull_schedule) EXAMPLE="examples/live_pull_schedule.ts"  ;;
+  recall)        EXAMPLE="examples/live_recall.ts"         ;;
   lite_pull)     EXAMPLE="examples/live_lite_pull.ts"      ;;
   admin)         EXAMPLE="examples/live_admin.ts"          ;;
   pop)           EXAMPLE="examples/live_pop.ts"            ;;
@@ -44,7 +46,7 @@ case "$WHICH" in
   fixes2)        EXAMPLE="examples/live_fixes2.ts"              ;;
   slave)         EXAMPLE="examples/live_slave_only.ts"          ;;
   batch)         EXAMPLE="examples/live_auto_batch.ts"          ;;
-  *) echo "unknown example: $WHICH (producer|consumer|pull|lite_pull|admin|pop|pop_batch_ack|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave)" >&2 ; exit 2 ;;
+  *) echo "unknown example: $WHICH (producer|consumer|pull|pull_schedule|recall|lite_pull|admin|pop|pop_batch_ack|request_reply|admin_ns|acl|tls|check_config|fixes2|batch|slave)" >&2 ; exit 2 ;;
 esac
 
 port_open() {

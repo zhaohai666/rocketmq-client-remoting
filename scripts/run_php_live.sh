@@ -70,6 +70,8 @@ case "$WHICH" in
   redelivery)    EXAMPLE="examples/live_redelivery.php"     ;;
   admin)         EXAMPLE="examples/live_admin.php"          ;;
   pull)          EXAMPLE="examples/live_pull.php"           ;;
+  pull_schedule) EXAMPLE="examples/live_pull_schedule.php"  ;;
+  recall)        EXAMPLE="examples/live_recall.php"         ;;
   lite_qc)       EXAMPLE="examples/live_lite_topic_queue_change.php" ;;
   compression)   EXAMPLE="examples/live_compression.php"    ;;
   pop)           EXAMPLE="examples/live_pop.php"            ;;
@@ -79,7 +81,7 @@ case "$WHICH" in
   registration)  EXAMPLE="examples/live_producer_registration.php" ;;
   sql92)         EXAMPLE="examples/live_sql92.php" ;;
   static_topic)  EXAMPLE="examples/live_static_topic.php"   ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|pop_batch_ack|tls|request_reply|pull|lite_qc|sql92|static_topic|registration)" >&2; exit 2 ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|pop_batch_ack|tls|request_reply|pull|pull_schedule|recall|lite_qc|sql92|static_topic|registration)" >&2; exit 2 ;;
 esac
 
 port_open() {
@@ -296,7 +298,7 @@ fi
 
 echo "=== php live: $EXAMPLE (ns=$NS) ==="
 cd "$ROOT/php" || exit 1
-if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pop_batch_ack" ] || [ "$WHICH" = "pull" ]; then
+if [ "$WHICH" = "redelivery" ] || [ "$WHICH" = "pop" ] || [ "$WHICH" = "pop_batch_ack" ] || [ "$WHICH" = "pull" ] || [ "$WHICH" = "pull_schedule" ]; then
     "$PHP_BIN" "$EXAMPLE" "$NS" "$LEGS"
 elif [ "$WHICH" = "request_reply" ]; then
     # Two-process orchestration: the responder (consumer + producer.reply) starts in the
