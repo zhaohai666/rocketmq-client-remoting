@@ -218,6 +218,11 @@ add_executable(rmq_test_trace_context test_trace_context.cpp)
 target_link_libraries(rmq_test_trace_context PRIVATE rocketmq::remoting)
 add_test(NAME trace_context COMMAND rmq_test_trace_context)
 
+# OpenTracing hook trio: span names/tag sets/close-out rules/propagation write-back on a fake tracer
+add_executable(rmq_test_open_tracing_hook test_open_tracing_hook.cpp)
+target_link_libraries(rmq_test_open_tracing_hook PRIVATE rocketmq::remoting)
+add_test(NAME open_tracing_hook COMMAND rmq_test_open_tracing_hook)
+
 # Cross-language interop harness; depends on the sibling venv interpreter; skipped if absent.
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")

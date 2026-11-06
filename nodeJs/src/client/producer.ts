@@ -112,6 +112,26 @@ export const LocalTransactionState = {
   UNKNOW: 2,
 };
 
+// Java-parity MessageType *name* classification for the send context, mirroring
+// go's producer.go: a prepared transaction flag makes TRANS_MSG_HALF, any of
+// the delay-class properties makes DELAY_MSG, otherwise NORMAL_MSG.
+const sendDelayClassProperties = [
+  MessageConst.PROPERTY_DELAY_TIME_LEVEL,
+  MessageConst.PROPERTY_TIMER_DELIVER_MS,
+  MessageConst.PROPERTY_TIMER_DELAY_SEC,
+  MessageConst.PROPERTY_TIMER_DELAY_MS,
+];
+
+export function classifySendMessageType(msg: Message): string {
+  if (msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED) === 'true') {
+    return 'TRANS_MSG_HALF';
+  }
+  for (const key of sendDelayClassProperties) {
+    if (msg.getProperty(key) != null) return 'DELAY_MSG';
+  }
+  return 'NORMAL_MSG';
+}
+
 export abstract class TransactionListener {
   // Returns the local transaction state after executing the local transaction.
   executeLocalTransaction(msg: Message, arg: any): number { void msg; void arg; return LocalTransactionState.UNKNOW; }
@@ -885,6 +905,7 @@ export class DefaultMQProducer {
     timeoutMillis: number = this.sendMsgTimeout,
   ): Promise<SendResult | null> {
     const ctx = new SendMessageContext(this.producerGroup, msg, mq, communicationMode, this.client!.publishAddrFor(mq));
+    ctx.msgType = classifySendMessageType(msg);
     // This port's SendMessageHook registry is global, not per producer.
     // The inner trace producer opts out (_skipSendHooks) so trace-topic writes
     // are not themselves traced.

@@ -116,6 +116,10 @@ struct TraceBean {
 
 // ---------------------------------------------------------------- TraceContext
 struct TraceContext {
+    // Polymorphic base: hook-private state stored in the mqTraceContext slot
+    // may be a TraceContext subclass (e.g. the OpenTracing span holders), and
+    // after-hooks read it back with dynamic_pointer_cast.
+    virtual ~TraceContext() = default;
     std::optional<TraceType> traceType;
     int64_t timeStamp = UtilAll::currentTimeMillis();
     std::string regionId;

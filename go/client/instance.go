@@ -244,8 +244,8 @@ type Instance struct {
 	// enableHeartbeatChannelEventListener is the live copy of the config field
 	// of the same name (default on).
 	enableHeartbeatChannelEventListener atomic.Bool
-	heartbeatPoolMu             sync.Mutex
-	concurrentHeartbeatPool     *boundedPool
+	heartbeatPoolMu                     sync.Mutex
+	concurrentHeartbeatPool             *boundedPool
 
 	consumerTable      map[string]Consumer
 	producerTable      map[string]struct{}

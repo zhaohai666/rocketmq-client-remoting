@@ -29,6 +29,10 @@ export class SendMessageContext {
   exception: Error | null;
   msgId: string | null;
   namespace: string | null;
+  // Java-parity MessageType *name* on the context ('NORMAL_MSG' | 'TRANS_MSG_HALF'
+  // | 'TRANS_MSG_COMMIT' | 'DELAY_MSG' | 'ORDER_MSG'); hooks that report the
+  // message type (trace, OpenTracing) read this instead of re-classifying.
+  msgType: string | null;
 
   constructor(producerGroup: string | null = null, message: Message | null = null,
     messageQueue: MessageQueue | null = null, communicationMode: number = CommunicationMode.SYNC,
@@ -43,6 +47,7 @@ export class SendMessageContext {
     this.exception = null;
     this.msgId = null;
     this.namespace = null;
+    this.msgType = null;
   }
 }
 

@@ -9,6 +9,7 @@ pub mod hook;
 pub mod latency;
 pub mod metrics;
 pub mod mq_client;
+pub mod open_tracing_hook;
 pub mod produce_accumulator;
 pub mod producer;
 pub mod pull_consumer;
