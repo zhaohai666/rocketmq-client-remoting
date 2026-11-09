@@ -88,7 +88,9 @@ impl MockCluster {
         let mut listeners = Vec::new();
         let mut addrs = Vec::new();
         for _ in 0..broker_count {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock broker");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
             addrs.push(listener.local_addr().expect("mock broker addr").to_string());
             listeners.push(listener);
         }
@@ -102,15 +104,29 @@ impl MockCluster {
 
     /// Start only the name server; the route points at the given addresses (an already-closed port can produce a connect failure).
     async fn with_addrs(broker_addrs: Vec<String>, route_ok: bool) -> MockCluster {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
-        let namesrv_addr = listener.local_addr().expect("mock namesrv addr").to_string();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock namesrv");
+        let namesrv_addr = listener
+            .local_addr()
+            .expect("mock namesrv addr")
+            .to_string();
         let count = broker_addrs.len();
         let state = Arc::new(Mutex::new(ClusterState {
             route_ok,
             brokers: (0..count).map(|_| BrokerScript::new()).collect(),
         }));
-        let tasks = vec![spawn_namesrv(listener, Arc::clone(&state), broker_addrs.clone())];
-        MockCluster { namesrv_addr, broker_addrs, state, tasks }
+        let tasks = vec![spawn_namesrv(
+            listener,
+            Arc::clone(&state),
+            broker_addrs.clone(),
+        )];
+        MockCluster {
+            namesrv_addr,
+            broker_addrs,
+            state,
+            tasks,
+        }
     }
 
     /// Script the `index`-th broker: answer per `steps` in order first, then keep using `tail`.
@@ -156,7 +172,9 @@ impl MockCluster {
 ///
 /// Binding then closing immediately is more reliable than inventing a port out of thin air (that port might be taken over by someone at any moment).
 async fn dead_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind then close");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind then close");
     let addr = listener.local_addr().expect("dead addr").to_string();
     drop(listener);
     addr
@@ -240,12 +258,16 @@ fn spawn_namesrv(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let state = Arc::clone(&state);
             let addrs = broker_addrs.clone();
             tokio::spawn(async move {
                 while let Some(frame) = read_frame(&mut stream).await {
-                    let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                    let Ok(request) = RemotingCommand::decode(&frame) else {
+                        return;
+                    };
                     let mut response = if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
                         let ok = lock(&state).route_ok;
                         if !ok {
@@ -273,11 +295,15 @@ fn spawn_broker(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let state = Arc::clone(&state);
             tokio::spawn(async move {
                 while let Some(frame) = read_frame(&mut stream).await {
-                    let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                    let Ok(request) = RemotingCommand::decode(&frame) else {
+                        return;
+                    };
                     if !is_send_code(request.code) {
                         if !request.is_oneway_rpc() {
                             let mut response = response_for(&request, response_code::SUCCESS);
@@ -300,7 +326,9 @@ fn spawn_broker(
                         );
                         broker.send_codes.push(request.code);
                         broker.send_opaques.push(request.opaque);
-                        broker.send_bodies.push(request.body().unwrap_or_default().to_vec());
+                        broker
+                            .send_bodies
+                            .push(request.body().unwrap_or_default().to_vec());
                         (step.0, step.1, broker.requests)
                     };
                     if code == CLOSE_WITHOUT_ANSWER {
@@ -336,14 +364,20 @@ async fn started(instance: &str, cluster: &MockCluster) -> DefaultMQProducer {
     let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name(instance);
     producer.set_namesrv_addr(&cluster.namesrv_addr);
-    producer.start().await.expect("start should succeed against the mock cluster");
+    producer
+        .start()
+        .await
+        .expect("start should succeed against the mock cluster");
     producer
 }
 
 /// Print the error on failure so assertions stay readable.
 fn expect_client_code(err: Error) -> (Option<i32>, String) {
     match err {
-        Error::Client { response_code, message } => (response_code, message),
+        Error::Client {
+            response_code,
+            message,
+        } => (response_code, message),
         other => panic!("expected an MQClientException, got {other}"),
     }
 }
@@ -374,16 +408,28 @@ fn default_retry_response_codes_match_protocol() {
 fn send_errors_classify_by_variant_arms() {
     let cases: [(&Error, Option<SendErrorKind>); 9] = [
         (
-            &Error::Broker { response_code: 2, message: "busy".into() },
+            &Error::Broker {
+                response_code: 2,
+                message: "busy".into(),
+            },
             Some(SendErrorKind::Broker),
         ),
-        (&Error::Connect { addr: "a:1".into() }, Some(SendErrorKind::Remoting)),
         (
-            &Error::SendRequest { addr: "a:1".into(), message: "io".into() },
+            &Error::Connect { addr: "a:1".into() },
             Some(SendErrorKind::Remoting),
         ),
         (
-            &Error::Timeout { addr: "a:1".into(), timeout_millis: 3000 },
+            &Error::SendRequest {
+                addr: "a:1".into(),
+                message: "io".into(),
+            },
+            Some(SendErrorKind::Remoting),
+        ),
+        (
+            &Error::Timeout {
+                addr: "a:1".into(),
+                timeout_millis: 3000,
+            },
             Some(SendErrorKind::Remoting),
         ),
         (
@@ -414,20 +460,34 @@ fn latency_since_never_goes_backwards() {
     let first = latency_since(began);
     let second = latency_since(began);
     assert!(first >= 10, "slept 15ms, measured {first}ms");
-    assert!(second >= first, "monotonic clock must not go backwards: {first} -> {second}");
+    assert!(
+        second >= first,
+        "monotonic clock must not go backwards: {first} -> {second}"
+    );
 }
 
 #[tokio::test]
 async fn retryable_broker_code_switches_to_another_broker() {
     let cluster = MockCluster::start(2, true).await;
-    cluster.script(0, vec![(response_code::SYSTEM_BUSY, 0)], (response_code::SUCCESS, 0));
+    cluster.script(
+        0,
+        vec![(response_code::SYSTEM_BUSY, 0)],
+        (response_code::SUCCESS, 0),
+    );
     cluster.script(1, vec![], (response_code::SUCCESS, 0));
     let producer = started("retry_switch", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("a retryable code should switch brokers and succeed");
+    let result = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("a retryable code should switch brokers and succeed");
     assert_eq!(result.status, SendStatus::SendOk);
-    assert_eq!(cluster.requests(0), 1, "the first broker answered SYSTEM_BUSY");
+    assert_eq!(
+        cluster.requests(0),
+        1,
+        "the first broker answered SYSTEM_BUSY"
+    );
     assert_eq!(cluster.requests(1), 1, "the second broker was polled once");
     producer.shutdown();
 }
@@ -440,11 +500,21 @@ async fn non_retryable_broker_code_throws_at_once() {
     let producer = started("retry_illegal", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("MESSAGE_ILLEGAL must be thrown verbatim");
+    let err = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect_err("MESSAGE_ILLEGAL must be thrown verbatim");
     assert_eq!(err.response_code(), Some(response_code::MESSAGE_ILLEGAL));
-    assert!(matches!(err, Error::Broker { .. }), "the thrown error should be an MQBrokerException: {err}");
+    assert!(
+        matches!(err, Error::Broker { .. }),
+        "the thrown error should be an MQBrokerException: {err}"
+    );
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "a deterministic error should not try the second broker");
+    assert_eq!(
+        cluster.requests(1),
+        0,
+        "a deterministic error should not try the second broker"
+    );
     producer.shutdown();
 }
 
@@ -460,7 +530,10 @@ async fn added_retry_response_code_makes_a_code_retryable() {
     assert!(!producer.is_retry_response_code(None));
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("adding the code should make it switch brokers");
+    let result = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("adding the code should make it switch brokers");
     assert_eq!(result.status, SendStatus::SendOk);
     assert_eq!(cluster.requests(1), 1);
     producer.shutdown();
@@ -475,7 +548,10 @@ async fn exhausted_retries_report_brokers_sent_and_code() {
     producer.set_retry_times_when_send_failed(2);
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("all attempts failing must throw");
+    let err = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect_err("all attempts failing must throw");
     let (code, message) = expect_client_code(err);
     // The last failure carries a broker code ⇒ that code is reused
     assert_eq!(code, Some(response_code::SYSTEM_BUSY));
@@ -485,7 +561,10 @@ async fn exhausted_retries_report_brokers_sent_and_code() {
         message.contains("BrokersSent: [broker-0, broker-1, broker-0]"),
         "{message}"
     );
-    assert!(message.contains("last error: MQBrokerException"), "{message}");
+    assert!(
+        message.contains("last error: MQBrokerException"),
+        "{message}"
+    );
     assert_eq!(cluster.requests(0) + cluster.requests(1), 3);
     producer.shutdown();
 }
@@ -496,11 +575,18 @@ async fn missing_route_fails_fast_with_not_found_topic_code() {
     let producer = started("retry_no_route", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let err = producer.send(&mut msg, None, None).await.expect_err("a missing route must fail");
+    let err = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect_err("a missing route must fail");
     let (code, message) = expect_client_code(err);
     assert_eq!(code, Some(client_error_code::NOT_FOUND_TOPIC_EXCEPTION));
     assert!(message.contains("Message Queue"), "{message}");
-    assert_eq!(cluster.requests(0), 0, "with no route at all, not even one request should be sent");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "with no route at all, not even one request should be sent"
+    );
     producer.shutdown();
 }
 
@@ -508,7 +594,9 @@ async fn missing_route_fails_fast_with_not_found_topic_code() {
 async fn connect_failure_is_qualified_with_10001() {
     // Occupy a port first and release it at once; the route points at it ⇒ the connect must be refused
     let dead_addr = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind dead port");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead port");
         listener.local_addr().expect("dead addr").to_string()
     };
     let cluster = MockCluster::with_addrs(vec![dead_addr], true).await;
@@ -522,7 +610,11 @@ async fn connect_failure_is_qualified_with_10001() {
         .await
         .expect_err("an unreachable target must fail");
     let (code, message) = expect_client_code(err);
-    assert_eq!(code, Some(client_error_code::CONNECT_BROKER_EXCEPTION), "{message}");
+    assert_eq!(
+        code,
+        Some(client_error_code::CONNECT_BROKER_EXCEPTION),
+        "{message}"
+    );
     producer.shutdown();
 }
 
@@ -551,7 +643,10 @@ async fn unreachable_name_server_is_never_reported_as_10004() {
     let producer = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     producer.set_instance_name("retry_dead_namesrv");
     producer.set_namesrv_addr(&addr);
-    producer.start().await.expect("a non-empty configuration should pass the gate");
+    producer
+        .start()
+        .await
+        .expect("a non-empty configuration should pass the gate");
 
     let mut msg = Message::new("T1", Some(b"body"));
     let err = producer
@@ -573,10 +668,20 @@ async fn producer_start_reports_10004_when_addressing_is_missing() {
     if DefaultTopAddressing::is_configured() {
         return;
     }
-    let err = producer.start().await.expect_err("without addressing it must not start");
-    assert_eq!(err.response_code(), Some(client_error_code::NO_NAME_SERVER_EXCEPTION), "{err}");
+    let err = producer
+        .start()
+        .await
+        .expect_err("without addressing it must not start");
+    assert_eq!(
+        err.response_code(),
+        Some(client_error_code::NO_NAME_SERVER_EXCEPTION),
+        "{err}"
+    );
     let (_, message) = expect_client_code(err);
-    assert!(message.contains("name server address is not set"), "{message}");
+    assert!(
+        message.contains("name server address is not set"),
+        "{message}"
+    );
 }
 
 /// The entire point of `sendMsgMaxTimeoutPerRequest`: a slow broker may only eat the clamped slice,
@@ -626,7 +731,10 @@ async fn exhausted_budget_reports_call_timeout() {
         matches!(err, Error::TooMuchRequest(_)),
         "expected sendDefaultImpl call timeout, got {err}"
     );
-    assert_eq!(err.to_string(), "too much request: sendDefaultImpl call timeout");
+    assert_eq!(
+        err.to_string(),
+        "too much request: sendDefaultImpl call timeout"
+    );
     producer.shutdown();
 }
 
@@ -639,14 +747,24 @@ async fn not_store_ok_only_switches_broker_when_configured() {
     let producer = started("retry_not_store", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("by default the result is returned as-is");
+    let result = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("by default the result is returned as-is");
     assert_eq!(result.status, SendStatus::FlushDiskTimeout);
-    assert_eq!(cluster.requests(1), 0, "without the switch on, no broker switch should happen");
+    assert_eq!(
+        cluster.requests(1),
+        0,
+        "without the switch on, no broker switch should happen"
+    );
 
     producer.set_retry_another_broker_when_not_store_ok(true);
     assert!(producer.is_retry_another_broker_when_not_store_ok());
     let mut msg2 = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg2, None, None).await.expect("with the switch on it should switch brokers");
+    let result = producer
+        .send(&mut msg2, None, None)
+        .await
+        .expect("with the switch on it should switch brokers");
     assert_eq!(result.status, SendStatus::SendOk);
     assert_eq!(cluster.requests(1), 1);
     producer.shutdown();
@@ -664,20 +782,36 @@ async fn failed_broker_is_isolated_and_latency_is_recorded() {
     assert!(producer.is_retry_response_code(Some(response_code::SERVICE_NOT_AVAILABLE)));
 
     let mut msg = Message::new("T1", Some(b"body"));
-    let result = producer.send(&mut msg, None, None).await.expect("after isolation it should switch to the healthy broker");
+    let result = producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("after isolation it should switch to the healthy broker");
     assert_eq!(result.status, SendStatus::SendOk);
 
     let tolerance = producer.inner.fault_strategy.latency_fault_tolerance();
-    assert!(!tolerance.is_available("broker-0"), "a broker that answered an error code must be isolated");
-    let failed = tolerance.get_fault_item("broker-0").expect("the failed broker must be in the table");
+    assert!(
+        !tolerance.is_available("broker-0"),
+        "a broker that answered an error code must be isolated"
+    );
+    let failed = tolerance
+        .get_fault_item("broker-0")
+        .expect("the failed broker must be in the table");
     assert!(
         failed.get_current_latency() >= 10 && failed.get_current_latency() < ISOLATION_LATENCY,
         "the fault table should record the real latency (around 30ms), got {}",
         failed.get_current_latency()
     );
-    assert!(!failed.is_reachable(), "the MQBrokerException tier passes reachable=False");
-    let ok = tolerance.get_fault_item("broker-1").expect("the successful broker must be in the table");
-    assert!(ok.is_available(tolerance.now_millis()), "a healthy broker should not be isolated");
+    assert!(
+        !failed.is_reachable(),
+        "the MQBrokerException tier passes reachable=False"
+    );
+    let ok = tolerance
+        .get_fault_item("broker-1")
+        .expect("the successful broker must be in the table");
+    assert!(
+        ok.is_available(tolerance.now_millis()),
+        "a healthy broker should not be isolated"
+    );
     assert!(ok.is_reachable(), "the success tier passes reachable=True");
     producer.shutdown();
 }
@@ -698,20 +832,29 @@ async fn unit_mode_is_carried_in_the_send_header() {
     on.set_instance_name("unit_mode_on");
     on.set_namesrv_addr(&cluster.namesrv_addr);
     on.set_unit_mode(true);
-    on.start().await.expect("start should succeed against the mock cluster");
+    on.start()
+        .await
+        .expect("start should succeed against the mock cluster");
     let mut msg = Message::new("T1", Some(b"unit-on"));
-    on.send(&mut msg, None, None).await.expect("send should succeed");
+    on.send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
 
     let off = DefaultMQProducer::new("GID_send_retry").expect("group name is valid");
     off.set_instance_name("unit_mode_off");
     off.set_namesrv_addr(&cluster.namesrv_addr);
     off.start().await.expect("default unitMode=false");
     let mut msg = Message::new("T1", Some(b"unit-off"));
-    off.send(&mut msg, None, None).await.expect("send should succeed");
+    off.send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
 
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "k"), Some("true"));
     assert_eq!(ext_value(&cluster.send_ext(0, 1), "k"), Some("false"));
-    assert_eq!(ext_value(&cluster.send_ext(0, 1), "a"), Some("GID_send_retry"));
+    assert_eq!(
+        ext_value(&cluster.send_ext(0, 1), "a"),
+        Some("GID_send_retry")
+    );
     on.shutdown();
     off.shutdown();
 }
@@ -730,7 +873,10 @@ async fn send_header_carries_broker_name_and_topic_keys() {
     let producer = started("send_header_fields", &cluster).await;
 
     let mut msg = Message::new("T1", Some(b"single"));
-    producer.send(&mut msg, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
     assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
     assert_eq!(
@@ -745,7 +891,10 @@ async fn send_header_carries_broker_name_and_topic_keys() {
     producer.set_create_topic_key("CreatedTopicKey");
     producer.set_default_topic_queue_nums(9);
     let mut msg = Message::new("T1", Some(b"configured"));
-    producer.send(&mut msg, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
     let ext = cluster.send_ext(0, 1);
     assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
     assert_eq!(ext_value(&ext, "d"), Some("9"));
@@ -776,11 +925,18 @@ async fn send_header_carries_broker_name_and_topic_keys() {
         .send_oneway(&mut msg, None)
         .await
         .expect("oneway send should succeed");
-    assert!(wait_until(|| cluster.requests(0) >= 4).await, "the oneway request must be captured too");
+    assert!(
+        wait_until(|| cluster.requests(0) >= 4).await,
+        "the oneway request must be captured too"
+    );
     let ext = cluster.send_ext(0, 3);
     assert_eq!(ext_value(&ext, "n"), Some("broker-0"));
     assert_eq!(ext_value(&ext, "c"), Some("CreatedTopicKey"));
-    assert_eq!(ext_value(&ext, "d"), Some("0"), "0 is the caller's explicit 0");
+    assert_eq!(
+        ext_value(&ext, "d"),
+        Some("0"),
+        "0 is the caller's explicit 0"
+    );
 
     let cb = Arc::new(Recorder::default());
     producer
@@ -805,9 +961,15 @@ async fn broker_name_header_follows_the_selected_queue() {
     let producer = started("send_header_broker_name", &cluster).await;
 
     let mut first = Message::new("T1", Some(b"to-0"));
-    producer.send(&mut first, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut first, None, None)
+        .await
+        .expect("send should succeed");
     let mut second = Message::new("T1", Some(b"to-1"));
-    producer.send(&mut second, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut second, None, None)
+        .await
+        .expect("send should succeed");
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "n"), Some("broker-0"));
     assert_eq!(ext_value(&cluster.send_ext(1, 0), "n"), Some("broker-1"));
 
@@ -831,7 +993,10 @@ async fn broker_name_header_follows_the_selected_queue() {
         .await
         .expect("an empty brokerName must not affect the send");
     let ext = cluster.send_ext(0, 1);
-    assert!(ext_value(&ext, "n").is_none(), "an empty brokerName must not go on the wire: {ext:?}");
+    assert!(
+        ext_value(&ext, "n").is_none(),
+        "an empty brokerName must not go on the wire: {ext:?}"
+    );
     assert_eq!(ext_value(&ext, "c"), Some(MixAll::DEFAULT_TOPIC));
     assert_eq!(ext_value(&ext, "d"), Some("4"));
 
@@ -846,10 +1011,7 @@ async fn broker_name_header_follows_the_selected_queue() {
 #[test]
 fn retry_topic_properties_are_lifted_into_the_send_header() {
     let mut msg = Message::new("%RETRY%GID_lift", Some(b"poison"));
-    msg.put_property(
-        crate::common::message_const::PROPERTY_RECONSUME_TIME,
-        "4",
-    );
+    msg.put_property(crate::common::message_const::PROPERTY_RECONSUME_TIME, "4");
     msg.put_property(
         crate::common::message_const::PROPERTY_MAX_RECONSUME_TIMES,
         "6",
@@ -868,7 +1030,11 @@ fn retry_topic_properties_are_lifted_into_the_send_header() {
     request.make_custom_header_to_net();
     let ext = request.ext_fields();
     assert_eq!(ext.get("j"), Some("4"), "reconsumeTimes is lifted into j");
-    assert_eq!(ext.get("l"), Some("6"), "maxReconsumeTimes is lifted into l");
+    assert_eq!(
+        ext.get("l"),
+        Some("6"),
+        "maxReconsumeTimes is lifted into l"
+    );
     let props = ext.get("i").unwrap_or_default();
     assert!(
         props.contains(crate::common::message_const::PROPERTY_RECONSUME_TIME),
@@ -880,10 +1046,7 @@ fn retry_topic_properties_are_lifted_into_the_send_header() {
 #[test]
 fn ordinary_topic_never_lifts_reconsume_times() {
     let mut msg = Message::new("T1", Some(b"normal"));
-    msg.put_property(
-        crate::common::message_const::PROPERTY_RECONSUME_TIME,
-        "4",
-    );
+    msg.put_property(crate::common::message_const::PROPERTY_RECONSUME_TIME, "4");
     msg.put_property(
         crate::common::message_const::PROPERTY_MAX_RECONSUME_TIMES,
         "6",
@@ -902,7 +1065,10 @@ fn ordinary_topic_never_lifts_reconsume_times() {
     request.make_custom_header_to_net();
     let ext = request.ext_fields();
     assert_eq!(ext.get("j"), Some("0"));
-    assert!(!ext.contains_key("l"), "unconfigured means it must not go on the wire: {ext:?}");
+    assert!(
+        !ext.contains_key("l"),
+        "unconfigured means it must not go on the wire: {ext:?}"
+    );
 }
 
 /// The unit name must appear in both the clientId and the wire message, without affecting the send.
@@ -919,7 +1085,10 @@ async fn unit_name_only_changes_the_client_id() {
         Some(format!("{}@unit_name_case@unitA", MixAll::cached_ip_str()))
     );
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
     assert!(cluster.send_ext(0, 0).iter().all(|(k, _)| k != "unitName"));
     producer.shutdown();
 }
@@ -937,7 +1106,10 @@ async fn send_request_code_follows_protocol_three_way_branch() {
     let producer = started("send_code_branch", &cluster).await;
 
     let mut single = Message::new("T1", Some(b"single"));
-    producer.send(&mut single, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut single, None, None)
+        .await
+        .expect("send should succeed");
     assert_eq!(cluster.send_code(0, 0), request_code::SEND_MESSAGE_V2);
     assert_eq!(ext_value(&cluster.send_ext(0, 0), "m"), Some("false"));
 
@@ -960,12 +1132,10 @@ async fn send_request_code_follows_protocol_three_way_branch() {
         Message::new("T1", Some(b"r-1")),
     ])
     .expect("same topic, not delayed, not a retry: should be legal");
-    reply_batch
-        .message
-        .put_property(
-            crate::common::message_const::PROPERTY_MESSAGE_TYPE,
-            MixAll::REPLY_MESSAGE_FLAG,
-        );
+    reply_batch.message.put_property(
+        crate::common::message_const::PROPERTY_MESSAGE_TYPE,
+        MixAll::REPLY_MESSAGE_FLAG,
+    );
     let mut publish = PublishMessage::Batch(&mut reply_batch);
     let mq = MessageQueue::new("T1", "broker-0", 0);
     let client = producer.require_client().expect("client is started");
@@ -1007,24 +1177,41 @@ async fn send_batch_writes_client_ids_before_encoding_the_body() {
     // (1) in the body that went on the wire, every sub-message carries a distinct 32-char client ID
     let wire = cluster.send_body(0, 0);
     let subs = crate::common::message_decoder::decode_batch_messages(&wire);
-    assert_eq!(subs.len(), 3, "the batch body must carry the 3 sub-messages verbatim");
+    assert_eq!(
+        subs.len(),
+        3,
+        "the batch body must carry the 3 sub-messages verbatim"
+    );
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for sub in &subs {
-        let id = crate::common::message_client_id_setter::get_uniq_id(sub)
-            .unwrap_or_else(|| panic!("sub-message lacks UNIQ_KEY: the ID must be written before encoding"));
+        let id = crate::common::message_client_id_setter::get_uniq_id(sub).unwrap_or_else(|| {
+            panic!("sub-message lacks UNIQ_KEY: the ID must be written before encoding")
+        });
         assert_eq!(id.len(), 32, "{id}");
-        assert!(seen.insert(id.clone()), "each sub-message's UNIQ_KEY must be distinct");
+        assert!(
+            seen.insert(id.clone()),
+            "each sub-message's UNIQ_KEY must be distinct"
+        );
         // The whole-batch ID must not collide with any sub-message's, otherwise the two were never told apart
         assert_ne!(result.msg_id.as_deref(), Some(id.as_str()));
     }
 
     // (2) msg_id is the batch's own UNIQ_KEY written into the message properties; offsetMsgId is the broker's copy
-    let msg_id = result.msg_id.clone().expect("the batch must also report its client ID");
+    let msg_id = result
+        .msg_id
+        .clone()
+        .expect("the batch must also report its client ID");
     assert_eq!(msg_id.len(), 32, "{msg_id}");
-    assert!(!msg_id.contains(','), "the batch msgId uses a single handle, not a comma-joined string: {msg_id}");
+    assert!(
+        !msg_id.contains(','),
+        "the batch msgId uses a single handle, not a comma-joined string: {msg_id}"
+    );
     let wire_ext = cluster.send_ext(0, 0);
     let props = ext_value(&wire_ext, "i").unwrap_or_default();
-    assert!(props.contains(msg_id.as_str()), "the batch's own ID must really go on the wire: {props}");
+    assert!(
+        props.contains(msg_id.as_str()),
+        "the batch's own ID must really go on the wire: {props}"
+    );
     assert_ne!(result.msg_id, result.offset_msg_id);
 
     producer.shutdown();
@@ -1047,22 +1234,26 @@ async fn stream_request_type_tags_requests_before_user_hooks_run() {
 
     let cluster = MockCluster::start(1, true).await;
     let probe = Arc::new(OrderProbe::default());
-    let producer = DefaultMQProducer::with_rpc_hook(
-        "GID_send_retry",
-        Some(probe.clone() as Arc<dyn RPCHook>),
-    )
-    .expect("group name is valid");
+    let producer =
+        DefaultMQProducer::with_rpc_hook("GID_send_retry", Some(probe.clone() as Arc<dyn RPCHook>))
+            .expect("group name is valid");
     producer.set_instance_name("stream_on");
     producer.set_namesrv_addr(&cluster.namesrv_addr);
     producer.set_enable_stream_request_type(true);
     producer.start().await.expect("start");
     assert!(
-        producer.client_id().unwrap_or_default().ends_with("@STREAM"),
+        producer
+            .client_id()
+            .unwrap_or_default()
+            .ends_with("@STREAM"),
         "with stream enabled the clientId must carry the @STREAM suffix"
     );
 
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
     assert_eq!(
         ext_value(&ext, MixAll::REQ_T),
@@ -1083,11 +1274,20 @@ async fn stream_request_type_is_off_by_default_for_producers() {
     let producer = started("stream_off", &cluster).await;
     assert!(!producer.config().enable_stream_request_type);
     let mut msg = Message::new("T1", Some(b"body"));
-    producer.send(&mut msg, None, None).await.expect("send should succeed");
+    producer
+        .send(&mut msg, None, None)
+        .await
+        .expect("send should succeed");
     let ext = cluster.send_ext(0, 0);
-    assert!(ext_value(&ext, MixAll::REQ_T).is_none(), "no ReqT by default: {ext:?}");
     assert!(
-        !producer.client_id().unwrap_or_default().ends_with("@STREAM"),
+        ext_value(&ext, MixAll::REQ_T).is_none(),
+        "no ReqT by default: {ext:?}"
+    );
+    assert!(
+        !producer
+            .client_id()
+            .unwrap_or_default()
+            .ends_with("@STREAM"),
         "the default clientId must not carry @STREAM"
     );
     producer.shutdown();
@@ -1261,15 +1461,16 @@ impl ParkingSendHook {
     }
 
     fn count_of(&self, label: &str) -> usize {
-        lock(&self.entries).iter().filter(|(l, _, _, _)| l == label).count()
+        lock(&self.entries)
+            .iter()
+            .filter(|(l, _, _, _)| l == label)
+            .count()
     }
 
     fn dump(&self) -> String {
         lock(&self.entries)
             .iter()
-            .map(|(label, at, free, total)| {
-                format!("{label}@{at}ms(free={free},cap={total})")
-            })
+            .map(|(label, at, free, total)| format!("{label}@{at}ms(free={free},cap={total})"))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -1305,13 +1506,9 @@ impl SendMessageHook for ParkingSendHook {
             self.witnessed_permits.fetch_min(free, Ordering::Relaxed);
         }
         let (free, cap) = gate.unwrap_or((-1, -1));
-        lock(&self.entries)
-            .push((label, began.elapsed().as_millis(), free, cap));
+        lock(&self.entries).push((label, began.elapsed().as_millis(), free, cap));
         // The WaitTimeoutResult must be read: discarding it means waiting without a timeout again, making the fallback useless.
-        let mut guard = self
-            .gate
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         while !*guard {
             match self.opened.wait_timeout(guard, PARK_BACKSTOP) {
                 Ok((next, timed_out)) => {
@@ -1401,9 +1598,13 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let hook = Arc::new(ParkingSendHook::new());
-    let producer =
-        backpressure_producer_with_hook("resize_in_pool", &cluster, MIN_ASYNC_SEND_NUM, hook.clone())
-            .await;
+    let producer = backpressure_producer_with_hook(
+        "resize_in_pool",
+        &cluster,
+        MIN_ASYNC_SEND_NUM,
+        hook.clone(),
+    )
+    .await;
     hook.observe_gate(&producer.inner);
     let _release = ReleaseHookOnDrop(hook.clone());
     hook.begin();
@@ -1428,11 +1629,7 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     // The first send through the gate takes a permit, so "the stuck 10th" becomes "the 10th stuck held",
     // and the verdict below would be luck (live B3 watches the same thing with a watchdog thread).
     assert!(
-        wait_until_within(
-            || hook.count_of("held") == PARKED_IN_HOOK,
-            DISPATCH_BUDGET
-        )
-        .await,
+        wait_until_within(|| hook.count_of("held") == PARKED_IN_HOOK, DISPATCH_BUDGET).await,
         "not all {} sends parked in the hook (recorded: {})",
         PARKED_IN_HOOK,
         hook.dump()
@@ -1453,11 +1650,7 @@ async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
     // That it stops at the gate (rather than still waiting in the pool queue) has evidence: the fair queue holds one more ticket.
     assert!(
         wait_until_within(
-            || producer
-                .inner
-                .semaphore_async_send_num
-                .waiting_count()
-                >= 1,
+            || producer.inner.semaphore_async_send_num.waiting_count() >= 1,
             DISPATCH_BUDGET
         )
         .await,
@@ -1647,11 +1840,13 @@ async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = backpressure_producer("bp_num_gate", &cluster, MIN_ASYNC_SEND_NUM).await;
-    assert!(producer
-        .inner
-        .semaphore_async_send_num
-        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
-        .await);
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_num
+            .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+            .await
+    );
 
     let began = Instant::now();
     let cb = Arc::new(Recorder::default());
@@ -1671,7 +1866,11 @@ async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
         "the failure was handed back before the timeout elapsed: {:?}",
         began.elapsed()
     );
-    assert_eq!(cluster.requests(0), 0, "when the gate rejects, not a single request should go out");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "when the gate rejects, not a single request should go out"
+    );
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
         MIN_ASYNC_SEND_SIZE,
@@ -1689,11 +1888,13 @@ async fn size_gate_rejects_and_gives_the_num_permit_back() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = backpressure_producer("bp_size_gate", &cluster, MIN_ASYNC_SEND_NUM).await;
-    assert!(producer
-        .inner
-        .semaphore_async_send_size
-        .try_acquire(MIN_ASYNC_SEND_SIZE, 0)
-        .await);
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_size
+            .try_acquire(MIN_ASYNC_SEND_SIZE, 0)
+            .await
+    );
 
     let cb = Arc::new(Recorder::default());
     producer
@@ -1793,9 +1994,17 @@ async fn retry_chain_holds_one_pair_not_one_per_attempt() {
         MIN_ASYNC_SEND_SIZE - 300
     );
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert_eq!(cluster.requests(0), 1, "the first attempt landed on the dropped broker");
+    assert_eq!(
+        cluster.requests(0),
+        1,
+        "the first attempt landed on the dropped broker"
+    );
     assert_eq!(cluster.requests(1), 1);
-    assert!(cb.errors().is_empty(), "after switching brokers the send should succeed: {:?}", cb.errors());
+    assert!(
+        cb.errors().is_empty(),
+        "after switching brokers the send should succeed: {:?}",
+        cb.errors()
+    );
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 10);
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
@@ -1809,11 +2018,13 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = backpressure_producer("bp_wait", &cluster, MIN_ASYNC_SEND_NUM).await;
-    assert!(producer
-        .inner
-        .semaphore_async_send_num
-        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
-        .await);
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_num
+            .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+            .await
+    );
 
     let cb = Arc::new(Recorder::default());
     let began = Instant::now();
@@ -1821,17 +2032,16 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
         .send_async(body_of(1), cb.clone(), Some(5_000), None)
         .expect("dispatchable within the runtime");
     // Let it queue at the gate, then confirm it is **still alive** (neither failed early nor sent out)
-    assert!(wait_until(|| producer
-        .inner
-        .semaphore_async_send_num
-        .waiting_count()
-        >= 1)
-    .await);
+    assert!(wait_until(|| producer.inner.semaphore_async_send_num.waiting_count() >= 1).await);
     assert_eq!(cb.done.load(Ordering::SeqCst), 0);
     assert_eq!(cluster.requests(0), 0);
 
     tokio::time::sleep(Duration::from_millis(120)).await;
-    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "it must not fail early before the timeout");
+    assert_eq!(
+        cb.done.load(Ordering::SeqCst),
+        0,
+        "it must not fail early before the timeout"
+    );
     producer
         .inner
         .semaphore_async_send_num
@@ -1842,7 +2052,10 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
         "it did not wait for a permit, failing the moment one look showed there was none: {:?}",
         began.elapsed()
     );
-    assert!(cb.errors().is_empty(), "once the permit arrives, this send should go out");
+    assert!(
+        cb.errors().is_empty(),
+        "once the permit arrives, this send should go out"
+    );
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(cluster.requests(0), 1);
     producer.shutdown();
@@ -1852,11 +2065,13 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
 async fn runtime_resize_keeps_the_in_flight_share() {
     let cluster = MockCluster::start(1, true).await;
     let producer = backpressure_producer("bp_resize", &cluster, MIN_ASYNC_SEND_NUM).await;
-    assert!(producer
-        .inner
-        .semaphore_async_send_num
-        .try_acquire(5, 0)
-        .await);
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_num
+            .try_acquire(5, 0)
+            .await
+    );
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 5);
     producer.set_back_pressure_for_async_send_num(15);
     assert_eq!(
@@ -1864,10 +2079,7 @@ async fn runtime_resize_keeps_the_in_flight_share() {
         15
     );
     assert_eq!(producer.get_back_pressure_for_async_send_num(), 15);
-    producer
-        .inner
-        .semaphore_async_send_num
-        .release(5);
+    producer.inner.semaphore_async_send_num.release(5);
     assert_eq!(producer.semaphore_async_send_num_available_permits(), 15);
     producer.shutdown();
 }
@@ -1877,25 +2089,26 @@ async fn growing_capacity_wakes_a_blocked_sender() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = backpressure_producer("bp_grow", &cluster, MIN_ASYNC_SEND_NUM).await;
-    assert!(producer
-        .inner
-        .semaphore_async_send_num
-        .try_acquire(MIN_ASYNC_SEND_NUM, 0)
-        .await);
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_num
+            .try_acquire(MIN_ASYNC_SEND_NUM, 0)
+            .await
+    );
 
     let cb = Arc::new(Recorder::default());
     producer
         .send_async(body_of(1), cb.clone(), Some(5_000), None)
         .expect("dispatchable within the runtime");
-    assert!(wait_until(|| producer
-        .inner
-        .semaphore_async_send_num
-        .waiting_count()
-        >= 1)
-    .await);
+    assert!(wait_until(|| producer.inner.semaphore_async_send_num.waiting_count() >= 1).await);
     producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 1); // one extra unit of capacity out of thin air
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "after the resize this send should go out: {:?}", cb.errors());
+    assert!(
+        cb.errors().is_empty(),
+        "after the resize this send should go out: {:?}",
+        cb.errors()
+    );
     assert_eq!(cluster.requests(0), 1);
     producer.shutdown();
 }
@@ -1929,7 +2142,11 @@ async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
         "error text checked verbatim: {}",
         errors[0]
     );
-    assert_eq!(cluster.requests(0), 0, "with no budget left, no request should be sent");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "with no budget left, no request should be sent"
+    );
     producer.shutdown();
 }
 
@@ -1953,7 +2170,10 @@ async fn queue_full_rejects_the_caller_without_sending() {
         ..Default::default()
     })
     .expect("config is valid");
-    producer.start().await.expect("start should succeed against the mock cluster");
+    producer
+        .start()
+        .await
+        .expect("start should succeed against the mock cluster");
     assert_eq!(producer.get_async_sender_queue_capacity(), 1);
 
     let cb = Arc::new(Recorder::default());
@@ -1967,8 +2187,16 @@ async fn queue_full_rejects_the_caller_without_sending() {
         err.to_string().contains("executor rejected"),
         "rejection text checked verbatim (no extra trailing space): {err}"
     );
-    assert_eq!(cb.done.load(Ordering::SeqCst), 0, "a rejected send must not call back");
-    assert_eq!(cluster.requests(0), 0, "before the rejection, no request should have been sent");
+    assert_eq!(
+        cb.done.load(Ordering::SeqCst),
+        0,
+        "a rejected send must not call back"
+    );
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "before the rejection, no request should have been sent"
+    );
 
     // after letting the queue drain, the first send goes out as usual and its callback still runs
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
@@ -1991,7 +2219,10 @@ async fn queue_full_with_backpressure_dispatches_off_the_queue() {
         ..Default::default()
     })
     .expect("config is valid");
-    producer.start().await.expect("start should succeed against the mock cluster");
+    producer
+        .start()
+        .await
+        .expect("start should succeed against the mock cluster");
 
     let cb = Arc::new(Recorder::default());
     producer
@@ -2027,18 +2258,20 @@ async fn send_async_after_shutdown_is_rejected() {
         .send_async(body_of(10), cb.clone(), Some(1_000), None)
         .expect_err("async sends must not be accepted after shutdown");
     assert!(err.to_string().contains("producer not started"), "{err}");
-    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "a rejected send must not call back");
+    assert_eq!(
+        cb.done.load(Ordering::SeqCst),
+        1,
+        "a rejected send must not call back"
+    );
 }
 
 #[tokio::test]
 async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
-    let producer = backpressure_producer("async_kernel_timeout", &cluster, MIN_ASYNC_SEND_NUM)
-        .await;
-    producer.register_check_forbidden_hook(Arc::new(SleepingForbiddenHook {
-        millis: 200,
-    }));
+    let producer =
+        backpressure_producer("async_kernel_timeout", &cluster, MIN_ASYNC_SEND_NUM).await;
+    producer.register_check_forbidden_hook(Arc::new(SleepingForbiddenHook { millis: 200 }));
     let hooks = Arc::new(CountingSendHook::default());
     producer.register_send_message_hook(hooks.clone());
 
@@ -2053,10 +2286,25 @@ async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
         "error text checked verbatim: {}",
         errors[0]
     );
-    assert_eq!(cluster.requests(0), 0, "with no budget left, the request must not be handed out");
-    assert_eq!(hooks.before(), 1, "the before hook runs before the budget check");
-    assert_eq!(hooks.after(), 1, "the after hook must run once before the abort");
-    assert_eq!(producer.semaphore_async_send_num_available_permits(), MIN_ASYNC_SEND_NUM);
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "with no budget left, the request must not be handed out"
+    );
+    assert_eq!(
+        hooks.before(),
+        1,
+        "the before hook runs before the budget check"
+    );
+    assert_eq!(
+        hooks.after(),
+        1,
+        "the after hook must run once before the abort"
+    );
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        MIN_ASYNC_SEND_NUM
+    );
     assert_eq!(
         producer.semaphore_async_send_size_available_permits(),
         MIN_ASYNC_SEND_SIZE
@@ -2081,7 +2329,11 @@ async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
         .send_async(body_of(10), cb.clone(), Some(30_000), None)
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "after switching brokers the send should succeed: {:?}", cb.errors());
+    assert!(
+        cb.errors().is_empty(),
+        "after switching brokers the send should succeed: {:?}",
+        cb.errors()
+    );
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(live.requests(0), 1, "the retry landed on the other broker");
     producer.shutdown();
@@ -2131,7 +2383,11 @@ async fn retry_times_when_send_async_failed_zero_means_one_attempt() {
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "with 0 configured, no broker switch should happen");
+    assert_eq!(
+        cluster.requests(1),
+        0,
+        "with 0 configured, no broker switch should happen"
+    );
     producer.shutdown();
 }
 
@@ -2154,7 +2410,11 @@ async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "the async chain does not switch brokers (the needRetry=false branch)");
+    assert_eq!(
+        cluster.requests(1),
+        0,
+        "the async chain does not switch brokers (the needRetry=false branch)"
+    );
     let errors = cb.errors();
     assert!(
         errors[0].contains("MQBrokerException"),
@@ -2189,7 +2449,10 @@ async fn after_hook_sees_the_async_outcome() {
     let cluster = MockCluster::start(1, true).await;
     cluster.script(
         0,
-        vec![(response_code::SYSTEM_ERROR, 0), (response_code::SUCCESS, 0)],
+        vec![
+            (response_code::SYSTEM_ERROR, 0),
+            (response_code::SUCCESS, 0),
+        ],
         (response_code::SUCCESS, 0),
     );
     let producer = started("async_hook_ctx", &cluster).await;
@@ -2206,10 +2469,20 @@ async fn after_hook_sees_the_async_outcome() {
     }
     assert_eq!(cb.ok.load(Ordering::SeqCst), 1);
     assert_eq!(cb.errors().len(), 1);
-    assert!(hooks.saw_result(), "the success branch must carry sendResult");
-    assert!(hooks.saw_exception(), "the failure branch must carry exception");
+    assert!(
+        hooks.saw_result(),
+        "the success branch must carry sendResult"
+    );
+    assert!(
+        hooks.saw_exception(),
+        "the failure branch must carry exception"
+    );
     assert_eq!(hooks.before(), 2);
-    assert_eq!(hooks.after(), 2, "each send runs after once at its terminal point");
+    assert_eq!(
+        hooks.after(),
+        2,
+        "each send runs after once at its terminal point"
+    );
     producer.shutdown();
 }
 
@@ -2229,8 +2502,16 @@ async fn pinned_mq_retries_on_the_same_broker_with_new_opaques() {
         .send_async(body_of(10), cb.clone(), Some(5_000), Some(mq))
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
-    assert!(cb.errors().is_empty(), "the third attempt should succeed: {:?}", cb.errors());
-    assert_eq!(cluster.requests(0), 3, "all three attempts stayed on the pinned broker");
+    assert!(
+        cb.errors().is_empty(),
+        "the third attempt should succeed: {:?}",
+        cb.errors()
+    );
+    assert_eq!(
+        cluster.requests(0),
+        3,
+        "all three attempts stayed on the pinned broker"
+    );
     assert_ne!(
         cluster.send_opaque(0, 0),
         cluster.send_opaque(0, 1),
@@ -2276,8 +2557,15 @@ async fn pinned_sync_send_refuses_a_mismatched_topic_before_any_request() {
     let (code, message) = expect_client_code(err);
     assert_eq!(code, None);
     assert_eq!(message, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
-    assert_eq!(msg.topic, "T1", "the guard runs before compression; the caller's message must be untouched");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "the refusal must happen before any request"
+    );
+    assert_eq!(
+        msg.topic, "T1",
+        "the guard runs before compression; the caller's message must be untouched"
+    );
     producer.shutdown();
 }
 
@@ -2338,7 +2626,11 @@ async fn pinned_sync_send_compares_topics_after_namespace_wrapping() {
         .await
         .expect_err("across namespaces it must say no");
     assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 2, "the first two go on the wire, the third does not");
+    assert_eq!(
+        cluster.requests(0),
+        2,
+        "the first two go on the wire, the third does not"
+    );
     producer.shutdown();
 }
 
@@ -2354,7 +2646,11 @@ async fn pinned_batch_send_shares_the_sync_guard() {
         .await
         .expect_err("a mismatched batch topic must be refused just the same");
     assert_eq!(expect_client_code(err).1, PINNED_TOPIC_MISMATCH_SYNC);
-    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "the refusal must happen before any request"
+    );
 
     let mq = MessageQueue::new("T1", "broker-0", 0);
     producer
@@ -2380,13 +2676,23 @@ async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
         .expect("dispatchable within the runtime");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cb.ok.load(Ordering::SeqCst), 0);
-    assert_eq!(cb.done.load(Ordering::SeqCst), 1, "the failure may be delivered only once");
+    assert_eq!(
+        cb.done.load(Ordering::SeqCst),
+        1,
+        "the failure may be delivered only once"
+    );
     let errors = cb.errors();
     assert!(
-        errors.first().is_some_and(|e| e.contains(PINNED_TOPIC_MISMATCH_ASYNC)),
+        errors
+            .first()
+            .is_some_and(|e| e.contains(PINNED_TOPIC_MISMATCH_ASYNC)),
         "async wording checked verbatim: {errors:?}"
     );
-    assert_eq!(cluster.requests(0), 0, "the refusal must happen before any request");
+    assert_eq!(
+        cluster.requests(0),
+        0,
+        "the refusal must happen before any request"
+    );
     producer.shutdown();
 }
 
@@ -2437,4 +2743,3 @@ async fn state_check_precedes_the_pinned_guard() {
         "the state check must precede the guard: {err}"
     );
 }
-

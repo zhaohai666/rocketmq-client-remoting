@@ -49,7 +49,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -181,7 +184,11 @@ impl Env {
 
     /// All message queues of this topic (from the producer-side route).
     async fn message_queues(&self) -> Vec<MessageQueue> {
-        match self.producer.fetch_publish_message_queues(&self.topic).await {
+        match self
+            .producer
+            .fetch_publish_message_queues(&self.topic)
+            .await
+        {
             Ok(queues) => queues,
             Err(e) => {
                 println!("  [WARN] fetch_publish_message_queues failed: {e}");
@@ -193,7 +200,12 @@ impl Env {
     /// Builds (but does not start) the push consumer; LAST_OFFSET so only messages sent
     /// after startup can arrive -- that is exactly what makes this a real-time test.
     fn consumer(&self, inbox: Arc<Inbox>) -> Result<DefaultMQPushConsumer, String> {
-        self.consumer_on(&self.topic, "MAIN", inbox, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET)
+        self.consumer_on(
+            &self.topic,
+            "MAIN",
+            inbox,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+        )
     }
 
     /// Generic variant: caller picks the topic, the group suffix and the initial-offset policy.
@@ -275,7 +287,11 @@ async fn run(namesrv: &str) -> Checker {
     // Wait for the queue assignment: without it the consumer holds no queue and nothing
     // can ever arrive (that would masquerade as a oneway defect).
     let assigned = poll_until(|| consumer.assigned_queue_count() >= 1, 20).await;
-    ck.check("consumer got at least one assigned queue", assigned, "assigned=0 after 20s");
+    ck.check(
+        "consumer got at least one assigned queue",
+        assigned,
+        "assigned=0 after 20s",
+    );
 
     // ---- O1: oneway via fault-strategy selection (mq=None) + a sync control ----
     println!("\n---------- O1 oneway send (auto queue selection) + sync control ----------");
@@ -284,7 +300,11 @@ async fn run(namesrv: &str) -> Checker {
         let body = format!("oneway-auto-{i}");
         let mut msg = Message::new(&env.topic, Some(body.as_bytes()));
         if let Err(e) = env.producer.send_oneway(&mut msg, None).await {
-            ck.check(&format!("O1 send_oneway({body}) returned Ok"), false, &e.to_string());
+            ck.check(
+                &format!("O1 send_oneway({body}) returned Ok"),
+                false,
+                &e.to_string(),
+            );
         } else {
             oneway_bodies.push(body);
         }
@@ -293,7 +313,11 @@ async fn run(namesrv: &str) -> Checker {
     let mut control = Message::new(&env.topic, Some(control_body.as_bytes()));
     match env.producer.send(&mut control, Some(5000), None).await {
         Ok(r) if r.status == SendStatus::SendOk => {}
-        Ok(r) => ck.check("O1 sync control SEND_OK", false, &format!("status={:?}", r.status)),
+        Ok(r) => ck.check(
+            "O1 sync control SEND_OK",
+            false,
+            &format!("status={:?}", r.status),
+        ),
         Err(e) => ck.check("O1 sync control SEND_OK", false, &e.to_string()),
     }
 
@@ -359,7 +383,11 @@ async fn run(namesrv: &str) -> Checker {
     let began = Instant::now();
     let mut first_route_ready = false;
     while began.elapsed() < Duration::from_secs(20) {
-        match env.producer.fetch_publish_message_queues(&first_topic).await {
+        match env
+            .producer
+            .fetch_publish_message_queues(&first_topic)
+            .await
+        {
             Ok(q) if q.len() >= QUEUE_NUMS as usize => {
                 first_route_ready = true;
                 break;
@@ -382,14 +410,22 @@ async fn run(namesrv: &str) -> Checker {
         let mut msg = Message::new(&first_topic, Some(body.as_bytes()));
         match env.producer.send_oneway(&mut msg, None).await {
             Ok(()) => first_oneway.push(body),
-            Err(e) => ck.check(&format!("O3 send_oneway({body}) returned Ok"), false, &e.to_string()),
+            Err(e) => ck.check(
+                &format!("O3 send_oneway({body}) returned Ok"),
+                false,
+                &e.to_string(),
+            ),
         }
     }
     let first_control = "sync-control-first".to_string();
     let mut control_msg = Message::new(&first_topic, Some(first_control.as_bytes()));
     match env.producer.send(&mut control_msg, Some(5000), None).await {
         Ok(r) if r.status == SendStatus::SendOk => {}
-        Ok(r) => ck.check("O3 sync control SEND_OK", false, &format!("status={:?}", r.status)),
+        Ok(r) => ck.check(
+            "O3 sync control SEND_OK",
+            false,
+            &format!("status={:?}", r.status),
+        ),
         Err(e) => ck.check("O3 sync control SEND_OK", false, &e.to_string()),
     }
     ck.check(

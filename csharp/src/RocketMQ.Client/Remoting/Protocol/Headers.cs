@@ -629,7 +629,7 @@ public sealed class QueryMessageRequestHeader : ICommandCustomHeader
     public long? BeginTimestamp { get; set; }
     public long? EndTimestamp { get; set; }
 
-    /// <summary>Index type: "K"=normal KEYS index, "U"=uniqKey (needs the RocksDB index), "T"=tag. When empty the broker treats it as "K".</summary>
+    /// <summary>Index type: "K"=normal KEYS index, "U"=uniqKey (walks the commitlog by the UNIQUE index type), "T"=tag. When empty the broker treats it as "K".</summary>
     public string? IndexType { get; set; }
 
     /// <summary>Pagination cursor: the broker returns at most maxNum per page; when paging, pass the key of the last item of the previous page.</summary>

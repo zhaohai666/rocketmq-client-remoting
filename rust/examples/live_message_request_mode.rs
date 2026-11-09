@@ -78,7 +78,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -231,9 +234,9 @@ async fn make_topic(
     let present = wait_async(
         || async {
             match route_response(client, namesrv, topic).await {
-                Ok(resp) if resp.code == response_code::SUCCESS => {
-                    decode_route(&resp, topic).map(|r| !r.queue_datas.is_empty()).unwrap_or(false)
-                }
+                Ok(resp) if resp.code == response_code::SUCCESS => decode_route(&resp, topic)
+                    .map(|r| !r.queue_datas.is_empty())
+                    .unwrap_or(false),
                 _ => false,
             }
         },
@@ -256,7 +259,10 @@ async fn read_mode_map(client: &RemotingClient, broker_addr: &str) -> Value {
     let mut request =
         RemotingCommand::create_request_command(request_code::GET_ALL_MESSAGE_REQUEST_MODE, None);
     let empty = Value::Object(serde_json::Map::new());
-    let Ok(resp) = client.invoke_sync(broker_addr, &mut request, Some(RPC_TIMEOUT_MS)).await else {
+    let Ok(resp) = client
+        .invoke_sync(broker_addr, &mut request, Some(RPC_TIMEOUT_MS))
+        .await
+    else {
         return empty;
     };
     if resp.code != response_code::SUCCESS {
@@ -292,14 +298,25 @@ async fn leg_positive(h: &Harness, topic: &str, group: &str, ck: &mut Checker) {
     ck.check(
         "L1 the production POP write was accepted by the broker (SUCCESS on 401)",
         write.is_ok(),
-        &write.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+        &write
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
     );
     if write.is_err() {
         return;
     }
 
     let found = wait_async(
-        || async { entry(&read_mode_map(&h.client, &h.broker_addr).await, topic, group).is_some() },
+        || async {
+            entry(
+                &read_mode_map(&h.client, &h.broker_addr).await,
+                topic,
+                group,
+            )
+            .is_some()
+        },
         MODE_BUDGET,
     )
     .await;
@@ -333,7 +350,11 @@ async fn leg_replacement(h: &Harness, topic: &str, group: &str, ck: &mut Checker
     ck.check(
         "L2 the production PULL write was accepted by the broker (SUCCESS on 401)",
         write.is_ok(),
-        &write.as_ref().err().map(|e| e.to_string()).unwrap_or_default(),
+        &write
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
     );
     if write.is_err() {
         return;
@@ -342,9 +363,13 @@ async fn leg_replacement(h: &Harness, topic: &str, group: &str, ck: &mut Checker
     // Wait for the PULL to become visible; on timeout the scene is printed by the assertions below.
     wait_async(
         || async {
-            entry(&read_mode_map(&h.client, &h.broker_addr).await, topic, group)
-                .and_then(|i| i.get("mode"))
-                .and_then(Value::as_str)
+            entry(
+                &read_mode_map(&h.client, &h.broker_addr).await,
+                topic,
+                group,
+            )
+            .and_then(|i| i.get("mode"))
+            .and_then(Value::as_str)
                 == Some("PULL")
         },
         MODE_BUDGET,
@@ -385,7 +410,11 @@ async fn leg_header_control(h: &Harness, topic: &str, ctrl_group: &str, ck: &mut
     request.add_ext_field("popShareQueueNum", "4");
     // No body: the four values ride the header only.
 
-    match h.client.invoke_sync(&h.broker_addr, &mut request, Some(RPC_TIMEOUT_MS)).await {
+    match h
+        .client
+        .invoke_sync(&h.broker_addr, &mut request, Some(RPC_TIMEOUT_MS))
+        .await
+    {
         Ok(resp) => {
             let code = resp.code;
             let remark = resp.remark.unwrap_or_default();
@@ -397,7 +426,11 @@ async fn leg_header_control(h: &Harness, topic: &str, ctrl_group: &str, ck: &mut
             );
         }
         Err(e) => {
-            ck.check("L3 the header-form control answered (no transport error)", false, &e.to_string());
+            ck.check(
+                "L3 the header-form control answered (no transport error)",
+                false,
+                &e.to_string(),
+            );
             return;
         }
     }
@@ -466,12 +499,20 @@ async fn run(namesrv: &str) -> Checker {
     // The topic must exist before 401: a broker refuses a 401 for a topic it has no config for, and
     // the subscription group is left to the broker's autoCreate.
     if let Err(e) = make_topic(&client, namesrv, &bootstrap_addr, &topic).await {
-        ck.check("L0 created the single-queue topic and its route is visible", false, &e);
+        ck.check(
+            "L0 created the single-queue topic and its route is visible",
+            false,
+            &e,
+        );
         admin.shutdown();
         client.shutdown();
         return ck;
     }
-    ck.check("L0 created the single-queue topic and its route is visible", true, "");
+    ck.check(
+        "L0 created the single-queue topic and its route is visible",
+        true,
+        "",
+    );
 
     // 401 / 402 are sent to the master broker the TOPIC route names -- never a hardcoded port.
     let broker_addr = match topic_master_addr(&client, namesrv, &topic).await {
@@ -485,7 +526,11 @@ async fn run(namesrv: &str) -> Checker {
     };
     println!("   master broker (from topic route) = {broker_addr}");
 
-    let harness = Harness { client, admin, broker_addr };
+    let harness = Harness {
+        client,
+        admin,
+        broker_addr,
+    };
 
     leg_positive(&harness, &topic, &group, &mut ck).await;
     leg_replacement(&harness, &topic, &group, &mut ck).await;
@@ -504,7 +549,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("############ PASS={} FAIL={} ############", ck.passed, ck.failed.len());
+    println!(
+        "############ PASS={} FAIL={} ############",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

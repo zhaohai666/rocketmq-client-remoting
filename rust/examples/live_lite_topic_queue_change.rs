@@ -28,8 +28,8 @@ use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::pull_consumer::{
     DefaultLitePullConsumer, LitePullConsumerConfig, TopicMessageQueueChangeListener,
 };
-use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::message::MessageQueue;
+use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PERM};
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 
@@ -49,7 +49,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -70,7 +73,9 @@ struct Recorder {
 
 impl Recorder {
     fn new() -> Arc<Recorder> {
-        Arc::new(Recorder { events: Mutex::new(Vec::new()) })
+        Arc::new(Recorder {
+            events: Mutex::new(Vec::new()),
+        })
     }
 
     fn snapshot(&self) -> Vec<(String, Vec<i32>)> {
@@ -173,7 +178,10 @@ async fn run(namesrv: &str) -> Checker {
     let ghost = format!("RustLiteQcGhost{s}");
     println!("namesrv={namesrv} topic={topic} group={group}");
 
-    let admin = MQClientInstance::new(&format!("rust-lite-qc-admin-{s}"), vec![namesrv.to_string()]);
+    let admin = MQClientInstance::new(
+        &format!("rust-lite-qc-admin-{s}"),
+        vec![namesrv.to_string()],
+    );
     if let Err(e) = admin.start().await {
         ck.check("admin start", false, &e.to_string());
         return ck;
@@ -226,7 +234,13 @@ async fn run(namesrv: &str) -> Checker {
     }
     let loop_start = Instant::now();
 
-    let visible = wait_queue_num(&consumer, &topic, BASE_QUEUES as usize, Duration::from_secs(30)).await;
+    let visible = wait_queue_num(
+        &consumer,
+        &topic,
+        BASE_QUEUES as usize,
+        Duration::from_secs(30),
+    )
+    .await;
     ck.check("L0 route visible (2 queues)", visible.is_some(), "timeout");
 
     // Registered while running ⇒ the snapshot is recorded immediately ⇒ the first round should not call back
@@ -260,7 +274,13 @@ async fn run(namesrv: &str) -> Checker {
 
     // ---- L2 scale up 2→4
     scale_topic(&admin, &broker_addr, &topic, SCALED_QUEUES).await;
-    let ns = wait_queue_num(&consumer, &topic, SCALED_QUEUES as usize, Duration::from_secs(45)).await;
+    let ns = wait_queue_num(
+        &consumer,
+        &topic,
+        SCALED_QUEUES as usize,
+        Duration::from_secs(45),
+    )
+    .await;
     ck.check("L2a nameserver reports 4 queues", ns.is_some(), "timeout");
     if ns.is_some() {
         let cb = wait_events(&rec, 1, FRESH_WINDOW).await;
@@ -287,8 +307,18 @@ async fn run(namesrv: &str) -> Checker {
 
     // ---- L4 scale down 4→2
     scale_topic(&admin, &broker_addr, &topic, BASE_QUEUES).await;
-    let ns = wait_queue_num(&consumer, &topic, BASE_QUEUES as usize, Duration::from_secs(45)).await;
-    ck.check("L4a nameserver reports back 2 queues", ns.is_some(), "timeout");
+    let ns = wait_queue_num(
+        &consumer,
+        &topic,
+        BASE_QUEUES as usize,
+        Duration::from_secs(45),
+    )
+    .await;
+    ck.check(
+        "L4a nameserver reports back 2 queues",
+        ns.is_some(),
+        "timeout",
+    );
     if ns.is_some() {
         let cb = wait_events(&rec, 2, FRESH_WINDOW).await;
         let got = cb.is_some()
@@ -321,7 +351,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

@@ -1979,7 +1979,7 @@ final class RunClientProducer
         $this->checkSame(2, count($queues), 'fetchPublishMessageQueues returns 2 queues');
         $this->checkSame('broker-a', $queues[0]->brokerName, 'queue brokerName');
 
-        $this->checkThrows(fn() => $p->viewMessage('T', 'id'), MQClientException::class, 'viewMessage unsupported');
+        $this->checkThrows(fn() => $p->viewMessage('T', 'id'), MQClientException::class, 'viewMessage requires a started client');
         $this->checkThrows(fn() => $p->createTopic('k', 'SCHEDULE_TOPIC_XXXX'), MQClientException::class, 'createTopic rejects system topic');
 
         $p->shutdown();

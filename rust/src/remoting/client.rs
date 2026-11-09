@@ -208,7 +208,8 @@ impl Connection {
     }
 
     fn touch(&self) {
-        self.last_activity_ms.store(mono_now_ms(), Ordering::Release);
+        self.last_activity_ms
+            .store(mono_now_ms(), Ordering::Release);
     }
 
     fn idle_millis(&self, now: u64) -> Option<u64> {
@@ -280,7 +281,8 @@ impl RemotingClient {
     }
 
     pub fn with_config(config: RemotingClientConfig) -> RemotingClient {
-        let channel_idle_timeout_ms = normalized_idle_timeout_millis(config.channel_idle_timeout_millis);
+        let channel_idle_timeout_ms =
+            normalized_idle_timeout_millis(config.channel_idle_timeout_millis);
         let close_socket_on_sync_timeout = config.close_socket_on_sync_timeout;
         RemotingClient {
             inner: Arc::new(Inner {
@@ -301,9 +303,7 @@ impl RemotingClient {
 
     /// Milliseconds a connection may carry no traffic before the sweeper closes it.
     pub fn channel_idle_timeout_millis(&self) -> i64 {
-        self.inner
-            .channel_idle_timeout_ms
-            .load(Ordering::Acquire)
+        self.inner.channel_idle_timeout_ms.load(Ordering::Acquire)
     }
 
     /// Setting a value that is not positive restores [`DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS`]:
@@ -744,10 +744,7 @@ fn on_connection_lost(inner: &Arc<Inner>, addr: &str, conn_id: u64) {
 /// then the connection is marked dead and its tasks aborted, and only the requests owned by **that**
 /// connection fail fast.
 fn sweep_idle_connections(inner: &Arc<Inner>) -> usize {
-    let limit = inner
-        .channel_idle_timeout_ms
-        .load(Ordering::Acquire)
-        .max(0) as u64;
+    let limit = inner.channel_idle_timeout_ms.load(Ordering::Acquire).max(0) as u64;
     let now = mono_now_ms();
     let doomed: Vec<Arc<Connection>> = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -757,7 +754,10 @@ fn sweep_idle_connections(inner: &Arc<Inner>) -> usize {
             .filter(|(_, c)| c.idle_millis(now).map(|idle| idle > limit).unwrap_or(false))
             .map(|(addr, _)| addr.clone())
             .collect();
-        stale.into_iter().filter_map(|addr| state.conns.remove(&addr)).collect()
+        stale
+            .into_iter()
+            .filter_map(|addr| state.conns.remove(&addr))
+            .collect()
     };
     if doomed.is_empty() {
         return 0;
@@ -804,7 +804,11 @@ fn ensure_sweeper(inner: &Arc<Inner>) {
 }
 
 fn stop_sweeper(inner: &Arc<Inner>) {
-    let handle = inner.sweeper.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let handle = inner
+        .sweeper
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(handle) = handle {
         handle.abort();
     }
@@ -1011,16 +1015,18 @@ async fn connect_plain(
     // Two handles on the same socket rather than one split stream: the write lane has to be able
     // to ask the socket itself whether it still takes bytes, and that question is only answerable
     // on a `TcpStream`, which a borrowed write half is not.
-    let std_stream = stream
-        .into_std()
-        .map_err(|_| Error::Connect { addr: addr.to_string() })?;
-    let read_std = std_stream
-        .try_clone()
-        .map_err(|_| Error::Connect { addr: addr.to_string() })?;
-    let read_stream =
-        TcpStream::from_std(read_std).map_err(|_| Error::Connect { addr: addr.to_string() })?;
-    let stream =
-        TcpStream::from_std(std_stream).map_err(|_| Error::Connect { addr: addr.to_string() })?;
+    let std_stream = stream.into_std().map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
+    let read_std = std_stream.try_clone().map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
+    let read_stream = TcpStream::from_std(read_std).map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
+    let stream = TcpStream::from_std(std_stream).map_err(|_| Error::Connect {
+        addr: addr.to_string(),
+    })?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let conn = Connection::new(addr, WriterHandle::Async(tx), Vec::new());
@@ -1298,7 +1304,9 @@ fn tls_read_loop(
             // The length prefix itself is out of range, so the bytes on the stream no longer line
             // up with the frame boundaries: the same event as an undecodable frame one level
             // earlier, reported once here, and the connection goes.
-            rmq_error!("remoting: illegal tls frame length {total} from {addr}, closing the connection");
+            rmq_error!(
+                "remoting: illegal tls frame length {total} from {addr}, closing the connection"
+            );
             break;
         }
         let mut frame = vec![0u8; 4 + total as usize];
@@ -1468,7 +1476,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, cmd.opaque, "the response must carry back the request opaque");
+        assert_eq!(
+            response.opaque, cmd.opaque,
+            "the response must carry back the request opaque"
+        );
         assert_eq!(response.remark.as_deref(), Some("pong:hi"));
         assert!(response.is_response_type());
         assert_eq!(client.connection_addrs(), vec![addr.clone()]);
@@ -1536,7 +1547,11 @@ mod tests {
         let mut cmd = request(request_code::HEART_BEAT, "once");
         client.invoke_oneway(&addr, &mut cmd).await.unwrap();
         assert!(cmd.is_oneway_rpc());
-        assert_eq!(client.in_flight_count(), 0, "oneway does not register in the in-flight table");
+        assert_eq!(
+            client.in_flight_count(),
+            0,
+            "oneway does not register in the in-flight table"
+        );
         client.shutdown();
     }
 
@@ -1557,7 +1572,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
         assert!(err.to_string().contains("200ms"));
-        assert_eq!(client.in_flight_count(), 0, "the in-flight table must be cleared after a timeout");
+        assert_eq!(
+            client.in_flight_count(),
+            0,
+            "the in-flight table must be cleared after a timeout"
+        );
         client.shutdown();
     }
 
@@ -1598,8 +1617,16 @@ mod tests {
             .invoke_sync(&addr, &mut cmd, Some(3000))
             .await
             .unwrap();
-        assert_eq!(response.code, response_code::SUCCESS, "the resend must get a real answer");
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "after GO_AWAY a new connection must be used");
+        assert_eq!(
+            response.code,
+            response_code::SUCCESS,
+            "the resend must get a real answer"
+        );
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            2,
+            "after GO_AWAY a new connection must be used"
+        );
         assert_eq!(client.in_flight_count(), 0);
         client.shutdown();
     }
@@ -1618,7 +1645,11 @@ mod tests {
             err.to_string().contains("GO_AWAY twice"),
             "the wording aligns with the send-request error text: {err}"
         );
-        assert_eq!(conns.load(Ordering::SeqCst), 2, "retry only once, no infinite reconnect loop");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            2,
+            "retry only once, no infinite reconnect loop"
+        );
         assert_eq!(client.in_flight_count(), 0);
         client.shutdown();
     }
@@ -1637,7 +1668,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(err.to_string().contains("Receive GO_AWAY from channel"));
-        assert_eq!(conns.load(Ordering::SeqCst), 1, "with the flag off it must not reconnect");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "with the flag off it must not reconnect"
+        );
         client.shutdown();
     }
 
@@ -1678,7 +1713,10 @@ mod tests {
             .await
             .unwrap();
         client.close_channel(&addr);
-        assert!(client.connection_addrs().is_empty(), "the closed address leaves the connection table");
+        assert!(
+            client.connection_addrs().is_empty(),
+            "the closed address leaves the connection table"
+        );
         // "No connection" is not "cannot write": the next send simply connects.
         assert!(client.is_channel_writable(&addr));
         let mut second = request(request_code::SEND_MESSAGE, "second");
@@ -1690,7 +1728,6 @@ mod tests {
         client.shutdown();
     }
 
-
     #[tokio::test]
     async fn channel_listener_fires_once_per_new_connection() {
         let (addr, _server) = echo_server().await;
@@ -1698,7 +1735,9 @@ mod tests {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         client.register_channel_listener(Arc::new(move |addr: &str| {
-            sink.lock().unwrap_or_else(|e| e.into_inner()).push(addr.to_string())
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(addr.to_string())
         }));
         assert_eq!(client.channel_listener_count(), 1);
 
@@ -1754,7 +1793,10 @@ mod tests {
             let addr = addr.clone();
             handles.push(tokio::spawn(async move {
                 let mut cmd = request(request_code::SEND_MESSAGE, &format!("n{i}"));
-                client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+                client
+                    .invoke_sync(&addr, &mut cmd, Some(5000))
+                    .await
+                    .unwrap();
             }));
         }
         for handle in handles {
@@ -1811,7 +1853,10 @@ mod tests {
                     tokio::spawn(async move {
                         // Close only after receiving the request: creates the EOF shape of "request written out, peer never replies".
                         let frame = read_frame(&mut stream).await;
-                        assert!(frame.is_some(), "a request should have arrived before the close");
+                        assert!(
+                            frame.is_some(),
+                            "a request should have arrived before the close"
+                        );
                         drop(stream);
                     });
                     continue;
@@ -1872,7 +1917,11 @@ mod tests {
             cost < Duration::from_secs(5),
             "must fail fast within milliseconds, not wait out the full 30s timeout: {cost:?}"
         );
-        assert_eq!(client.in_flight_count(), 0, "the in-flight table must be cleared after fail-fast");
+        assert_eq!(
+            client.in_flight_count(),
+            0,
+            "the in-flight table must be cleared after fail-fast"
+        );
         assert_eq!(conns.load(Ordering::SeqCst), 1);
         client.shutdown();
     }
@@ -1900,7 +1949,11 @@ mod tests {
             .unwrap();
         let err = result.unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "the callback must be delivered exactly once");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the callback must be delivered exactly once"
+        );
         client.shutdown();
     }
 
@@ -1919,7 +1972,11 @@ mod tests {
                 client.invoke_sync(&addr, &mut cmd, Some(30_000)).await
             })
         };
-        wait_until(|| frames.load(Ordering::SeqCst) >= 1, "alive connection received the request").await;
+        wait_until(
+            || frames.load(Ordering::SeqCst) >= 1,
+            "alive connection received the request",
+        )
+        .await;
 
         let mut cmd = request(request_code::SEND_MESSAGE_V2, "eof");
         let err = client
@@ -1928,8 +1985,15 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
 
-        assert_eq!(client.in_flight_count(), 1, "only the requests on the failed connection itself should be failed");
-        assert!(!slow.is_finished(), "requests on the alive connection must not be caught in the blast");
+        assert_eq!(
+            client.in_flight_count(),
+            1,
+            "only the requests on the failed connection itself should be failed"
+        );
+        assert!(
+            !slow.is_finished(),
+            "requests on the alive connection must not be caught in the blast"
+        );
         slow.abort();
         client.shutdown();
     }
@@ -2022,7 +2086,9 @@ mod tests {
             stream.write_all(&bytes).await.unwrap();
             stream.flush().await.unwrap();
             loop {
-                let frame = read_frame(&mut stream).await.expect("the client should reply");
+                let frame = read_frame(&mut stream)
+                    .await
+                    .expect("the client should reply");
                 let cmd = RemotingCommand::decode(&frame).unwrap();
                 if cmd.is_response_type() {
                     let _ = push_tx.send(cmd);
@@ -2055,7 +2121,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, 5_555, "the response must carry back the broker request's opaque");
+        assert_eq!(
+            response.opaque, 5_555,
+            "the response must carry back the broker request's opaque"
+        );
         assert!(response.is_response_type());
         server.await.unwrap();
         connect.shutdown();
@@ -2388,7 +2457,10 @@ mod tests {
             .await
             .expect("TLS round trip failed");
         assert_eq!(response.code, response_code::SUCCESS);
-        assert_eq!(response.opaque, cmd.opaque, "the TLS response must carry back the request's opaque");
+        assert_eq!(
+            response.opaque, cmd.opaque,
+            "the TLS response must carry back the request's opaque"
+        );
         assert_eq!(response.remark.as_deref(), Some("pong:tls"));
         client.shutdown();
     }
@@ -2548,7 +2620,8 @@ mod tests {
         };
         let responded = Arc::new(AtomicBool::new(false));
         let saw_runtime = Arc::new(AtomicBool::new(false));
-        let addr = start_tls_push_server(&pkcs12, responded.clone()).expect("TLS server failed to start");
+        let addr =
+            start_tls_push_server(&pkcs12, responded.clone()).expect("TLS server failed to start");
         struct Probe {
             saw_runtime: Arc<AtomicBool>,
         }
@@ -2589,7 +2662,10 @@ mod tests {
             saw_runtime.load(Ordering::Acquire),
             "the TLS read thread must carry a runtime context, otherwise the processor cannot spawn background tasks"
         );
-        assert!(got_response, "the broker-pushed request must be answered and the response written back to the peer");
+        assert!(
+            got_response,
+            "the broker-pushed request must be answered and the response written back to the peer"
+        );
     }
 
     #[tokio::test]
@@ -2722,7 +2798,11 @@ mod tests {
             "the peer sees the connection closed",
         )
         .await;
-        assert_eq!(client.in_flight_count(), 0, "the request it never answered is gone too");
+        assert_eq!(
+            client.in_flight_count(),
+            0,
+            "the request it never answered is gone too"
+        );
 
         // The next request goes over a fresh connection and is served like any other.
         let mut next = request(request_code::SEND_MESSAGE_V2, "served");
@@ -2795,7 +2875,10 @@ mod tests {
         let client = RemotingClient::new();
         let tail = LogTail::mark();
         let mut cmd = request(request_code::SEND_MESSAGE, "first");
-        let response = client.invoke_sync(&addr, &mut cmd, Some(5000)).await.unwrap();
+        let response = client
+            .invoke_sync(&addr, &mut cmd, Some(5000))
+            .await
+            .unwrap();
 
         let lines = tail
             .wait_for(
@@ -2819,7 +2902,11 @@ mod tests {
 
         // A frame that answers nothing is still a frame: the stream lines up, so the connection stays.
         assert_eq!(client.connection_addrs(), vec![addr.clone()]);
-        assert_eq!(closes.load(Ordering::SeqCst), 0, "reporting a stray is not a connection event");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "reporting a stray is not a connection event"
+        );
         let mut second = request(request_code::SEND_MESSAGE, "second");
         let second_response = client
             .invoke_sync(&addr, &mut second, Some(5000))
@@ -2878,7 +2965,11 @@ mod tests {
             "once the frame is on the wire the socket takes bytes again",
         )
         .await;
-        assert_eq!(conns.load(Ordering::SeqCst), 1, "one connection carried it all");
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "one connection carried it all"
+        );
         client.shutdown();
     }
 
@@ -2893,9 +2984,15 @@ mod tests {
 
         // A limit that is not positive restores the default instead of switching the sweep off.
         client.set_channel_idle_timeout_millis(0);
-        assert_eq!(client.channel_idle_timeout_millis(), DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS);
+        assert_eq!(
+            client.channel_idle_timeout_millis(),
+            DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS
+        );
         client.set_channel_idle_timeout_millis(-1);
-        assert_eq!(client.channel_idle_timeout_millis(), DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS);
+        assert_eq!(
+            client.channel_idle_timeout_millis(),
+            DEFAULT_CHANNEL_IDLE_TIMEOUT_MILLIS
+        );
         let configured = RemotingClient::with_config(RemotingClientConfig {
             channel_idle_timeout_millis: -5000,
             ..RemotingClientConfig::default()
@@ -2984,9 +3081,17 @@ mod tests {
 
         for addr in [&quiet_addr, &busy_addr] {
             let lines = tail
-                .wait_for(&[addr.as_str(), "idle for", "closing it"], 1, "the reap is logged")
+                .wait_for(
+                    &[addr.as_str(), "idle for", "closing it"],
+                    1,
+                    "the reap is logged",
+                )
                 .await;
-            assert_eq!(lines.len(), 1, "one warning per reaped connection for {addr}");
+            assert_eq!(
+                lines.len(),
+                1,
+                "one warning per reaped connection for {addr}"
+            );
             assert!(lines[0].contains("[WARN]"), "{}", lines[0]);
             assert!(
                 lines[0].contains("limit 300 ms"),
@@ -3012,9 +3117,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         for cmd in commands.drain(..) {
             let tx = tx.clone();
-            client.invoke_async(&addr, cmd, Box::new(move |result| {
-                let _ = tx.send(result);
-            }), Some(200));
+            client.invoke_async(
+                &addr,
+                cmd,
+                Box::new(move |result| {
+                    let _ = tx.send(result);
+                }),
+                Some(200),
+            );
         }
         for _ in 0..2 {
             let result = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -3035,7 +3145,11 @@ mod tests {
         assert_eq!(client.connection_addrs(), vec![addr.clone()]);
 
         let lines = tail
-            .wait_for(&[addr.as_str(), "failed with a timeout"], 2, "one warning per expired request")
+            .wait_for(
+                &[addr.as_str(), "failed with a timeout"],
+                2,
+                "one warning per expired request",
+            )
             .await;
         assert_eq!(lines.len(), 2, "two requests are two separate reports");
         assert!(lines.iter().all(|line| line.contains("[WARN]")));
@@ -3088,8 +3202,12 @@ mod tests {
             timed_out,
             connection_kept: !client.connection_addrs().is_empty(),
             peer_closes: closes.load(Ordering::SeqCst),
-            close_warns: tail.lines_with(&[addr.as_str(), "closing the connection"]).len(),
-            expiry_warns: tail.lines_with(&[addr.as_str(), "failed with a timeout"]).len(),
+            close_warns: tail
+                .lines_with(&[addr.as_str(), "closing the connection"])
+                .len(),
+            expiry_warns: tail
+                .lines_with(&[addr.as_str(), "failed with a timeout"])
+                .len(),
         };
         client.shutdown();
         run
@@ -3098,15 +3216,24 @@ mod tests {
     #[tokio::test]
     async fn sync_timeout_closes_the_connection_by_default() {
         let on = run_sync_timeout(true, 400).await;
-        assert!(on.timed_out, "the caller still gets the timeout it asked for");
-        assert!(!on.connection_kept, "by default the connection the wait ran out on is closed");
+        assert!(
+            on.timed_out,
+            "the caller still gets the timeout it asked for"
+        );
+        assert!(
+            !on.connection_kept,
+            "by default the connection the wait ran out on is closed"
+        );
         assert_eq!(on.peer_closes, 1, "the peer sees the close");
         assert_eq!(on.close_warns, 1);
         assert_eq!(on.expiry_warns, 1);
 
         let off = run_sync_timeout(false, 400).await;
         assert!(off.timed_out, "the timeout is still reported to the caller");
-        assert!(off.connection_kept, "with the knob off the socket is kept -- the timeout is caller-side");
+        assert!(
+            off.connection_kept,
+            "with the knob off the socket is kept -- the timeout is caller-side"
+        );
         assert_eq!(off.peer_closes, 0);
         assert_eq!(off.close_warns, 0);
         assert_eq!(off.expiry_warns, 1);
@@ -3120,12 +3247,21 @@ mod tests {
     #[tokio::test]
     async fn sync_timeout_close_rule_has_one_floor_shape() {
         let zero = run_sync_timeout(true, 0).await;
-        assert!(zero.timed_out, "a zero budget still reports the timeout to the caller");
-        assert!(zero.connection_kept, "a zero budget is at both floors, so the connection is kept");
+        assert!(
+            zero.timed_out,
+            "a zero budget still reports the timeout to the caller"
+        );
+        assert!(
+            zero.connection_kept,
+            "a zero budget is at both floors, so the connection is kept"
+        );
         assert_eq!(zero.close_warns, 0);
 
         let just_above = run_sync_timeout(true, 101).await;
-        assert!(!just_above.connection_kept, "one millisecond above the floor is a close, not a keep");
+        assert!(
+            !just_above.connection_kept,
+            "one millisecond above the floor is a close, not a keep"
+        );
         assert_eq!(just_above.close_warns, 1);
     }
 

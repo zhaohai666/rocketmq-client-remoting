@@ -173,7 +173,11 @@ mod tests {
         sorted.sort_unstable();
         let before = sorted.len();
         sorted.dedup();
-        assert_eq!(before, sorted.len(), "STRING_ALL_PROPERTY contains duplicate keys");
+        assert_eq!(
+            before,
+            sorted.len(),
+            "STRING_ALL_PROPERTY contains duplicate keys"
+        );
         for key in STRING_ALL_PROPERTY {
             assert!(is_system_property(key));
         }

@@ -58,9 +58,8 @@ use rocketmq_client_remoting::client::allocate_strategy::{
 use rocketmq_client_remoting::client::consume_executor::{ConsumeExecutor, ConsumeTask};
 use rocketmq_client_remoting::client::hook::{
     execute_consume_hook_after, execute_consume_hook_before, execute_send_message_hook_after,
-    execute_send_message_hook_before, CommunicationMode, ConsumeMessageContext,
-    ConsumeMessageHook, ConsumeMessageHookList, HookList, SendMessageContext, SendMessageHook,
-    SendMessageHookList,
+    execute_send_message_hook_before, CommunicationMode, ConsumeMessageContext, ConsumeMessageHook,
+    ConsumeMessageHookList, HookList, SendMessageContext, SendMessageHook, SendMessageHookList,
 };
 use rocketmq_client_remoting::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, MessageListenerConcurrently, SendResult,
@@ -83,11 +82,11 @@ use rocketmq_client_remoting::common::topic_config::{self, TopicFilterType};
 use rocketmq_client_remoting::common::util_all;
 use rocketmq_client_remoting::remoting::client::RemotingClient;
 use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response_code};
-use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::headers::{
     CreateTopicRequestHeader, DeleteTopicRequestHeader, GetRouteInfoRequestHeader,
     PullMessageRequestHeader, SendMessageRequestHeaderV2, SendMessageResponseHeader,
 };
+use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
@@ -122,7 +121,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -232,7 +234,11 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
         ));
     }
     let route = decode_route(&resp, "TBW102")?;
-    let broker_addr = match route.broker_datas.first().and_then(|b| b.select_broker_addr()) {
+    let broker_addr = match route
+        .broker_datas
+        .first()
+        .and_then(|b| b.select_broker_addr())
+    {
         Some(a) => a,
         None => return Err("default route has no usable broker address".to_string()),
     };
@@ -326,7 +332,9 @@ async fn send_full(
         sys_flag: Some(0),
         born_timestamp: Some(util_all::current_time_millis()),
         flag: Some(msg.get_flag()),
-        properties: Some(message_decoder::message_properties_2_string(msg.get_properties())),
+        properties: Some(message_decoder::message_properties_2_string(
+            msg.get_properties(),
+        )),
         reconsume_times: Some(0),
         unit_mode: Some(false),
         max_reconsume_times: Some(0),
@@ -351,12 +359,18 @@ async fn send_full(
         .map_err(|e| format!("decode SendMessageResponseHeader failed: {e}"))?;
     let broker_msg_id = resp_header.msg_id.clone().unwrap_or_default();
     let uniq = message_client_id_setter::get_uniq_id(msg).unwrap_or_default();
-    let region = resp.get_ext_field(message_const::PROPERTY_MSG_REGION).unwrap_or_default();
+    let region = resp
+        .get_ext_field(message_const::PROPERTY_MSG_REGION)
+        .unwrap_or_default();
     let trace_switch = resp.get_ext_field(message_const::PROPERTY_TRACE_SWITCH);
     let result = SendResult {
         status,
         // use uniq when it is non-empty, otherwise fall back to the msgId in the response header
-        msg_id: Some(if uniq.is_empty() { broker_msg_id.clone() } else { uniq.clone() }),
+        msg_id: Some(if uniq.is_empty() {
+            broker_msg_id.clone()
+        } else {
+            uniq.clone()
+        }),
         message_queue: Some(MessageQueue::new(
             &topic,
             broker_name,
@@ -448,9 +462,16 @@ async fn pull_until(
 ) -> Result<Vec<MessageExt>, String> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (msgs, _) =
-            pull_messages(client, broker_addr, topic, consumer_group, queue_id, from_offset, 32)
-                .await?;
+        let (msgs, _) = pull_messages(
+            client,
+            broker_addr,
+            topic,
+            consumer_group,
+            queue_id,
+            from_offset,
+            32,
+        )
+        .await?;
         if msgs.len() >= want || Instant::now() > deadline {
             return Ok(msgs);
         }
@@ -501,17 +522,22 @@ async fn r1_allocate_strategy(
     ck.check(
         "R1 the real route exposes exactly the writable queues we created",
         queue_ids(&mq_all) == (0..QUEUE_NUMS).collect::<Vec<i32>>()
-            && mq_all.iter().all(|q| q.topic == topic && q.broker_name == broker_name),
+            && mq_all
+                .iter()
+                .all(|q| q.topic == topic && q.broker_name == broker_name),
         &format!("mqs={mq_all:?} want queues 0..{QUEUE_NUMS} on {broker_name}"),
     );
 
     let avg: Arc<dyn AllocateMessageQueueStrategy> = Arc::new(AllocateMessageQueueAveragely);
     let circle: Arc<dyn AllocateMessageQueueStrategy> =
         Arc::new(AllocateMessageQueueAveragelyByCircle);
-    let config: Arc<dyn AllocateMessageQueueStrategy> = Arc::new(AllocateMessageQueueByConfig::default());
+    let config: Arc<dyn AllocateMessageQueueStrategy> =
+        Arc::new(AllocateMessageQueueByConfig::default());
     ck.check(
         "R1 strategy names are AVG / AVG_BY_CIRCLE / CONFIG",
-        avg.get_name() == "AVG" && circle.get_name() == "AVG_BY_CIRCLE" && config.get_name() == "CONFIG",
+        avg.get_name() == "AVG"
+            && circle.get_name() == "AVG_BY_CIRCLE"
+            && config.get_name() == "CONFIG",
         &format!(
             "names=[{}, {}, {}]",
             avg.get_name(),
@@ -520,13 +546,18 @@ async fn r1_allocate_strategy(
         ),
     );
 
-    let alloc = |s: &Arc<dyn AllocateMessageQueueStrategy>, cid: &str, cids: &[String]| -> Result<Vec<i32>, String> {
+    let alloc = |s: &Arc<dyn AllocateMessageQueueStrategy>,
+                 cid: &str,
+                 cids: &[String]|
+     -> Result<Vec<i32>, String> {
         s.allocate(consumer_group, cid, &mq_all, cids)
             .map(|v| queue_ids(&v))
             .map_err(|e| format!("allocate failed: {e}"))
     };
     let cids = |n: usize| -> Vec<String> {
-        (0..n).map(|i| format!("{consumer_group}@127.0.0.1#{i}")).collect()
+        (0..n)
+            .map(|i| format!("{consumer_group}@127.0.0.1#{i}"))
+            .collect()
     };
 
     // 2 consumers: the 4 queues are cut in two exactly, the first half goes to A and the second to
@@ -569,7 +600,8 @@ async fn r1_allocate_strategy(
     );
     ck.check(
         "R1 every strategy partitions the real queues exactly once",
-        is_partition(&avg3, QUEUE_NUMS) && is_partition(&circle3, QUEUE_NUMS)
+        is_partition(&avg3, QUEUE_NUMS)
+            && is_partition(&circle3, QUEUE_NUMS)
             && is_partition(&avg4, QUEUE_NUMS)
             && is_partition(&[a_two.clone(), b_two.clone()], QUEUE_NUMS),
         &format!("avg3={avg3:?} circle3={circle3:?} avg4={avg4:?}"),
@@ -579,7 +611,10 @@ async fn r1_allocate_strategy(
     ck.check(
         "R1 allocation is deterministic across repeated calls",
         again == avg3[0] && again_circle == circle3[0],
-        &format!("avg {:?} -> {again:?}, circle {:?} -> {again_circle:?}", avg3[0], circle3[0]),
+        &format!(
+            "avg {:?} -> {again:?}, circle {:?} -> {again_circle:?}",
+            avg3[0], circle3[0]
+        ),
     );
 
     // Guards: a client id not in the group / no queues / no peer ⇒ empty result (no error).
@@ -624,10 +659,16 @@ async fn r1_allocate_strategy(
             sent.queue_id == q,
             &format!("asked {q}, got {}", sent.queue_id),
         );
-        per_queue.entry(q).or_default().push(String::from_utf8_lossy(&body).into_owned());
+        per_queue
+            .entry(q)
+            .or_default()
+            .push(String::from_utf8_lossy(&body).into_owned());
     }
     for (cid, mine) in two.iter().zip([a_two.clone(), b_two.clone()]) {
-        let group = format!("{consumer_group}-part{}", cid.rsplit('#').next().unwrap_or_default());
+        let group = format!(
+            "{consumer_group}-part{}",
+            cid.rsplit('#').next().unwrap_or_default()
+        );
         let mut seen: Vec<String> = Vec::new();
         let mut foreign = 0;
         for q in &mine {
@@ -635,8 +676,10 @@ async fn r1_allocate_strategy(
             foreign += msgs.iter().filter(|m| m.queue_id != *q).count();
             seen.extend(bodies(&msgs));
         }
-        let mut want: Vec<String> =
-            mine.iter().flat_map(|q| per_queue.get(q).cloned().unwrap_or_default()).collect();
+        let mut want: Vec<String> = mine
+            .iter()
+            .flat_map(|q| per_queue.get(q).cloned().unwrap_or_default())
+            .collect();
         seen.sort();
         want.sort();
         ck.check(
@@ -696,8 +739,13 @@ impl MessageListenerConcurrently for LiveListener {
             })
             .count();
         self.real_field_msgs.fetch_add(real, Ordering::SeqCst);
-        lock(&self.ctx_queue_ids)
-            .push(context.message_queue.as_ref().map(|q| q.queue_id).unwrap_or(-1));
+        lock(&self.ctx_queue_ids).push(
+            context
+                .message_queue
+                .as_ref()
+                .map(|q| q.queue_id)
+                .unwrap_or(-1),
+        );
         lock(&self.outcomes).push((status.name().to_string(), list));
         status
     }
@@ -739,7 +787,11 @@ async fn r2_consume_executor(
     let mut sent_bodies: Vec<String> = Vec::new();
     let mut prev_offset: Option<i64> = None;
     for i in 0..MSG_TOTAL {
-        let prefix = if i >= MSG_TOTAL - 2 { LATER_PREFIX } else { "ok-" };
+        let prefix = if i >= MSG_TOTAL - 2 {
+            LATER_PREFIX
+        } else {
+            "ok-"
+        };
         let body = format!("{prefix}consume-{topic}-{i}").into_bytes();
         let msg = build_message(topic, &body, "TagConsume", "consumeKey");
         let sent = send_full(client, broker_addr, broker_name, 0, producer_group, &msg).await?;
@@ -747,7 +799,9 @@ async fn r2_consume_executor(
         // increasing by 1".
         ck.check(
             "R2 queue offsets advance by exactly one per send",
-            prev_offset.map(|p| sent.queue_offset == p + 1).unwrap_or(true),
+            prev_offset
+                .map(|p| sent.queue_offset == p + 1)
+                .unwrap_or(true),
             &format!("prev={prev_offset:?} now={}", sent.queue_offset),
         );
         prev_offset = Some(sent.queue_offset);
@@ -761,16 +815,23 @@ async fn r2_consume_executor(
         sent_bodies.push(String::from_utf8_lossy(&body).into_owned());
     }
     let from = prev_offset.unwrap_or(0) - i64::from(MSG_TOTAL) + 1;
-    let msgs = pull_until(client, broker_addr, topic, consumer_group, 0, from, MSG_TOTAL as usize)
-        .await?;
+    let msgs = pull_until(
+        client,
+        broker_addr,
+        topic,
+        consumer_group,
+        0,
+        from,
+        MSG_TOTAL as usize,
+    )
+    .await?;
     if msgs.len() != MSG_TOTAL as usize {
         return Err(format!(
             "pulled {} of {MSG_TOTAL} messages from offset {from}, cannot run R2",
             msgs.len()
         ));
     }
-    let batches: Vec<Arc<Vec<MessageExt>>> =
-        msgs.chunks(2).map(|c| Arc::new(c.to_vec())).collect();
+    let batches: Vec<Arc<Vec<MessageExt>>> = msgs.chunks(2).map(|c| Arc::new(c.to_vec())).collect();
     ck.check(
         "R2 the real batch splits into 4 pairs",
         batches.len() == 4 && batches.iter().all(|b| b.len() == 2),
@@ -804,7 +865,10 @@ async fn r2_consume_executor(
     let rejected = executor.set_core_pool_size(-1).err().map(|e| e.to_string());
     ck.check(
         "R2 set_core_pool_size(-1) is rejected with the expected error text",
-        rejected.as_deref().map(|m| m.ends_with("core pool size must be >= 0")) == Some(true),
+        rejected
+            .as_deref()
+            .map(|m| m.ends_with("core pool size must be >= 0"))
+            == Some(true),
         &format!("err={rejected:?}"),
     );
 
@@ -822,18 +886,28 @@ async fn r2_consume_executor(
             broker_name,
             topic,
         );
-        executor.submit(task).map_err(|e| format!("submit failed: {e}"))?;
+        executor
+            .submit(task)
+            .map_err(|e| format!("submit failed: {e}"))?;
     }
     let two_running = wait_within(|| lock(&started).len() == 2, Duration::from_secs(5)).await;
     ck.check(
         "R2 with core=2 exactly two tasks run concurrently",
         two_running && executor.worker_count() == 2,
-        &format!("started={:?} workers={}", lock(&started), executor.worker_count()),
+        &format!(
+            "started={:?} workers={}",
+            lock(&started),
+            executor.worker_count()
+        ),
     );
     ck.check(
         "R2 the third task waits in the unbounded queue and spawns no extra worker",
         executor.queued_count() == 1 && lock(&started).len() == 2,
-        &format!("queued={} started={}", executor.queued_count(), lock(&started).len()),
+        &format!(
+            "queued={} started={}",
+            executor.queued_count(),
+            lock(&started).len()
+        ),
     );
 
     gate.store(true, Ordering::SeqCst);
@@ -845,7 +919,11 @@ async fn r2_consume_executor(
     ck.check(
         "R2 the pool drains back to an empty queue but keeps its core workers",
         executor.queued_count() == 0 && executor.worker_count() == 2,
-        &format!("queued={} workers={}", executor.queued_count(), executor.worker_count()),
+        &format!(
+            "queued={} workers={}",
+            executor.queued_count(),
+            executor.worker_count()
+        ),
     );
 
     // The 4th batch goes through clone: `Clone` shares the same pool.
@@ -859,14 +937,19 @@ async fn r2_consume_executor(
         broker_name,
         topic,
     );
-    shared.submit(task).map_err(|e| format!("submit via clone failed: {e}"))?;
+    shared
+        .submit(task)
+        .map_err(|e| format!("submit via clone failed: {e}"))?;
     let four_done = wait_until(|| lock(&listener.outcomes).len() == 4).await;
     let mut batch_ids = lock(&started).clone();
     batch_ids.sort_unstable();
     ck.check(
         "R2 a cloned executor feeds the same pool and spawns no extra workers",
         four_done && batch_ids == vec![0, 1, 2, 3] && shared.worker_count() == 2,
-        &format!("started={batch_ids:?} cloneWorkers={}", shared.worker_count()),
+        &format!(
+            "started={batch_ids:?} cloneWorkers={}",
+            shared.worker_count()
+        ),
     );
 
     // Every real message is consumed exactly once and the listener sees real fields.
@@ -880,7 +963,10 @@ async fn r2_consume_executor(
         consumed == want,
         &format!("consumed={consumed:?}\n           want={want:?}"),
     );
-    let success = outcomes.iter().filter(|(s, _)| s == "CONSUME_SUCCESS").count();
+    let success = outcomes
+        .iter()
+        .filter(|(s, _)| s == "CONSUME_SUCCESS")
+        .count();
     ck.check(
         "R2 the listener's status travels back per batch (one RECONSUME_LATER, on the sentinel batch)",
         success == 3
@@ -911,7 +997,9 @@ async fn r2_consume_executor(
 
     // Raising core to 3 only adds "the few tasks actually waiting in the queue", not enough to make
     // it as long as the queue.
-    executor.set_core_pool_size(3).map_err(|e| format!("resize failed: {e}"))?;
+    executor
+        .set_core_pool_size(3)
+        .map_err(|e| format!("resize failed: {e}"))?;
     ck.check(
         "R2 raising core is recorded immediately and clamps max upward",
         executor.get_core_pool_size() == 3
@@ -928,7 +1016,10 @@ async fn r2_consume_executor(
     // Shutdown: first shutdown (it takes no more work and finishes what it already has), then wait
     // for all workers to exit.
     executor.shutdown();
-    let refused = shared.submit(Box::pin(async {})).err().map(|e| e.to_string());
+    let refused = shared
+        .submit(Box::pin(async {}))
+        .err()
+        .map(|e| e.to_string());
     ck.check(
         "R2 submit after shutdown is refused with the expected error text, and the clone sees the same flag",
         refused.as_deref().map(|m| m.ends_with("ConsumeExecutor has been shut down")) == Some(true),
@@ -939,13 +1030,21 @@ async fn r2_consume_executor(
     ck.check(
         "R2 await_termination returns once the core workers retire",
         terminated.is_ok() && executor.worker_count() == 0,
-        &format!("timedOut={} workers={}", terminated.is_err(), executor.worker_count()),
+        &format!(
+            "timedOut={} workers={}",
+            terminated.is_err(),
+            executor.worker_count()
+        ),
     );
     let graceful = tokio::time::timeout(Duration::from_secs(5), shared.shutdown_gracefully()).await;
     ck.check(
         "R2 shutdown_gracefully on an already stopped pool is a no-op",
         graceful.is_ok() && shared.worker_count() == 0,
-        &format!("done={} workers={}", graceful.is_ok(), shared.worker_count()),
+        &format!(
+            "done={} workers={}",
+            graceful.is_ok(),
+            shared.worker_count()
+        ),
     );
     Ok(())
 }
@@ -1104,11 +1203,12 @@ async fn r3_trace_hook(
     ));
     let dyn_sink = Arc::clone(&sink) as Arc<dyn TraceReportSink>;
     let send_hooks: SendMessageHookList = HookList::new();
-    send_hooks.register(Arc::new(SendMessageTraceHook::new(Arc::clone(&dyn_sink)))
-        as Arc<dyn SendMessageHook>);
+    send_hooks.register(
+        Arc::new(SendMessageTraceHook::new(Arc::clone(&dyn_sink))) as Arc<dyn SendMessageHook>
+    );
     let consume_hooks: ConsumeMessageHookList = HookList::new();
-    consume_hooks.register(Arc::new(ConsumeMessageTraceHook::new(dyn_sink))
-        as Arc<dyn ConsumeMessageHook>);
+    consume_hooks
+        .register(Arc::new(ConsumeMessageTraceHook::new(dyn_sink)) as Arc<dyn ConsumeMessageHook>);
 
     // ---- Send side: 3 real messages, each running before/after once ----
     let mut uniq_keys: Vec<String> = Vec::new();
@@ -1131,8 +1231,15 @@ async fn r3_trace_hook(
                 sink.reports().len()
             ),
         );
-        let sent =
-            send_full(client, broker_addr, broker_name, TRACE_QUEUE, producer_group, &msg).await?;
+        let sent = send_full(
+            client,
+            broker_addr,
+            broker_name,
+            TRACE_QUEUE,
+            producer_group,
+            &msg,
+        )
+        .await?;
         ctx.send_result = Some(sent.result.clone());
         execute_send_message_hook_after(&send_hooks, &mut ctx);
         uniq_keys.push(sent.msg_id.clone());
@@ -1141,12 +1248,15 @@ async fn r3_trace_hook(
     }
     ck.check(
         "R3 the broker really turns TRACE_ON on and stamps MSG_REGION, so records can land",
-        results.iter().all(|r| {
-            r.trace_on && r.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID)
-        }),
+        results
+            .iter()
+            .all(|r| r.trace_on && r.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID)),
         &format!(
             "regions={:?}",
-            results.iter().map(|r| r.region_id.clone()).collect::<Vec<_>>()
+            results
+                .iter()
+                .map(|r| r.region_id.clone())
+                .collect::<Vec<_>>()
         ),
     );
     let pub_reports = sink.take_reports();
@@ -1165,7 +1275,11 @@ async fn r3_trace_hook(
     ck.check(
         "R3 three Pub records were reported, each naming the real client msgId",
         pubs.len() == 3
-            && pubs.iter().map(|c| c.trace_beans[0].msg_id.clone()).collect::<Vec<_>>() == uniq_keys
+            && pubs
+                .iter()
+                .map(|c| c.trace_beans[0].msg_id.clone())
+                .collect::<Vec<_>>()
+                == uniq_keys
             && pubs.iter().all(|c| c.cost_time >= 0 && c.is_success),
         &format!("pubs={} ids={uniq_keys:?}", pubs.len()),
     );
@@ -1179,7 +1293,10 @@ async fn r3_trace_hook(
             && first_bean.offset_msg_id == broker_ids[0]
             && first_bean.msg_type == MessageType::NormalMsg
             && first_bean.retry_times == 0,
-        &format!("bean={first_bean:?} wantBodyLen={}", format!("trace-{topic}-payload-0").len()),
+        &format!(
+            "bean={first_bean:?} wantBodyLen={}",
+            format!("trace-{topic}-payload-0").len()
+        ),
     );
     ck.check(
         "R3 storeTime is time_stamp + costTime/2 (integer division)",
@@ -1193,11 +1310,24 @@ async fn r3_trace_hook(
         "R3 the Pub record carries the producer group and the broker's region",
         first_pub.group_name == producer_group
             && first_pub.region_id == MixAll::DEFAULT_TRACE_REGION_ID,
-        &format!("group={} region={}", first_pub.group_name, first_pub.region_id),
+        &format!(
+            "group={} region={}",
+            first_pub.group_name, first_pub.region_id
+        ),
     );
 
-    let trace_msg = build_message(trace_topic, format!("trace-in-trace-{topic}").as_bytes(), "", "");
-    let mut skip_ctx = send_context(&trace_msg, producer_group, broker_addr, MessageType::NormalMsg);
+    let trace_msg = build_message(
+        trace_topic,
+        format!("trace-in-trace-{topic}").as_bytes(),
+        "",
+        "",
+    );
+    let mut skip_ctx = send_context(
+        &trace_msg,
+        producer_group,
+        broker_addr,
+        MessageType::NormalMsg,
+    );
     execute_send_message_hook_before(&send_hooks, &mut skip_ctx);
     let held = skip_ctx.mq_trace_context.is_some();
     let before = sink.accepted();
@@ -1209,8 +1339,12 @@ async fn r3_trace_hook(
     );
 
     sink.accepting.store(false, Ordering::SeqCst);
-    let mut off_ctx =
-        send_context(&build_message(topic, b"trace-off", "", ""), producer_group, broker_addr, MessageType::NormalMsg);
+    let mut off_ctx = send_context(
+        &build_message(topic, b"trace-off", "", ""),
+        producer_group,
+        broker_addr,
+        MessageType::NormalMsg,
+    );
     execute_send_message_hook_before(&send_hooks, &mut off_ctx);
     off_ctx.send_result = Some(results[0].clone());
     let before_off = sink.accepted();
@@ -1236,9 +1370,12 @@ async fn r3_trace_hook(
     )
     .await?;
     let consumed_bodies = bodies(&consumed);
-    if consumed.len() != 3 || !consumed_bodies.iter().enumerate().all(|(i, b)| {
-        *b == format!("trace-{topic}-payload-{i}")
-    }) {
+    if consumed.len() != 3
+        || !consumed_bodies
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == format!("trace-{topic}-payload-{i}"))
+    {
         return Err(format!(
             "pulled {} trace-hook messages from queue {TRACE_QUEUE} at offset {}: {consumed_bodies:?}",
             consumed.len(),
@@ -1262,7 +1399,10 @@ async fn r3_trace_hook(
     ck.check(
         "R3 consumeMessageBefore and After report exactly one context each",
         after_before == before + 1 && consume_reports.len() == 2,
-        &format!("before={before} mid={after_before} drained={}", consume_reports.len()),
+        &format!(
+            "before={before} mid={after_before} drained={}",
+            consume_reports.len()
+        ),
     );
     let (sub_before, sub_after) = (&consume_reports[0], &consume_reports[1]);
     ck.check(
@@ -1271,12 +1411,19 @@ async fn r3_trace_hook(
             && sub_after.trace_type == Some(TraceType::SubAfter)
             && !sub_before.request_id.is_empty()
             && sub_before.request_id == sub_after.request_id,
-        &format!("before={:?} after={:?}", sub_before.request_id, sub_after.request_id),
+        &format!(
+            "before={:?} after={:?}",
+            sub_before.request_id, sub_after.request_id
+        ),
     );
-    let pulled_ids: Vec<String> =
-        consumed.iter().map(|m| m.msg_id.clone().unwrap_or_default()).collect();
-    let pulled_keys: Vec<String> =
-        consumed.iter().map(|m| m.get_keys().unwrap_or_default().to_string()).collect();
+    let pulled_ids: Vec<String> = consumed
+        .iter()
+        .map(|m| m.msg_id.clone().unwrap_or_default())
+        .collect();
+    let pulled_keys: Vec<String> = consumed
+        .iter()
+        .map(|m| m.get_keys().unwrap_or_default().to_string())
+        .collect();
     ck.check(
         "R3 SubBefore beans come from the real pulled messages (broker msgId, storeSize, retryTimes)",
         sub_before.trace_beans.len() == 3
@@ -1305,7 +1452,11 @@ async fn r3_trace_hook(
     ck.check(
         "R3 an empty batch reports nothing and leaves the private slot untouched",
         sink.accepted() == before_empty && empty_ctx.mq_trace_context.is_none(),
-        &format!("accepted={before_empty}->{} holder={}", sink.accepted(), empty_ctx.mq_trace_context.is_some()),
+        &format!(
+            "accepted={before_empty}->{} holder={}",
+            sink.accepted(),
+            empty_ctx.mq_trace_context.is_some()
+        ),
     );
 
     // ---- The key hop: the trace records really land on the broker and are pulled back for decoding ----
@@ -1343,12 +1494,16 @@ async fn r3_trace_hook(
             bodies(&trace_msgs)
         ));
     }
-    let texts: Vec<String> =
-        trace_msgs.iter().map(|m| String::from_utf8_lossy(m.get_body()).into_owned()).collect();
+    let texts: Vec<String> = trace_msgs
+        .iter()
+        .map(|m| String::from_utf8_lossy(m.get_body()).into_owned())
+        .collect();
     ck.check(
         "R3 each trace message ends with STX, so records are self-delimiting on disk",
-        texts.iter().all(|t| t.ends_with(TraceConstants::FIELD_SPLITOR)
-            && t.contains(TraceConstants::CONTENT_SPLITOR)),
+        texts.iter().all(|t| {
+            t.ends_with(TraceConstants::FIELD_SPLITOR)
+                && t.contains(TraceConstants::CONTENT_SPLITOR)
+        }),
         &format!("first={:?}", texts[0]),
     );
     ck.check(
@@ -1359,7 +1514,13 @@ async fn r3_trace_hook(
                 .split(message_const::KEY_SEPARATOR)
                 .any(|k| uniq_keys.contains(&k.to_string()))
         }),
-        &format!("keys={:?}", trace_msgs.iter().map(|m| m.get_keys().unwrap_or_default()).collect::<Vec<_>>()),
+        &format!(
+            "keys={:?}",
+            trace_msgs
+                .iter()
+                .map(|m| m.get_keys().unwrap_or_default())
+                .collect::<Vec<_>>()
+        ),
     );
     let mut decoded: Vec<TraceContext> = Vec::new();
     for text in &texts {
@@ -1380,8 +1541,10 @@ async fn r3_trace_hook(
             trace_msgs.len()
         ),
     );
-    let decoded_pubs: Vec<&TraceContext> =
-        decoded.iter().filter(|c| c.trace_type == Some(TraceType::Pub)).collect();
+    let decoded_pubs: Vec<&TraceContext> = decoded
+        .iter()
+        .filter(|c| c.trace_type == Some(TraceType::Pub))
+        .collect();
     ck.check(
         "R3 the Pub records read back from the broker still name the real msgIds",
         decoded_pubs
@@ -1397,16 +1560,19 @@ async fn r3_trace_hook(
             }),
         &format!(
             "ids={:?}",
-            decoded_pubs.iter().map(|c| c.trace_beans[0].msg_id.clone()).collect::<Vec<_>>()
+            decoded_pubs
+                .iter()
+                .map(|c| c.trace_beans[0].msg_id.clone())
+                .collect::<Vec<_>>()
         ),
     );
-    let store_time_ok = decoded_pubs
-        .iter()
-        .zip(pubs.iter())
-        .all(|(d, o)| d.trace_beans[0].store_time == 0 && d.trace_beans[0].client_host == local_address()
+    let store_time_ok = decoded_pubs.iter().zip(pubs.iter()).all(|(d, o)| {
+        d.trace_beans[0].store_time == 0
+            && d.trace_beans[0].client_host == local_address()
             && d.trace_beans[0].body_length == o.trace_beans[0].body_length
             && d.cost_time == o.cost_time
-            && d.time_stamp == o.time_stamp);
+            && d.time_stamp == o.time_stamp
+    });
     ck.check(
         "R3 a decoded Pub record keeps costTime/bodyLength and has no storeTime",
         store_time_ok,
@@ -1426,11 +1592,19 @@ async fn r3_trace_hook(
         "R3 the three SubBefore lines and the three SubAfter lines share one requestId",
         before_ids.iter().all(|id| *id == sub_before.request_id)
             && after_ids.iter().all(|id| *id == sub_before.request_id),
-        &format!("before={before_ids:?} after={after_ids:?} want={:?}", sub_before.request_id),
+        &format!(
+            "before={before_ids:?} after={after_ids:?} want={:?}",
+            sub_before.request_id
+        ),
     );
     let bean_ids: Vec<String> = decoded
         .iter()
-        .filter(|c| matches!(c.trace_type, Some(TraceType::SubBefore) | Some(TraceType::SubAfter)))
+        .filter(|c| {
+            matches!(
+                c.trace_type,
+                Some(TraceType::SubBefore) | Some(TraceType::SubAfter)
+            )
+        })
         .map(|c| c.trace_beans[0].msg_id.clone())
         .collect();
     ck.check(
@@ -1439,8 +1613,12 @@ async fn r3_trace_hook(
         &format!("wire={bean_ids:?} pulled={pulled_ids:?}"),
     );
     match (
-        decoded.iter().find(|c| c.trace_type == Some(TraceType::SubBefore)),
-        decoded.iter().find(|c| c.trace_type == Some(TraceType::SubAfter)),
+        decoded
+            .iter()
+            .find(|c| c.trace_type == Some(TraceType::SubBefore)),
+        decoded
+            .iter()
+            .find(|c| c.trace_type == Some(TraceType::SubAfter)),
     ) {
         (Some(b), Some(a)) => ck.check(
             "R3 SubBefore/SubAfter round-trip keeps group, region, keys and contextCode",
@@ -1483,7 +1661,9 @@ async fn r4_cleanup(
             broker_addr,
             RemotingCommand::create_request_command(
                 request_code::DELETE_TOPIC_IN_BROKER,
-                Some(Box::new(DeleteTopicRequestHeader { topic: Some(topic.to_string()) })),
+                Some(Box::new(DeleteTopicRequestHeader {
+                    topic: Some(topic.to_string()),
+                })),
             ),
             5000,
         )
@@ -1625,9 +1805,14 @@ async fn main() -> ExitCode {
         }
     }
 
-    if let Err(e) =
-        r4_cleanup(&client, &namesrv, &broker_addr, &[topic.as_str(), trace_topic.as_str()], &mut ck)
-            .await
+    if let Err(e) = r4_cleanup(
+        &client,
+        &namesrv,
+        &broker_addr,
+        &[topic.as_str(), trace_topic.as_str()],
+        &mut ck,
+    )
+    .await
     {
         ck.abort("R4 cleanup", &e);
     }
@@ -1642,7 +1827,11 @@ async fn main() -> ExitCode {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

@@ -156,7 +156,10 @@ async fn main() -> ExitCode {
     producer.create_topic(&topic, 1, 0).await.unwrap();
 
     let bridged = producer.trace_dispatcher();
-    check!("B1 enable_trace producer automatically carries a dispatcher after start", bridged.is_some());
+    check!(
+        "B1 enable_trace producer automatically carries a dispatcher after start",
+        bridged.is_some()
+    );
     let inner_topic = bridged
         .as_ref()
         .map(|d| d.trace_topic_name())
@@ -206,8 +209,13 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        let sr = sr.unwrap_or_else(|| panic!("still unsent after waiting 60s, last_err={last_err}"));
-        check!("B2 message SEND_OK", sr.status == SendStatus::SendOk, "i={i}");
+        let sr =
+            sr.unwrap_or_else(|| panic!("still unsent after waiting 60s, last_err={last_err}"));
+        check!(
+            "B2 message SEND_OK",
+            sr.status == SendStatus::SendOk,
+            "i={i}"
+        );
         traced_ids.push(sr.msg_id.unwrap_or_default());
     }
 
@@ -260,7 +268,9 @@ async fn main() -> ExitCode {
     let deadline = Instant::now() + Duration::from_secs(120);
     let got_all = reader_inbox.wait_for(deadline, |texts| {
         let corpus = texts.join("");
-        traced_ids.iter().all(|id| !id.is_empty() && corpus.contains(id))
+        traced_ids
+            .iter()
+            .all(|id| !id.is_empty() && corpus.contains(id))
     });
     check!(
         "B2 the trace text contains all 3 business msgIds (producer-side traces really leave the process and land on the broker)",
@@ -332,7 +342,9 @@ async fn main() -> ExitCode {
     });
     admin.start().await.unwrap();
     let _ = admin.delete_topic(&topic, None).await;
-    let _ = admin.delete_topic(&format!("%RETRY%{biz_group}"), None).await;
+    let _ = admin
+        .delete_topic(&format!("%RETRY%{biz_group}"), None)
+        .await;
     admin.shutdown();
     producer.shutdown();
     notrace.shutdown();

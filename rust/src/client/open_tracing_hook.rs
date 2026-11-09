@@ -22,18 +22,20 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::client::hook::{
+    AnyHolder, ConsumeMessageContext, ConsumeMessageHook, EndTransactionContext,
+    EndTransactionHook, SendMessageContext, SendMessageHook,
+};
+use crate::client::result::SendStatus;
+#[cfg(test)]
+use crate::client::result::LocalTransactionState;
+use crate::client::trace::TraceConstants;
 #[cfg(test)]
 use crate::common::message::MessageExt;
 use crate::common::message_const::PROPERTY_MSG_REGION;
 use crate::common::message_type::MessageType;
-use crate::client::hook::{
-    ConsumeMessageContext, ConsumeMessageHook, EndTransactionContext, EndTransactionHook,
-    SendMessageContext, SendMessageHook, AnyHolder,
-};
-use crate::client::result::{LocalTransactionState, SendStatus};
-use crate::client::trace::TraceConstants;
-use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::protocol::ext_fields::StringMap;
+use crate::remoting::protocol::namespace_util::NamespaceUtil;
 
 // OpenTracing standard tags (io.opentracing.tag.Tags).
 pub const OT_SPAN_KIND: &str = "span.kind";
@@ -127,7 +129,10 @@ fn ot_bool_str(b: bool) -> &'static str {
     }
 }
 
-fn ot_extract_upstream(tracer: &dyn OpenTracingTracer, props: &StringMap) -> Option<Arc<dyn OpenTracingSpanContext>> {
+fn ot_extract_upstream(
+    tracer: &dyn OpenTracingTracer,
+    props: &StringMap,
+) -> Option<Arc<dyn OpenTracingSpanContext>> {
     tracer.extract(props)
 }
 
@@ -146,7 +151,11 @@ fn ot_inject_into_message(
     }
 }
 
-fn try_inject(tracer: &dyn OpenTracingTracer, sc: &Arc<dyn OpenTracingSpanContext>, carrier: &mut StringMap) {
+fn try_inject(
+    tracer: &dyn OpenTracingTracer,
+    sc: &Arc<dyn OpenTracingSpanContext>,
+    carrier: &mut StringMap,
+) {
     tracer.inject(sc, carrier);
 }
 
@@ -172,8 +181,7 @@ impl SendMessageHook for SendMessageOpenTracingHook {
         let upstream = ot_extract_upstream(self.tracer.as_ref(), &msg.properties);
         let mut tags: OTTagMap = BTreeMap::new();
         tags.insert(OT_SPAN_KIND.to_string(), OT_SPAN_KIND_PRODUCER.to_string());
-        let refs: Vec<Arc<dyn OpenTracingSpanContext>> =
-            upstream.clone().into_iter().collect();
+        let refs: Vec<Arc<dyn OpenTracingSpanContext>> = upstream.clone().into_iter().collect();
         let span = self.tracer.start_span(
             &format!("{}{}", TraceConstants::TO_PREFIX, msg.get_topic()),
             &tags,
@@ -192,7 +200,9 @@ impl SendMessageHook for SendMessageOpenTracingHook {
     }
 
     fn send_message_after(&self, context: &mut SendMessageContext) -> crate::error::Result<()> {
-        let Some(holder) = crate::client::hook::any_downcast::<OTSpanHolder>(&context.mq_trace_context) else {
+        let Some(holder) =
+            crate::client::hook::any_downcast::<OTSpanHolder>(&context.mq_trace_context)
+        else {
             return Ok(());
         };
         // No result, or no region id on it: nothing to report, span stays open.
@@ -203,7 +213,10 @@ impl SendMessageHook for SendMessageOpenTracingHook {
             return Ok(());
         }
         let span = holder.span.clone();
-        span.set_tag(OT_ROCKETMQ_SUCCESS, ot_bool_str(sr.status == SendStatus::SendOk));
+        span.set_tag(
+            OT_ROCKETMQ_SUCCESS,
+            ot_bool_str(sr.status == SendStatus::SendOk),
+        );
         span.set_tag(OT_ROCKETMQ_MSG_ID, sr.msg_id.as_deref().unwrap_or(""));
         span.set_tag(OT_ROCKETMQ_REGION_ID, sr.region_id.as_deref().unwrap_or(""));
         span.finish();
@@ -225,7 +238,10 @@ impl ConsumeMessageHook for ConsumeMessageOpenTracingHook {
         "ConsumeMessageOpenTracingHook"
     }
 
-    fn consume_message_before(&self, context: &mut ConsumeMessageContext) -> crate::error::Result<()> {
+    fn consume_message_before(
+        &self,
+        context: &mut ConsumeMessageContext,
+    ) -> crate::error::Result<()> {
         if context.msg_list.is_empty() {
             return Ok(());
         }
@@ -234,8 +250,7 @@ impl ConsumeMessageHook for ConsumeMessageOpenTracingHook {
             let upstream = ot_extract_upstream(self.tracer.as_ref(), &msg.properties);
             let mut tags: OTTagMap = BTreeMap::new();
             tags.insert(OT_SPAN_KIND.to_string(), OT_SPAN_KIND_CONSUMER.to_string());
-            let refs: Vec<Arc<dyn OpenTracingSpanContext>> =
-                upstream.clone().into_iter().collect();
+            let refs: Vec<Arc<dyn OpenTracingSpanContext>> = upstream.clone().into_iter().collect();
             let span = self.tracer.start_span(
                 &format!("{}{}", TraceConstants::FROM_PREFIX, msg.get_topic()),
                 &tags,
@@ -261,8 +276,12 @@ impl ConsumeMessageHook for ConsumeMessageOpenTracingHook {
         Ok(())
     }
 
-    fn consume_message_after(&self, context: &mut ConsumeMessageContext) -> crate::error::Result<()> {
-        let Some(holder) = crate::client::hook::any_downcast::<OTConsumeSpanHolder>(&context.mq_trace_context)
+    fn consume_message_after(
+        &self,
+        context: &mut ConsumeMessageContext,
+    ) -> crate::error::Result<()> {
+        let Some(holder) =
+            crate::client::hook::any_downcast::<OTConsumeSpanHolder>(&context.mq_trace_context)
         else {
             return Ok(());
         };
@@ -296,15 +315,41 @@ impl EndTransactionHook for EndTransactionOpenTracingHook {
         let mut tags: OTTagMap = BTreeMap::new();
         tags.insert(OT_SPAN_KIND.to_string(), OT_SPAN_KIND_PRODUCER.to_string());
         let refs: Vec<Arc<dyn OpenTracingSpanContext>> = upstream.into_iter().collect();
-        let span = self.tracer.start_span(TraceConstants::END_TRANSACTION, &tags, refs);
+        let span = self
+            .tracer
+            .start_span(TraceConstants::END_TRANSACTION, &tags, refs);
         span.set_tag(OT_PEER_SERVICE, OT_ROCKETMQ_SERVICE);
-        span.set_tag(OT_MESSAGE_BUS_DESTINATION, context.message.as_ref().map(|m| m.get_topic()).unwrap_or(""));
-        span.set_tag(OT_ROCKETMQ_TAGS, context.message.as_ref().and_then(|m| m.get_tags()).unwrap_or(""));
-        span.set_tag(OT_ROCKETMQ_KEYS, context.message.as_ref().and_then(|m| m.get_keys()).unwrap_or(""));
+        span.set_tag(
+            OT_MESSAGE_BUS_DESTINATION,
+            context
+                .message
+                .as_ref()
+                .map(|m| m.get_topic())
+                .unwrap_or(""),
+        );
+        span.set_tag(
+            OT_ROCKETMQ_TAGS,
+            context
+                .message
+                .as_ref()
+                .and_then(|m| m.get_tags())
+                .unwrap_or(""),
+        );
+        span.set_tag(
+            OT_ROCKETMQ_KEYS,
+            context
+                .message
+                .as_ref()
+                .and_then(|m| m.get_keys())
+                .unwrap_or(""),
+        );
         span.set_tag(OT_ROCKETMQ_STORE_HOST, &context.broker_addr);
         span.set_tag(OT_ROCKETMQ_MSG_ID, context.msg_id.as_deref().unwrap_or(""));
         span.set_tag(OT_ROCKETMQ_MSG_TYPE, OT_TRANS_MSG_COMMIT);
-        span.set_tag(OT_ROCKETMQ_TRANSACTION_ID, context.transaction_id.as_deref().unwrap_or(""));
+        span.set_tag(
+            OT_ROCKETMQ_TRANSACTION_ID,
+            context.transaction_id.as_deref().unwrap_or(""),
+        );
         span.set_tag(
             OT_ROCKETMQ_TRANSACTION_STATE,
             context
@@ -313,7 +358,10 @@ impl EndTransactionHook for EndTransactionOpenTracingHook {
                 .unwrap_or_default()
                 .as_str(),
         );
-        span.set_tag(OT_ROCKETMQ_IS_FROM_TRANSACTION_CHECK, ot_bool_str(context.from_transaction_check));
+        span.set_tag(
+            OT_ROCKETMQ_IS_FROM_TRANSACTION_CHECK,
+            ot_bool_str(context.from_transaction_check),
+        );
         span.finish();
         Ok(())
     }
@@ -350,7 +398,11 @@ mod tests {
 
     impl OpenTracingSpan for FakeSpan {
         fn set_tag(&self, key: &str, value: &str) {
-            self.inner.lock().unwrap().tags.insert(key.to_string(), value.to_string());
+            self.inner
+                .lock()
+                .unwrap()
+                .tags
+                .insert(key.to_string(), value.to_string());
         }
 
         fn context(&self) -> Option<Arc<dyn OpenTracingSpanContext>> {
@@ -413,7 +465,8 @@ mod tests {
         }
 
         fn extract(&self, _carrier: &StringMap) -> Option<Arc<dyn OpenTracingSpanContext>> {
-            self.upstream.map(|id| Arc::new(FakeSpanContext { id }) as Arc<dyn OpenTracingSpanContext>)
+            self.upstream
+                .map(|id| Arc::new(FakeSpanContext { id }) as Arc<dyn OpenTracingSpanContext>)
         }
 
         fn inject(&self, span_context: &Arc<dyn OpenTracingSpanContext>, carrier: &mut StringMap) {
@@ -428,7 +481,13 @@ mod tests {
     }
 
     fn tag(span: &Arc<FakeSpan>, key: &str) -> String {
-        span.inner.lock().unwrap().tags.get(key).cloned().unwrap_or_default()
+        span.inner
+            .lock()
+            .unwrap()
+            .tags
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn make_send_msg() -> Message {
@@ -460,7 +519,9 @@ mod tests {
     #[test]
     fn send_before_opens_producer_span_with_documented_tags() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         ctx.broker_addr = "127.0.0.1:10911".into();
@@ -487,7 +548,9 @@ mod tests {
     #[test]
     fn send_after_closes_with_success_msg_id_region_id() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         hook.send_message_before(&mut ctx).unwrap();
@@ -509,7 +572,9 @@ mod tests {
     #[test]
     fn send_after_no_result_or_region_id_leaves_span_open() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         hook.send_message_before(&mut ctx).unwrap();
@@ -528,7 +593,9 @@ mod tests {
     #[test]
     fn send_after_failure_reports_success_false() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         hook.send_message_before(&mut ctx).unwrap();
@@ -546,20 +613,27 @@ mod tests {
     #[test]
     fn send_injects_span_context_into_message_properties() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         hook.send_message_before(&mut ctx).unwrap();
 
         let msg = ctx.message.as_ref().unwrap();
-        assert_eq!(msg.properties.get("traceparent"), Some("fake-trace-context"));
+        assert_eq!(
+            msg.properties.get("traceparent"),
+            Some("fake-trace-context")
+        );
         assert_eq!(tracer.injected.lock().unwrap().len(), 1);
     }
 
     #[test]
     fn send_upstream_context_becomes_ref() {
         let tracer = Arc::new(FakeTracer::new(Some(99)));
-        let hook = SendMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = SendMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = SendMessageContext::default();
         ctx.message = Some(make_send_msg());
         hook.send_message_before(&mut ctx).unwrap();
@@ -571,8 +645,14 @@ mod tests {
     #[test]
     fn send_msg_type_tag_uses_java_enum_name() {
         assert_eq!(ot_msg_type_name(MessageType::NormalMsg), "NORMAL_MSG");
-        assert_eq!(ot_msg_type_name(MessageType::TransMsgHalf), "TRANS_MSG_HALF");
-        assert_eq!(ot_msg_type_name(MessageType::TransMsgCommit), "TRANS_MSG_COMMIT");
+        assert_eq!(
+            ot_msg_type_name(MessageType::TransMsgHalf),
+            "TRANS_MSG_HALF"
+        );
+        assert_eq!(
+            ot_msg_type_name(MessageType::TransMsgCommit),
+            "TRANS_MSG_COMMIT"
+        );
         assert_eq!(ot_msg_type_name(MessageType::DelayMsg), "DELAY_MSG");
         assert_eq!(ot_msg_type_name(MessageType::OrderMsg), "ORDER_MSG");
     }
@@ -582,8 +662,11 @@ mod tests {
     #[test]
     fn consume_before_opens_one_span_per_message() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = ConsumeMessageOpenTracingHook { tracer: tracer.clone() };
-        let mut ctx = ConsumeMessageContext::new("CID_test", Some(vec![make_ext(), make_ext()]), None);
+        let hook = ConsumeMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
+        let mut ctx =
+            ConsumeMessageContext::new("CID_test", Some(vec![make_ext(), make_ext()]), None);
         hook.consume_message_before(&mut ctx).unwrap();
 
         let spans = tracer.spans.lock().unwrap().clone();
@@ -602,15 +685,18 @@ mod tests {
             assert_eq!(tag(span, OT_ROCKETMQ_RETRY_TIMERS), "2");
             assert_eq!(tag(span, OT_ROCKETMQ_REGION_ID), "DefaultRegion");
         }
-        let holder = crate::client::hook::any_downcast::<OTConsumeSpanHolder>(&ctx.mq_trace_context)
-            .expect("consume spans stashed");
+        let holder =
+            crate::client::hook::any_downcast::<OTConsumeSpanHolder>(&ctx.mq_trace_context)
+                .expect("consume spans stashed");
         assert_eq!(holder.spans.len(), 2);
     }
 
     #[test]
     fn consume_after_tags_success_and_finishes_all() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = ConsumeMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = ConsumeMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = ConsumeMessageContext::new("CID_test", Some(vec![make_ext()]), None);
         hook.consume_message_before(&mut ctx).unwrap();
         ctx.success = false;
@@ -623,7 +709,9 @@ mod tests {
     #[test]
     fn consume_empty_msg_list_is_noop() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = ConsumeMessageOpenTracingHook { tracer: tracer.clone() };
+        let hook = ConsumeMessageOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = ConsumeMessageContext::new("CID_test", None, None);
         hook.consume_message_before(&mut ctx).unwrap();
         hook.consume_message_after(&mut ctx).unwrap();
@@ -636,7 +724,9 @@ mod tests {
     #[test]
     fn end_transaction_opens_and_closes_immediately() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = EndTransactionOpenTracingHook { tracer: tracer.clone() };
+        let hook = EndTransactionOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = EndTransactionContext::default();
         ctx.message = Some(make_send_msg());
         ctx.broker_addr = "127.0.0.1:10911".into();
@@ -666,29 +756,43 @@ mod tests {
     #[test]
     fn end_transaction_without_message_still_opens_span() {
         let tracer = Arc::new(FakeTracer::new(None));
-        let hook = EndTransactionOpenTracingHook { tracer: tracer.clone() };
+        let hook = EndTransactionOpenTracingHook {
+            tracer: tracer.clone(),
+        };
         let mut ctx = EndTransactionContext::default();
         ctx.msg_id = Some("TX".into());
         ctx.transaction_state = Some(LocalTransactionState::RollbackMessage);
         hook.end_transaction(&mut ctx).unwrap();
         let span = hook_of(&tracer);
         assert_eq!(tag(&span, OT_MESSAGE_BUS_DESTINATION), "");
-        assert_eq!(tag(&span, OT_ROCKETMQ_TRANSACTION_STATE), "ROLLBACK_MESSAGE");
+        assert_eq!(
+            tag(&span, OT_ROCKETMQ_TRANSACTION_STATE),
+            "ROLLBACK_MESSAGE"
+        );
         assert!(span.snapshot().2);
     }
 
     #[test]
     fn hook_names_match_java_impls() {
         assert_eq!(
-            SendMessageOpenTracingHook { tracer: Arc::new(FakeTracer::new(None)) }.hook_name(),
+            SendMessageOpenTracingHook {
+                tracer: Arc::new(FakeTracer::new(None))
+            }
+            .hook_name(),
             "SendMessageOpenTracingHook"
         );
         assert_eq!(
-            ConsumeMessageOpenTracingHook { tracer: Arc::new(FakeTracer::new(None)) }.hook_name(),
+            ConsumeMessageOpenTracingHook {
+                tracer: Arc::new(FakeTracer::new(None))
+            }
+            .hook_name(),
             "ConsumeMessageOpenTracingHook"
         );
         assert_eq!(
-            EndTransactionOpenTracingHook { tracer: Arc::new(FakeTracer::new(None)) }.hook_name(),
+            EndTransactionOpenTracingHook {
+                tracer: Arc::new(FakeTracer::new(None))
+            }
+            .hook_name(),
             "EndTransactionOpenTracingHook"
         );
     }

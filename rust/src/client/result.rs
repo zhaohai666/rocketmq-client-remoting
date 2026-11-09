@@ -1,4 +1,3 @@
-
 use std::fmt;
 
 use crate::common::message::{MessageExt, MessageQueue};
@@ -245,7 +244,10 @@ pub struct PullResult {
 
 impl PullResult {
     pub fn new(status: PullStatus) -> PullResult {
-        PullResult { status, ..Default::default() }
+        PullResult {
+            status,
+            ..Default::default()
+        }
     }
 
     pub fn get_status(&self) -> PullStatus {
@@ -442,9 +444,7 @@ impl ConsumeOrderlyStatus {
             ConsumeOrderlyStatus::Success => "SUCCESS",
             ConsumeOrderlyStatus::Rollback => "ROLLBACK",
             ConsumeOrderlyStatus::Commit => "COMMIT",
-            ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => {
-                "SUSPEND_CURRENT_QUEUE_A_MOMENT"
-            }
+            ConsumeOrderlyStatus::SuspendCurrentQueueAMoment => "SUSPEND_CURRENT_QUEUE_A_MOMENT",
         }
     }
 }
@@ -520,7 +520,10 @@ mod tests {
         assert_eq!(SendStatus::from_code(42), SendStatus::SendOk);
         assert_eq!(SendStatus::from_code(-1), SendStatus::SendOk);
         assert_eq!(SendStatus::FlushSlaveTimeout.code(), 2);
-        assert_eq!(SendStatus::SlaveNotAvailable.to_string(), "SLAVE_NOT_AVAILABLE");
+        assert_eq!(
+            SendStatus::SlaveNotAvailable.to_string(),
+            "SLAVE_NOT_AVAILABLE"
+        );
     }
 
     #[test]
@@ -556,7 +559,10 @@ mod tests {
         assert_eq!(LocalTransactionState::CommitMessage.code(), 0);
         assert_eq!(LocalTransactionState::RollbackMessage.code(), 1);
         assert_eq!(LocalTransactionState::Unknow.code(), 2);
-        assert_eq!(LocalTransactionState::from_code(9), LocalTransactionState::Unknow);
+        assert_eq!(
+            LocalTransactionState::from_code(9),
+            LocalTransactionState::Unknow
+        );
         assert_eq!(LocalTransactionState::Unknow.to_string(), "UNKNOW");
     }
 
@@ -566,7 +572,10 @@ mod tests {
         assert_eq!(PullStatus::from_code(1), PullStatus::NoNewMsg);
         assert_eq!(PullStatus::from_code(3), PullStatus::OffsetIllegal);
         assert_eq!(PullStatus::from_code(7), PullStatus::Found);
-        assert_eq!(PullStatus::from_name("NO_MATCHED_MSG"), PullStatus::NoMatchedMsg);
+        assert_eq!(
+            PullStatus::from_name("NO_MATCHED_MSG"),
+            PullStatus::NoMatchedMsg
+        );
         assert_eq!(PullStatus::from_name("weird"), PullStatus::Found);
         assert_eq!(PullStatus::OffsetIllegal.code(), 3);
         assert_eq!(PullStatus::NoNewMsg.name(), "NO_NEW_MSG");
@@ -577,7 +586,10 @@ mod tests {
         // POLLING_FULL is 2, while PullStatus's 2 is NO_MATCHED_MSG -- the two sets must not be mixed
         assert_eq!(PopStatus::PollingFull as i32, 2);
         assert_eq!(PullStatus::NoMatchedMsg as i32, 2);
-        assert_eq!(PopStatus::from_name("POLLING_NOT_FOUND"), PopStatus::PollingNotFound);
+        assert_eq!(
+            PopStatus::from_name("POLLING_NOT_FOUND"),
+            PopStatus::PollingNotFound
+        );
         assert_eq!(PopStatus::from_name(""), PopStatus::Found);
     }
 
@@ -620,7 +632,10 @@ mod tests {
         let orderly = ConsumeOrderlyContext::new(Some(MessageQueue::new("T", "b", 0)));
         assert!(orderly.auto_commit);
         assert_eq!(orderly.suspend_current_queue_time_millis, -1);
-        assert_eq!(ConsumeConcurrentlyStatus::ReconsumeLater.to_string(), "RECONSUME_LATER");
+        assert_eq!(
+            ConsumeConcurrentlyStatus::ReconsumeLater.to_string(),
+            "RECONSUME_LATER"
+        );
         assert_eq!(
             ConsumeOrderlyStatus::SuspendCurrentQueueAMoment.name(),
             "SUSPEND_CURRENT_QUEUE_A_MOMENT"

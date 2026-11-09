@@ -30,13 +30,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
-use rocketmq_client_remoting::client::backpressure::{
-    MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
-};
+use rocketmq_client_remoting::client::backpressure::{MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE};
 use rocketmq_client_remoting::client::hook::{SendMessageContext, SendMessageHook};
-use rocketmq_client_remoting::client::producer::{
-    DefaultMQProducer, ProducerConfig, SendCallback,
-};
+use rocketmq_client_remoting::client::producer::{DefaultMQProducer, ProducerConfig, SendCallback};
 use rocketmq_client_remoting::client::result::SendResult;
 use rocketmq_client_remoting::common::message::{Message, MessageQueue};
 use rocketmq_client_remoting::error::Result;
@@ -128,7 +124,10 @@ impl Recorder {
 
 impl SendCallback for Recorder {
     fn on_success(&self, result: SendResult) {
-        if matches!(result.status, rocketmq_client_remoting::client::result::SendStatus::SendOk) {
+        if matches!(
+            result.status,
+            rocketmq_client_remoting::client::result::SendStatus::SendOk
+        ) {
             self.ok.fetch_add(1, Ordering::SeqCst);
         }
         self.done.fetch_add(1, Ordering::SeqCst);
@@ -177,7 +176,10 @@ impl SlowHook {
 
     /// How many sends labelled `label` entered the hook.
     fn count_of(&self, label: &str) -> usize {
-        lock(&self.entries).iter().filter(|(l, _)| l == label).count()
+        lock(&self.entries)
+            .iter()
+            .filter(|(l, _)| l == label)
+            .count()
     }
 
     /// Earliest moment a send labelled `label` entered the hook (`None` if it never did).
@@ -271,7 +273,12 @@ impl GateWatch {
                 std::thread::sleep(Duration::from_millis(1));
             }
         });
-        GateWatch { stop, min, hit, task: Some(task) }
+        GateWatch {
+            stop,
+            min,
+            hit,
+            task: Some(task),
+        }
     }
 
     /// Stops the thread and returns `(minimum free permits in the window, whether target was ever hit)`.
@@ -334,7 +341,10 @@ impl Env {
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("cluster liveness", "the nameServer returned no broker within the budget");
+                ck.abort(
+                    "cluster liveness",
+                    "the nameServer returned no broker within the budget",
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -415,11 +425,13 @@ async fn landed_count(env: &Env, topic: &str) -> i64 {
         for queue_id in 0..queue.read_queue_nums {
             let mq = MessageQueue::new(topic, &queue.broker_name, queue_id);
             // Both reads can fail right after the queue is created; treat as "not ready yet" instead of 0
-            let (max, min) =
-                match (env.admin.max_offset(&mq).await, env.admin.min_offset(&mq).await) {
-                    (Ok(max), Ok(min)) => (max, min),
-                    _ => return -1,
-                };
+            let (max, min) = match (
+                env.admin.max_offset(&mq).await,
+                env.admin.min_offset(&mq).await,
+            ) {
+                (Ok(max), Ok(min)) => (max, min),
+                _ => return -1,
+            };
             total += max - min;
         }
     }
@@ -476,7 +488,11 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
             rejected += 1;
         }
     }
-    ck.check("B1 none of the 40 send_async calls were rejected at enqueue", rejected == 0, "rejected={rejected}");
+    ck.check(
+        "B1 none of the 40 send_async calls were rejected at enqueue",
+        rejected == 0,
+        "rejected={rejected}",
+    );
     ck.check(
         "B1 all 40 async sends completed their callbacks",
         wait_until(|| rec.done() >= 40, 20).await,
@@ -488,7 +504,11 @@ async fn b1_default_capacity_no_leak(ck: &mut Checker, env: &Env) {
         &rec.summary(),
     );
     let landed = wait_landed(env, &topic, 40).await;
-    ck.check("B1 exactly 40 messages landed on the broker", landed == 40, &format!("landed={landed}"));
+    ck.check(
+        "B1 exactly 40 messages landed on the broker",
+        landed == 40,
+        &format!("landed={landed}"),
+    );
     ck.check(
         "B1 count permits fully returned",
         producer.semaphore_async_send_num_available_permits() == 1024,
@@ -568,8 +588,7 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         &format!("filled-hit={drained} min free in sampling window={min_free}"),
     );
     let both_failed = victims_done
-        && rejected
-            .all_errors_contain("send message tryAcquire semaphoreAsyncNum timeout", 2);
+        && rejected.all_errors_contain("send message tryAcquire semaphoreAsyncNum timeout", 2);
     ck.check(
         "B2 the two over-limit sends callback with TooMuchRequest, wording matched verbatim",
         both_failed,
@@ -579,7 +598,10 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     ck.check(
         "B2 the gate waits until the budget is exhausted before erroring (not a glance-and-reject)",
         waited >= Duration::from_millis(130),
-        &format!("waited {}ms (the time driver stalls while the hook blocks; this is a lower bound)", waited.as_millis()),
+        &format!(
+            "waited {}ms (the time driver stalls while the hook blocks; this is a lower bound)",
+            waited.as_millis()
+        ),
     );
     let landed = wait_landed(env, &topic, GATE_NUM).await;
     ck.check(
@@ -658,8 +680,7 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         let fired = slow.clone();
         move || {
             std::thread::sleep(Duration::from_millis(RESIZE_AT as u64));
-            resize_fired_at
-                .store(fired.elapsed_of_clock() as i64, Ordering::SeqCst);
+            resize_fired_at.store(fired.elapsed_of_clock() as i64, Ordering::SeqCst);
             producer.set_back_pressure_for_async_send_num(GATE_NUM + 2);
         }
     })
@@ -671,14 +692,18 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
     ck.check(
         "B3 the 11th send is held at the gate (handed over before the resize)",
         sent_while_gated && sent_at >= 0 && (sent_at as u128) < RESIZE_AT,
-        &format!("gate-emptied={sent_while_gated} handed-over-at={sent_at}ms resize at {RESIZE_AT}ms"),
+        &format!(
+            "gate-emptied={sent_while_gated} handed-over-at={sent_at}ms resize at {RESIZE_AT}ms"
+        ),
     );
     ck.check(
         "B3 the woken send really went out",
-        wait_until(|| woken.done() > 0, 20).await
-            && woken.ok() == 1
-            && woken.errors().is_empty(),
-        &format!("{} resize actually happened at {}ms", woken.summary(), resize_fired_at.load(Ordering::SeqCst)),
+        wait_until(|| woken.done() > 0, 20).await && woken.ok() == 1 && woken.errors().is_empty(),
+        &format!(
+            "{} resize actually happened at {}ms",
+            woken.summary(),
+            resize_fired_at.load(Ordering::SeqCst)
+        ),
     );
     // The moment is recorded by the hook itself: its kernel entry is both after the resize and before the 10 in-flight
     // returns, so the only thing that could have let it through is the resize itself.
@@ -783,10 +808,7 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
         ),
     );
     let rejected_ok = victims_done
-        && second.all_errors_contain(
-            "send message tryAcquire semaphoreAsyncSize timeout",
-            2,
-        );
+        && second.all_errors_contain("send message tryAcquire semaphoreAsyncSize timeout", 2);
     ck.check(
         "B4 the two over-limit sends callback with semaphoreAsyncSize timeout, wording matched verbatim",
         rejected_ok,
@@ -856,12 +878,7 @@ async fn b5_disabled_never_limits(ck: &mut Checker, env: &Env) {
     let big = vec![b'y'; 300 * 1024];
     for i in 0..30 {
         let body: &[u8] = if i % 10 == 9 { &big } else { b"b5-small" };
-        let _ = producer.send_async(
-            message(&topic, "b5", body),
-            rec.clone(),
-            Some(15_000),
-            None,
-        );
+        let _ = producer.send_async(message(&topic, "b5", body), rec.clone(), Some(15_000), None);
     }
     let done = wait_until(|| rec.done() >= 30, 30).await;
     ck.check(

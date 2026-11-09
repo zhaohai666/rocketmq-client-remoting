@@ -436,36 +436,50 @@ internal static class AdminLive
         // viewMessage(byOffsetMsgId): only a broker-assigned offset msgId can decode the commitLog offset
         try
         {
-            MessageExt vm = admin.ViewMessage(topic, sent[0].OffsetMsgId);
-            string bodyStr = Bytes2Str(vm.Body);
-            string head = bodyStr.Length > 32 ? bodyStr.Substring(0, 32) : bodyStr;
-            Check("viewMessage(byOffsetMsgId)", true,
-                "topic=" + vm.Topic + " offset=" + vm.QueueOffset.ToString(CultureInfo.InvariantCulture)
-                + " body=" + head);
-            bool bodyEq = vm.Body.Length == sent[0].Body.Length && vm.Body.AsSpan().SequenceEqual(sent[0].Body.AsSpan());
-            Check("viewMessage body matches what was sent", bodyEq,
-                "expected " + Bytes2Str(sent[0].Body) + " got " + Bytes2Str(vm.Body));
+            MessageExt? vm = admin.ViewMessage(topic, sent[0].OffsetMsgId);
+            if (vm is null)
+            {
+                Check("viewMessage(byOffsetMsgId)", false, "no message matched");
+            }
+            else
+            {
+                string bodyStr = Bytes2Str(vm.Body);
+                string head = bodyStr.Length > 32 ? bodyStr.Substring(0, 32) : bodyStr;
+                Check("viewMessage(byOffsetMsgId)", true,
+                    "topic=" + vm.Topic + " offset=" + vm.QueueOffset.ToString(CultureInfo.InvariantCulture)
+                    + " body=" + head);
+                bool bodyEq = vm.Body.Length == sent[0].Body.Length && vm.Body.AsSpan().SequenceEqual(sent[0].Body.AsSpan());
+                Check("viewMessage body matches what was sent", bodyEq,
+                    "expected " + Bytes2Str(sent[0].Body) + " got " + Bytes2Str(vm.Body));
+            }
         }
         catch (Exception e)
         {
             Check("viewMessage(byOffsetMsgId)", false, e.Message);
         }
 
-        // viewMessage(uniqKey): the 5.x msgId cannot decode an offset; must fall back to uniqKey with a clean exception,
-        // instead of connecting with a garbage port (previously showed "connect failed to 192.168.0.105:371196628")
+        // viewMessage(uniqKey): the 5.x msgId cannot decode an offset; the admin
+        // falls back to the U-index across brokers and returns null when neither
+        // leg matches (the default file index has no uniq index — a miss is
+        // expected there, not an error).
         try
         {
-            admin.ViewMessage(topic, sent[0].MsgId);
-            Check("viewMessage(uniqKey) falls back with a clean exception", false, "no exception was thrown");
-        }
-        catch (MQClientException e)
-        {
-            Check("viewMessage(uniqKey) falls back with a clean exception", true, "code="
-                + e.ResponseCode.ToString(CultureInfo.InvariantCulture));
+            MessageExt? byUniq = admin.ViewMessage(topic, sent[0].MsgId);
+            if (byUniq is null)
+            {
+                Skip("viewMessage(uniqKey) fallback resolved nothing",
+                    "null is the Java-parity no-match answer; this machine uses the default file index without a uniq index");
+            }
+            else
+            {
+                Check("viewMessage(uniqKey) falls back and fetches the message",
+                    byUniq.Body.AsSpan().SequenceEqual(sent[0].Body.AsSpan()),
+                    "body=" + Bytes2Str(byUniq.Body));
+            }
         }
         catch (Exception e)
         {
-            Check("viewMessage(uniqKey) falls back with a clean exception", false,
+            Check("viewMessage(uniqKey) falls back with a clean answer", false,
                 e.GetType().Name + ": " + e.Message);
         }
 

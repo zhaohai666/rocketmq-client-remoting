@@ -9,7 +9,6 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-
 use crate::client::result::LocalTransactionState;
 use crate::common::message_const::KEY_SEPARATOR;
 use crate::common::message_type::MessageType;
@@ -666,7 +665,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn encode_pub_matches_wire_vector() {
         let mut ctx = ctx_of(TraceType::Pub, vec![bean(MSG_ID_1, "KeyA KeyB", 2)]);
@@ -999,7 +997,10 @@ mod tests {
         let legacy = expect(&["SubAfter", "REQ", MSG_ID_1, "5", "true", "KeyA", "0"]);
         let got = &TraceDataEncoder::decoder_from_trace_data_string(Some(&legacy))[0];
         assert_eq!(got.context_code, 0);
-        assert!(got.time_stamp > TS, "falls back to the current time from TraceContext::new()");
+        assert!(
+            got.time_stamp > TS,
+            "falls back to the current time from TraceContext::new()"
+        );
         assert_eq!(got.group_name, "");
     }
 
@@ -1202,7 +1203,11 @@ mod tests {
         if groups == 8 {
             assert!(addr.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
         }
-        assert_eq!(addr, local_address(), "must be cached in-process (OnceLock)");
+        assert_eq!(
+            addr,
+            local_address(),
+            "must be cached in-process (OnceLock)"
+        );
     }
 
     #[test]

@@ -90,7 +90,10 @@ fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
             let text = fs::read_to_string(&out_path).unwrap_or_default();
             (s.success(), text.trim().to_string())
         }
-        Err(e) => (false, format!("run {} {action} failed: {e}", script.display())),
+        Err(e) => (
+            false,
+            format!("run {} {action} failed: {e}", script.display()),
+        ),
     }
 }
 
@@ -236,7 +239,11 @@ impl Fixture {
             .map(|bd| bd.broker_addrs.clone())
     }
 
-    fn build_consumer(&self, group: &str, sink: Arc<Sink>) -> Result<DefaultMQPushConsumer, String> {
+    fn build_consumer(
+        &self,
+        group: &str,
+        sink: Arc<Sink>,
+    ) -> Result<DefaultMQPushConsumer, String> {
         let cfg = ConsumerConfig {
             consumer_group: group.to_string(),
             name_server_addrs: vec![self.namesrv.clone()],
@@ -254,7 +261,10 @@ impl Fixture {
     }
 
     async fn seed_queues(&self) -> Result<Vec<MessageQueue>, Error> {
-        let info = self.admin.get_topic_publish_info(&self.topic, false).await?;
+        let info = self
+            .admin
+            .get_topic_publish_info(&self.topic, false)
+            .await?;
         Ok(info.msg_queue_list())
     }
 
@@ -346,7 +356,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let Some(addrs) = addrs else {
         return;
     };
-    let route_slave = addrs.iter().find(|(id, _)| *id == 1).map(|(_, a)| a.clone());
+    let route_slave = addrs
+        .iter()
+        .find(|(id, _)| *id == 1)
+        .map(|(_, a)| a.clone());
     ck.check(
         "S0 the slave address matches the argument",
         route_slave.as_deref() == Some(fx.slave.as_str()),
@@ -367,7 +380,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         queues.len() == QUEUES as usize,
         &format!(
             "queues={:?}",
-            queues.iter().map(|q| (&q.broker_name, q.queue_id)).collect::<Vec<_>>()
+            queues
+                .iter()
+                .map(|q| (&q.broker_name, q.queue_id))
+                .collect::<Vec<_>>()
         ),
     );
     let subs = fx.admin.get_topic_subscribe_info(&topic).await;
@@ -376,7 +392,9 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         subs.len() == QUEUES as usize,
         &format!(
             "queues={:?}",
-            subs.iter().map(|q| (&q.broker_name, q.queue_id)).collect::<Vec<_>>()
+            subs.iter()
+                .map(|q| (&q.broker_name, q.queue_id))
+                .collect::<Vec<_>>()
         ),
     );
     if queues.len() != QUEUES as usize {
@@ -446,7 +464,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     ck.check(
         &format!("S1 all {QUEUES} messages are replicated to the slave's store"),
         caught_up.is_some(),
-        &format!("master={master_max:?} slave={:?}", caught_up.unwrap_or_default()),
+        &format!(
+            "master={master_max:?} slave={:?}",
+            caught_up.unwrap_or_default()
+        ),
     );
 
     // ---------- S2 stop master ----------
@@ -532,7 +553,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
 
     // Refresh the send instance's own route cache into the post-stop shape (the same code path as the 30s periodic task)
     let Some(pcli) = fx.producer.client() else {
-        ck.check("S5b got the send instance", false, "the producer is not started");
+        ck.check(
+            "S5b got the send instance",
+            false,
+            "the producer is not started",
+        );
         return;
     };
     if let Err(e) = pcli
@@ -547,7 +572,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         send_publish
             .as_ref()
             .err()
-            .map(|e| e.to_string().contains("Can not find Message Queue for topic"))
+            .map(|e| {
+                e.to_string()
+                    .contains("Can not find Message Queue for topic")
+            })
             .unwrap_or(false),
         &match &send_publish {
             Ok(info) => format!("unexpectedly got {} queues", info.msg_queue_list().len()),
@@ -613,7 +641,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     let client_id = format!("pr_master_rs_lock_{}", fx.stamp);
     let lock_mqs = vec![MessageQueue::new(&topic, BROKER_NAME, 0)];
     let began = Instant::now();
-    let locks = match fx.admin.lock_batch_mq(&group, &client_id, &lock_mqs, 3000).await {
+    let locks = match fx
+        .admin
+        .lock_batch_mq(&group, &client_id, &lock_mqs, 3000)
+        .await
+    {
         Ok(l) => l,
         Err(e) => {
             println!("    (lock_batch_mq failed: {e})");
@@ -643,7 +675,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("slave maxOffset={slave_serving:?}"),
     );
     let began = Instant::now();
-    let _ = fx.admin.unlock_batch_mq(&group, &client_id, &lock_mqs, 3000).await;
+    let _ = fx
+        .admin
+        .unlock_batch_mq(&group, &client_id, &lock_mqs, 3000)
+        .await;
     let unlock_ms = began.elapsed().as_secs_f64() * 1000.0;
     ck.check(
         "S5e3 unlock is likewise quietly skipped (no throw, no send)",
@@ -652,7 +687,9 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     );
 
     // ---------- S5f (E) subscribe semantics: POP only accepts the master ----------
-    println!("\nS5f (E) POP pull: local side reports \"The broker[broker-a] not exist\" (no wire sent)");
+    println!(
+        "\nS5f (E) POP pull: local side reports \"The broker[broker-a] not exist\" (no wire sent)"
+    );
     let began = Instant::now();
     let pop = fx
         .admin
@@ -729,7 +766,11 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
                 ),
             );
         }
-        None => ck.check("S6a got the consumer's own instance", false, "consumer.client() is None"),
+        None => ck.check(
+            "S6a got the consumer's own instance",
+            false,
+            "consumer.client() is None",
+        ),
     }
     let mut expected = seeded.clone();
     expected.sort();
@@ -785,9 +826,10 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         queues_back.is_some(),
         &format!(
             "queues={:?}",
-            queues_back
-                .as_ref()
-                .map(|q| q.iter().map(|x| (&x.broker_name, x.queue_id)).collect::<Vec<_>>())
+            queues_back.as_ref().map(|q| q
+                .iter()
+                .map(|x| (&x.broker_name, x.queue_id))
+                .collect::<Vec<_>>())
         ),
     );
     // Neither failed send left a message on the broker: every seeded queue's maxOffset is still 1

@@ -15,9 +15,7 @@ use super::serialize::{
     RemotingSerializable, RocketMQSerializable,
 };
 use crate::error::{Error, Result};
-use crate::remoting::protocol::codes::{
-    language_code, remoting_command_type, serialize_type,
-};
+use crate::remoting::protocol::codes::{language_code, remoting_command_type, serialize_type};
 
 pub const RPC_TYPE: i32 = 0;
 pub const RPC_ONEWAY: i32 = 1;
@@ -89,7 +87,10 @@ impl RemotingCommand {
         }
     }
 
-    pub fn create_request_command(code: i32, header: Option<Box<dyn CustomHeader>>) -> RemotingCommand {
+    pub fn create_request_command(
+        code: i32,
+        header: Option<Box<dyn CustomHeader>>,
+    ) -> RemotingCommand {
         let mut cmd = RemotingCommand::new();
         cmd.code = code;
         cmd.custom_header = header;
@@ -239,7 +240,8 @@ impl RemotingCommand {
     /// Encodes the whole frame (including the 4-byte totalLength).
     pub fn encode(&mut self) -> Vec<u8> {
         let header_data = self.header_encode();
-        let mut out = Vec::with_capacity(8 + header_data.len() + self.body.as_ref().map_or(0, Vec::len));
+        let mut out =
+            Vec::with_capacity(8 + header_data.len() + self.body.as_ref().map_or(0, Vec::len));
         let header_len = header_data.len();
         let total_len = 4 + header_len + self.body.as_ref().map_or(0, Vec::len);
         out.extend_from_slice(&(total_len as i32).to_be_bytes());

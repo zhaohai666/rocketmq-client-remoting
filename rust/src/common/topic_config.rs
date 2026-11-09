@@ -195,7 +195,10 @@ mod tests {
             r#"{"topicName":"t","attributes":null,"order":null,"readQueueNums":"8"}"#,
         )
         .unwrap();
-        assert_eq!(cfg.read_queue_nums, 8, "numbers written as strings must still parse");
+        assert_eq!(
+            cfg.read_queue_nums, 8,
+            "numbers written as strings must still parse"
+        );
         assert!(!cfg.order, "null falls back to the default");
         assert!(cfg.attributes.is_empty());
     }
@@ -203,10 +206,7 @@ mod tests {
     #[test]
     fn decode_rejects_non_object() {
         assert!(TopicConfig::decode("[1,2]").is_err());
-        assert!(matches!(
-            TopicConfig::decode("null"),
-            Err(Error::Decode(_))
-        ));
+        assert!(matches!(TopicConfig::decode("null"), Err(Error::Decode(_))));
     }
 
     #[test]

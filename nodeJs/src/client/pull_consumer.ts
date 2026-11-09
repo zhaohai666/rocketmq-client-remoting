@@ -607,4 +607,12 @@ export class DefaultMQPullConsumer {
       return null;
     }
   }
+
+  // viewMessage is Java DefaultMQPullConsumerImpl#viewMessage
+  // (DefaultMQPullConsumerImpl.java:838) parity: the MQAdminImpl single-leg
+  // path — offset msgId only, no uniq-key fallback at this layer.
+  async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
+    if (!this.mqClient) throw new Error('consumer not started');
+    return this.mqClient.viewMessage(topic, msgId);
+  }
 }

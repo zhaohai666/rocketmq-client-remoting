@@ -113,7 +113,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -189,8 +192,7 @@ impl Creds {
 
 fn acl_hook(access_key: &str, secret_key: &str) -> Arc<dyn RPCHook> {
     Arc::new(AclClientRPCHook::new(SessionCredentials::new(
-        access_key,
-        secret_key,
+        access_key, secret_key,
     )))
 }
 
@@ -368,7 +370,11 @@ impl SendCallback for AsyncProbe {
 struct CommitAlways;
 
 impl TransactionListener for CommitAlways {
-    fn execute_local_transaction(&self, _msg: &Message, _arg: Option<&AnyHolder>) -> LocalTransactionState {
+    fn execute_local_transaction(
+        &self,
+        _msg: &Message,
+        _arg: Option<&AnyHolder>,
+    ) -> LocalTransactionState {
         LocalTransactionState::CommitMessage
     }
 
@@ -515,7 +521,10 @@ async fn a0_unsigned_probe(namesrv: &str, probe_topic: &str, run: &str, ck: &mut
     anon.set_namesrv_addr(namesrv);
     anon.set_instance_name(&format!("{run}-anon"));
     if let Err(e) = anon.start().await {
-        ck.abort("A0 anonymous producer start", &format!("{} {e}", code_of(&e)));
+        ck.abort(
+            "A0 anonymous producer start",
+            &format!("{} {e}", code_of(&e)),
+        );
         return;
     }
     let mut m = Message::new(probe_topic, Some(b"should-not-be-accepted"));
@@ -563,8 +572,8 @@ fn push_consumer(
     if first_offset {
         cfg.consume_from_where = ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string();
     }
-    let consumer =
-        DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build {group} failed: {e}"))?;
+    let consumer = DefaultMQPushConsumer::with_config(cfg)
+        .map_err(|e| format!("build {group} failed: {e}"))?;
     consumer.set_rpc_hook(creds.hook());
     Ok(consumer)
 }
@@ -607,7 +616,10 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     p.set_namesrv_addr(namesrv);
     p.set_instance_name(&format!("{run}-p"));
     if let Err(e) = p.start().await {
-        ck.abort("producer start (signature registration)", &format!("{} {e}", code_of(&e)));
+        ck.abort(
+            "producer start (signature registration)",
+            &format!("{} {e}", code_of(&e)),
+        );
         return ck;
     }
     let instance = match p.client() {
@@ -730,10 +742,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
             .and(c.map_err(|e| e.to_string()))
     };
     if let Err(e) = started {
-        ck.abort(
-            "consumer start (heartbeat/registration must be signed)",
-            &e,
-        );
+        ck.abort("consumer start (heartbeat/registration must be signed)", &e);
         main_c.shutdown();
         tag_c.shutdown();
         order_c.shutdown();
@@ -758,7 +767,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         }
     };
     let sync_mq = r1.message_queue.clone().unwrap_or_default();
-    let back_sync = body_at(&instance, &sync_mq, r1.queue_offset, &cluster.broker_addr, READ_BACK_BUDGET).await;
+    let back_sync = body_at(
+        &instance,
+        &sync_mq,
+        r1.queue_offset,
+        &cluster.broker_addr,
+        READ_BACK_BUDGET,
+    )
+    .await;
     let sync_read = wait_bodies(&instance, &topic, &cluster, &["acl-sync"], READ_BACK_BUDGET).await;
     let sync_pulled = sync_read.first().cloned().unwrap_or_default();
     ck.check(
@@ -779,7 +795,12 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     // ---- A2 async send
     println!("A2 async send (callback)");
     let probe = Arc::new(AsyncProbe::default());
-    if let Err(e) = p.send_async(msg(&topic, b"acl-async", "TagAsync", ""), probe.clone(), Some(5000), None) {
+    if let Err(e) = p.send_async(
+        msg(&topic, b"acl-async", "TagAsync", ""),
+        probe.clone(),
+        Some(5000),
+        None,
+    ) {
         ck.abort("A2 send_async dispatch", &format!("{} {e}", code_of(&e)));
     }
     let called = wait_until(|| async { probe.done() >= 1 }, Duration::from_secs(15)).await;
@@ -790,7 +811,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     let back_async = match async_result.as_ref() {
         Some(r) => {
             let mq = r.message_queue.clone().unwrap_or_default();
-            body_at(&instance, &mq, r.queue_offset, &cluster.broker_addr, READ_BACK_BUDGET).await
+            body_at(
+                &instance,
+                &mq,
+                r.queue_offset,
+                &cluster.broker_addr,
+                READ_BACK_BUDGET,
+            )
+            .await
         }
         None => None,
     };
@@ -807,8 +835,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     if let Err(e) = p.send_oneway(&mut m3, Some(&oneway_mq)).await {
         ck.abort("A3 oneway send", &format!("{} {e}", code_of(&e)));
     }
-    let oneway_back =
-        wait_bodies(&instance, &topic, &cluster, &["acl-oneway"], READ_BACK_BUDGET).await;
+    let oneway_back = wait_bodies(
+        &instance,
+        &topic,
+        &cluster,
+        &["acl-oneway"],
+        READ_BACK_BUDGET,
+    )
+    .await;
     let oneway_count = snapshot(&instance, &topic, &cluster)
         .await
         .iter()
@@ -843,10 +877,8 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     let offsets: Vec<i64> = back_batch.iter().map(|m| m.queue_offset).collect();
     let mut sorted_offsets = offsets.clone();
     sorted_offsets.sort_unstable();
-    let contiguous = sorted_offsets.len() == 3
-        && sorted_offsets
-            .windows(2)
-            .all(|w| w[1] - w[0] == 1);
+    let contiguous =
+        sorted_offsets.len() == 3 && sorted_offsets.windows(2).all(|w| w[1] - w[0] == 1);
     ck.check(
         "A4 three messages written in one batch, sub-message offsets contiguous and all readable back",
         batch_result.is_ok() && back_batch.len() == 3 && contiguous,
@@ -879,7 +911,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     };
     // The read-back is exactly the proof that "END_TRANSACTION really took effect": the broker will
     // not deliver a half message before it is turned into a normal message.
-    let back_tx = wait_bodies(&instance, &topic, &cluster, &["acl-tx-commit"], READ_BACK_BUDGET).await;
+    let back_tx = wait_bodies(
+        &instance,
+        &topic,
+        &cluster,
+        &["acl-tx-commit"],
+        READ_BACK_BUDGET,
+    )
+    .await;
     ck.check(
         "A7 after the transaction commits the message becomes consumable (read-back proves END_TRANSACTION took effect)",
         tx_send_ok && back_tx.len() == 1,
@@ -901,9 +940,19 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     let mut picked: Vec<i32> = Vec::new();
     let mut order_send_failed: Vec<String> = Vec::new();
     for i in 0..6 {
-        let mut m = msg(&order_topic, format!("acl-order-{i}").as_bytes(), "TagOrder", "");
+        let mut m = msg(
+            &order_topic,
+            format!("acl-order-{i}").as_bytes(),
+            "TagOrder",
+            "",
+        );
         match p
-            .send_by_selector(&mut m, &SelectMessageQueueByHash, "acl-shard-key", Some(5000))
+            .send_by_selector(
+                &mut m,
+                &SelectMessageQueueByHash,
+                "acl-shard-key",
+                Some(5000),
+            )
             .await
         {
             Ok(r) => picked.push(r.message_queue.clone().map(|q| q.queue_id).unwrap_or(-1)),
@@ -918,7 +967,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     );
     let order_bodies: Vec<String> = (0..6).map(|i| format!("acl-order-{i}")).collect();
     let order_want: Vec<&str> = order_bodies.iter().map(|s| s.as_str()).collect();
-    let back_order = wait_bodies(&instance, &order_topic, &cluster, &order_want, READ_BACK_BUDGET).await;
+    let back_order = wait_bodies(
+        &instance,
+        &order_topic,
+        &cluster,
+        &order_want,
+        READ_BACK_BUDGET,
+    )
+    .await;
     let mut by_offset = back_order
         .iter()
         .map(|m| (m.queue_offset, body_of(m)))
@@ -973,10 +1029,24 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     let tag_b: Vec<String> = (0..3).map(|i| format!("acl-tagB-{i}")).collect();
     let tag_want_a: Vec<&str> = tag_a.iter().map(|s| s.as_str()).collect();
     let tag_want_b: Vec<&str> = tag_b.iter().map(|s| s.as_str()).collect();
-    let back_tag_a = wait_bodies(&instance, &tag_topic, &cluster, &tag_want_a, READ_BACK_BUDGET).await;
+    let back_tag_a = wait_bodies(
+        &instance,
+        &tag_topic,
+        &cluster,
+        &tag_want_a,
+        READ_BACK_BUDGET,
+    )
+    .await;
     // TagB must also be on the broker: otherwise "only TagA arrived" might just mean TagB was never
     // sent in the first place.
-    let back_tag_b = wait_bodies(&instance, &tag_topic, &cluster, &tag_want_b, READ_BACK_BUDGET).await;
+    let back_tag_b = wait_bodies(
+        &instance,
+        &tag_topic,
+        &cluster,
+        &tag_want_b,
+        READ_BACK_BUDGET,
+    )
+    .await;
     let filtered = wait_until(
         || async { tag_inbox.bodies().len() >= 3 },
         Duration::from_secs(20),
@@ -1002,7 +1072,10 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     println!("A10 server-side query by key (QUERY_MSG_BY_KEY)");
     let found_by_key = wait_until(
         || async {
-            match p.query_message(&topic, &key_sync, 32, now_ms() - 60_000, now_ms() + 5_000).await {
+            match p
+                .query_message(&topic, &key_sync, 32, now_ms() - 60_000, now_ms() + 5_000)
+                .await
+            {
                 Ok(list) => list.iter().any(|m| body_of(m) == "acl-sync"),
                 Err(_) => false,
             }
@@ -1015,7 +1088,13 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         .await
         .unwrap_or_default();
     let missing_key = p
-        .query_message(&topic, "no-such-key-at-all", 32, now_ms() - 60_000, now_ms() + 5_000)
+        .query_message(
+            &topic,
+            "no-such-key-at-all",
+            32,
+            now_ms() - 60_000,
+            now_ms() + 5_000,
+        )
         .await
         .map(|v| v.len())
         .unwrap_or(999);
@@ -1031,7 +1110,9 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
 
     // ---- A5 delayed message + A6 timer message: read back first, then use the timestamps to prove
     // "delivered only at the due time"
-    println!("A5/A6 delay level and timer messages (wait for the delivery moment, proved by timestamps)");
+    println!(
+        "A5/A6 delay level and timer messages (wait for the delivery moment, proved by timestamps)"
+    );
     let delay_born = now_ms();
     let mut m5 = msg(&topic, b"acl-delay", "TagDelay", "");
     m5.set_delay_time_level(DELAY_LEVEL);
@@ -1087,8 +1168,14 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         .iter()
         .map(|m| (body_of(m), m.clone()))
         .collect();
-    let got_delay = delayed_map.iter().find(|(b, _)| b == "acl-delay").map(|(_, m)| m.clone());
-    let got_timer = delayed_map.iter().find(|(b, _)| b == "acl-timer").map(|(_, m)| m.clone());
+    let got_delay = delayed_map
+        .iter()
+        .find(|(b, _)| b == "acl-delay")
+        .map(|(_, m)| m.clone());
+    let got_timer = delayed_map
+        .iter()
+        .find(|(b, _)| b == "acl-timer")
+        .map(|(_, m)| m.clone());
     let delay_drift = got_delay.as_ref().map(drift_ms).unwrap_or_default();
     let timer_drift = got_timer.as_ref().map(drift_ms).unwrap_or_default();
     ck.check(
@@ -1104,7 +1191,9 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
 
     // ---- A12 read-back by a signed push consumer: body/properties/timestamps all re-checked from the
     // consuming side
-    println!("A12 signed push consumer received everything (heartbeat/pull/offset commit all signed)");
+    println!(
+        "A12 signed push consumer received everything (heartbeat/pull/offset commit all signed)"
+    );
     let expect: [&str; 9] = [
         "acl-sync",
         "acl-async",
@@ -1141,24 +1230,24 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     );
     ck.check(
         "A10 keys passed through to the consuming side",
-        consumed_sync
-            .as_ref()
-            .is_some_and(|s| s.keys == key_sync),
+        consumed_sync.as_ref().is_some_and(|s| s.keys == key_sync),
         &format!("{:?}", consumed_sync.as_ref().map(|s| s.keys.clone())),
     );
     ck.check(
         "A1 tag passed through to the consuming side",
-        consumed_sync
-            .as_ref()
-            .is_some_and(|s| s.tags == "TagSync"),
+        consumed_sync.as_ref().is_some_and(|s| s.tags == "TagSync"),
         &format!("{:?}", consumed_sync.as_ref().map(|s| s.tags.clone())),
     );
     let consumed_delay = main_inbox.find("acl-delay");
     let consumed_timer = main_inbox.find("acl-timer");
     ck.check(
         "A5/A6 the delivery delay seen on the consuming side matches what the read-back shows",
-        consumed_delay.as_ref().is_some_and(|s| s.store_timestamp - s.born_timestamp >= DELAY_MILLIS - CLOCK_SLACK)
-            && consumed_timer.as_ref().is_some_and(|s| s.store_timestamp - s.born_timestamp >= TIMER_AHEAD_MILLIS - CLOCK_SLACK),
+        consumed_delay
+            .as_ref()
+            .is_some_and(|s| s.store_timestamp - s.born_timestamp >= DELAY_MILLIS - CLOCK_SLACK)
+            && consumed_timer.as_ref().is_some_and(|s| {
+                s.store_timestamp - s.born_timestamp >= TIMER_AHEAD_MILLIS - CLOCK_SLACK
+            }),
         &format!(
             "delay={:?} timer={:?}",
             consumed_delay.map(|s| s.store_timestamp - s.born_timestamp),
@@ -1182,8 +1271,7 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
                 false,
             )
             .await;
-        if matches!(committed, Ok(Some(offset)) if offset > 0)
-            || Instant::now() >= commit_deadline
+        if matches!(committed, Ok(Some(offset)) if offset > 0) || Instant::now() >= commit_deadline
         {
             break;
         }

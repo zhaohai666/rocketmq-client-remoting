@@ -537,6 +537,10 @@ public:
 
     // ---------------- Administration ----------------
     std::vector<MessageQueue> fetchSubscribeMessageQueues(const std::string& topic);
+    // Java DefaultMQPushConsumerImpl#viewMessage parity
+    // (DefaultMQPushConsumerImpl.java:1329): the MQAdminImpl single-leg path —
+    // offset msgId only, no uniq-key fallback at this layer.
+    MessageExt viewMessage(const std::string& topic, const std::string& msgId);
     // Message redelivery (sendMessageBack): never throws internally; returning false means both
     // CONSUMER_SEND_MSG_BACK and the plain-message redelivery fallback failed.
     bool sendMessageBack(const MessageExt& msg, int32_t delayLevel,

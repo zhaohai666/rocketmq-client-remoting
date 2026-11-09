@@ -35,9 +35,7 @@ use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
 use rocketmq_client_remoting::client::hook::{
     CheckForbiddenContext, CheckForbiddenHook, SendMessageContext, SendMessageHook,
 };
-use rocketmq_client_remoting::client::producer::{
-    DefaultMQProducer, ProducerConfig, SendCallback,
-};
+use rocketmq_client_remoting::client::producer::{DefaultMQProducer, ProducerConfig, SendCallback};
 use rocketmq_client_remoting::client::result::{SendResult, SendStatus};
 use rocketmq_client_remoting::common::message::{Message, MessageQueue};
 use rocketmq_client_remoting::common::message_decoder::decode_message_id;
@@ -317,7 +315,10 @@ impl Env {
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("cluster liveness probe", "the nameServer returned no broker within the budget");
+                ck.abort(
+                    "cluster liveness probe",
+                    "the nameServer returned no broker within the budget",
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -443,11 +444,11 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
         let body = body.clone();
         tokio::task::spawn_blocking(move || {
             let began = Instant::now();
-            let rejected = match p.send_async(message(&topic, &body, "TagAsync"), r, Some(5_000), None)
-            {
-                Ok(()) => None,
-                Err(e) => Some(e.to_string()),
-            };
+            let rejected =
+                match p.send_async(message(&topic, &body, "TagAsync"), r, Some(5_000), None) {
+                    Ok(()) => None,
+                    Err(e) => Some(e.to_string()),
+                };
             (
                 std::thread::current().id(),
                 began.elapsed(),
@@ -471,13 +472,16 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     );
     ck.check(
         "A1 the callback fired exactly once and was SEND_OK",
-        wait_until(|| rec.done() >= 1, 20).await && rec.done() == 1 && rec.ok() == 1
+        wait_until(|| rec.done() >= 1, 20).await
+            && rec.done() == 1
+            && rec.ok() == 1
             && rec.errors().is_empty(),
         &rec.summary(),
     );
     ck.check(
         "A1 the before hook does not run on the caller thread (async send thread pool)",
-        hook.first_before_thread().is_some_and(|t| t != caller_thread),
+        hook.first_before_thread()
+            .is_some_and(|t| t != caller_thread),
         &format!(
             "hook thread={:?} caller thread={caller_thread:?}",
             hook.first_before_thread()
@@ -528,17 +532,17 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         match env.admin.view_message(&topic, &offset_msg_id).await {
-            Ok(msg) => {
+            Ok(Some(msg)) => {
                 back = Some(msg);
                 break;
             }
-            // the commitLog has not been flushed yet
-            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            // the commitLog has not been flushed yet (or a transient miss)
+            _ => tokio::time::sleep(Duration::from_millis(500)).await,
         }
     }
-    let read_back = back.as_ref().is_some_and(|m| {
-        m.body.as_deref() == Some(body.as_slice()) && m.topic == topic
-    });
+    let read_back = back
+        .as_ref()
+        .is_some_and(|m| m.body.as_deref() == Some(body.as_slice()) && m.topic == topic);
     ck.check(
         "A1 the offsetMsgId from the callback can read this message back",
         read_back,
@@ -555,7 +559,10 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
             &format!("queueOffset={} maxOffset={}", first.queue_offset, max),
         );
     } else {
-        ck.abort("A1 the queueOffset in the callback is exactly where it landed", "the callback carried no MessageQueue");
+        ck.abort(
+            "A1 the queueOffset in the callback is exactly where it landed",
+            "the callback carried no MessageQueue",
+        );
     }
     ck.check(
         "A1 the broker stored this one message",
@@ -582,7 +589,10 @@ async fn a2_burst_exactly_once_each(ck: &mut Checker, env: &Env) {
             Some(8_000),
             None,
         ) {
-            return ck.abort("A2 all 30 concurrent sends got their callbacks", &format!("send #{i} was rejected at enqueue: {e}"));
+            return ck.abort(
+                "A2 all 30 concurrent sends got their callbacks",
+                &format!("send #{i} was rejected at enqueue: {e}"),
+            );
         }
     }
     let all_back = wait_until(|| each.iter().all(|r| r.done() >= 1), 20).await;
@@ -747,7 +757,10 @@ async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
     let rejected = Arc::new(Recorder::default());
     let bad = message(&topic, b"async-a4-rejected", "forbidden");
     if let Err(e) = producer.send_async(bad, rejected.clone(), Some(5_000), None) {
-        return ck.abort("A4 the exception rejected by the hook reached the callback verbatim", &e.to_string());
+        return ck.abort(
+            "A4 the exception rejected by the hook reached the callback verbatim",
+            &e.to_string(),
+        );
     }
     ck.check(
         "A4 the exception rejected by the hook reached the callback verbatim",
@@ -777,7 +790,10 @@ async fn a4_forbidden_hook(ck: &mut Checker, env: &Env) {
     let passed = Arc::new(Recorder::default());
     let ok = message(&topic, b"async-a4-ok", "TagA4");
     if let Err(e) = producer.send_async(ok, passed.clone(), Some(5_000), None) {
-        return ck.abort("A4 the same producer with a different tag lands normally", &e.to_string());
+        return ck.abort(
+            "A4 the same producer with a different tag lands normally",
+            &e.to_string(),
+        );
     }
     ck.check(
         "A4 the same producer with a different tag lands normally (the rejection did not break the pool)",
@@ -837,9 +853,10 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
             && rec.done() == 1
             && rec.ok() == 1
             && rec.errors().is_empty()
-            && rec.results().first().is_some_and(|r| {
-                r.msg_id.as_ref().is_some_and(|id| !id.is_empty())
-            }),
+            && rec
+                .results()
+                .first()
+                .is_some_and(|r| r.msg_id.as_ref().is_some_and(|id| !id.is_empty())),
         &rec.summary(),
     );
     let landed = wait_landed(env, &topic, 5).await;
@@ -866,7 +883,7 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     if let Some(&id) = sub_offsets.first() {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(m) = env.admin.view_message(&topic, id).await {
+            if let Ok(Some(m)) = env.admin.view_message(&topic, id).await {
                 // MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX
                 stored_uniq = m.get_property("UNIQ_KEY").map(str::to_string);
                 break;
@@ -885,11 +902,12 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     ck.check(
         "A5 the batch SendResult.msgId is the batch's own 32-hex id, not the offsetMsgId",
         rec.results().first().is_some_and(|r| {
-            r.msg_id.as_deref().is_some_and(|id| id.len() == 32 && !id.contains(','))
+            r.msg_id
+                .as_deref()
+                .is_some_and(|id| id.len() == 32 && !id.contains(','))
                 && r.msg_id != r.offset_msg_id
         }),
-        &rec
-            .results()
+        &rec.results()
             .first()
             .map(|r| format!("msgId={:?} offsetMsgId={:?}", r.msg_id, r.offset_msg_id))
             .unwrap_or_default(),
@@ -914,9 +932,8 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
     {
         return ck.abort("A5 aimed batch submit", &e.to_string());
     }
-    let pinned_ok = wait_until(|| pinned.done() >= 1, 20).await
-        && pinned.done() == 1
-        && pinned.ok() == 1;
+    let pinned_ok =
+        wait_until(|| pinned.done() >= 1, 20).await && pinned.done() == 1 && pinned.ok() == 1;
     let landed_on_aimed = pinned
         .results()
         .first()
@@ -1139,7 +1156,10 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
     let fresh = Arc::new(Recorder::default());
     let again = message(&topic, b"async-a6-new-producer", "TagA6");
     if let Err(e) = p2.send_async(again, fresh.clone(), Some(8_000), None) {
-        return ck.abort("A6 the pool that was shut down is not reused by another producer", &e.to_string());
+        return ck.abort(
+            "A6 the pool that was shut down is not reused by another producer",
+            &e.to_string(),
+        );
     }
     ck.check(
         "A6 the pool that was shut down is not reused by another producer (the new producer can go on sending)",

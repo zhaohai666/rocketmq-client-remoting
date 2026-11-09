@@ -333,19 +333,19 @@ void a1NonBlockingAndReadBack(Env& env, const std::string& t) {
     }
     const SendResult& r = rs[0];
     // offsetMsgId is handed out by the broker and only it decodes to the commitLog offset => read the message back and compare the body
-    MessageExt back;
+    std::optional<MessageExt> back;
     const bool read = waitUntil(
         [&]() {
             try {
                 back = env.admin->viewMessage(t, r.offsetMsgId);
-                return true;
+                return back.has_value();
             } catch (const std::exception&) {
                 return false;  // the commitLog is not flushed out yet
             }
         },
         15000);
-    check("A1 the offsetMsgId from the callback reads this message back", read && bodyOf(back) == body,
-          "body=" + bodyOf(back));
+    check("A1 the offsetMsgId from the callback reads this message back", read && bodyOf(*back) == body,
+          "body=" + (read ? bodyOf(*back) : std::string("<no match>")));
     int64_t maxOffset = -1;
     try {
         maxOffset = env.admin->maxOffset(r.messageQueue);
@@ -538,21 +538,21 @@ void a5BatchAsync(Env& env, const std::string& t) {
     }
     check("A5 the broker returned 5 per-message commitLog offsets (the batch really was split on storage)",
           subOffsets.size() == 5, "offsetMsgId=" + batchResult.offsetMsgId);
-    MessageExt storedSub;
+    std::optional<MessageExt> storedSub;
     const bool readSub =
         !subOffsets.empty()
         && waitUntil(
                [&]() {
                    try {
                        storedSub = env.admin->viewMessage(t, subOffsets.front());
-                       return true;
+                       return storedSub.has_value();
                    } catch (const std::exception&) {
                        return false;  // the commitLog is not flushed out yet
                    }
                },
                15000);
     const std::string storedUniq =
-        readSub ? storedSub.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+        readSub ? storedSub->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
                 : std::string();
     check("A5 the sub-message stored on the broker carries the client UNIQ_KEY (the per-message id is encoded in the body)",
           storedUniq.size() == 32, "stored UNIQ_KEY=" + storedUniq);

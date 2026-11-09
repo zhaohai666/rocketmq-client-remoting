@@ -240,7 +240,10 @@ pub fn parse_message_queue_key(key: &str) -> Option<MessageQueueKey> {
 /// Generic: parses a map keyed by MessageQueue (fastjson2 non-string keys), preserving payload order.
 ///
 /// Non-inline-object keys (the malformed entries in the payload) are skipped outright.
-pub fn decode_message_queue_map<T, F>(raw: Option<&Value>, parse: F) -> Result<Vec<(MessageQueueKey, T)>>
+pub fn decode_message_queue_map<T, F>(
+    raw: Option<&Value>,
+    parse: F,
+) -> Result<Vec<(MessageQueueKey, T)>>
 where
     F: Fn(&Value) -> Result<T>,
 {
@@ -248,7 +251,11 @@ where
     match raw {
         None | Some(Value::Null) => return Ok(out),
         Some(Value::Object(_)) => {}
-        Some(_) => return Err(Error::Decode("messageQueue-keyed map is not an object".into())),
+        Some(_) => {
+            return Err(Error::Decode(
+                "messageQueue-keyed map is not an object".into(),
+            ))
+        }
     }
     if let Some(map) = raw.and_then(Value::as_object) {
         for (k, v) in map {
@@ -372,7 +379,12 @@ pub struct OffsetWrapper {
 }
 
 impl OffsetWrapper {
-    pub fn new(broker_offset: i64, consumer_offset: i64, last_timestamp: i64, pull_offset: i64) -> OffsetWrapper {
+    pub fn new(
+        broker_offset: i64,
+        consumer_offset: i64,
+        last_timestamp: i64,
+        pull_offset: i64,
+    ) -> OffsetWrapper {
         OffsetWrapper {
             broker_offset,
             consumer_offset,
@@ -486,7 +498,9 @@ impl TopicConfigSerializeWrapper {
         let mut table = Vec::new();
         for (k, v) in jentries(value, "topicConfigTable")? {
             if !v.is_object() {
-                return Err(Error::Decode(format!("topicConfigTable[{k}] is not an object")));
+                return Err(Error::Decode(format!(
+                    "topicConfigTable[{k}] is not an object"
+                )));
             }
             table.push((k.clone(), v.clone()));
         }
@@ -575,8 +589,14 @@ pub struct QueryConsumeQueueResponseBody {
 impl QueryConsumeQueueResponseBody {
     pub fn to_json_value(&self) -> Value {
         let mut map = Map::new();
-        map.insert("maxQueueIndex".to_string(), Value::from(self.max_queue_index));
-        map.insert("minQueueIndex".to_string(), Value::from(self.min_queue_index));
+        map.insert(
+            "maxQueueIndex".to_string(),
+            Value::from(self.max_queue_index),
+        );
+        map.insert(
+            "minQueueIndex".to_string(),
+            Value::from(self.min_queue_index),
+        );
         if let Some(v) = &self.subscription_data {
             map.insert("subscriptionData".to_string(), v.clone());
         }
@@ -644,7 +664,10 @@ pub struct ReplicaIdentity {
 impl ReplicaIdentity {
     pub fn to_json_value(&self) -> Value {
         let mut map = Map::new();
-        map.insert("brokerName".to_string(), Value::String(self.broker_name.clone()));
+        map.insert(
+            "brokerName".to_string(),
+            Value::String(self.broker_name.clone()),
+        );
         if let Some(id) = self.broker_id {
             map.insert("brokerId".to_string(), Value::from(id));
         }
@@ -696,7 +719,12 @@ impl ReplicasInfo {
         }
         map.insert(
             "inSyncReplicas".to_string(),
-            Value::Array(self.in_sync_replicas.iter().map(|r| r.to_json_value()).collect()),
+            Value::Array(
+                self.in_sync_replicas
+                    .iter()
+                    .map(|r| r.to_json_value())
+                    .collect(),
+            ),
         );
         map.insert(
             "notInSyncReplicas".to_string(),
@@ -761,7 +789,9 @@ impl BrokerReplicasInfo {
         for (name, raw) in jentries(value, "replicasInfoTable")? {
             table.push((name.clone(), ReplicasInfo::from_json_value(raw)?));
         }
-        Ok(BrokerReplicasInfo { replicas_info_table: table })
+        Ok(BrokerReplicasInfo {
+            replicas_info_table: table,
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -889,7 +919,10 @@ mod tests {
         assert_eq!(table.offset_table.len(), 1);
         assert_eq!(table.offset_table.len(), 1);
         let (mq, offset) = &table.offset_table[0];
-        assert_eq!((mq.topic.as_str(), mq.broker_name.as_str(), mq.queue_id), ("MyTopic", "broker-a", 3));
+        assert_eq!(
+            (mq.topic.as_str(), mq.broker_name.as_str(), mq.queue_id),
+            ("MyTopic", "broker-a", 3)
+        );
         assert_eq!(offset.min_offset, 0);
         assert_eq!(offset.max_offset, 500);
         assert_eq!(offset.last_update_timestamp, 1700000000000);
@@ -906,7 +939,10 @@ mod tests {
         assert_eq!(stats.consume_tps, 1.5);
         assert_eq!(stats.offset_table.len(), 1);
         let ow = &stats.offset_table[0].1;
-        assert_eq!((ow.broker_offset, ow.consumer_offset, ow.pull_offset), (100, 90, 0));
+        assert_eq!(
+            (ow.broker_offset, ow.consumer_offset, ow.pull_offset),
+            (100, 90, 0)
+        );
         assert_eq!(ow.last_timestamp, 1700000000000);
         assert_eq!(ow.lag(), 10);
         assert_eq!(stats.total_lag(), 10);

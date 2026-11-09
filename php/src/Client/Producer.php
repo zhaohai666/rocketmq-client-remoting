@@ -2913,9 +2913,16 @@ class DefaultMQProducer
         return MessageDecoder::decodeMessages($body);
     }
 
-    public function viewMessage(string $topic, string $msgId): never
+    /**
+     * Java DefaultMQProducerImpl#viewMessage parity (DefaultMQProducerImpl.java:517):
+     * the MQAdminImpl single-leg path — offset msgId only, decoded and asked
+     * VIEW_MESSAGE_BY_ID(33) on the broker that stamped it. A msgId that does
+     * not decode as an offset id surfaces the NO_MESSAGE client error (no
+     * uniq-key fallback at this layer).
+     */
+    public function viewMessage(string $topic, string $msgId): MessageExt
     {
-        throw new MQClientException('viewMessage by msgId is not supported in this edition');
+        return $this->requireClient()->viewMessage($topic, $msgId);
     }
 
     // ================================================================ Helpers

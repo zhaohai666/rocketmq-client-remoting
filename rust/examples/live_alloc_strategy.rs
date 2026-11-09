@@ -15,9 +15,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::allocate_strategy::{
-    AllocateMachineRoomNearby, AllocateMessageQueueAveragely, AllocateMessageQueueAveragelyByCircle,
-    AllocateMessageQueueByConfig, AllocateMessageQueueByMachineRoom,
-    AllocateMessageQueueConsistentHash, AllocateMessageQueueStrategy, MachineRoomResolver,
+    AllocateMachineRoomNearby, AllocateMessageQueueAveragely,
+    AllocateMessageQueueAveragelyByCircle, AllocateMessageQueueByConfig,
+    AllocateMessageQueueByMachineRoom, AllocateMessageQueueConsistentHash,
+    AllocateMessageQueueStrategy, MachineRoomResolver,
 };
 use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
@@ -52,22 +53,40 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
         if cond {
             self.passed += 1;
-            println!("  [PASS] {name}{}", if detail.is_empty() { String::new() } else { format!("  {detail}") });
+            println!(
+                "  [PASS] {name}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            );
         } else {
-            let label = format!("{name}{}", if detail.is_empty() { String::new() } else { format!("  {detail}") });
+            let label = format!(
+                "{name}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            );
             self.failed.push(label.clone());
             println!("  [FAIL] {label}");
         }
     }
 
     fn abort(&mut self, name: &str, detail: &str) {
-        self.failed.push(format!("{name} (prerequisite failed): {detail}"));
+        self.failed
+            .push(format!("{name} (prerequisite failed): {detail}"));
         println!("  [ABORT] {name}: {detail}");
     }
 }
@@ -104,7 +123,11 @@ fn bodies(msgs: &[MessageExt]) -> BTreeSet<String> {
 fn bodies_on(msgs: &[MessageExt], on_queues: &BTreeSet<String>) -> BTreeSet<String> {
     msgs.iter()
         .filter(|m| {
-            on_queues.contains(&format!("{}#{}", m.get_broker_name().unwrap_or_default(), m.queue_id))
+            on_queues.contains(&format!(
+                "{}#{}",
+                m.get_broker_name().unwrap_or_default(),
+                m.queue_id
+            ))
         })
         .map(|m| String::from_utf8_lossy(m.get_body()).into_owned())
         .collect()
@@ -259,7 +282,11 @@ impl Fixture {
     }
 
     /// Builds a lite consumer from group name + instance name (not subscribed, not started).
-    fn consumer(&self, group_kind: &str, instance: &str) -> Result<DefaultLitePullConsumer, String> {
+    fn consumer(
+        &self,
+        group_kind: &str,
+        instance: &str,
+    ) -> Result<DefaultLitePullConsumer, String> {
         let cfg = LitePullConsumerConfig {
             consumer_group: self.group_name(group_kind),
             name_server_addrs: vec![self.namesrv.clone()],
@@ -267,7 +294,8 @@ impl Fixture {
             poll_timeout_millis: 1000,
             ..Default::default()
         };
-        DefaultLitePullConsumer::with_config(cfg).map_err(|e| format!("{instance} build failed: {e}"))
+        DefaultLitePullConsumer::with_config(cfg)
+            .map_err(|e| format!("{instance} build failed: {e}"))
     }
 
     /// Sends TagA/TagB alternately (even indices TagA), body = `<topic>-<i:02>`.
@@ -375,15 +403,15 @@ async fn wait_until_prediction_converged(
     }
     let deadline = now_ms() + (secs as i64) * 1000;
     loop {
-        let live: Vec<BTreeSet<String>> = asserted.iter().map(|c| queue_keys(&c.assignment())).collect();
-        let matched = live.len() == expected.len()
-            && live.iter().zip(expected.iter()).all(|(l, e)| l == e);
+        let live: Vec<BTreeSet<String>> = asserted
+            .iter()
+            .map(|c| queue_keys(&c.assignment()))
+            .collect();
+        let matched =
+            live.len() == expected.len() && live.iter().zip(expected.iter()).all(|(l, e)| l == e);
         if matched || now_ms() >= deadline {
             let mut parts: Vec<String> = Vec::new();
-            for (c, (l, e)) in asserted
-                .iter()
-                .zip(live.iter().zip(expected.iter()))
-            {
+            for (c, (l, e)) in asserted.iter().zip(live.iter().zip(expected.iter())) {
                 parts.push(format!(
                     "cid={} live=[{}] predict=[{}]",
                     c.client_id(),
@@ -514,10 +542,7 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         .filter(|(_, mq)| ka.contains(&format!("{}#{}", mq.broker_name, mq.queue_id)))
         .map(|(i, _)| i)
         .collect();
-    let circle_shape = pos_a.len() == 2
-        && pos_a
-            .windows(2)
-            .all(|w| (w[1] - w[0]) % 2 == 0);
+    let circle_shape = pos_a.len() == 2 && pos_a.windows(2).all(|w| (w[1] - w[0]) % 2 == 0);
     ck.check(
         "A2 allocation shape is alternating (stride 2), not AVG's contiguous segments",
         all.len() != 4 || circle_shape,
@@ -561,8 +586,12 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
             return;
         }
     };
-    ca.set_allocate_message_queue_strategy(std::sync::Arc::new(AllocateMessageQueueByConfig::new(half_a.clone())));
-    cb.set_allocate_message_queue_strategy(std::sync::Arc::new(AllocateMessageQueueByConfig::new(half_b.clone())));
+    ca.set_allocate_message_queue_strategy(std::sync::Arc::new(AllocateMessageQueueByConfig::new(
+        half_a.clone(),
+    )));
+    cb.set_allocate_message_queue_strategy(std::sync::Arc::new(AllocateMessageQueueByConfig::new(
+        half_b.clone(),
+    )));
     for c in [&ca, &cb] {
         c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
         if let Err(e) = c.subscribe(topic, "*") {
@@ -626,14 +655,14 @@ async fn a3_config_halves(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Me
 async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
     let ch = std::sync::Arc::new(AllocateMessageQueueConsistentHash::new());
     let strategy: std::sync::Arc<dyn AllocateMessageQueueStrategy> = ch.clone();
-    let (ca, cb) = match pair_with_strategy(fx, "chash", &[strategy.clone(), strategy.clone()], topic)
-    {
-        Ok(p) => p,
-        Err(e) => {
-            ck.abort("A4 build", &e);
-            return;
-        }
-    };
+    let (ca, cb) =
+        match pair_with_strategy(fx, "chash", &[strategy.clone(), strategy.clone()], topic) {
+            Ok(p) => p,
+            Err(e) => {
+                ck.abort("A4 build", &e);
+                return;
+            }
+        };
     let got = ca.allocate_message_queue_strategy();
     ck.check(
         "A4 strategy name after replacement = CONSISTENT_HASH",
@@ -659,7 +688,11 @@ async fn a4_consistent_hash(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A4 live allocation converges to the consistent-hash ring's offline prediction", matched, &detail);
+    ck.check(
+        "A4 live allocation converges to the consistent-hash ring's offline prediction",
+        matched,
+        &detail,
+    );
     let qa = ca.assignment();
     let qb = cb.assignment();
     let ka = queue_keys(&qa);
@@ -695,9 +728,11 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
     let inner: std::sync::Arc<dyn AllocateMessageQueueStrategy> =
         std::sync::Arc::new(AllocateMessageQueueConsistentHash::new());
     let resolver = std::sync::Arc::new(OneRoom::new());
-    let nearby: std::sync::Arc<dyn AllocateMessageQueueStrategy> =
-        std::sync::Arc::new(AllocateMachineRoomNearby::new(inner.clone(), resolver.clone()));
-    let (ca, cb) = match pair_with_strategy(fx, "nearby", &[nearby.clone(), nearby.clone()], topic) {
+    let nearby: std::sync::Arc<dyn AllocateMessageQueueStrategy> = std::sync::Arc::new(
+        AllocateMachineRoomNearby::new(inner.clone(), resolver.clone()),
+    );
+    let (ca, cb) = match pair_with_strategy(fx, "nearby", &[nearby.clone(), nearby.clone()], topic)
+    {
         Ok(p) => p,
         Err(e) => {
             ck.abort("A5 build", &e);
@@ -730,7 +765,11 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A5 NEARBY's live allocation == the inner ring's offline prediction", matched, &detail);
+    ck.check(
+        "A5 NEARBY's live allocation == the inner ring's offline prediction",
+        matched,
+        &detail,
+    );
     let ka = queue_keys(&ca.assignment());
     let kb = queue_keys(&cb.assignment());
     let overlap: BTreeSet<String> = ka.intersection(&kb).cloned().collect();
@@ -746,12 +785,15 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
     let seen: BTreeSet<String> = broker_calls.iter().cloned().collect();
     let real_brokers: BTreeSet<String> = all.iter().map(|m| m.broker_name.clone()).collect();
     ck.check(
-        &format!("A5 resolver was asked for the machine room per queue ({} calls)", broker_calls.len()),
+        &format!(
+            "A5 resolver was asked for the machine room per queue ({} calls)",
+            broker_calls.len()
+        ),
         !broker_calls.is_empty() && seen == real_brokers,
         &format!("brokers={seen:?}"),
     );
-    let both_cids = consumer_calls.contains(&ca.client_id())
-        && consumer_calls.contains(&cb.client_id());
+    let both_cids =
+        consumer_calls.contains(&ca.client_id()) && consumer_calls.contains(&cb.client_id());
     ck.check(
         "A5 resolver was asked about both real clientIds",
         both_cids,
@@ -763,11 +805,17 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
 
 // ------------------------------------------------------------------ A6 machine room mismatch
 
-async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
+async fn a6_machine_room_starved(
+    ck: &mut Checker,
+    fx: &Fixture,
+    topic: &str,
+    all: &[MessageQueue],
+) {
     let room_strategy = AllocateMessageQueueByMachineRoom::new([ROOM]);
     ck.check(
         "A6 strategy name = MACHINE_ROOM and the whitelist reads back",
-        room_strategy.get_name() == "MACHINE_ROOM" && room_strategy.get_consumeridcs().contains(ROOM),
+        room_strategy.get_name() == "MACHINE_ROOM"
+            && room_strategy.get_consumeridcs().contains(ROOM),
         format!("idcs={:?}", room_strategy.get_consumeridcs()).as_str(),
     );
     let room: std::sync::Arc<dyn AllocateMessageQueueStrategy> = std::sync::Arc::new(room_strategy);
@@ -810,7 +858,11 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
         WAIT_SECONDS,
     )
     .await;
-    ck.check("A6 both sides' live allocations each converge to their own strategy's offline prediction", matched, &detail);
+    ck.check(
+        "A6 both sides' live allocations each converge to their own strategy's offline prediction",
+        matched,
+        &detail,
+    );
     let ga = drain_for(ck, &ca, 5).await;
     ck.check(
         "A6 the starved side polls no messages and raises no error",
@@ -848,7 +900,10 @@ async fn run(namesrv: &str) -> Checker {
     }
     let all = sorted_queues(route_queues(&fx, &topic).await);
     if all.len() != QUEUE_NUMS as usize {
-        ck.abort("route has fewer queues than expected", &format!("got {}", all.len()));
+        ck.abort(
+            "route has fewer queues than expected",
+            &format!("got {}", all.len()),
+        );
         fx.cleanup(&mut ck).await;
         return ck;
     }

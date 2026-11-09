@@ -1,4 +1,3 @@
-
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -22,15 +21,16 @@ pub fn monotonic_millis() -> f64 {
 }
 
 pub fn nano_time() -> u128 {
-    MONOTONIC_ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()
+    MONOTONIC_ORIGIN
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
 }
 
 pub fn java_string_hash(s: &str) -> i32 {
     let mut h: i32 = 0;
     for ch in s.chars() {
-        h = h
-            .wrapping_mul(31)
-            .wrapping_add(ch as u32 as i32);
+        h = h.wrapping_mul(31).wrapping_add(ch as u32 as i32);
     }
     h
 }
@@ -62,9 +62,11 @@ pub fn time_to_human_string(ts: i64) -> String {
     if ts <= 0 {
         return "-".to_string();
     }
-    chrono::DateTime::<chrono::Local>::from(UNIX_EPOCH + std::time::Duration::from_millis(ts as u64))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string()
+    chrono::DateTime::<chrono::Local>::from(
+        UNIX_EPOCH + std::time::Duration::from_millis(ts as u64),
+    )
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string()
 }
 
 pub fn is_blank(s: Option<&str>) -> bool {
@@ -107,7 +109,11 @@ fn crc32_table() -> &'static [u32; 256] {
         for (i, slot) in table.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             *slot = c;
         }
@@ -283,7 +289,10 @@ mod tests {
 
     #[test]
     fn addr_parsing() {
-        assert_eq!(parse_addr("127.0.0.1:9876"), ("127.0.0.1".into(), "9876".into()));
+        assert_eq!(
+            parse_addr("127.0.0.1:9876"),
+            ("127.0.0.1".into(), "9876".into())
+        );
         assert_eq!(parse_addr("[::1]:9876"), ("::1".into(), "9876".into()));
         assert!(is_ipv4("127.0.0.1"));
         assert!(!is_ipv4("::1"));
@@ -301,13 +310,22 @@ mod tests {
     fn uniq_id_shape_and_uniqueness() {
         let first = create_uniq_id();
         let second = create_uniq_id();
-        assert_ne!(first, second, "two consecutive calls in the same process must differ");
+        assert_ne!(
+            first, second,
+            "two consecutive calls in the same process must differ"
+        );
         // IPv4: IP(4)+PID(2)+hash(4)+dayMs(4)+counter(2) = 16B -> 32 uppercase hex chars
         if is_ipv4(&crate::common::mix_all::MixAll::get_ip_str()) {
-            assert_eq!(first.len(), 32, "length is always 32 under IPv4, got {first}");
+            assert_eq!(
+                first.len(),
+                32,
+                "length is always 32 under IPv4, got {first}"
+            );
         }
         assert!(
-            first.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
             "only uppercase hex allowed, got {first}"
         );
         // The last 4 chars are the auto-increment counter; the second is always the first plus 1

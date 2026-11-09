@@ -785,6 +785,17 @@ func (c *DefaultMQPullConsumer) requireClient() (*Instance, error) {
 	return c.instance, nil
 }
 
+// ViewMessage is Java DefaultMQPullConsumerImpl#viewMessage
+// (DefaultMQPullConsumerImpl.java:838) parity: the MQAdminImpl single-leg
+// path — offset msgId only, no uniq-key fallback at this layer.
+func (c *DefaultMQPullConsumer) ViewMessage(topic, msgID string) (*common.MessageExt, error) {
+	client, err := c.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.ViewMessage(topic, msgID, defaultViewMessageTimeoutMillis)
+}
+
 // Instance exposes the underlying client instance (diagnostics/tests).
 func (c *DefaultMQPullConsumer) Instance() *Instance {
 	c.mu.Lock()

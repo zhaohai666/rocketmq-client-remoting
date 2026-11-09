@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/client"
@@ -215,11 +216,16 @@ func main() {
 	// "found >= 1" would then be a much weaker statement).
 	key := fmt.Sprintf("adminkey-%d", stamp)
 	sent := 0
+	firstUniqKey := ""
 	for i := 0; i < seed; i++ {
 		m := common.NewMessage(*topic, []byte(fmt.Sprintf("admin-msg-%d", i)))
 		m.SetKeys(key)
-		if _, err := producer.Send(m); err != nil {
+		if sr, err := producer.Send(m); err != nil {
 			continue
+		} else if firstUniqKey == "" && sr != nil {
+			// The send's MsgID is the client UNIQ_KEY — the id the uniq-key
+			// fallback of ViewMessage resolves by.
+			firstUniqKey = sr.MsgID
 		}
 		sent++
 	}
@@ -316,6 +322,20 @@ func main() {
 				vm != nil && bytes.Equal(vm.Body, msgs[0].Body),
 				fmt.Sprintf("want=%q got=%q", msgs[0].Body, vm.Body))
 		}
+	}
+
+	// viewMessage(uniqKey): the send's MsgID is the client UNIQ_KEY (it does not
+	// decode to an offset), so the admin takes the uniq-key fallback and must
+	// fetch one of the seeded messages back.
+	if vm2, err := admin.ViewMessage(*topic, firstUniqKey); err != nil {
+		check("viewMessage(uniqKey) fallback fetches a message", false, err.Error())
+	} else if vm2 == nil {
+		check("viewMessage(uniqKey) fallback fetches a message", false,
+			"no match (client-visible id filter failed)")
+	} else {
+		check("viewMessage(uniqKey) fallback fetches a message",
+			strings.HasPrefix(string(vm2.Body), "admin-msg-"),
+			fmt.Sprintf("body=%q", vm2.Body))
 	}
 
 	// ---- 9. teardown: delete topic + group, then prove the topic is gone -------

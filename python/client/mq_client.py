@@ -1429,7 +1429,14 @@ class MQClientInstance:
             for m in decode_messages(body):
                 m.broker_name = broker_data.broker_name
                 if uniq_key:
-                    if m.msg_id == key:
+                    # Java decodes query results as MessageClientExt, whose
+                    # getMsgId() returns the UNIQ_KEY property (offset id only as
+                    # fallback) — the client-visible id the hit is verified
+                    # against. The python decoder keeps msg_id = offset id, so
+                    # resolve the client-visible id here (csharp does the same
+                    # swap inside its decoder; node verifies the property).
+                    visible = m.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) or m.msg_id
+                    if visible == key:
                         messages.append(m)
                 else:
                     keys = m.get_keys()
@@ -1440,6 +1447,42 @@ class MQClientInstance:
                                 break
         messages.sort(key=lambda x: (x.queue_offset or 0))
         return messages[:max_num] if max_num > 0 else messages
+
+    def view_message(self, topic: str, msg_id: str, timeout_millis: int = 6000,
+                     vip_channel_enabled: bool = False) -> MessageExt:
+        """Java ``MQAdminImpl#viewMessage(topic, msgId)`` parity (MQAdminImpl.java:267).
+
+        A SINGLE leg: decode the ``ip:port:offset`` msgId and ask THAT broker
+        ``VIEW_MESSAGE_BY_ID(33)`` directly -- the only id that encodes the
+        broker address and the commitlog offset. A decode failure maps to the
+        ``NO_MESSAGE`` client error Java raises there; every other leg failure
+        surfaces as-is.
+
+        The uniq-key fallback is NOT part of this layer -- it belongs to the
+        admin facade only (``DefaultMQAdminExtImpl#viewMessage``, see
+        ``Admin.view_message``), while the producer / push / pull facades ride
+        this single-leg path in Java. ``timeout_millis`` defaults to
+        ``MQAdminImpl``'s own RPC budget (MQAdminImpl.java:67, 6000).
+        """
+        from common.message_decoder import decode_message_id
+        try:
+            ip, port, offset = decode_message_id(msg_id)
+        except Exception as e:  # noqa: BLE001
+            raise MQClientException("query message by id finished, but no message.", None, e) from e
+        if not 0 < port <= 65535:
+            raise MQClientException("not a valid offset msgId: %s" % msg_id)
+        # The address is the store host:port the broker stamped into the offset
+        # msgId -- a broker address, so the VIP-channel rewrite applies to it
+        # like to any other query request.
+        addr = MixAll.broker_vip_channel(vip_channel_enabled, "%s:%d" % (ip, port))
+        request = RemotingCommand.create_request_command(RequestCode.VIEW_MESSAGE_BY_ID, None)
+        request.ext_fields["topic"] = topic
+        request.ext_fields["offset"] = str(offset)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+        if response.body:
+            return decode_message(response.body)
+        raise MQBrokerException(ResponseCode.NO_MESSAGE, "message not found: %s" % msg_id)
 
     # ---------------- queue lock (orderly consumption) ----------------
 

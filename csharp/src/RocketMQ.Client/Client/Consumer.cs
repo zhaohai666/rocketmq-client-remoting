@@ -2086,6 +2086,14 @@ public sealed class DefaultMQPushConsumer
         return _mqClient;
     }
 
+    /// <summary>
+    /// Java DefaultMQPushConsumerImpl#viewMessage parity
+    /// (DefaultMQPushConsumerImpl.java:1329): the MQAdminImpl single-leg path —
+    /// offset msgId only, no uniq-key fallback at this layer.
+    /// </summary>
+    public MessageExt ViewMessage(string topic, string msgId) =>
+        Client().ViewMessage(topic, msgId);
+
     // ---------------- Consume loops ----------------
     private bool IsOrderly() => _messageListener is not null && _messageListener.Orderly();
 

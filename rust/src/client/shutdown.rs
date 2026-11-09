@@ -133,7 +133,10 @@ mod tests {
             flag.store(true, Ordering::Release);
         });
         assert!(ok);
-        assert!(done.load(Ordering::Acquire), "must have completed by the time we return");
+        assert!(
+            done.load(Ordering::Acquire),
+            "must have completed by the time we return"
+        );
     }
 
     /// Over budget: returns `false` (with a warning), but finalization is not cut off --
@@ -150,7 +153,10 @@ mod tests {
         });
         assert!(!ok);
         assert!(start.elapsed() >= Duration::from_millis(50));
-        assert!(!done.load(Ordering::Acquire), "should not have completed within the budget");
+        assert!(
+            !done.load(Ordering::Acquire),
+            "should not have completed within the budget"
+        );
         // Finalization was not cancelled: wait one beat and it can be seen wrapping up.
         for _ in 0..100 {
             if done.load(Ordering::Acquire) {
@@ -158,7 +164,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(done.load(Ordering::Acquire), "timeout only gives up the wait, it does not cancel");
+        assert!(
+            done.load(Ordering::Acquire),
+            "timeout only gives up the wait, it does not cancel"
+        );
     }
 
     /// Calling thread is not inside any runtime (plain std thread): blocks directly until done.

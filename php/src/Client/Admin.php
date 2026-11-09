@@ -2295,9 +2295,9 @@ class DefaultMQAdminExt
     /**
      * Query messages by uniqKey: indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true".
      *
-     * Note: the broker-side uniqKey index is only supported by the RocksDB index
-     * implementation (IndexRocksDBStore); under the default file index this query may
-     * return empty, which is a broker configuration difference rather than a client issue.
+     * The broker-side U-index query walks the commitlog directly (UNIQUE index
+     * type), so it hits on the default file index too; a miss here is a real
+     * no-match, not a broker configuration difference.
      */
     public function queryMessageByUniqKey(string $topic, string $uniqKey): ?MessageExt
     {
@@ -2331,55 +2331,21 @@ class DefaultMQAdminExt
     }
 
     /**
-     * View a single message.
-     *
-     * First decode the broker address + commitLog offset from offsetMsgId and go through
-     * VIEW_MESSAGE_BY_ID, falling back to the UNIQ_KEY index on **any** failure. This
-     * fallback must be kept: a 5.x client's msgId is a client-generated uniqKey, also 32
-     * hex digits, so hard-decoding would assemble a nonexistent ip:port
-     * (a port beyond 16 bits is not a valid offsetMsgId; it is validated here and the
-     * fallback is taken, without throwing the exception to the caller and breaking the exception contract).
+     * Java DefaultMQAdminExtImpl#viewMessage parity (DefaultMQAdminExtImpl.java:578):
+     * try the offset-msgId leg first, and when it fails for any reason (the msgId
+     * "maybe created by new client") fall back to the UNIQ_KEY index across
+     * brokers. When neither leg matches, Java returns null here instead of
+     * raising — so does this method. (The single-leg core the producer / push /
+     * pull facades share is MQClientInstance::viewMessage.)
      */
-    public function viewMessage(string $topic, string $msgId): MessageExt
+    public function viewMessage(string $topic, string $msgId): ?MessageExt
     {
-        $byIdError = null;
         try {
-            [$ip, $port, $offset] = MessageDecoder::decodeMessageId($msgId);
-            if (!($port > 0 && $port <= 65535)) {
-                throw new MQClientException(sprintf('not a valid offset msgId: %s', $msgId));
-            }
-            $response = $this->invokeBroker(
-                sprintf('%s:%d', $ip, $port),
-                RequestCode::VIEW_MESSAGE_BY_ID,
-                ['topic' => $topic, 'offset' => (string) $offset],
-            );
-            if ($response->body !== null && $response->body !== '') {
-                $msg = MessageDecoder::decodeMessage($response->body);
-                if ($msg !== null) {
-                    return $msg;
-                }
-                $byIdError = new MQBrokerException(ResponseCode::NO_MESSAGE, sprintf('message not found: %s', $msgId));
-            } else {
-                $byIdError = new MQBrokerException(ResponseCode::NO_MESSAGE, sprintf('message not found: %s', $msgId));
-            }
-        } catch (\Throwable $e) {
-            // Only record the error and take the uniqKey fallback
-            $byIdError = $e;
+            return $this->requireClient()->viewMessage($topic, $msgId, $this->timeoutMillis);
+        } catch (\Throwable) {
+            // The offset-msgId leg failed — the uniq-key leg decides.
         }
-
-        $found = $this->queryMessageByUniqKey($topic, $msgId);
-        if ($found !== null) {
-            return $found;
-        }
-        throw new MQClientException(
-            sprintf(
-                'viewMessage failed: neither offset msgId nor uniq key matched message %s of %s',
-                $msgId,
-                $topic,
-            ),
-            ResponseCode::NO_MESSAGE,
-            $byIdError,
-        );
+        return $this->queryMessageByUniqKey($topic, $msgId);
     }
 
     public function consumeMessageDirectly(
@@ -2393,6 +2359,11 @@ class DefaultMQAdminExt
         $outMsgId = $msgId;
         if ($addr === null || $addr === '') {
             $msg = $this->viewMessage($topic, $msgId);
+            // Java dereferences the viewMessage null unguarded here (a latent
+            // NPE); fail with a clear client error instead.
+            if ($msg === null) {
+                throw new MQClientException(sprintf('message %s of %s not found', $msgId, $topic));
+            }
             $addr = $msg->getStoreHostString();
             $uniqKey = $msg->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
             if ($uniqKey !== null && $msg->getOffsetMsgId() !== null) {

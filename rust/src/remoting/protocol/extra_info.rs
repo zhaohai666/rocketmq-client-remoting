@@ -89,10 +89,7 @@ pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
 /// since an empty tail is not a topic name, and any name built on a different group, since
 /// this consumer has no business rewriting another group's retry queue.
 pub fn parse_pop_normal_topic(topic: &str, cid: &str) -> String {
-    if topic.is_empty()
-        || cid.is_empty()
-        || !topic.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX)
-    {
+    if topic.is_empty() || cid.is_empty() || !topic.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX) {
         return topic.to_string();
     }
     let head = format!("{}{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, cid);
@@ -502,10 +499,7 @@ mod tests {
         assert_eq!(parse_pop_normal_topic("%RETRY%GID+Topic", "GID"), "Topic");
         // The '+' right after the group is the separator, so a topic carrying an
         // underscore is read whole instead of being cut at its first '_'.
-        assert_eq!(
-            parse_pop_normal_topic("%RETRY%GID+A_B", "GID"),
-            "A_B"
-        );
+        assert_eq!(parse_pop_normal_topic("%RETRY%GID+A_B", "GID"), "A_B");
         // Nothing after the separator is not a topic name, so the retry name stays.
         assert_eq!(parse_pop_normal_topic("%RETRY%GID_", "GID"), "%RETRY%GID_");
         assert_eq!(parse_pop_normal_topic("%RETRY%GID+", "GID"), "%RETRY%GID+");
@@ -517,7 +511,10 @@ mod tests {
         );
         assert_eq!(parse_pop_normal_topic("Topic", "GID"), "Topic");
         assert_eq!(parse_pop_normal_topic("", "GID"), "");
-        assert_eq!(parse_pop_normal_topic("%RETRY%GID_Topic", ""), "%RETRY%GID_Topic");
+        assert_eq!(
+            parse_pop_normal_topic("%RETRY%GID_Topic", ""),
+            "%RETRY%GID_Topic"
+        );
     }
 
     #[test]

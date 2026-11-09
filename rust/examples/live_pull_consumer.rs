@@ -33,9 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
-use rocketmq_client_remoting::client::pull_consumer::{
-    DefaultMQPullConsumer, PullConsumerConfig,
-};
+use rocketmq_client_remoting::client::pull_consumer::{DefaultMQPullConsumer, PullConsumerConfig};
 use rocketmq_client_remoting::client::result::{PullResult, PullStatus};
 use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueue};
 use rocketmq_client_remoting::common::mix_all::MixAll;
@@ -277,14 +275,22 @@ async fn p1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         }
     };
     match bare.start().await {
-        Ok(()) => ck.check("P1 start fails when no name server is configured", false, "start unexpectedly succeeded"),
+        Ok(()) => ck.check(
+            "P1 start fails when no name server is configured",
+            false,
+            "start unexpectedly succeeded",
+        ),
         Err(e) => ck.check(
             "P1 start fails when no name server is configured",
             e.to_string().contains("name server address is not set"),
             &e.to_string(),
         ),
     }
-    ck.check("P1 no started state left over after the failure", !bare.is_started(), "");
+    ck.check(
+        "P1 no started state left over after the failure",
+        !bare.is_started(),
+        "",
+    );
 
     let c = match fx.consumer("life") {
         Ok(c) => c,
@@ -312,7 +318,11 @@ async fn p1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         return;
     }
     ck.check("P1 is_started after start", c.is_started(), "");
-    ck.check("P1 a repeated start is idempotent", c.start().await.is_ok(), "");
+    ck.check(
+        "P1 a repeated start is idempotent",
+        c.start().await.is_ok(),
+        "",
+    );
     let client_id = c.client_id();
     ck.check(
         "P1 start mints the client_id on the spot (localIP@instanceName, buildMQClientId semantics)",
@@ -323,14 +333,24 @@ async fn p1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     );
     ck.check(
         "P1 the default topic route is fetchable after start",
-        c.fetch_subscribe_message_queues(MixAll::DEFAULT_TOPIC).await.is_ok(),
+        c.fetch_subscribe_message_queues(MixAll::DEFAULT_TOPIC)
+            .await
+            .is_ok(),
         "",
     );
     c.shutdown();
     c.shutdown();
-    ck.check("P1 shutdown is idempotent and does not panic", !c.is_started(), "");
+    ck.check(
+        "P1 shutdown is idempotent and does not panic",
+        !c.is_started(),
+        "",
+    );
     match c.pull(&mq, "*", 0, 1, Some(100)).await {
-        Ok(r) => ck.check("P1 pulling after shutdown errors again", false, &describe(&r)),
+        Ok(r) => ck.check(
+            "P1 pulling after shutdown errors again",
+            false,
+            &describe(&r),
+        ),
         Err(e) => ck.check(
             "P1 pulling after shutdown errors again",
             e.to_string().contains("consumer not started"),
@@ -361,8 +381,7 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
     );
     ck.check(
         "P2 queue topic/broker match the created topic",
-        mqs.iter().all(|m| m.topic == topic)
-            && mqs.iter().all(|m| m.broker_name == fx.broker_name),
+        mqs.iter().all(|m| m.topic == topic) && mqs.iter().all(|m| m.broker_name == fx.broker_name),
         &format!("{mqs:?}"),
     );
     let ids: BTreeSet<i32> = mqs.iter().map(|m| m.queue_id).collect();
@@ -400,8 +419,7 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
     );
     ck.check(
         "P2b the balance view is a subset of this topic's subscription view",
-        mine
-            .iter()
+        mine.iter()
             .all(|m| m.topic == topic && m.broker_name == fx.broker_name),
         &format!("{mine:?}"),
     );
@@ -516,7 +534,10 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
         got.iter().all(|m| m.get_tags() == Some(TAG))
             && got.iter().all(|m| m.reconsume_times == 0)
             && got.iter().all(|m| m.queue_offset >= 0),
-        &format!("{:?}", got.first().map(|m| (m.get_tags(), m.reconsume_times))),
+        &format!(
+            "{:?}",
+            got.first().map(|m| (m.get_tags(), m.reconsume_times))
+        ),
     );
 
     // ---------------- P5 commit offsets and read them back
@@ -529,7 +550,10 @@ async fn p4_pull_all(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Message
             c.shutdown();
             return;
         }
-        readback.push((mq.queue_id, c.fetch_consume_offset(mq).await.unwrap_or(None)));
+        readback.push((
+            mq.queue_id,
+            c.fetch_consume_offset(mq).await.unwrap_or(None),
+        ));
     }
     let consistent = mqs.iter().all(|mq| {
         let want = next.get(&mq.queue_id).copied().unwrap_or(0);
@@ -731,7 +755,11 @@ async fn p9_send_back(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQueue]) {
     let mut got: Vec<MessageExt> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        for rmq in c.fetch_subscribe_message_queues(&retry_topic).await.unwrap_or_default() {
+        for rmq in c
+            .fetch_subscribe_message_queues(&retry_topic)
+            .await
+            .unwrap_or_default()
+        {
             let rmin = c.min_offset(&rmq).await.unwrap_or(0);
             let rmax = c.max_offset(&rmq).await.unwrap_or(0);
             if rmax > rmin {
@@ -782,7 +810,11 @@ async fn p10_consumer_create_topic(ck: &mut Checker, fx: &Fixture) {
             min == 0 && max == 0,
             &format!("min={min} max={max}"),
         ),
-        _ => ck.check("P10 the new topic's queues answer min/max offset queries", false, "the RPC failed"),
+        _ => ck.check(
+            "P10 the new topic's queues answer min/max offset queries",
+            false,
+            "the RPC failed",
+        ),
     }
     c.shutdown();
 }

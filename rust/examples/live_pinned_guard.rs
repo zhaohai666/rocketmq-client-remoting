@@ -16,9 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
 use rocketmq_client_remoting::client::consumer::{ConsumerConfig, DefaultMQPushConsumer};
-use rocketmq_client_remoting::client::producer::{
-    DefaultMQProducer, ProducerConfig, SendCallback,
-};
+use rocketmq_client_remoting::client::producer::{DefaultMQProducer, ProducerConfig, SendCallback};
 use rocketmq_client_remoting::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, MessageListenerConcurrently, SendResult,
     SendStatus,
@@ -46,7 +44,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -129,7 +130,9 @@ struct KeySink {
 
 impl KeySink {
     fn new() -> Arc<KeySink> {
-        Arc::new(KeySink { keys: Mutex::new(Vec::new()) })
+        Arc::new(KeySink {
+            keys: Mutex::new(Vec::new()),
+        })
     }
 
     fn snapshot(&self) -> Vec<String> {
@@ -209,7 +212,10 @@ impl Env {
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("cluster probe", "nameServer returned no broker within the budget");
+                ck.abort(
+                    "cluster probe",
+                    "nameServer returned no broker within the budget",
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -399,7 +405,10 @@ async fn run(namesrv: &str) -> Checker {
     sb1.set_keys(&k_b1);
     let mut sb2 = Message::new(&topic_a, Some(b"s1-b2"));
     sb2.set_keys(&k_b2);
-    match producer.send_batch(vec![sb1, sb2], Some(&mq_a), Some(5_000)).await {
+    match producer
+        .send_batch(vec![sb1, sb2], Some(&mq_a), Some(5_000))
+        .await
+    {
         Ok(r) => {
             let same = r
                 .message_queue
@@ -429,7 +438,11 @@ async fn run(namesrv: &str) -> Checker {
     let began = Instant::now();
     let single = producer.send(&mut r1, Some(5_000), Some(&mq_b)).await;
     let single_ms = began.elapsed().as_secs_f64() * 1000.0;
-    let single_msg = single.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    let single_msg = single
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "S2a sync single refusal (message text matches verbatim)",
         single.is_err() && single_msg.contains(SYNC_WORDING),
@@ -443,9 +456,15 @@ async fn run(namesrv: &str) -> Checker {
     let rb1 = Message::new(&topic_a, Some(b"r1"));
     let rb2 = Message::new(&topic_a, Some(b"r2"));
     let began = Instant::now();
-    let batch = producer.send_batch(vec![rb1, rb2], Some(&mq_b), Some(5_000)).await;
+    let batch = producer
+        .send_batch(vec![rb1, rb2], Some(&mq_b), Some(5_000))
+        .await;
     let batch_ms = began.elapsed().as_secs_f64() * 1000.0;
-    let batch_msg = batch.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    let batch_msg = batch
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "S2c sync batch shares the same guard and the same message text",
         batch.is_err() && batch_msg.contains(SYNC_WORDING) && batch_ms < LOCAL_BUDGET_MS,
@@ -510,7 +529,11 @@ async fn run(namesrv: &str) -> Checker {
     let began = Instant::now();
     let ns2 = nsprod.send(&mut n3, Some(5_000), Some(&ns2_mq)).await;
     let ns2_ms = began.elapsed().as_secs_f64() * 1000.0;
-    let ns2_msg = ns2.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    let ns2_msg = ns2
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "S3d refused only when the prefix changes to ns2% (control leg: what is refused is the name, not merely having a prefix)",
         ns2.is_err() && ns2_msg.contains(SYNC_WORDING) && ns2_ms < LOCAL_BUDGET_MS,
@@ -528,7 +551,8 @@ async fn run(namesrv: &str) -> Checker {
     let refused_latch = Latch::new();
     let mut ar = Message::new(&topic_a, Some(b"async-refused"));
     ar.set_keys(&format!("pinned-async-refused-{stamp}"));
-    if let Err(e) = producer.send_async(ar, refused_latch.clone(), Some(5_000), Some(mq_b.clone())) {
+    if let Err(e) = producer.send_async(ar, refused_latch.clone(), Some(5_000), Some(mq_b.clone()))
+    {
         ck.abort("S4a the async call itself must not throw", &e.to_string());
     }
     let got = refused_latch.wait(10).await;
@@ -554,7 +578,10 @@ async fn run(namesrv: &str) -> Checker {
         Some(5_000),
         Some(mq_b.clone()),
     ) {
-        ck.abort("S4c the batch async call itself must not throw", &e.to_string());
+        ck.abort(
+            "S4c the batch async call itself must not throw",
+            &e.to_string(),
+        );
     }
     let got = batch_refused.wait(10).await;
     let errs = batch_refused.errors();

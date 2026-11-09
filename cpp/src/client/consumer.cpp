@@ -4199,6 +4199,11 @@ std::vector<MessageQueue> DefaultMQPushConsumer::fetchSubscribeMessageQueues(
     return c.getTopicSubscribeInfo(topic);
 }
 
+// Java DefaultMQPushConsumerImpl#viewMessage: the MQAdminImpl single leg (see consumer.h).
+MessageExt DefaultMQPushConsumer::viewMessage(const std::string& topic, const std::string& msgId) {
+    return client().viewMessage(topic, msgId);
+}
+
 int32_t DefaultMQPushConsumer::maxReconsumeTimesOrDefault() const {
     // -1 means the broker default retryMaxTimes = 16
     return maxReconsumeTimes_ == -1 ? 16 : maxReconsumeTimes_;

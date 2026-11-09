@@ -174,31 +174,74 @@ const MD5_SHIFTS: [u32; 64] = [
 
 /// `K[i] = floor(abs(sin(i + 1)) * 2^32)` (the table from RFC 1321 §3.4).
 const MD5_K: [u32; 64] = [
-    0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, //
-    0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501, //
-    0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be, //
-    0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821, //
-    0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa, //
-    0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8, //
-    0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed, //
-    0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a, //
-    0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c, //
-    0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70, //
-    0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05, //
-    0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665, //
-    0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039, //
-    0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1, //
-    0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1, //
-    0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391, //
+    0xd76a_a478,
+    0xe8c7_b756,
+    0x2420_70db,
+    0xc1bd_ceee, //
+    0xf57c_0faf,
+    0x4787_c62a,
+    0xa830_4613,
+    0xfd46_9501, //
+    0x6980_98d8,
+    0x8b44_f7af,
+    0xffff_5bb1,
+    0x895c_d7be, //
+    0x6b90_1122,
+    0xfd98_7193,
+    0xa679_438e,
+    0x49b4_0821, //
+    0xf61e_2562,
+    0xc040_b340,
+    0x265e_5a51,
+    0xe9b6_c7aa, //
+    0xd62f_105d,
+    0x0244_1453,
+    0xd8a1_e681,
+    0xe7d3_fbc8, //
+    0x21e1_cde6,
+    0xc337_07d6,
+    0xf4d5_0d87,
+    0x455a_14ed, //
+    0xa9e3_e905,
+    0xfcef_a3f8,
+    0x676f_02d9,
+    0x8d2a_4c8a, //
+    0xfffa_3942,
+    0x8771_f681,
+    0x6d9d_6122,
+    0xfde5_380c, //
+    0xa4be_ea44,
+    0x4bde_cfa9,
+    0xf6bb_4b60,
+    0xbebf_bc70, //
+    0x289b_7ec6,
+    0xeaa1_27fa,
+    0xd4ef_3085,
+    0x0488_1d05, //
+    0xd9d4_d039,
+    0xe6db_99e5,
+    0x1fa2_7cf8,
+    0xc4ac_5665, //
+    0xf429_2244,
+    0x432a_ff97,
+    0xab94_23a7,
+    0xfc93_a039, //
+    0x655b_59c3,
+    0x8f0c_cc92,
+    0xffef_f47d,
+    0x8584_5dd1, //
+    0x6fa8_7e4f,
+    0xfe2c_e6e0,
+    0xa301_4314,
+    0x4e08_11a1, //
+    0xf753_7e82,
+    0xbd3a_f235,
+    0x2ad7_d2bb,
+    0xeb86_d391, //
 ];
 
 fn md5(input: &[u8]) -> [u8; 16] {
-    let mut state = [
-        0x6745_2301u32,
-        0xefcd_ab89,
-        0x98ba_dcfe,
-        0x1032_5476,
-    ];
+    let mut state = [0x6745_2301u32, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
 
     // Padding: 0x80 + some 0x00 bytes to bring the length to ≡56 (mod 64), then append the 8-byte little-endian bit length.
     let bit_len = (input.len() as u64).wrapping_mul(8);
@@ -262,7 +305,10 @@ mod tests {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(md5_hex(b"a"), "0cc175b9c0f1b6a831c399e269772661");
         assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(
+            md5_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
         assert_eq!(
             md5_hex(b"abcdefghijklmnopqrstuvwxyz"),
             "c3fcd3d76192e4007dfb496cca67e13b"
@@ -288,16 +334,26 @@ mod tests {
     fn ring_md5_hash_takes_only_the_first_four_bytes() {
         assert_eq!(Md5Hash.hash(""), 0xd41d_8cd9);
         assert_eq!(Md5Hash.hash("abc"), 0x9001_5098);
-        assert_eq!(Md5Hash.hash("abc") >> 32, 0, "the result must fit in 32 bits (only 4 bytes taken)");
+        assert_eq!(
+            Md5Hash.hash("abc") >> 32,
+            0,
+            "the result must fit in 32 bits (only 4 bytes taken)"
+        );
     }
 
     #[test]
     fn ring_routes_to_the_clockwise_neighbour_and_wraps_around() {
-        let nodes: Vec<Arc<dyn Node>> =
-            vec![Arc::new(ClientNode::new("n0")), Arc::new(ClientNode::new("n1"))];
+        let nodes: Vec<Arc<dyn Node>> = vec![
+            Arc::new(ClientNode::new("n0")),
+            Arc::new(ClientNode::new("n1")),
+        ];
         let router = ConsistentHashRouter::new(&nodes, 5).unwrap();
         // The same key always lands on the same node (the stability premise of the strategy)
-        for key in ["MessageQueue [topic=t, brokerName=b, queueId=0]", "k", "另一个"] {
+        for key in [
+            "MessageQueue [topic=t, brokerName=b, queueId=0]",
+            "k",
+            "另一个",
+        ] {
             let first = router.route_node(key).unwrap().get_key().to_string();
             for _ in 0..3 {
                 assert_eq!(router.route_node(key).unwrap().get_key(), first, "{key}");
@@ -306,12 +362,20 @@ mod tests {
         // Wrap-around branch: a node must always be found on the ring, and both nodes get routed to (10 virtual nodes are dense enough)
         let mut seen: Vec<String> = Vec::new();
         for i in 0..64 {
-            let routed = router.route_node(&format!("queue-{i}")).unwrap().get_key().to_string();
+            let routed = router
+                .route_node(&format!("queue-{i}"))
+                .unwrap()
+                .get_key()
+                .to_string();
             if !seen.contains(&routed) {
                 seen.push(routed);
             }
         }
-        assert_eq!(seen.len(), 2, "both physical nodes must be routed to: {seen:?}");
+        assert_eq!(
+            seen.len(),
+            2,
+            "both physical nodes must be routed to: {seen:?}"
+        );
     }
 
     #[test]
@@ -323,7 +387,10 @@ mod tests {
     #[test]
     fn negative_virtual_node_count_is_rejected() {
         let nodes: Vec<Arc<dyn Node>> = vec![Arc::new(ClientNode::new("a"))];
-        assert!(ConsistentHashRouter::new(&[], -1).is_ok(), "an empty node set does not trigger the check");
+        assert!(
+            ConsistentHashRouter::new(&[], -1).is_ok(),
+            "an empty node set does not trigger the check"
+        );
         let err = ConsistentHashRouter::new(&nodes, -1).expect_err("must be rejected");
         assert!(
             err.to_string().contains("illegal virtual node counts :-1"),
@@ -339,15 +406,21 @@ mod tests {
         assert_eq!(router.get_existing_replicas(&node), 3);
         router.add_node(&node, 2).unwrap();
         assert_eq!(router.get_existing_replicas(&node), 5);
-        assert_eq!(router.ring.len(), 5, "5 virtual nodes must occupy 5 distinct hashes");
+        assert_eq!(
+            router.ring.len(),
+            5,
+            "5 virtual nodes must occupy 5 distinct hashes"
+        );
     }
 
     #[test]
     fn remove_node_drops_only_that_physical_node() {
         let a = ClientNode::new("a");
         let b = ClientNode::new("b");
-        let nodes: Vec<Arc<dyn Node>> =
-            vec![Arc::new(ClientNode::new("a")), Arc::new(ClientNode::new("b"))];
+        let nodes: Vec<Arc<dyn Node>> = vec![
+            Arc::new(ClientNode::new("a")),
+            Arc::new(ClientNode::new("b")),
+        ];
         let mut router = ConsistentHashRouter::new(&nodes, 4).unwrap();
         router.remove_node(&a);
         assert_eq!(router.get_existing_replicas(&a), 0);
@@ -364,8 +437,10 @@ mod tests {
                 key.bytes().next().unwrap_or(0) as i64
             }
         }
-        let nodes: Vec<Arc<dyn Node>> =
-            vec![Arc::new(ClientNode::new("aaa")), Arc::new(ClientNode::new("bbb"))];
+        let nodes: Vec<Arc<dyn Node>> = vec![
+            Arc::new(ClientNode::new("aaa")),
+            Arc::new(ClientNode::new("bbb")),
+        ];
         let router =
             ConsistentHashRouter::with_hash_function(&nodes, 1, Arc::new(FirstByte)).unwrap();
         // "a"(97) and "b"(98) each take one slot; "c"(99) goes past the end → wraps to the node with the smallest hash

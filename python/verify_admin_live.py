@@ -10,7 +10,6 @@ from client.admin import DefaultMQAdminExt
 from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
 from client.producer import DefaultMQProducer
 from client.consumer_result import ConsumeConcurrentlyStatus
-from client.exception import MQClientException
 from common.message import Message, MessageQueue
 from common.mix_all import MixAll
 from remoting.protocol.heartbeat import ConsumeFromWhere
@@ -224,12 +223,10 @@ def main():
               lambda: admin.query_consume_queue(broker_addr, TOPIC, 0, 0, 10, GROUP),
               lambda r: "min=%d max=%d" % (r.min_queue_index, r.max_queue_index))
 
-    # queryMessage: only assert that "the request is reachable, the broker replies normally and the
-    # return type is correct". It deliberately does not assert "it must be found": msgId belongs to
-    # uniqKey, and on the broker side the uniqKey inverted index is only supported by the RocksDB
-    # index implementation (IndexRocksDBStore); the local broker uses the default file index and
-    # the messages do not set KEYS explicitly, so finding nothing is a **broker configuration
-    # difference**, not a client bug.
+    # queryMessage: the request must be reachable and reply normally. The KEYS
+    # queries walk the broker's index file and the messages sent here set no
+    # KEYS, so zero hits is expected there. The UNIQ query walks the broker's
+    # commitlog by the UNIQUE index type and must fetch the message back.
     body0, msg_id0, mq0 = sent[0]
     now_ms = int(time.time() * 1000)
     qm_ok, qm_detail = True, ""
@@ -244,8 +241,11 @@ def main():
         qm_ok = False
         qm_detail = "%s: %s" % (type(e).__name__, e)
     check("the queryMessage request is reachable and replies normally", qm_ok, qm_detail)
-    skip("queryMessage hit results (requires the broker to enable the RocksDB/KEYS index)",
-         "the local broker uses the default file index and the messages have no KEYS, so an empty uniqKey query result is expected")
+    check("queryMessageByUniqKey fetches the message back",
+          res_uniq is not None and res_uniq.body == body0,
+          "no match" if res_uniq is None else "body=%s" % (res_uniq.body[:32],))
+    skip("queryMessage KEYS hits",
+         "the messages sent here set no KEYS, so zero KEYS-query hits is expected (the uniq query above must hit)")
 
     # viewMessage by offsetMsgId (only this one encodes the broker address + commitLog offset)
     vm = safe("viewMessage(byOffsetMsgId)",
@@ -256,15 +256,15 @@ def main():
         check("the viewMessage body matches what was sent", vm.body == body0,
               "expected %r, actual %r" % (body0, vm.body))
 
-    try:
-        admin.view_message(TOPIC, msg_id0)
-        check("viewMessage(uniqKey) falls back and gives a clean exception", False, "no exception was raised")
-    except MQClientException as e:
-        check("viewMessage(uniqKey) falls back and gives a clean exception", True,
-              "code=%s" % e.response_code)
-    except Exception as e:  # noqa: BLE001
-        check("viewMessage(uniqKey) falls back and gives a clean exception", False,
-              "%s: %s" % (type(e).__name__, e))
+    # viewMessage by uniqKey: the admin takes the two-leg path (offset decode
+    # first, then the uniq query); on a hit the original message comes back,
+    # a miss is Java's null — never a raised exception.
+    vm_uniq = safe("viewMessage(uniqKey) falls back and fetches the message",
+                   lambda: admin.view_message(TOPIC, msg_id0),
+                   lambda m: "topic=%s body=%s" % (m.topic, m.body[:32]) if m is not None else "no match")
+    check("viewMessage(uniqKey) body matches what was sent",
+          vm_uniq is not None and vm_uniq.body == body0,
+          "no match" if vm_uniq is None else "body ok")
 
     # ---------- 7. offset management (read-only queries) ----------
     mq = mq0 if isinstance(mq0, MessageQueue) else MessageQueue(TOPIC, route.get_broker_datas()[0].broker_name, 0)

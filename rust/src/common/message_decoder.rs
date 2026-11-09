@@ -96,8 +96,16 @@ pub fn ip_to_bytes(ip: &str, v6: bool) -> Result<Vec<u8>> {
 
 fn to_v6_compatible(v4: &Ipv4Addr) -> Ipv6Addr {
     let octets = v4.octets();
-    Ipv6Addr::new(0, 0, 0, 0, 0, 0xFFFF, u16::from_be_bytes([octets[0], octets[1]]),
-        u16::from_be_bytes([octets[2], octets[3]]))
+    Ipv6Addr::new(
+        0,
+        0,
+        0,
+        0,
+        0,
+        0xFFFF,
+        u16::from_be_bytes([octets[0], octets[1]]),
+        u16::from_be_bytes([octets[2], octets[3]]),
+    )
 }
 
 /// Reverse parse of the in-frame host field: 8 bytes = ipv4+port, 20 bytes = ipv6+port.
@@ -108,7 +116,12 @@ pub fn bytes_to_ip_and_port(raw: &[u8]) -> Result<(String, u32)> {
         other => return Err(Error::Decode(format!("illegal host bytes length: {other}"))),
     };
     let ip = bytes_to_ip(&raw[..ip_len], family_v6)?;
-    let port = u32::from_be_bytes([raw[ip_len], raw[ip_len + 1], raw[ip_len + 2], raw[ip_len + 3]]);
+    let port = u32::from_be_bytes([
+        raw[ip_len],
+        raw[ip_len + 1],
+        raw[ip_len + 2],
+        raw[ip_len + 3],
+    ]);
     Ok((ip, port))
 }
 
@@ -254,7 +267,8 @@ fn host_length(sys_flag: i32, v6_flag: i32) -> usize {
 pub fn encode_message_ext(message_ext: &MessageExt, need_compress: bool) -> Result<Vec<u8>> {
     let mut body: Vec<u8> = message_ext.body.clone().unwrap_or_default();
     let sys_flag = message_ext.sys_flag;
-    if need_compress && (sys_flag & MessageSysFlag::COMPRESSED_FLAG) == MessageSysFlag::COMPRESSED_FLAG
+    if need_compress
+        && (sys_flag & MessageSysFlag::COMPRESSED_FLAG) == MessageSysFlag::COMPRESSED_FLAG
     {
         let compression_type = MessageSysFlag::get_compression_type(sys_flag);
         body = compression::compress(&body, compression_type, compression::DEFAULT_COMPRESS_LEVEL)?;
@@ -296,9 +310,16 @@ pub fn encode_message_ext(message_ext: &MessageExt, need_compress: bool) -> Resu
         .store_host
         .clone()
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let born_addr = ip_and_port_to_bytes(&born_host, message_ext.born_host_port, bornhost_length == 20)?;
-    let store_addr =
-        ip_and_port_to_bytes(&store_host, message_ext.store_host_port, storehost_length == 20)?;
+    let born_addr = ip_and_port_to_bytes(
+        &born_host,
+        message_ext.born_host_port,
+        bornhost_length == 20,
+    )?;
+    let store_addr = ip_and_port_to_bytes(
+        &store_host,
+        message_ext.store_host_port,
+        storehost_length == 20,
+    )?;
 
     let mut writer = Writer::with_capacity(store_size);
     writer.i32(store_size as i32); // 1 TOTALSIZE
@@ -440,12 +461,7 @@ pub fn decode_messages_with(raw: &[u8], options: &DecodeOptions) -> Vec<MessageE
         if total - pos < 4 {
             break;
         }
-        let store_size = i32::from_be_bytes([
-            raw[pos],
-            raw[pos + 1],
-            raw[pos + 2],
-            raw[pos + 3],
-        ]);
+        let store_size = i32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
         if store_size <= 0 || store_size as usize > total - pos {
             break;
         }
@@ -597,8 +613,7 @@ fn decode_inner_batch_members(raw: &[u8]) -> Result<Vec<Message>> {
         if raw.len() - pos < 4 {
             return Err(Error::Decode("truncated inner batch record".into()));
         }
-        let store_size =
-            i32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
+        let store_size = i32::from_be_bytes([raw[pos], raw[pos + 1], raw[pos + 2], raw[pos + 3]]);
         if store_size <= 0 || store_size as usize > raw.len() - pos {
             return Err(Error::Decode(format!(
                 "illegal inner batch record size: {store_size}"
@@ -687,7 +702,8 @@ mod tests {
     /// A 139-byte extended-message frame: ground truth of the v1 17-field encoding, BODYCRC
     /// written the way the store writes it (0x7330_7B09 = CRC-32 of "hello rocketmq" with the
     /// sign bit cleared, not the full 0xF330_7B09).
-    const EXT_HEX: &str = "0000008bdaa320a773307b09000000030000000200000000000000580000000000000400\
+    const EXT_HEX: &str =
+        "0000008bdaa320a773307b09000000030000000200000000000000580000000000000400\
                            000000000000018bcfe568007f0000010000d4310000018bcfe5687b7f00000100002a9f\
                            0000000100000000000000000000000e68656c6c6f20726f636b65746d7109546f706963\
                            546573740019544147530154616741024b455953016b657931206b65793202";
@@ -706,7 +722,10 @@ mod tests {
         props.insert("KEYS", "k1 k2 k3");
         props.insert("UNIQ_KEY", "0A0A0A0A");
         let raw = message_properties_2_string(&props);
-        assert_eq!(raw.chars().filter(|c| *c == NAME_VALUE_SEPARATOR).count(), 3);
+        assert_eq!(
+            raw.chars().filter(|c| *c == NAME_VALUE_SEPARATOR).count(),
+            3
+        );
         assert_eq!(raw.chars().filter(|c| *c == PROPERTY_SEPARATOR).count(), 3);
         assert_eq!(string_2_message_properties(&raw), props);
     }
@@ -804,7 +823,11 @@ mod tests {
     fn store_size_respects_existing_value() {
         let mut raw = encode_message_ext(&build_ext(&[("store_size", "1")]), false).unwrap();
         let declared = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        assert_eq!(declared as usize, raw.len(), "storeSize=1 should be floored by the max fallback");
+        assert_eq!(
+            declared as usize,
+            raw.len(),
+            "storeSize=1 should be floored by the max fallback"
+        );
         raw = encode_message_ext(&build_ext(&[("store_size", "200")]), false).unwrap();
         assert_eq!(raw.len(), 200);
         assert!(raw[139..].iter().all(|b| *b == 0));
@@ -814,8 +837,10 @@ mod tests {
     fn msg_id_from_store_host_and_offset() {
         let raw = encode_message_ext(&build_ext(&[]), false).unwrap();
         let got = decode_message(&raw).unwrap();
-        let expected =
-            create_message_id(&ip_and_port_to_bytes("127.0.0.1", 10911, false).unwrap(), 1024);
+        let expected = create_message_id(
+            &ip_and_port_to_bytes("127.0.0.1", 10911, false).unwrap(),
+            1024,
+        );
         assert_eq!(expected, EXT_MSG_ID);
         assert_eq!(got.get_msg_id(), Some(EXT_MSG_ID));
         assert_eq!(got.get_offset_msg_id(), Some(EXT_MSG_ID));
@@ -832,10 +857,7 @@ mod tests {
     #[test]
     fn truncated_frame_is_an_error() {
         let raw = encode_message_ext(&build_ext(&[]), false).unwrap();
-        assert!(matches!(
-            decode_message(&raw[..20]),
-            Err(Error::Decode(_))
-        ));
+        assert!(matches!(decode_message(&raw[..20]), Err(Error::Decode(_))));
         assert!(matches!(decode_message(&[]), Err(Error::Decode(_))));
     }
 
@@ -930,10 +952,13 @@ mod tests {
         assert_eq!(got.get_store_host(), Some("2001:db8::2"));
         assert_eq!(
             got.get_msg_id(),
-            Some(create_message_id(
-                &ip_and_port_to_bytes("2001:db8::2", 10911, true).unwrap(),
-                64
-            ).as_str())
+            Some(
+                create_message_id(
+                    &ip_and_port_to_bytes("2001:db8::2", 10911, true).unwrap(),
+                    64
+                )
+                .as_str()
+            )
         );
         // Ground truth captured from the wire (156 bytes)
         assert_eq!(
@@ -946,27 +971,38 @@ mod tests {
     fn ip_port_bytes() {
         let raw = ip_and_port_to_bytes("10.0.0.1", 9876, false).unwrap();
         assert_eq!(raw.len(), 8);
-        assert_eq!(bytes_to_ip_and_port(&raw).unwrap(), ("10.0.0.1".to_string(), 9876));
+        assert_eq!(
+            bytes_to_ip_and_port(&raw).unwrap(),
+            ("10.0.0.1".to_string(), 9876)
+        );
         let raw6 = ip_and_port_to_bytes("2001:db8::1", 9876, true).unwrap();
         assert_eq!(raw6.len(), 20);
         assert_eq!(
             bytes_to_ip_and_port(&raw6).unwrap(),
             ("2001:db8::1".to_string(), 9876)
         );
-        assert!(matches!(ip_and_port_to_bytes("not-an-ip", 1, false), Err(Error::Decode(_))));
+        assert!(matches!(
+            ip_and_port_to_bytes("not-an-ip", 1, false),
+            Err(Error::Decode(_))
+        ));
         assert!(matches!(
             ip_and_port_to_bytes("2001:db8::1", 1, false),
             Err(Error::Decode(_))
         ));
-        assert!(matches!(bytes_to_ip_and_port(&[0u8; 6]), Err(Error::Decode(_))));
+        assert!(matches!(
+            bytes_to_ip_and_port(&[0u8; 6]),
+            Err(Error::Decode(_))
+        ));
     }
 
     // --------------------------------------------------------- msgId
 
     #[test]
     fn msg_id_create_and_decode_v4() {
-        let msg_id =
-            create_message_id(&ip_and_port_to_bytes("10.0.0.1", 10911, false).unwrap(), 2048);
+        let msg_id = create_message_id(
+            &ip_and_port_to_bytes("10.0.0.1", 10911, false).unwrap(),
+            2048,
+        );
         assert_eq!(msg_id.len(), 32);
         assert_eq!(msg_id, msg_id.to_ascii_uppercase());
         let (ip, port, offset) = decode_message_id(&msg_id).unwrap();
@@ -975,8 +1011,10 @@ mod tests {
 
     #[test]
     fn msg_id_create_and_decode_v6() {
-        let msg_id =
-            create_message_id(&ip_and_port_to_bytes("2001:db8::1", 10911, true).unwrap(), 4096);
+        let msg_id = create_message_id(
+            &ip_and_port_to_bytes("2001:db8::1", 10911, true).unwrap(),
+            4096,
+        );
         assert_eq!(msg_id.len(), 56);
         let (ip, port, offset) = decode_message_id(&msg_id).unwrap();
         assert_eq!((ip.as_str(), port, offset), ("2001:db8::1", 10911, 4096));
@@ -995,7 +1033,10 @@ mod tests {
     #[test]
     fn bytes2string_matches_wire_hex() {
         assert_eq!(bytes2string(b"\x00\x0f\xab\xff"), "000FABFF");
-        assert_eq!(string2bytes_hex("000FABFF"), Some(vec![0x00, 0x0F, 0xAB, 0xFF]));
+        assert_eq!(
+            string2bytes_hex("000FABFF"),
+            Some(vec![0x00, 0x0F, 0xAB, 0xFF])
+        );
         assert_eq!(string2bytes_hex(""), None);
         assert_eq!(string2bytes_hex("XYZ"), None);
     }
@@ -1004,7 +1045,20 @@ mod tests {
 
     fn build_v2_frame(topic: &str, body: &[u8], properties_bytes: &[u8]) -> Vec<u8> {
         let topic_bytes = string2bytes(topic);
-        let store_size = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 4 + 8
+        let store_size = 4
+            + 4
+            + 4
+            + 4
+            + 4
+            + 8
+            + 8
+            + 4
+            + 8
+            + 8
+            + 8
+            + 8
+            + 4
+            + 8
             + 4
             + body.len()
             + 2
@@ -1053,8 +1107,13 @@ mod tests {
         let got = decode_message(&raw).unwrap();
         assert_eq!(
             got.get_msg_id(),
-            Some(create_message_id(&ip_and_port_to_bytes("127.0.0.1", 10911, false).unwrap(), 2048)
-                .as_str())
+            Some(
+                create_message_id(
+                    &ip_and_port_to_bytes("127.0.0.1", 10911, false).unwrap(),
+                    2048
+                )
+                .as_str()
+            )
         );
         // V2 frames use a u16 length field, so long topics can also be expressed; totalLength must match the decoded storeSize.
         let expected = build_v2_frame(&topic, b"batch-body", b"TAGS\x01TagB\x02");
@@ -1310,7 +1369,10 @@ mod tests {
         assert!(raw.len() < plain.len());
         let got = decode_message(&raw).unwrap();
         assert_eq!(got.get_body(), plain);
-        assert_eq!(got.sys_flag, MessageSysFlag::clear_compressed_flag(sys_flag));
+        assert_eq!(
+            got.sys_flag,
+            MessageSysFlag::clear_compressed_flag(sys_flag)
+        );
         assert_eq!(
             got.sys_flag,
             MessageSysFlag::set_compression_type(0, MessageSysFlag::ZLIB_TYPE)

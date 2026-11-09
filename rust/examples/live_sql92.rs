@@ -56,7 +56,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -135,7 +138,10 @@ impl CheckConfigProbe {
     }
 
     fn first_body(&self) -> JsonValue {
-        lock(&self.bodies).first().cloned().unwrap_or(JsonValue::Null)
+        lock(&self.bodies)
+            .first()
+            .cloned()
+            .unwrap_or(JsonValue::Null)
     }
 }
 
@@ -337,7 +343,10 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
         &format!("codes={:?}", probe.codes()),
     );
     let body = probe.first_body();
-    let sd = body.get("subscriptionData").cloned().unwrap_or(JsonValue::Null);
+    let sd = body
+        .get("subscriptionData")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
     let want_group = format!("{}_SQL", env.group);
     ck.check(
         "body is CheckClientRequestBody (clientId / group / subscriptionData)",
@@ -373,7 +382,9 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
 }
 
 async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
-    println!("\n---------- S2 broker filters by property / S3 never-matching expression ----------");
+    println!(
+        "\n---------- S2 broker filters by property / S3 never-matching expression ----------"
+    );
     let built = [
         ("FILTER", Some(MessageSelector::by_sql("color = 'red'"))),
         ("NONE", Some(MessageSelector::by_sql("color = 'green'"))),
@@ -451,18 +462,26 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
 
 async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
     println!("\n---------- S4 illegal expression fails at startup ----------");
-    let (consumer, _inbox) = match env.consumer("BAD", Some(MessageSelector::by_sql("color ==")), None)
-    {
-        Ok(pair) => pair,
-        Err(e) => return ck.abort("S4 build consumer", &e),
-    };
+    let (consumer, _inbox) =
+        match env.consumer("BAD", Some(MessageSelector::by_sql("color ==")), None) {
+            Ok(pair) => pair,
+            Err(e) => return ck.abort("S4 build consumer", &e),
+        };
     let began = Instant::now();
     let err = consumer.start().await.err();
     let cost = began.elapsed().as_secs_f64();
     match &err {
-        None => ck.check("start() returns an error", false, "the illegal expression actually started successfully"),
+        None => ck.check(
+            "start() returns an error",
+            false,
+            "the illegal expression actually started successfully",
+        ),
         Some(e) => {
-            ck.check("start() returns a client error", client_code(e).is_some(), &e.to_string());
+            ck.check(
+                "start() returns a client error",
+                client_code(e).is_some(),
+                &e.to_string(),
+            );
             ck.check(
                 "the error code is the broker's SUBSCRIPTION_PARSE_FAILED(23)",
                 client_code(e) == Some(response_code::SUBSCRIPTION_PARSE_FAILED),
@@ -470,7 +489,11 @@ async fn s4_bad_expression_fails_start(env: &Env, ck: &mut Checker) {
             );
         }
     }
-    ck.check("the consumer is not left in the started state after the failure", !consumer.is_started(), "still left at started=true");
+    ck.check(
+        "the consumer is not left in the started state after the failure",
+        !consumer.is_started(),
+        "still left at started=true",
+    );
     ck.check(
         "the illegal expression fails immediately (<5s, not by waiting out the timeout fallback)",
         cost < 5.0,
@@ -513,14 +536,24 @@ async fn s5_send_first_first_offset(env: &Env, ck: &mut Checker) {
     let mut ready = false;
     while began.elapsed() < Duration::from_secs(20) {
         if let Ok(route) = env.admin.examine_topic_route(&topic).await {
-            if route.queue_datas.iter().map(|q| q.read_queue_nums).sum::<i32>() >= QUEUE_NUMS {
+            if route
+                .queue_datas
+                .iter()
+                .map(|q| q.read_queue_nums)
+                .sum::<i32>()
+                >= QUEUE_NUMS
+            {
                 ready = true;
                 break;
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    ck.check("S5 topic route ready (4 queues)", ready, "route never carried the queues");
+    ck.check(
+        "S5 topic route ready (4 queues)",
+        ready,
+        "route never carried the queues",
+    );
     if !ready {
         return;
     }
@@ -560,7 +593,9 @@ async fn s5_send_first_first_offset(env: &Env, ck: &mut Checker) {
         Ok(c) => c,
         Err(e) => return ck.abort("S5 build consumer", &e),
     };
-    if let Err(e) = consumer.subscribe_with_selector(&topic, &MessageSelector::by_sql("color = 'red'")) {
+    if let Err(e) =
+        consumer.subscribe_with_selector(&topic, &MessageSelector::by_sql("color = 'red'"))
+    {
         return ck.abort("S5 subscribe", &e.to_string());
     }
     consumer.set_message_listener_concurrently(Arc::new(CollectingListener {
@@ -616,7 +651,11 @@ async fn run(namesrv: &str) -> Checker {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    ck.check("T0 topic route ready (4 queues)", ready, "examine_topic_route cannot get the queues");
+    ck.check(
+        "T0 topic route ready (4 queues)",
+        ready,
+        "examine_topic_route cannot get the queues",
+    );
 
     // Preflight: does this broker accept SQL92 subscriptions at all? The broker answers
     // CHECK_CLIENT_CONFIG(46) with SYSTEM_ERROR ("The broker does not support consumer to

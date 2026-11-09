@@ -35,7 +35,10 @@ const SLOW_PERSIST_MS: u64 = 60_000;
 const PERSIST_INITIAL_DELAY_MS: u64 = 10_000;
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -86,7 +89,11 @@ struct Check {
 
 impl Check {
     fn new() -> Check {
-        Check { passed: 0, failed: Vec::new(), skipped: 0 }
+        Check {
+            passed: 0,
+            failed: Vec::new(),
+            skipped: 0,
+        }
     }
 
     fn check(&mut self, name: &str, ok: bool, detail: &str) {
@@ -108,7 +115,9 @@ struct BodySink {
 
 impl BodySink {
     fn new() -> Arc<BodySink> {
-        Arc::new(BodySink { items: Mutex::new(Vec::new()) })
+        Arc::new(BodySink {
+            items: Mutex::new(Vec::new()),
+        })
     }
 
     fn count(&self) -> usize {
@@ -155,9 +164,17 @@ impl Fixture {
 }
 
 async fn topic_route(admin: &DefaultMQAdminExt, topic: &str) -> Result<(String, String), String> {
-    let route = admin.examine_topic_route(topic).await.map_err(|e| e.to_string())?;
-    let bd = route.broker_datas.first().ok_or_else(|| format!("{topic} has no broker in its route"))?;
-    let addr = bd.select_broker_addr().ok_or_else(|| format!("{topic}'s broker has no address"))?;
+    let route = admin
+        .examine_topic_route(topic)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bd = route
+        .broker_datas
+        .first()
+        .ok_or_else(|| format!("{topic} has no broker in its route"))?;
+    let addr = bd
+        .select_broker_addr()
+        .ok_or_else(|| format!("{topic}'s broker has no address"))?;
     Ok((bd.broker_name.clone(), addr))
 }
 
@@ -179,7 +196,10 @@ async fn wait_offset_at_least(
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    let namesrv = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9876".to_string());
+    let namesrv = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:9876".to_string());
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     match rt.block_on(run(&namesrv)) {
         Ok(true) => ExitCode::SUCCESS,
@@ -207,7 +227,10 @@ async fn run(namesrv: &str) -> Result<bool, String> {
         timeout_millis: 10_000,
         ..Default::default()
     });
-    admin.start().await.map_err(|e| format!("admin start failed: {e}"))?;
+    admin
+        .start()
+        .await
+        .map_err(|e| format!("admin start failed: {e}"))?;
 
     let mut ck = Check::new();
     println!("namesrv = {namesrv}  stamp = {stamp}");
@@ -228,10 +251,14 @@ async fn run(namesrv: &str) -> Result<bool, String> {
         admin,
         broker_addr,
     };
-    let groups =
-        [&g_poll_fast, &g_poll_slow, &g_persist_fast, &g_persist_slow, &g_producer];
-    let outcome =
-        run_all(&mut ck, &fx, &t_poll, &t_persist, &groups).await;
+    let groups = [
+        &g_poll_fast,
+        &g_poll_slow,
+        &g_persist_fast,
+        &g_persist_slow,
+        &g_producer,
+    ];
+    let outcome = run_all(&mut ck, &fx, &t_poll, &t_persist, &groups).await;
 
     // Wrap-up (runs even on failure): delete the topics and subscription groups cleanly to avoid polluting the next run
     for topic in [&t_poll, &t_persist] {
@@ -241,7 +268,11 @@ async fn run(namesrv: &str) -> Result<bool, String> {
         }
     }
     for g in groups {
-        match fx.admin.delete_subscription_group(&fx.broker_addr, g, true).await {
+        match fx
+            .admin
+            .delete_subscription_group(&fx.broker_addr, g, true)
+            .await
+        {
             Ok(()) => println!("    (deleteSubscriptionGroup({g}) OK)"),
             Err(e) => println!("    (deleteSubscriptionGroup({g}) failed: {e})"),
         }
@@ -281,12 +312,16 @@ async fn run_all(
     fast.set_namesrv_addr(&fx.namesrv);
     fast.set_instance_name(&format!("interval-poll-fast-{}", fx.stamp));
     fast.set_poll_name_server_interval_millis(FAST_POLL_MS);
-    fast.start().await.map_err(|e| format!("fast producer start: {e}"))?;
+    fast.start()
+        .await
+        .map_err(|e| format!("fast producer start: {e}"))?;
 
     let slow = DefaultMQProducer::new(g_poll_slow).map_err(|e| e.to_string())?;
     slow.set_namesrv_addr(&fx.namesrv);
     slow.set_instance_name(&format!("interval-poll-slow-{}", fx.stamp));
-    slow.start().await.map_err(|e| format!("slow producer start: {e}"))?;
+    slow.start()
+        .await
+        .map_err(|e| format!("slow producer start: {e}"))?;
 
     let fast_client: MQClientInstance = fast.client().ok_or("fast producer has no instance")?;
     let slow_client: MQClientInstance = slow.client().ok_or("slow producer has no instance")?;
@@ -321,7 +356,11 @@ async fn run_all(
         .create_topic(MixAll::DEFAULT_TOPIC, t_poll, 1, 0)
         .await
         .map_err(|e| format!("createTopic({t_poll}) failed: {e}"))?;
-    ck.check("I1 admin created the topic", true, &format!("{t_poll} 1 queue"));
+    ck.check(
+        "I1 admin created the topic",
+        true,
+        &format!("{t_poll} 1 queue"),
+    );
 
     let fast_client_1 = fast_client.clone();
     let t_poll_1 = t_poll.to_string();
@@ -375,7 +414,9 @@ async fn run_all(
 
     let prod = DefaultMQProducer::new(g_producer).map_err(|e| e.to_string())?;
     prod.set_namesrv_addr(&fx.namesrv);
-    prod.start().await.map_err(|e| format!("producer start: {e}"))?;
+    prod.start()
+        .await
+        .map_err(|e| format!("producer start: {e}"))?;
 
     let fast_sink = BodySink::new();
     let fast_c = DefaultMQPushConsumer::new(g_persist_fast).map_err(|e| e.to_string())?;
@@ -384,9 +425,16 @@ async fn run_all(
     fast_c.set_poll_name_server_interval_millis(2_000);
     fast_c.set_persist_consumer_offset_interval_millis(FAST_PERSIST_MS);
     fast_c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-    fast_c.subscribe(t_persist, "*").map_err(|e| e.to_string())?;
-    fast_c.set_message_listener_concurrently(Arc::new(CollectListener { sink: fast_sink.clone() }));
-    fast_c.start().await.map_err(|e| format!("fast consumer start: {e}"))?;
+    fast_c
+        .subscribe(t_persist, "*")
+        .map_err(|e| e.to_string())?;
+    fast_c.set_message_listener_concurrently(Arc::new(CollectListener {
+        sink: fast_sink.clone(),
+    }));
+    fast_c
+        .start()
+        .await
+        .map_err(|e| format!("fast consumer start: {e}"))?;
 
     let slow_sink = BodySink::new();
     let slow_c = DefaultMQPushConsumer::new(g_persist_slow).map_err(|e| e.to_string())?;
@@ -394,9 +442,16 @@ async fn run_all(
     slow_c.set_instance_name(&format!("interval-persist-slow-{}", fx.stamp));
     slow_c.set_persist_consumer_offset_interval_millis(SLOW_PERSIST_MS);
     slow_c.set_consume_from_where(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-    slow_c.subscribe(t_persist, "*").map_err(|e| e.to_string())?;
-    slow_c.set_message_listener_concurrently(Arc::new(CollectListener { sink: slow_sink.clone() }));
-    slow_c.start().await.map_err(|e| format!("slow consumer start: {e}"))?;
+    slow_c
+        .subscribe(t_persist, "*")
+        .map_err(|e| e.to_string())?;
+    slow_c.set_message_listener_concurrently(Arc::new(CollectListener {
+        sink: slow_sink.clone(),
+    }));
+    slow_c
+        .start()
+        .await
+        .map_err(|e| format!("slow consumer start: {e}"))?;
 
     let persist_ms = fast_c.config().persist_consumer_offset_interval_millis;
     let fast_persist_ok = fast_c
@@ -437,7 +492,10 @@ async fn run_all(
     ck.check(
         "I2 after consuming, the broker offset has not been pushed up immediately",
         off_fast < 3 && off_slow < 3,
-        &format!("fast={off_fast} slow={off_slow} elapsed={}", secs(t_first.elapsed())),
+        &format!(
+            "fast={off_fast} slow={off_slow} elapsed={}",
+            secs(t_first.elapsed())
+        ),
     );
 
     let fast_first = wait_offset_at_least(fx, g_persist_fast, &mq, 3, 20_000).await;
@@ -450,7 +508,10 @@ async fn run_all(
     ck.check(
         "I2 the first persist is no earlier than the initialDelay 10s",
         dt_first >= Duration::from_millis(9_500),
-        &format!("dt={} initialDelay={PERSIST_INITIAL_DELAY_MS}ms", secs(dt_first)),
+        &format!(
+            "dt={} initialDelay={PERSIST_INITIAL_DELAY_MS}ms",
+            secs(dt_first)
+        ),
     );
 
     let slow_first = wait_offset_at_least(fx, g_persist_slow, &mq, 3, 20_000).await;
@@ -482,7 +543,10 @@ async fn run_all(
     ck.check(
         "I2 the 1s group pushes the second batch's offset up within one interval",
         fast_six,
-        &format!("dt={} interval={FAST_PERSIST_MS}ms", secs(t_second.elapsed())),
+        &format!(
+            "dt={} interval={FAST_PERSIST_MS}ms",
+            secs(t_second.elapsed())
+        ),
     );
 
     let off_slow_now = fx.read_offset(g_persist_slow, &mq).await?;
@@ -512,6 +576,8 @@ async fn run_all(
 
 async fn send_body(prod: &DefaultMQProducer, topic: &str, body: &str) -> Result<(), String> {
     let mut msg = Message::new(topic, Some(body.as_bytes()));
-    prod.send(&mut msg, None, None).await.map_err(|e| format!("send({body}) failed: {e}"))?;
+    prod.send(&mut msg, None, None)
+        .await
+        .map_err(|e| format!("send({body}) failed: {e}"))?;
     Ok(())
 }

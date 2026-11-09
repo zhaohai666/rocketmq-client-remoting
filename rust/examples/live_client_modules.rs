@@ -30,9 +30,9 @@ use rocketmq_client_remoting::client::consumer_stats::{
 use rocketmq_client_remoting::client::hook::{
     execute_check_forbidden_hook, execute_consume_hook_after, execute_consume_hook_before,
     execute_filter_hooks, execute_send_message_hook_after, execute_send_message_hook_before,
-    CheckForbiddenContext, CheckForbiddenHookList, ConsumeMessageContext, ConsumeMessageHookList,
-    CommunicationMode, FilterMessageContext, FilterMessageHookList, HookList, SendMessageContext,
-    SendMessageHookList,
+    CheckForbiddenContext, CheckForbiddenHookList, CommunicationMode, ConsumeMessageContext,
+    ConsumeMessageHookList, FilterMessageContext, FilterMessageHookList, HookList,
+    SendMessageContext, SendMessageHookList,
 };
 use rocketmq_client_remoting::client::latency::{
     MQFaultStrategy, PublishInfo, QueueFilter, ISOLATION_LATENCY,
@@ -45,11 +45,12 @@ use rocketmq_client_remoting::client::request_reply::{
 use rocketmq_client_remoting::client::result::{SendResult, SendStatus};
 use rocketmq_client_remoting::client::top_addressing::DefaultTopAddressing;
 use rocketmq_client_remoting::client::trace::{
-    local_address, TraceBean, TraceConstants, TraceContext, TraceDataEncoder, TraceType, AccessChannel,
+    local_address, AccessChannel, TraceBean, TraceConstants, TraceContext, TraceDataEncoder,
+    TraceType,
 };
 use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueue};
 use rocketmq_client_remoting::common::message_client_id_setter;
-use rocketmq_client_remoting::common::message_const as message_const;
+use rocketmq_client_remoting::common::message_const;
 use rocketmq_client_remoting::common::message_decoder;
 use rocketmq_client_remoting::common::message_type::MessageType;
 use rocketmq_client_remoting::common::mix_all::MixAll;
@@ -59,11 +60,11 @@ use rocketmq_client_remoting::common::util_all;
 use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::client::RemotingClient;
 use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response_code};
-use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::headers::{
     CreateTopicRequestHeader, DeleteTopicRequestHeader, GetRouteInfoRequestHeader,
     PullMessageRequestHeader, SendMessageRequestHeaderV2, SendMessageResponseHeader,
 };
+use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
@@ -93,7 +94,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -182,7 +186,11 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
         ));
     }
     let route = decode_route(&resp, "TBW102")?;
-    let broker_addr = match route.broker_datas.first().and_then(|b| b.select_broker_addr()) {
+    let broker_addr = match route
+        .broker_datas
+        .first()
+        .and_then(|b| b.select_broker_addr())
+    {
         Some(a) => a,
         None => return Err("default route has no usable broker address".to_string()),
     };
@@ -256,15 +264,19 @@ async fn send_message(
         sys_flag: Some(0),
         born_timestamp: Some(util_all::current_time_millis()),
         flag: Some(msg.get_flag()),
-        properties: Some(message_decoder::message_properties_2_string(msg.get_properties())),
+        properties: Some(message_decoder::message_properties_2_string(
+            msg.get_properties(),
+        )),
         reconsume_times: Some(0),
         unit_mode: Some(false),
         max_reconsume_times: Some(0),
         batch: Some(false),
         broker_name: Some(broker_name.to_string()),
     };
-    let mut req =
-        RemotingCommand::create_request_command(request_code::SEND_MESSAGE_V2, Some(Box::new(header)));
+    let mut req = RemotingCommand::create_request_command(
+        request_code::SEND_MESSAGE_V2,
+        Some(Box::new(header)),
+    );
     req.set_body(Some(msg.get_body().to_vec()));
 
     let (resp, rt) = rpc_timed(client, broker_addr, req, 10_000).await;
@@ -348,7 +360,8 @@ async fn pull_until(
 ) -> Result<(Vec<MessageExt>, i64), String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (msgs, rt) = pull_messages(client, broker_addr, topic, group, 0, from_offset, 32).await?;
+        let (msgs, rt) =
+            pull_messages(client, broker_addr, topic, group, 0, from_offset, 32).await?;
         if msgs.len() >= want || Instant::now() > deadline {
             return Ok((msgs, rt));
         }
@@ -372,7 +385,10 @@ async fn t1_top_addressing(
         .map_err(|e| format!("stub local_addr unavailable: {e}"))?
         .port();
     // (status, body) is re-read on every connection so a scenario can change the response mid-run.
-    let served = Arc::new(Mutex::new((200_u16, format!("{namesrv}\n10.255.255.1:9876"))));
+    let served = Arc::new(Mutex::new((
+        200_u16,
+        format!("{namesrv}\n10.255.255.1:9876"),
+    )));
     let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let task = {
         let served = Arc::clone(&served);
@@ -449,8 +465,7 @@ async fn t1_top_addressing(
     };
     ck.check(
         "T1 unit+para URL reaches the server",
-        second_get.as_deref()
-            == Some("GET /rocketmq/nsaddr-unitA?nofix=1&nofix=2 HTTP/1.1"),
+        second_get.as_deref() == Some("GET /rocketmq/nsaddr-unitA?nofix=1&nofix=2 HTTP/1.1"),
         &format!("got line={second_get:?}"),
     );
 
@@ -492,8 +507,7 @@ async fn t1_top_addressing(
         &format!("ns_addr={:?}", blank.ns_addr()),
     );
     let started = Instant::now();
-    let dead =
-        DefaultTopAddressing::from_domain(DEAD_ADDR).with_timeout_millis(300);
+    let dead = DefaultTopAddressing::from_domain(DEAD_ADDR).with_timeout_millis(300);
     ck.check(
         "T1 unreachable server yields None",
         dead.fetch_ns_addr(true).await.is_none(),
@@ -548,7 +562,10 @@ struct LivePublishInfo {
 
 impl LivePublishInfo {
     fn new(queues: Vec<MessageQueue>) -> LivePublishInfo {
-        LivePublishInfo { queues, next: AtomicUsize::new(0) }
+        LivePublishInfo {
+            queues,
+            next: AtomicUsize::new(0),
+        }
     }
 
     fn len(&self) -> usize {
@@ -649,7 +666,9 @@ async fn t2_latency(
 
     // 1) The real successful latency is recorded: a local RT is usually < 50ms => the lowest tier, isolation window 0.
     strategy.update_fault_item(broker_name, sent.rt_millis, false, true);
-    let item = strategy.latency_fault_tolerance().get_fault_item(broker_name);
+    let item = strategy
+        .latency_fault_tolerance()
+        .get_fault_item(broker_name);
     ck.check(
         "T2 real send latency recorded under the broker name",
         item.as_ref().map(|i| i.current_latency) == Some(sent.rt_millis),
@@ -736,7 +755,10 @@ async fn t2_latency(
         "T2 a disabled strategy records nothing",
         off.latency_fault_tolerance().fault_item_names().is_empty()
             && off.latency_fault_tolerance().is_available(broker_name),
-        &format!("names={:?}", off.latency_fault_tolerance().fault_item_names()),
+        &format!(
+            "names={:?}",
+            off.latency_fault_tolerance().fault_item_names()
+        ),
     );
     let plain = off
         .select_one_message_queue(&info, None, true)
@@ -802,7 +824,11 @@ async fn t3_consumer_stats(
     );
     // A repeated start must be a no-op (it returns directly when an existing thread is found).
     mgr.start_with_handle(&handle);
-    ck.check("T3 start is idempotent", mgr.is_running(), "second start killed the sampler");
+    ck.check(
+        "T3 start is idempotent",
+        mgr.is_running(),
+        "second start killed the sampler",
+    );
 
     // Sampling with fixed timestamps is what makes the StatsSnapshot arithmetic exactly comparable.
     let key = ConsumerStatsManager::key(topic, group);
@@ -814,7 +840,10 @@ async fn t3_consumer_stats(
     ck.check(
         "T3 pull TPS accumulated one per real message",
         total_value == msgs.len() as i64 && total_times == msgs.len() as i64,
-        &format!("value={total_value} times={total_times} msgs={}", msgs.len()),
+        &format!(
+            "value={total_value} times={total_times} msgs={}",
+            msgs.len()
+        ),
     );
     ck.check(
         "T3 pull RT accumulated the real RTs",
@@ -824,7 +853,8 @@ async fn t3_consumer_stats(
 
     tps_item.sample_at(1_000);
     rt_item.sample_at(1_000);
-    let (more_msgs, more_rt) = pull_messages(client, broker_addr, topic, group, 0, from, 32).await?;
+    let (more_msgs, more_rt) =
+        pull_messages(client, broker_addr, topic, group, 0, from, 32).await?;
     for _ in &more_msgs {
         mgr.inc_pull_rt(group, topic, more_rt);
         mgr.inc_pull_tps(group, topic, 1);
@@ -848,15 +878,16 @@ async fn t3_consumer_stats(
     };
     ck.check(
         "T3 minute RT avgpt is the mean real RT",
-        rt_snap.sum == more_rt * more_msgs.len() as i64
-            && (rt_snap.avgpt - want_avg).abs() < 1e-9,
+        rt_snap.sum == more_rt * more_msgs.len() as i64 && (rt_snap.avgpt - want_avg).abs() < 1e-9,
         &format!("snap={rt_snap} wantAvg={want_avg}"),
     );
     // Feeding compute_stats_data directly matches the item's accounting (the same first/last differencing algorithm).
     let direct: StatsSnapshot = compute_stats_data(&[(1_000, 0, 0), (3_000, 4, 2)]);
     ck.check(
         "T3 compute_stats_data matches the first/last diff",
-        direct.sum == 4 && direct.times == 2 && (direct.tps - 2.0).abs() < 1e-9
+        direct.sum == 4
+            && direct.times == 2
+            && (direct.tps - 2.0).abs() < 1e-9
             && (direct.avgpt - 2.0).abs() < 1e-9,
         &format!("direct={direct}"),
     );
@@ -868,7 +899,11 @@ async fn t3_consumer_stats(
     ck.check(
         "T3 hour window is empty before the first hour sample",
         rt_item.hour_len() == 0 && rt_item.get_stats_data_in_hour() == StatsSnapshot::default(),
-        &format!("hourLen={} snap={}", rt_item.hour_len(), rt_item.get_stats_data_in_hour()),
+        &format!(
+            "hourLen={} snap={}",
+            rt_item.hour_len(),
+            rt_item.get_stats_data_in_hour()
+        ),
     );
 
     // One sampling sweep: the minute chain grows, the hour chain is still empty (the hour boundary has not arrived).
@@ -894,7 +929,11 @@ async fn t3_consumer_stats(
     );
     // After shutdown a restart is possible (the thread handle is reset to None).
     mgr.start_with_handle(&handle);
-    ck.check("T3 restart after shutdown works", mgr.is_running(), "restart failed");
+    ck.check(
+        "T3 restart after shutdown works",
+        mgr.is_running(),
+        "restart failed",
+    );
     mgr.shutdown();
     Ok(())
 }
@@ -909,13 +948,21 @@ struct Recorder {
 
 impl rocketmq_client_remoting::client::hook::SendMessageHook for Recorder {
     fn hook_name(&self) -> &str {
-        if self.poison { "poison-send-hook" } else { "record-send-hook" }
+        if self.poison {
+            "poison-send-hook"
+        } else {
+            "record-send-hook"
+        }
     }
 
     fn send_message_before(&self, context: &mut SendMessageContext) -> Result<(), Error> {
         lock(&self.events).push(format!(
             "send_before:{}",
-            context.message.as_ref().map(|m| m.get_topic().to_string()).unwrap_or_default()
+            context
+                .message
+                .as_ref()
+                .map(|m| m.get_topic().to_string())
+                .unwrap_or_default()
         ));
         if self.poison {
             return Err(Error::client("intentional before-hook failure"));
@@ -926,7 +973,11 @@ impl rocketmq_client_remoting::client::hook::SendMessageHook for Recorder {
     fn send_message_after(&self, context: &mut SendMessageContext) -> Result<(), Error> {
         lock(&self.events).push(format!(
             "send_after:ok={} uniq={}",
-            context.send_result.as_ref().map(|r| r.status == SendStatus::SendOk).unwrap_or(false),
+            context
+                .send_result
+                .as_ref()
+                .map(|r| r.status == SendStatus::SendOk)
+                .unwrap_or(false),
             context
                 .send_result
                 .as_ref()
@@ -958,7 +1009,11 @@ impl rocketmq_client_remoting::client::hook::ConsumeMessageHook for Recorder {
 
 impl rocketmq_client_remoting::client::hook::CheckForbiddenHook for Recorder {
     fn hook_name(&self) -> &str {
-        if self.poison { "deny-hook" } else { "allow-hook" }
+        if self.poison {
+            "deny-hook"
+        } else {
+            "allow-hook"
+        }
     }
 
     fn check_forbidden(&self, context: &mut CheckForbiddenContext) -> Result<(), Error> {
@@ -1010,9 +1065,15 @@ async fn t4_hooks(
         send_hooks.is_empty() && !send_hooks.has_hooks(),
         &format!("len={}", send_hooks.len()),
     );
-    send_hooks.register(Arc::new(Recorder { events: Arc::clone(&events), poison: false })
+    send_hooks.register(Arc::new(Recorder {
+        events: Arc::clone(&events),
+        poison: false,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::SendMessageHook>);
-    send_hooks.register(Arc::new(Recorder { events: Arc::clone(&events), poison: true })
+    send_hooks.register(Arc::new(Recorder {
+        events: Arc::clone(&events),
+        poison: true,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::SendMessageHook>);
     ck.check(
         "T4 hooks register in order",
@@ -1064,8 +1125,10 @@ async fn t4_hooks(
     consume_hooks.register(Arc::new(Recorder {
         events: Arc::clone(&consume_events),
         poison: false,
-    }) as Arc<dyn rocketmq_client_remoting::client::hook::ConsumeMessageHook>);
-    let mut cctx = ConsumeMessageContext::new(consumer_group, Some(pulled.to_vec()), Some(mq.clone()));
+    })
+        as Arc<dyn rocketmq_client_remoting::client::hook::ConsumeMessageHook>);
+    let mut cctx =
+        ConsumeMessageContext::new(consumer_group, Some(pulled.to_vec()), Some(mq.clone()));
     ck.check(
         "T4 ConsumeMessageContext defaults success to True",
         cctx.success && cctx.msg_list.len() == pulled.len(),
@@ -1087,9 +1150,15 @@ async fn t4_hooks(
     // CheckForbidden is the opposite of the above: the Err must propagate up and later hooks must not run.
     let forbidden_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let deny: CheckForbiddenHookList = HookList::new();
-    deny.register(Arc::new(Recorder { events: Arc::clone(&forbidden_events), poison: true })
+    deny.register(Arc::new(Recorder {
+        events: Arc::clone(&forbidden_events),
+        poison: true,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::CheckForbiddenHook>);
-    deny.register(Arc::new(Recorder { events: Arc::clone(&forbidden_events), poison: false })
+    deny.register(Arc::new(Recorder {
+        events: Arc::clone(&forbidden_events),
+        poison: false,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::CheckForbiddenHook>);
     let mut fctx = CheckForbiddenContext {
         name_srv_addr: String::new(),
@@ -1108,7 +1177,10 @@ async fn t4_hooks(
         &format!("result={:?} events={fe:?}", denied.is_ok()),
     );
     let allow: CheckForbiddenHookList = HookList::new();
-    allow.register(Arc::new(Recorder { events: Arc::clone(&forbidden_events), poison: false })
+    allow.register(Arc::new(Recorder {
+        events: Arc::clone(&forbidden_events),
+        poison: false,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::CheckForbiddenHook>);
     ck.check(
         "T4 an allowing checkForbidden hook passes",
@@ -1119,14 +1191,21 @@ async fn t4_hooks(
     // FilterMessage: the list after the hook rewrites it is exactly the list the client sees.
     let filter_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let filters: FilterMessageHookList = HookList::new();
-    filters.register(Arc::new(Recorder { events: Arc::clone(&filter_events), poison: false })
+    filters.register(Arc::new(Recorder {
+        events: Arc::clone(&filter_events),
+        poison: false,
+    })
         as Arc<dyn rocketmq_client_remoting::client::hook::FilterMessageHook>);
     let mut gctx = FilterMessageContext::new(consumer_group, Some(pulled.to_vec()), Some(mq));
     execute_filter_hooks(&filters, &mut gctx);
     ck.check(
         "T4 a filter hook can drop the whole real batch",
         gctx.msg_list.is_empty() && lock(&filter_events).len() == 1,
-        &format!("len={} events={:?}", gctx.msg_list.len(), lock(&filter_events)),
+        &format!(
+            "len={} events={:?}",
+            gctx.msg_list.len(),
+            lock(&filter_events)
+        ),
     );
     let empty_ctx = FilterMessageContext::new(consumer_group, None, None);
     let no_hooks: FilterMessageHookList = HookList::new();
@@ -1192,7 +1271,9 @@ async fn t5_trace(
     ck.check(
         "T5 encoded record is field-terminated by STX",
         transfer.trans_data.ends_with(TraceConstants::FIELD_SPLITOR)
-            && transfer.trans_data.contains(TraceConstants::CONTENT_SPLITOR),
+            && transfer
+                .trans_data
+                .contains(TraceConstants::CONTENT_SPLITOR),
         &format!("data={:?}", transfer.trans_data),
     );
     ck.check(
@@ -1244,7 +1325,10 @@ async fn t5_trace(
     ck.check(
         "T5 a Pub record carries no storeTime (14-field layout)",
         got.store_time == 0 && got.client_host == local_address(),
-        &format!("storeTime={} clientHost={}", got.store_time, got.client_host),
+        &format!(
+            "storeTime={} clientHost={}",
+            got.store_time, got.client_host
+        ),
     );
     let mut comparable = bean.clone();
     comparable.store_time = 0;
@@ -1265,7 +1349,9 @@ async fn t5_trace(
     let old = TraceDataEncoder::decoder_from_trace_data_string(Some(&fifteen));
     ck.check(
         "T5 the >=15-field Pub branch restores clientHost",
-        old.first().and_then(|c| c.trace_beans.first()).map(|b| b.client_host.as_str())
+        old.first()
+            .and_then(|c| c.trace_beans.first())
+            .map(|b| b.client_host.as_str())
             == Some("10.9.8.7:10911"),
         &format!("text={fifteen:?}"),
     );
@@ -1296,8 +1382,16 @@ async fn t5_trace(
         Ok(s) => s,
         Err(e) => return Err(format!("send trace record failed: {e}")),
     };
-    let (backed, _) = pull_messages(client, broker_addr, topic, &format!("CID_unused_{topic}"), 0, trace_sent.queue_offset, 32)
-        .await?;
+    let (backed, _) = pull_messages(
+        client,
+        broker_addr,
+        topic,
+        &format!("CID_unused_{topic}"),
+        0,
+        trace_sent.queue_offset,
+        32,
+    )
+    .await?;
     let pulled_trace = match backed.first() {
         Some(m) => m,
         None => return Err("trace record message was not pulled back".to_string()),
@@ -1311,7 +1405,10 @@ async fn t5_trace(
     let online = TraceDataEncoder::decoder_from_trace_data_string(Some(&text));
     ck.check(
         "T5 a record read back from the broker still decodes identically",
-        online.first().and_then(|c| c.trace_beans.first()).map(|b| b.msg_id.as_str())
+        online
+            .first()
+            .and_then(|c| c.trace_beans.first())
+            .map(|b| b.msg_id.as_str())
             == Some(uniq_id.as_str()),
         &format!("contexts={}", online.len()),
     );
@@ -1547,12 +1644,19 @@ async fn t7_request_reply(
     ck.check(
         "T7 reply topic is <cluster>_REPLY_TOPIC and MSG_TYPE is reply",
         reply.get_topic() == expected_reply_topic && is_reply_message(&reply),
-        &format!("topic={} want={expected_reply_topic} type={:?}", reply.get_topic(), reply.get_property(message_const::PROPERTY_MESSAGE_TYPE)),
+        &format!(
+            "topic={} want={expected_reply_topic} type={:?}",
+            reply.get_topic(),
+            reply.get_property(message_const::PROPERTY_MESSAGE_TYPE)
+        ),
     );
     ck.check(
         "T7 the original request is not itself a reply message",
         !is_reply_message(&request_msg),
-        &format!("msgType={:?}", request_msg.get_property(message_const::PROPERTY_MESSAGE_TYPE)),
+        &format!(
+            "msgType={:?}",
+            request_msg.get_property(message_const::PROPERTY_MESSAGE_TYPE)
+        ),
     );
     let mut no_cluster = Message::new(topic, Some(b"x"));
     no_cluster.set_topic(topic);
@@ -1566,8 +1670,7 @@ async fn t7_request_reply(
             let code = e.response_code();
             ck.check(
                 "T7 create_reply_message refuses a request without CLUSTER (10007)",
-                code == Some(10007)
-                    && e.to_string().contains("property[CLUSTER] is null."),
+                code == Some(10007) && e.to_string().contains("property[CLUSTER] is null."),
                 &format!("code={code:?} err={e}"),
             );
         }
@@ -1590,7 +1693,9 @@ async fn t8_cleanup(
         broker_addr,
         RemotingCommand::create_request_command(
             request_code::DELETE_TOPIC_IN_BROKER,
-            Some(Box::new(DeleteTopicRequestHeader { topic: Some(topic.to_string()) })),
+            Some(Box::new(DeleteTopicRequestHeader {
+                topic: Some(topic.to_string()),
+            })),
         ),
         5000,
     )
@@ -1601,7 +1706,8 @@ async fn t8_cleanup(
         &format!("code={} remark={:?}", resp.code, resp.remark),
     );
     // 5.x defaults deleteTopicWithBrokerRegistration=false => the namesrv route must also be deleted explicitly.
-    let mut del = RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
+    let mut del =
+        RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
     del.add_ext_field("topic", topic);
     let resp = rpc(client, namesrv, del, 5000).await?;
     ck.check(
@@ -1664,7 +1770,10 @@ async fn main() -> ExitCode {
         Some(bd) => match bd.select_broker_addr() {
             Some(addr) => (bd.broker_name.clone(), addr),
             None => {
-                ck.abort("T0 broker address", &format!("broker {} has no address", bd.broker_name));
+                ck.abort(
+                    "T0 broker address",
+                    &format!("broker {} has no address", bd.broker_name),
+                );
                 client.shutdown();
                 report(&mut ck);
                 return ExitCode::FAILURE;
@@ -1683,7 +1792,17 @@ async fn main() -> ExitCode {
     let mut sent = Vec::new();
     for i in 0..3 {
         let body = format!("rust-live-client-{topic}-{i}").into_bytes();
-        match send_message(&client, &broker_addr, &broker_name, &topic, &producer_group, &body, "TagRustLiveClient").await {
+        match send_message(
+            &client,
+            &broker_addr,
+            &broker_name,
+            &topic,
+            &producer_group,
+            &body,
+            "TagRustLiveClient",
+        )
+        .await
+        {
             Ok(s) => sent.push(s),
             Err(e) => {
                 ck.abort("T0 send warm-up messages", &e);
@@ -1700,7 +1819,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (pulled, _) = match pull_until(&client, &broker_addr, &topic, &consumer_group, first_offset, sent.len()).await {
+    let (pulled, _) = match pull_until(
+        &client,
+        &broker_addr,
+        &topic,
+        &consumer_group,
+        first_offset,
+        sent.len(),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(e) => {
             ck.abort("T0 pull warm-up messages", &e);
@@ -1711,7 +1839,10 @@ async fn main() -> ExitCode {
         "        live data: sent={} pulled={} offsets={}",
         sent.len(),
         pulled.len(),
-        sent.iter().map(|s| s.queue_offset.to_string()).collect::<Vec<_>>().join(",")
+        sent.iter()
+            .map(|s| s.queue_offset.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let Some(primary) = sent.first() else {
         client.shutdown();
@@ -1720,25 +1851,79 @@ async fn main() -> ExitCode {
     };
 
     let scenarios: Vec<(&str, Live)> = vec![
-        ("T1 top_addressing", t1_top_addressing(&client, &namesrv, &topic, &mut ck).await),
-        ("T2 latency", t2_latency(&client, &namesrv, &topic, &broker_name, &broker_addr, primary, &mut ck).await),
+        (
+            "T1 top_addressing",
+            t1_top_addressing(&client, &namesrv, &topic, &mut ck).await,
+        ),
+        (
+            "T2 latency",
+            t2_latency(
+                &client,
+                &namesrv,
+                &topic,
+                &broker_name,
+                &broker_addr,
+                primary,
+                &mut ck,
+            )
+            .await,
+        ),
         (
             "T3 consumer_stats",
-            t3_consumer_stats(&client, &broker_addr, &topic, &consumer_group, &pulled, primary.rt_millis, &mut ck).await,
+            t3_consumer_stats(
+                &client,
+                &broker_addr,
+                &topic,
+                &consumer_group,
+                &pulled,
+                primary.rt_millis,
+                &mut ck,
+            )
+            .await,
         ),
         (
             "T4 hook",
-            t4_hooks(&topic, &producer_group, &consumer_group, &broker_addr, primary, &pulled, &mut ck).await,
+            t4_hooks(
+                &topic,
+                &producer_group,
+                &consumer_group,
+                &broker_addr,
+                primary,
+                &pulled,
+                &mut ck,
+            )
+            .await,
         ),
         (
             "T5 trace",
-            t5_trace(&client, &broker_addr, &broker_name, &topic, &producer_group, &pulled, &mut ck).await,
+            t5_trace(
+                &client,
+                &broker_addr,
+                &broker_name,
+                &topic,
+                &producer_group,
+                &pulled,
+                &mut ck,
+            )
+            .await,
         ),
         (
             "T6 metrics",
-            t6_metrics(&client, &broker_addr, &broker_name, &topic, &producer_group, primary, &mut ck).await,
+            t6_metrics(
+                &client,
+                &broker_addr,
+                &broker_name,
+                &topic,
+                &producer_group,
+                primary,
+                &mut ck,
+            )
+            .await,
         ),
-        ("T7 request_reply", t7_request_reply(&topic, "DefaultCluster", &pulled, &mut ck).await),
+        (
+            "T7 request_reply",
+            t7_request_reply(&topic, "DefaultCluster", &pulled, &mut ck).await,
+        ),
     ];
     for (name, outcome) in scenarios {
         if let Err(e) = outcome {
@@ -1760,7 +1945,11 @@ async fn main() -> ExitCode {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

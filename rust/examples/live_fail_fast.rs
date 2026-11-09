@@ -100,7 +100,10 @@ fn broker_ctl(script: &PathBuf, action: &str) -> (bool, String) {
             let text = fs::read_to_string(&out_path).unwrap_or_default();
             (s.success(), text.trim().to_string())
         }
-        Err(e) => (false, format!("run {} {action} failed: {e}", script.display())),
+        Err(e) => (
+            false,
+            format!("run {} {action} failed: {e}", script.display()),
+        ),
     }
 }
 
@@ -112,9 +115,7 @@ fn parked_pull_request(group: &str, mq: &MessageQueue, queue_offset: i64) -> Rem
         queue_id: Some(mq.queue_id),
         queue_offset: Some(queue_offset),
         max_msg_nums: Some(32),
-        sys_flag: Some(PullSysFlag::build_sys_flag_basic(
-            false, true, true, false,
-        )),
+        sys_flag: Some(PullSysFlag::build_sys_flag_basic(false, true, true, false)),
         commit_offset: Some(0),
         suspend_timeout_millis: Some(BROKER_SUSPEND_MILLIS),
         subscription: Some("*".to_string()),
@@ -141,7 +142,9 @@ impl Drop for BrokerGuard {
         if ok {
             return;
         }
-        println!("  [cleanup] the broker is DOWN when the case ends ({out}); running one extra start");
+        println!(
+            "  [cleanup] the broker is DOWN when the case ends ({out}); running one extra start"
+        );
         let (ok, out) = broker_ctl(&self.script, "start");
         if !ok {
             println!("  [cleanup] the broker still did not come up: {out}");
@@ -160,8 +163,10 @@ async fn park_one(
 ) -> (String, String, Duration) {
     let mut cmd = parked_pull_request(&group, &mq, offset);
     let started = Instant::now();
-    let (kind, message) =
-        match remoting.invoke_sync(&addr, &mut cmd, Some(CLIENT_TIMEOUT_MILLIS)).await {
+    let (kind, message) = match remoting
+        .invoke_sync(&addr, &mut cmd, Some(CLIENT_TIMEOUT_MILLIS))
+        .await
+    {
         Ok(resp) => (format!("response:{}", resp.code), String::new()),
         Err(e) => {
             let k = match &e {
@@ -258,7 +263,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         &format!("queues={}", queues.len()),
     );
     let Some(mq) = queues.first().cloned() else {
-        ck.check("L1 queues fetched", false, "no queue, the rest cannot proceed");
+        ck.check(
+            "L1 queues fetched",
+            false,
+            "no queue, the rest cannot proceed",
+        );
         consumer.shutdown();
         producer.shutdown();
         return ck;
@@ -267,7 +276,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     let client = match producer.client() {
         Some(c) => c,
         None => {
-            ck.check("L1 MQClientInstance obtained", false, "producer not started");
+            ck.check(
+                "L1 MQClientInstance obtained",
+                false,
+                "producer not started",
+            );
             consumer.shutdown();
             producer.shutdown();
             return ck;
@@ -278,7 +291,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .as_ref()
         .and_then(|r| MQClientInstance::find_broker_addr_in_route(r, &mq.broker_name));
     let Some(addr) = addr else {
-        ck.check("L1 broker address obtained", false, "the route does not contain this broker");
+        ck.check(
+            "L1 broker address obtained",
+            false,
+            "the route does not contain this broker",
+        );
         consumer.shutdown();
         producer.shutdown();
         return ck;
@@ -288,7 +305,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     let max_offset = match consumer.max_offset(&mq).await {
         Ok(o) => o,
         Err(e) => {
-            ck.check("L1 the queue to park long polls on has an offset available", false, &e.to_string());
+            ck.check(
+                "L1 the queue to park long polls on has an offset available",
+                false,
+                &e.to_string(),
+            );
             consumer.shutdown();
             producer.shutdown();
             return ck;
@@ -351,7 +372,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     for handle in handles {
         match handle.await {
             Ok(r) => parked.push(r),
-            Err(e) => ck.check("L3 all parked long polls returned (none stuck)", false, &e.to_string()),
+            Err(e) => ck.check(
+                "L3 all parked long polls returned (none stuck)",
+                false,
+                &e.to_string(),
+            ),
         }
     }
     ck.check(
@@ -362,11 +387,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
 
     let send_request = parked.iter().filter(|p| p.1 == "send_request").count();
     let timeouts = parked.iter().filter(|p| p.1 == "timeout").count();
-    let worst = parked
-        .iter()
-        .map(|p| p.3)
-        .max()
-        .unwrap_or(Duration::ZERO);
+    let worst = parked.iter().map(|p| p.3).max().unwrap_or(Duration::ZERO);
     let kinds = parked
         .iter()
         .map(|p| p.1.clone())
@@ -390,7 +411,11 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
     ck.check(
         "L3 the kill takes far less than the 30s client timeout",
         worst < FAIL_FAST_LIMIT,
-        &format!("worst={:.2}s limit={}s", worst.as_secs_f64(), FAIL_FAST_LIMIT.as_secs()),
+        &format!(
+            "worst={:.2}s limit={}s",
+            worst.as_secs_f64(),
+            FAIL_FAST_LIMIT.as_secs()
+        ),
     );
     ck.check(
         "L3 the error text carries the disconnect reason",

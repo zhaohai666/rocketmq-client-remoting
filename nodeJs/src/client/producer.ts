@@ -1801,6 +1801,17 @@ export class DefaultMQProducer {
   // ---- accessors ----
   getMQClient(): MQClient | null { return this.client; }
   getProducerGroup(): string { return this.producerGroup; }
+
+  // viewMessage is Java DefaultMQProducerImpl#viewMessage
+  // (DefaultMQProducerImpl.java:517) parity: the facade rides the MQAdminImpl
+  // single-leg path — offset msgId only, decoded and asked
+  // VIEW_MESSAGE_BY_ID(33) on the broker that stamped it. A msgId that does
+  // not decode as an offset id surfaces the NO_MESSAGE client error (no
+  // uniq-key fallback at this layer).
+  async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
+    if (this.client == null) throw new MQClientException('producer not started');
+    return this.client.viewMessage(topic, msgId);
+  }
 }
 
 // Transaction producer (a DefaultMQProducer that always carries a transaction listener).

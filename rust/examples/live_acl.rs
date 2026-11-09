@@ -55,9 +55,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rocketmq_client_remoting::client::consumer::{ConsumerConfig, DefaultMQPushConsumer};
 use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
-use rocketmq_client_remoting::client::pull_consumer::{
-    DefaultMQPullConsumer, PullConsumerConfig,
-};
+use rocketmq_client_remoting::client::pull_consumer::{DefaultMQPullConsumer, PullConsumerConfig};
 use rocketmq_client_remoting::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, MessageListenerConcurrently, PullStatus,
 };
@@ -93,7 +91,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -137,8 +138,7 @@ fn code_of(err: &Error) -> String {
 
 fn acl_hook(access_key: &str, secret_key: &str) -> Arc<dyn RPCHook> {
     Arc::new(AclClientRPCHook::new(SessionCredentials::new(
-        access_key,
-        secret_key,
+        access_key, secret_key,
     )))
 }
 
@@ -168,8 +168,7 @@ impl MessageListenerConcurrently for AclListener {
         _context: &mut ConsumeConcurrentlyContext,
     ) -> ConsumeConcurrentlyStatus {
         for m in msgs {
-            lock(&self.0.bodies)
-                .insert(String::from_utf8_lossy(m.get_body()).into_owned());
+            lock(&self.0.bodies).insert(String::from_utf8_lossy(m.get_body()).into_owned());
         }
         ConsumeConcurrentlyStatus::ConsumeSuccess
     }
@@ -388,10 +387,14 @@ async fn s3_bad_secret(ck: &mut Checker, fx: &Fixture) {
         ck.abort("S3 start", &e.to_string());
         return;
     }
-    let evidence = fx.send_bodies(&producer, &["should-not-send".to_string()]).await;
+    let evidence = fx
+        .send_bodies(&producer, &["should-not-send".to_string()])
+        .await;
     // send_bodies squashes errors into an evidence string: here success is decided by whether a
     // "SEND_OK" shows up.
-    let accepted = evidence.iter().any(|s| s.contains("SendOk") || s.starts_with("SEND_OK"));
+    let accepted = evidence
+        .iter()
+        .any(|s| s.contains("SendOk") || s.starts_with("SEND_OK"));
     ck.check(
         "S3 wrong secretKey rejected by broker",
         !accepted,
@@ -404,7 +407,9 @@ async fn s3_bad_secret(ck: &mut Checker, fx: &Fixture) {
 
 /// Start the push consumer with credentials first, then send, then confirm everything arrived.
 async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
-    println!("\nS4/S5 producer/consumer with correct credentials (start the consumer before sending)");
+    println!(
+        "\nS4/S5 producer/consumer with correct credentials (start the consumer before sending)"
+    );
     let bodies: Vec<String> = (0..N_MSG).map(|i| format!("acl-ok-{i}")).collect();
 
     let inbox = Arc::new(Inbox::default());
@@ -428,7 +433,10 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
     }
     consumer.set_message_listener_concurrently(Arc::new(AclListener(inbox.clone())));
     if let Err(e) = consumer.start().await {
-        ck.abort("S5 start consumer (heartbeat/registration needs a signature)", &e.to_string());
+        ck.abort(
+            "S5 start consumer (heartbeat/registration needs a signature)",
+            &e.to_string(),
+        );
         return Vec::new();
     }
 
@@ -445,7 +453,10 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
         }
     };
     if let Err(e) = producer.start().await {
-        ck.abort("S4 start producer (registration needs a signature)", &e.to_string());
+        ck.abort(
+            "S4 start producer (registration needs a signature)",
+            &e.to_string(),
+        );
         consumer.shutdown();
         return Vec::new();
     }
@@ -464,7 +475,9 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
     // signed request.
     ck.check(
         "S4 broker assigned a msgId to the messages",
-        evidence.iter().all(|s| s.split(':').nth(1).is_some_and(|id| !id.is_empty())),
+        evidence
+            .iter()
+            .all(|s| s.split(':').nth(1).is_some_and(|id| !id.is_empty())),
         &format!("evidence={evidence:?}"),
     );
 
@@ -478,7 +491,11 @@ async fn s4_s5_signed_roundtrip(ck: &mut Checker, fx: &Fixture) -> Vec<String> {
         &format!("got={} bodies={:?}", inbox.len(), inbox.snapshot()),
     );
     consumer.shutdown();
-    if sent == N_MSG { bodies } else { Vec::new() }
+    if sent == N_MSG {
+        bodies
+    } else {
+        Vec::new()
+    }
 }
 
 // ------------------------------------------------------------------ S6/S7 boundary
@@ -493,7 +510,10 @@ async fn s6_unsigned_broker_rpc(ck: &mut Checker, fx: &Fixture) {
         Ok(list) => ck.check(
             "S6 broker RPC without credentials rejected",
             false,
-            &format!("the broker actually replied {:?} (most likely authentication is off)", list),
+            &format!(
+                "the broker actually replied {:?} (most likely authentication is off)",
+                list
+            ),
         ),
         Err(e) => ck.check(
             "S6 broker RPC without credentials rejected",
@@ -526,7 +546,9 @@ async fn s7_namesrv_without_creds(ck: &mut Checker, fx: &Fixture) {
 // ------------------------------------------------------------------ S8 pull-mode signature chain
 
 async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
-    println!("\nS8 pull consumer with credentials: fetch queues / pull / commit offsets, all signed");
+    println!(
+        "\nS8 pull consumer with credentials: fetch queues / pull / commit offsets, all signed"
+    );
     if bodies.is_empty() {
         ck.abort("S8 pull", "S4/S5 did not send any message, skipping");
         return;
@@ -577,8 +599,9 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
                 }
                 // Offset commit is a different RPC (UPDATE_CONSUMER_OFFSET); a missing signature makes it fail
                 // silently as an exception.
-                if let Err(e) =
-                    consumer.update_consume_offset(mq, r.next_begin_offset).await
+                if let Err(e) = consumer
+                    .update_consume_offset(mq, r.next_begin_offset)
+                    .await
                 {
                     commit_failed.push(format!("{}:{e}", code_of(&e)));
                 }
@@ -596,7 +619,10 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
     }
     let want: BTreeSet<String> = bodies.iter().cloned().collect();
     ck.check(
-        &format!("S8 pull with credentials fetched all {} messages", bodies.len()),
+        &format!(
+            "S8 pull with credentials fetched all {} messages",
+            bodies.len()
+        ),
         got == want,
         &format!("got={got:?}"),
     );
@@ -614,7 +640,9 @@ async fn s9_cleanup(ck: &mut Checker, fx: &Fixture) {
     println!("\nS9 cleanup: delete the topic created this round, with credentials");
     match fx.signed_admin("cleaner").await {
         Ok(admin) => {
-            let r = admin.delete_topic_in_broker(&fx.broker_addr, &fx.topic, 5000).await;
+            let r = admin
+                .delete_topic_in_broker(&fx.broker_addr, &fx.topic, 5000)
+                .await;
             ck.check(
                 "S9 delete the topic created this round",
                 r.is_ok(),

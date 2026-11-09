@@ -1,4 +1,3 @@
-
 use std::collections::HashSet;
 
 pub const TOPIC_MAX_LENGTH: i32 = 127;
@@ -68,7 +67,9 @@ fn allowed_char(b: u8) -> bool {
 }
 
 pub fn is_topic_or_group_illegal(name: &str) -> bool {
-    name.as_bytes().iter().any(|&b| b >= 0x80 || !allowed_char(b))
+    name.as_bytes()
+        .iter()
+        .any(|&b| b >= 0x80 || !allowed_char(b))
 }
 
 pub fn is_system_topic(topic: &str) -> bool {
@@ -108,7 +109,10 @@ mod tests {
             "tab\there",
             "line\nbreak",
         ] {
-            assert!(is_topic_or_group_illegal(illegal), "{illegal} should be illegal");
+            assert!(
+                is_topic_or_group_illegal(illegal),
+                "{illegal} should be illegal"
+            );
         }
     }
 
@@ -154,7 +158,10 @@ mod tests {
             "RMQ_SYS_ROCKSDB_TRANS_HALF_TOPIC",
             "RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC",
         ] {
-            assert!(is_not_allowed_send_topic(t), "{t} must not be sent to directly");
+            assert!(
+                is_not_allowed_send_topic(t),
+                "{t} must not be sent to directly"
+            );
         }
         assert!(!is_not_allowed_send_topic("TBW102"));
         // Target topics of the redelivery path must never be forbidden

@@ -2001,6 +2001,16 @@ class DefaultMQPushConsumer:
         """Whether the consumer is currently suspended."""
         return self._paused
 
+    def view_message(self, topic: str, msg_id: str) -> MessageExt:
+        """Java ``DefaultMQPushConsumer#viewMessage`` (the MQAdmin facade, :513).
+
+        Delegates to the client instance's SINGLE-leg lookup
+        (``MQAdminImpl#viewMessage``): offset msgId only, decoded and asked
+        VIEW_MESSAGE_BY_ID(33) on the broker that stamped it -- no uniq-key
+        fallback at this layer.
+        """
+        return self._require_client().view_message(topic, msg_id)
+
     def _require_client(self) -> MQClientInstance:
         if not self._started or self._mq_client is None:
             raise MQClientException("consumer not started, call start() first")
@@ -4734,6 +4744,16 @@ class DefaultMQPullConsumer:
         if not self._started or self._mq_client is None:
             raise MQClientException("consumer not started, call start() first")
         return self._mq_client
+
+    def view_message(self, topic: str, msg_id: str) -> MessageExt:
+        """Java ``DefaultMQPullConsumer#viewMessage`` (the MQAdmin facade, :439).
+
+        Delegates to the client instance's SINGLE-leg lookup
+        (``MQAdminImpl#viewMessage``): offset msgId only, decoded and asked
+        VIEW_MESSAGE_BY_ID(33) on the broker that stamped it -- no uniq-key
+        fallback at this layer.
+        """
+        return self._require_client().view_message(topic, msg_id)
 
     # ---------------- Pull ----------------
     def fetch_subscribe_message_queues(self, topic: str) -> List[MessageQueue]:

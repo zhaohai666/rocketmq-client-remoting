@@ -316,7 +316,9 @@ impl AllocateMessageQueueConsistentHash {
     }
 
     /// Construct with a given virtual node count.
-    pub fn with_virtual_node_cnt(virtual_node_cnt: i32) -> Result<AllocateMessageQueueConsistentHash> {
+    pub fn with_virtual_node_cnt(
+        virtual_node_cnt: i32,
+    ) -> Result<AllocateMessageQueueConsistentHash> {
         Self::with_hash_function(virtual_node_cnt, None)
     }
 
@@ -425,10 +427,7 @@ impl AllocateMessageQueueByMachineRoom {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        *self
-            .consumeridcs
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) =
+        *self.consumeridcs.write().unwrap_or_else(|e| e.into_inner()) =
             consumeridcs.into_iter().map(Into::into).collect();
     }
 
@@ -449,9 +448,7 @@ impl AllocateMessageQueueStrategy for AllocateMessageQueueByMachineRoom {
         mq_all: &[MessageQueue],
         cid_all: &[String],
     ) -> Result<Vec<MessageQueue>> {
-        let Some(current_index) =
-            check_config(consumer_group, current_cid, mq_all, cid_all)
-        else {
+        let Some(current_index) = check_config(consumer_group, current_cid, mq_all, cid_all) else {
             return Ok(Vec::new());
         };
         let rooms = self
@@ -593,8 +590,7 @@ impl AllocateMessageQueueStrategy for AllocateMachineRoomNearby {
             .get(&current_machine_room)
             .cloned()
             .unwrap_or_default();
-        if let Some(mq_in_this_machine_room) =
-            mq_in_this_machine_room.filter(|mqs| !mqs.is_empty())
+        if let Some(mq_in_this_machine_room) = mq_in_this_machine_room.filter(|mqs| !mqs.is_empty())
         {
             allocate_results.extend(self.allocate_message_queue_strategy.allocate(
                 consumer_group,
@@ -1072,7 +1068,11 @@ mod tests {
     #[test]
     fn matches_golden_reference_arithmetic() {
         // Independently transcribed arithmetic (shares no code with this module), used only for the differential test.
-        fn averagely_reference_allocation(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
+        fn averagely_reference_allocation(
+            mq_all: &[i32],
+            cid_all: &[String],
+            current_cid: &str,
+        ) -> Vec<i32> {
             if mq_all.is_empty() {
                 return vec![];
             }
@@ -1106,7 +1106,11 @@ mod tests {
             mq_all[start_index..end].to_vec()
         }
 
-        fn circle_reference_allocation(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
+        fn circle_reference_allocation(
+            mq_all: &[i32],
+            cid_all: &[String],
+            current_cid: &str,
+        ) -> Vec<i32> {
             if mq_all.is_empty() {
                 return vec![];
             }
@@ -1216,7 +1220,11 @@ mod tests {
         for case in cases {
             let mq_all = ch_queues(case.mq_size);
             let cid_all = ch_cids(case.cid_size);
-            assert_eq!(case.expect.len(), case.cid_size, "case cid count mismatch: {case:?}");
+            assert_eq!(
+                case.expect.len(),
+                case.cid_size,
+                "case cid count mismatch: {case:?}"
+            );
             for (index, expected) in case.expect.iter().enumerate() {
                 let got = allocate_ids(
                     strategy,
@@ -1295,9 +1303,15 @@ mod tests {
     fn consistent_hash_matches_the_canonical_ring_table() {
         let vc3 = AllocateMessageQueueConsistentHash::with_virtual_node_cnt(3).expect("vc>=0");
         run_consistent_hash_table(&vc3, CONSISTENT_HASH_CASES);
-        run_consistent_hash_table(&AllocateMessageQueueConsistentHash::new(), CONSISTENT_HASH_DEFAULT_VC_CASES);
+        run_consistent_hash_table(
+            &AllocateMessageQueueConsistentHash::new(),
+            CONSISTENT_HASH_DEFAULT_VC_CASES,
+        );
         assert_eq!(vc3.get_virtual_node_cnt(), 3);
-        assert_eq!(AllocateMessageQueueConsistentHash::default().get_virtual_node_cnt(), 10);
+        assert_eq!(
+            AllocateMessageQueueConsistentHash::default().get_virtual_node_cnt(),
+            10
+        );
     }
 
     /// Full coverage: at any size, every queue is assigned to exactly one consumer (no duplicates, no omissions).
@@ -1332,7 +1346,9 @@ mod tests {
                     map[mq.get_queue_id() as usize] = Some(cid.to_string());
                 }
             }
-            map.into_iter().map(|o| o.expect("every queue has an owner")).collect()
+            map.into_iter()
+                .map(|o| o.expect("every queue has an owner"))
+                .collect()
         };
         let before = owner_of(&cid_all);
 
@@ -1342,7 +1358,10 @@ mod tests {
         let after_remove = owner_of(&remaining);
         for (qid, owner) in before.iter().enumerate() {
             if owner != "CID-0" {
-                assert_eq!(&after_remove[qid], owner, "qid={qid} must not change owner on removal");
+                assert_eq!(
+                    &after_remove[qid], owner,
+                    "qid={qid} must not change owner on removal"
+                );
             }
         }
 
@@ -1352,7 +1371,10 @@ mod tests {
         let after_add = owner_of(&joined);
         for (qid, owner) in before.iter().enumerate() {
             if after_add[qid] != "CID-NEW" {
-                assert_eq!(&after_add[qid], owner, "qid={qid} must not change owner on join");
+                assert_eq!(
+                    &after_add[qid], owner,
+                    "qid={qid} must not change owner on join"
+                );
             }
         }
     }
@@ -1364,7 +1386,9 @@ mod tests {
         mq_all: &[MessageQueue],
         cid_all: &[String],
     ) -> Vec<MessageQueue> {
-        strategy.allocate(group, cid, mq_all, cid_all).expect("built-in strategies never return Err")
+        strategy
+            .allocate(group, cid, mq_all, cid_all)
+            .expect("built-in strategies never return Err")
     }
 
     /// Construction must reject a negative virtual node count (the error string `illegal virtualNodeCnt :` is fixed);
@@ -1373,8 +1397,12 @@ mod tests {
     fn consistent_hash_rejects_negative_virtual_node_cnt() {
         let err = AllocateMessageQueueConsistentHash::with_virtual_node_cnt(-1)
             .expect_err("must be rejected");
-        assert!(err.to_string().contains("illegal virtualNodeCnt :-1"), "{err}");
-        let zero = AllocateMessageQueueConsistentHash::with_virtual_node_cnt(0).expect("0 is legal");
+        assert!(
+            err.to_string().contains("illegal virtualNodeCnt :-1"),
+            "{err}"
+        );
+        let zero =
+            AllocateMessageQueueConsistentHash::with_virtual_node_cnt(0).expect("0 is legal");
         assert!(allocate(&zero, "g", "CID-0", &ch_queues(4), &ch_cids(2)).is_empty());
     }
 
@@ -1393,18 +1421,25 @@ mod tests {
         }
 
         let counter = Arc::new(FirstChar(AtomicUsize::new(0)));
-        let strategy = AllocateMessageQueueConsistentHash::with_hash_function(
-            2,
-            Some(counter.clone()),
-        )
-        .expect("vc>=0");
+        let strategy =
+            AllocateMessageQueueConsistentHash::with_hash_function(2, Some(counter.clone()))
+                .expect("vc>=0");
         let mq_all = ch_queues(4);
         let cid_all = ch_cids(2);
         // Fixed truth for this scenario: both cids' virtual node keys ("CID-0-0"...) start with 'C'
         // ⇒ same hash ⇒ the later one overwrites the earlier one at the same address; only CID-1 remains on the ring ⇒ all queues go to it.
-        assert_eq!(allocate_ids(&strategy, "g", "CID-0", &mq_all, &cid_all), Vec::<i32>::new());
-        assert_eq!(allocate_ids(&strategy, "g", "CID-1", &mq_all, &cid_all), vec![0, 1, 2, 3]);
-        assert!(counter.0.load(Ordering::Relaxed) > 0, "custom hash was never called");
+        assert_eq!(
+            allocate_ids(&strategy, "g", "CID-0", &mq_all, &cid_all),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            allocate_ids(&strategy, "g", "CID-1", &mq_all, &cid_all),
+            vec![0, 1, 2, 3]
+        );
+        assert!(
+            counter.0.load(Ordering::Relaxed) > 0,
+            "custom hash was never called"
+        );
     }
 
     /// Guard semantics are the same as the other strategies.
@@ -1430,7 +1465,15 @@ mod tests {
     fn by_machine_room_matches_canonical_allocations() {
         let mq_all: Vec<MessageQueue> = (0..10i32)
             .map(|i| {
-                MessageQueue::new("topic", if i < 5 { "room1@broker-a" } else { "room2@broker-b" }, i)
+                MessageQueue::new(
+                    "topic",
+                    if i < 5 {
+                        "room1@broker-a"
+                    } else {
+                        "room2@broker-b"
+                    },
+                    i,
+                )
             })
             .collect();
         let cid_all = create_consumer_id_list(2);
@@ -1464,9 +1507,9 @@ mod tests {
         // (broker name, segment count after dropping the tail, whether it joins allocation)
         let cases: &[(&str, usize, bool)] = &[
             ("room1@broker-a", 2, true),
-            ("room1@", 1, false),          // trailing empty segment dropped
-            ("room1@b@", 2, true),         // still 2 segments after dropping the tail
-            ("@room1", 2, false),          // 2 segments, but the room is an empty string, not in the whitelist
+            ("room1@", 1, false),  // trailing empty segment dropped
+            ("room1@b@", 2, true), // still 2 segments after dropping the tail
+            ("@room1", 2, false), // 2 segments, but the room is an empty string, not in the whitelist
             ("room1@broker@a", 3, false),
             ("@", 0, false),
             ("broker-a", 1, false),
@@ -1497,7 +1540,10 @@ mod tests {
         // The whitelist is replaceable (setter); the change takes effect on the same queue immediately
         strategy.set_consumeridcs(["room2"]);
         assert!(strategy.get_consumeridcs().contains("room2"));
-        assert!(allocate_one("room1@broker-a").is_empty(), "room1 no longer joins after the whitelist is replaced");
+        assert!(
+            allocate_one("room1@broker-a").is_empty(),
+            "room1 no longer joins after the whitelist is replaced"
+        );
     }
 
     /// The machine-room strategy goes through the `check_config` guard as well.
@@ -1518,7 +1564,14 @@ mod tests {
                 cid_all.len()
             );
         }
-        assert!(allocate(&strategy, "G", "CID_PREFIX0", &[], &create_consumer_id_list(2)).is_empty());
+        assert!(allocate(
+            &strategy,
+            "G",
+            "CID_PREFIX0",
+            &[],
+            &create_consumer_id_list(2)
+        )
+        .is_empty());
     }
 
     // --------------------------------------------- Machine-room-nearby proxy (MACHINE_ROOM_NEARBY)
@@ -1571,7 +1624,9 @@ mod tests {
             Arc::new(AllocateMessageQueueAveragely),
             Arc::new(DashRoom),
         );
-        for (idc_size, queue_size, consumer_size) in [(5, 20i32, 10), (5, 20, 20), (5, 20, 30), (5, 20, 1)] {
+        for (idc_size, queue_size, consumer_size) in
+            [(5, 20i32, 10), (5, 20, 20), (5, 20, 30), (5, 20, 1)]
+        {
             let mq_all = nearby_mq(idc_size, queue_size);
             let cid_all = nearby_cids(idc_size, consumer_size);
             let mut flat: Vec<(String, i32)> = Vec::new();
@@ -1591,10 +1646,17 @@ mod tests {
                 .iter()
                 .map(|mq| (mq.get_broker_name().to_string(), mq.get_queue_id()))
                 .collect();
-            assert_eq!(flat.len(), expected.len(), "{idc_size}×{queue_size}×{consumer_size} missing or duplicated");
+            assert_eq!(
+                flat.len(),
+                expected.len(),
+                "{idc_size}×{queue_size}×{consumer_size} missing or duplicated"
+            );
             flat.sort();
             expected.sort();
-            assert_eq!(flat, expected, "{idc_size}×{queue_size}×{consumer_size} union does not equal the full set");
+            assert_eq!(
+                flat, expected,
+                "{idc_size}×{queue_size}×{consumer_size} union does not equal the full set"
+            );
         }
     }
 
@@ -1654,12 +1716,20 @@ mod tests {
             for mq in allocate(&strategy, "Test-C-G", cid, &mq_all, &cid_all) {
                 let room = DashRoom.broker_deploy_in(&mq);
                 if room == "IDC1" || room == "IDC2" {
-                    assert_eq!(room, DashRoom.consumer_deploy_in(cid), "{room}'s queues leaked out");
+                    assert_eq!(
+                        room,
+                        DashRoom.consumer_deploy_in(cid),
+                        "{room}'s queues leaked out"
+                    );
                 }
                 claimed += 1;
             }
         }
-        assert_eq!(claimed, mq_all.len(), "no duplicates or omissions in the empty-room scenario");
+        assert_eq!(
+            claimed,
+            mq_all.len(),
+            "no duplicates or omissions in the empty-room scenario"
+        );
     }
 
     /// `get_name()` = `MACHINE_ROOM_NEARBY-<inner strategy name>` (fixed values:
@@ -1678,7 +1748,9 @@ mod tests {
         assert_eq!(circle.get_name(), "MACHINE_ROOM_NEARBY-AVG_BY_CIRCLE");
         // The same composition applies when the inner strategy is CONFIG
         let by_config = AllocateMachineRoomNearby::new(
-            Arc::new(AllocateMessageQueueByConfig::new(create_message_queue_list(1))),
+            Arc::new(AllocateMessageQueueByConfig::new(
+                create_message_queue_list(1),
+            )),
             Arc::new(DashRoom),
         );
         assert_eq!(by_config.get_name(), "MACHINE_ROOM_NEARBY-CONFIG");
@@ -1728,7 +1800,8 @@ mod tests {
             .allocate("G", "CID-0", &mq_all, &cid_all)
             .expect_err("an empty room must raise an error");
         assert!(
-            err.to_string().contains("Machine room is null for consumer id CID-0"),
+            err.to_string()
+                .contains("Machine room is null for consumer id CID-0"),
             "{err}"
         );
         // The guard still takes priority: when current_cid is not in cid_all, return empty first without touching the resolver
@@ -1736,7 +1809,10 @@ mod tests {
             Arc::new(AllocateMessageQueueAveragely),
             Arc::new(BlankBrokerRoom),
         );
-        assert!(guard.allocate("G", "CID-0", &mq_all, &[]).expect("the guard does not error").is_empty());
+        assert!(guard
+            .allocate("G", "CID-0", &mq_all, &[])
+            .expect("the guard does not error")
+            .is_empty());
     }
 
     /// Literal values of the `get_name()` strategy names (all six strategies present).
@@ -1782,19 +1858,34 @@ mod tests {
         let strategy = push.allocate_message_queue_strategy();
         assert_eq!(strategy.get_name(), "CONSISTENT_HASH");
         // Single consumer + hash ring: all 4 queues land on this consumer alone
-        assert_eq!(queue_ids(&allocate(strategy.as_ref(), "g", "CID-0", &mq_all, &cid_all)), vec![0, 1, 2, 3]);
+        assert_eq!(
+            queue_ids(&allocate(
+                strategy.as_ref(),
+                "g",
+                "CID-0",
+                &mq_all,
+                &cid_all
+            )),
+            vec![0, 1, 2, 3]
+        );
 
         let lite = DefaultLitePullConsumer::new("G_lite").expect("ok");
-        lite.set_allocate_message_queue_strategy(Arc::new(
-            AllocateMessageQueueByMachineRoom::new(["room1"]),
-        ));
+        lite.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueByMachineRoom::new(
+            ["room1"],
+        )));
         let strategy = lite.allocate_message_queue_strategy();
         assert_eq!(strategy.get_name(), "MACHINE_ROOM");
         let room_queues: Vec<MessageQueue> = (0..3i32)
             .map(|i| MessageQueue::new("topic", "room1@broker-a", i))
             .collect();
         assert_eq!(
-            queue_ids(&allocate(strategy.as_ref(), "g", "CID-0", &room_queues, &cid_all)),
+            queue_ids(&allocate(
+                strategy.as_ref(),
+                "g",
+                "CID-0",
+                &room_queues,
+                &cid_all
+            )),
             vec![0, 1, 2]
         );
 

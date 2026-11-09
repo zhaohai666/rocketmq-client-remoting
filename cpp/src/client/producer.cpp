@@ -1903,6 +1903,11 @@ std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic
     return decodeMessages(body);
 }
 
+// Java DefaultMQProducerImpl#viewMessage: the MQAdminImpl single leg (see producer.h).
+MessageExt DefaultMQProducer::viewMessage(const std::string& topic, const std::string& msgId) {
+    return client().viewMessage(topic, msgId);
+}
+
 std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std::string& topic) {
     MQClientInstance& c = client();
     const std::string realTopic = namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);

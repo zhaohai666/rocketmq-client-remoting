@@ -409,10 +409,7 @@ async fn run(namesrv: &str) -> Checker {
     ck.check(
         "A1-first delivery has reconsumeTimes=0",
         first.first().is_some_and(|(n, _)| *n == 0),
-        &format!(
-            "times={}",
-            first.first().map(|(n, _)| *n).unwrap_or(-1)
-        ),
+        &format!("times={}", first.first().map(|(n, _)| *n).unwrap_or(-1)),
     );
     let entries = consumer.process_queue_entries(&biz_key);
     ck.check(
@@ -529,7 +526,11 @@ async fn run(namesrv: &str) -> Checker {
     // ---------------- Cleanup ----------------
     listener.release();
     consumer.shutdown();
-    if let Err(e) = fx.admin.delete_topic_in_broker(&fx.broker_addr, &topic, 5000).await {
+    if let Err(e) = fx
+        .admin
+        .delete_topic_in_broker(&fx.broker_addr, &topic, 5000)
+        .await
+    {
         println!("    (deleteTopic({topic}) failed: {e})");
     } else {
         println!("    (deleteTopic({topic}) OK)");

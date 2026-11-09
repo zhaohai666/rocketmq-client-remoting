@@ -156,11 +156,20 @@ async function main(): Promise<void> {
   }
 
   // 10. consume stats (group must be online; empty → CONSUMER_NOT_ONLINE)
+  // The push consumer persists offsets to the broker on a 5s tick, so the
+  // broker-side offset table stays empty until the first persist after the
+  // message is consumed — a fixed short sleep races that tick (seen live:
+  // entries=0 at +500ms). Poll instead.
   try {
     await producer.send(new Message(TOPIC, Buffer.from('admin-probe'), 'TagA', 'ka'));
-    await sleep(500);
-    const stats = await admin.examineConsumeStats(GROUP);
-    check('examineConsumeStats', stats.offsetTable.size >= 1, `entries=${stats.offsetTable.size}`);
+    let stats: Awaited<ReturnType<DefaultMQAdminExt['examineConsumeStats']>> | null = null;
+    for (let i = 0; i < 16; ++i) {
+      await sleep(500);
+      stats = await admin.examineConsumeStats(GROUP);
+      if (stats.offsetTable.size >= 1) break;
+    }
+    check('examineConsumeStats', !!stats && stats.offsetTable.size >= 1,
+      `entries=${stats ? stats.offsetTable.size : 'n/a'}`);
   } catch (e) {
     check('examineConsumeStats', false, String((e as Error).message));
   }
@@ -174,6 +183,23 @@ async function main(): Promise<void> {
     check('maxOffset', max >= 0, `max=${max}`);
   } catch (e) {
     check('maxOffset', false, String((e as Error).message));
+  }
+
+  // 12. viewMessage: single-leg by the broker's offsetMsgId, and the admin's
+  // two-leg path by the client UNIQ_KEY (the send's msgId) — the fallback must
+  // fetch the original message back.
+  try {
+    const sr = await producer.send(new Message(TOPIC, Buffer.from('admin-view'), 'TagA', 'viewkey'));
+    const byOffset = await admin.viewMessage(TOPIC, sr.offsetMsgId!);
+    check('viewMessage(byOffsetMsgId)', byOffset != null && byOffset.body.equals(Buffer.from('admin-view')),
+      byOffset != null ? `body=${byOffset.body.toString().slice(0, 32)}` : 'no match');
+    const byUniq = await admin.viewMessage(TOPIC, sr.msgId);
+    check('viewMessage(uniqKey) fallback fetches the message',
+      byUniq != null && byUniq.body.equals(Buffer.from('admin-view')),
+      byUniq != null ? `body=${byUniq.body.toString().slice(0, 32)}`
+                     : 'no match (client-visible id filter failed)');
+  } catch (e) {
+    check('viewMessage legs', false, String((e as Error).message));
   }
 
   await admin.shutdown();

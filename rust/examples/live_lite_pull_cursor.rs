@@ -78,7 +78,11 @@ async fn poll_until(mut pred: impl FnMut() -> bool, secs: u64) -> bool {
 /// Polls repeatedly until `expect` messages are collected (or timeout), returning the received bodies.
 ///
 /// `Err` means a poll refused to answer (the consumer is not running) -- that is not "not yet delivered".
-async fn drain(c: &DefaultLitePullConsumer, expect: usize, secs: u64) -> Result<Vec<String>, String> {
+async fn drain(
+    c: &DefaultLitePullConsumer,
+    expect: usize,
+    secs: u64,
+) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
     while out.len() < expect && Instant::now() < deadline {
@@ -155,7 +159,10 @@ async fn run(namesrv: &str) -> Checker {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let admin = MQClientInstance::new(&format!("rust-lite-cursor-admin-{stamp}"), vec![namesrv.to_string()]);
+    let admin = MQClientInstance::new(
+        &format!("rust-lite-cursor-admin-{stamp}"),
+        vec![namesrv.to_string()],
+    );
     if let Err(e) = admin.start().await {
         ck.check("admin start", false, &e.to_string());
         return ck;
@@ -440,7 +447,9 @@ fn broker_route(route: &TopicRouteData) -> Result<(String, String), String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let namesrv = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9876".to_string());
+    let namesrv = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:9876".to_string());
     let ck = run(&namesrv).await;
     println!(
         "\nlite pull cursor live: {} passed, {} failed",

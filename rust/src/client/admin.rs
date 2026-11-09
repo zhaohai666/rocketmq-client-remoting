@@ -17,7 +17,6 @@ use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::message_const::{
     INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
-use crate::common::message_decoder::{decode_message, decode_message_id};
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::PermName;
 use crate::common::topic_config::TopicConfig;
@@ -247,10 +246,7 @@ fn filter_user_topic_configs(
 }
 
 /// Merges the paged topic config tables: same name overwrites, first-appearance order kept.
-fn merge_topic_config_table(
-    table: &mut Vec<(String, Value)>,
-    part: Vec<(String, Value)>,
-) {
+fn merge_topic_config_table(table: &mut Vec<(String, Value)>, part: Vec<(String, Value)>) {
     for (name, config) in part {
         match table.iter_mut().find(|(n, _)| *n == name) {
             Some(entry) => entry.1 = config,
@@ -365,7 +361,12 @@ pub const READ_AHEAD_MODE_EXT_KEY: &str = "READ_AHEAD_MODE";
 
 /// `%RETRY%<group>_<topic>`: the pop retry topic of a group/topic pair.
 fn build_pop_retry_topic(topic: &str, consumer_group: &str) -> String {
-    format!("{}{}_{}", MixAll::RETRY_GROUP_TOPIC_PREFIX, consumer_group, topic)
+    format!(
+        "{}{}_{}",
+        MixAll::RETRY_GROUP_TOPIC_PREFIX,
+        consumer_group,
+        topic
+    )
 }
 
 /// The config categories of `EXPORT_ROCKSDB_CONFIG_TO_JSON(355)`.
@@ -528,12 +529,12 @@ impl Default for DefaultMQAdminExt {
 }
 
 impl DefaultMQAdminExt {
-/// Constructs the admin with the default config.
+    /// Constructs the admin with the default config.
     pub fn new() -> DefaultMQAdminExt {
         DefaultMQAdminExt::with_config(AdminConfig::default())
     }
 
-/// Constructs the admin with an RPC hook.
+    /// Constructs the admin with an RPC hook.
     pub fn with_rpc_hook(rpc_hook: Option<Arc<dyn RPCHook>>) -> DefaultMQAdminExt {
         let admin = DefaultMQAdminExt::new();
         admin.set_rpc_hook(rpc_hook);
@@ -552,12 +553,12 @@ impl DefaultMQAdminExt {
 
     // ---------------- Config and lifecycle ----------------
 
-/// Snapshot of the current config.
+    /// Snapshot of the current config.
     pub fn config(&self) -> AdminConfig {
         read_cfg(&self.inner.cfg)
     }
 
-/// Mutates the config in place via a closure.
+    /// Mutates the config in place via a closure.
     pub fn update_config(&self, f: impl FnOnce(&mut AdminConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -633,7 +634,7 @@ impl DefaultMQAdminExt {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
-/// Joins the address list back into one string with semicolons.
+    /// Joins the address list back into one string with semicolons.
     pub fn get_name_server_addr(&self) -> String {
         read_cfg(&self.inner.cfg).name_server_addrs.join(";")
     }
@@ -1112,7 +1113,9 @@ impl DefaultMQAdminExt {
     ) -> Result<TopicConfigSerializeWrapper> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
-        let page_size = read_cfg(&self.inner.cfg).max_page_size_in_get_metadata.max(1);
+        let page_size = read_cfg(&self.inner.cfg)
+            .max_page_size_in_get_metadata
+            .max(1);
         let began = Instant::now();
         let mut current_version: Option<Value> = None;
         let mut topic_seq: i32 = 0;
@@ -1570,7 +1573,9 @@ impl DefaultMQAdminExt {
     ) -> Result<SubscriptionGroupWrapper> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
-        let page_size = read_cfg(&self.inner.cfg).max_page_size_in_get_metadata.max(1);
+        let page_size = read_cfg(&self.inner.cfg)
+            .max_page_size_in_get_metadata
+            .max(1);
         let began = Instant::now();
         let mut current_version: Option<Value> = None;
         let mut group_seq: i32 = 0;
@@ -1615,7 +1620,8 @@ impl DefaultMQAdminExt {
                 None => SubscriptionGroupWrapper::new(),
             };
             let new_version = wrapper.data_version.clone();
-            let page_len = i32::try_from(wrapper.subscription_group_table.len()).unwrap_or(i32::MAX);
+            let page_len =
+                i32::try_from(wrapper.subscription_group_table.len()).unwrap_or(i32::MAX);
             merge_group_table(&mut table, wrapper.subscription_group_table);
             merge_json_map(&mut forbidden, wrapper.forbidden_table);
             if current_version.is_none() {
@@ -1889,7 +1895,6 @@ impl DefaultMQAdminExt {
             None => Ok(Vec::new()),
         }
     }
-
 
     pub async fn examine_consume_stats_group(
         &self,
@@ -2412,8 +2417,9 @@ impl DefaultMQAdminExt {
 
     /// `indexType="U"` + `_UNIQUE_KEY_QUERY="true"`.
     ///
-    /// Note: broker-side uniqKey indexes are only supported by the RocksDB index implementation
-    /// (`IndexRocksDBStore`); with the default file index this query may return empty -- a broker config difference, not a client problem.
+    /// The U-index query walks the broker's commitlog directly (UNIQUE index
+    /// type), so it hits on the default file index too; a miss here is a real
+    /// no-match, not a broker config difference.
     pub async fn query_message_by_uniq_key(
         &self,
         topic: &str,
@@ -2482,47 +2488,24 @@ impl DefaultMQAdminExt {
             .await)
     }
 
-    pub async fn view_message(&self, topic: &str, msg_id: &str) -> Result<MessageExt> {
-        let by_id_error: Option<String>;
-        match decode_message_id(msg_id) {
-            Ok((ip, port, offset)) => {
-                if port > 0 && port <= 65_535 {
-                    let ext =
-                        ext_pairs(&[("topic", topic.to_string()), ("offset", offset.to_string())]);
-                    let addr = format!("{ip}:{port}");
-                    match self
-                        .invoke_broker(&addr, request_code::VIEW_MESSAGE_BY_ID, &ext, None, None)
-                        .await
-                    {
-                        Ok(response) => match response.body.as_deref().filter(|b| !b.is_empty()) {
-                            Some(body) => match decode_message(body) {
-                                Ok(msg) => return Ok(msg),
-                                Err(e) => by_id_error = Some(e.to_string()),
-                            },
-                            None => by_id_error = Some(format!("message not found: {msg_id}")),
-                        },
-                        Err(e) => by_id_error = Some(e.to_string()),
-                    }
-                } else {
-                    by_id_error = Some(format!("not a valid offset msgId: {msg_id}"));
-                }
-            }
-            Err(e) => by_id_error = Some(e.to_string()),
+    /// Java `DefaultMQAdminExtImpl#viewMessage` parity
+    /// (DefaultMQAdminExtImpl.java:578): try the offset-msgId leg first, and
+    /// when it fails for any reason (the msgId "maybe created by new client")
+    /// fall back to the uniq-key query across brokers. When neither leg
+    /// matches, Java returns null here instead of raising — so this resolves
+    /// to `Ok(None)`. (The single-leg core the producer / push / pull facades
+    /// share is [`MQClientInstance::view_message`].)
+    pub async fn view_message(&self, topic: &str, msg_id: &str) -> Result<Option<MessageExt>> {
+        if let Ok(msg) = self
+            .get_mq_client_instance()?
+            .view_message(topic, msg_id, self.timeout_millis())
+            .await
+        {
+            return Ok(Some(msg));
         }
-
-        // The uniq query sits outside the error fallback: when that path really throws, the error
-        // passes through; only "queried but empty" falls through to the final NO_MESSAGE.
-        if let Some(found) = self.query_message_by_uniq_key(topic, msg_id).await? {
-            return Ok(found);
-        }
-        Err(Error::client_with_code(
-            response_code::NO_MESSAGE,
-            format!(
-                "viewMessage failed: neither offset msgId nor uniq key matched message {msg_id} \
-                 of {topic}, cause: {}",
-                by_id_error.unwrap_or_default()
-            ),
-        ))
+        // The offset-msgId leg failed — the uniq-key leg decides. Java's
+        // queryMessageByUniqKey returns null when nothing matches.
+        self.query_message_by_uniq_key(topic, msg_id).await
     }
 
     pub async fn consume_message_directly(
@@ -2533,8 +2516,18 @@ impl DefaultMQAdminExt {
         msg_id: &str,
     ) -> Result<ConsumeMessageDirectlyResult> {
         let msg = self.view_message(topic, msg_id).await?;
+        // Java dereferences the viewMessage null unguarded here (a latent NPE);
+        // fail with a clear client error instead.
+        let msg = msg.ok_or_else(|| {
+            Error::client_with_code(
+                response_code::NO_MESSAGE,
+                format!("message {msg_id} of {topic} not found"),
+            )
+        })?;
         let addr = msg.get_store_host_string().ok_or_else(|| {
-            Error::client(format!("message {msg_id} has no store host, cannot consume directly"))
+            Error::client(format!(
+                "message {msg_id} has no store host, cannot consume directly"
+            ))
         })?;
         let direct_msg_id = match msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) {
             Some(_) => msg.get_offset_msg_id().unwrap_or(msg_id),
@@ -2547,7 +2540,13 @@ impl DefaultMQAdminExt {
             ("topic", topic.to_string()),
         ]);
         let response = self
-            .invoke_broker(&addr, request_code::CONSUME_MESSAGE_DIRECTLY, &ext, None, None)
+            .invoke_broker(
+                &addr,
+                request_code::CONSUME_MESSAGE_DIRECTLY,
+                &ext,
+                None,
+                None,
+            )
             .await?;
         match response.body.as_deref().filter(|b| !b.is_empty()) {
             Some(body) => ConsumeMessageDirectlyResult::decode(body),
@@ -2588,7 +2587,6 @@ impl DefaultMQAdminExt {
             None => Ok(QueryConsumeQueueResponseBody::default()),
         }
     }
-
 
     /// `UPDATE_AND_CREATE_TOPIC_LIST(18)`.
     ///
@@ -3069,11 +3067,7 @@ impl DefaultMQAdminExt {
     }
 
     /// `AUTH_CREATE_USER(3001)`: the header carries the name, the body carries the whole record.
-    pub async fn create_user_with_config(
-        &self,
-        broker_addr: &str,
-        user: &AuthUser,
-    ) -> Result<()> {
+    pub async fn create_user_with_config(&self, broker_addr: &str, user: &AuthUser) -> Result<()> {
         self.write_user(broker_addr, request_code::AUTH_CREATE_USER, user)
             .await
     }
@@ -3093,11 +3087,7 @@ impl DefaultMQAdminExt {
     }
 
     /// `AUTH_UPDATE_USER(3002)`: same shape as 3001, and the same omission rule.
-    pub async fn update_user_with_config(
-        &self,
-        broker_addr: &str,
-        user: &AuthUser,
-    ) -> Result<()> {
+    pub async fn update_user_with_config(&self, broker_addr: &str, user: &AuthUser) -> Result<()> {
         self.write_user(broker_addr, request_code::AUTH_UPDATE_USER, user)
             .await
     }
@@ -3105,8 +3095,14 @@ impl DefaultMQAdminExt {
     /// `AUTH_DELETE_USER(3003)`: header-only, and the reply body is never read.
     pub async fn delete_user(&self, broker_addr: &str, username: &str) -> Result<()> {
         let ext = ext_pairs(&[("username", username.to_string())]);
-        self.invoke_broker_plain(broker_addr, request_code::AUTH_DELETE_USER, &ext, None, None)
-            .await?;
+        self.invoke_broker_plain(
+            broker_addr,
+            request_code::AUTH_DELETE_USER,
+            &ext,
+            None,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -3120,7 +3116,11 @@ impl DefaultMQAdminExt {
     }
 
     /// `AUTH_LIST_USER(3005)`: `filter=None` sends no filter header at all rather than an empty one.
-    pub async fn list_user(&self, broker_addr: &str, filter: Option<&str>) -> Result<Vec<AuthUser>> {
+    pub async fn list_user(
+        &self,
+        broker_addr: &str,
+        filter: Option<&str>,
+    ) -> Result<Vec<AuthUser>> {
         let ext = match filter {
             Some(v) => ext_pairs(&[("filter", v.to_string())]),
             None => ExtFields::new(),
@@ -3290,14 +3290,20 @@ impl DefaultMQAdminExt {
         controller_addr: &str,
     ) -> Result<ControllerMetaData> {
         let client = self.require_client()?;
-        let mut request = build_request(request_code::CONTROLLER_GET_METADATA_INFO, &ExtFields::new(), None);
+        let mut request = build_request(
+            request_code::CONTROLLER_GET_METADATA_INFO,
+            &ExtFields::new(),
+            None,
+        );
         let response = client
             .invoke_sync(controller_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
             .await?;
         MQClientInstance::check_response(&response)?;
         Ok(ControllerMetaData {
             group: response.get_ext_field("group").map(str::to_string),
-            controller_leader_id: response.get_ext_field("controllerLeaderId").map(str::to_string),
+            controller_leader_id: response
+                .get_ext_field("controllerLeaderId")
+                .map(str::to_string),
             controller_leader_address: response
                 .get_ext_field("controllerLeaderAddress")
                 .map(str::to_string),
@@ -3338,8 +3344,11 @@ impl DefaultMQAdminExt {
                 .collect::<Vec<_>>(),
         )
         .map_err(|e| Error::Encode(format!("encode broker list: {e}")))?;
-        let mut request =
-            build_request(request_code::CONTROLLER_GET_SYNC_STATE_DATA, &ExtFields::new(), Some(body));
+        let mut request = build_request(
+            request_code::CONTROLLER_GET_SYNC_STATE_DATA,
+            &ExtFields::new(),
+            Some(body),
+        );
         let response = client
             .invoke_sync(&leader_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
             .await?;
@@ -3449,7 +3458,10 @@ impl DefaultMQAdminExt {
         if let Some(ids) = broker_controller_ids_to_clean {
             pairs.push(("brokerControllerIdsToClean", ids.to_string()));
         }
-        pairs.push(("isCleanLivingBroker", bool_flag(is_clean_living_broker).to_string()));
+        pairs.push((
+            "isCleanLivingBroker",
+            bool_flag(is_clean_living_broker).to_string(),
+        ));
         pairs.push(("invokeTime", current_time_millis().to_string()));
         let ext = ext_pairs(&pairs);
         let client = self.require_client()?;
@@ -3508,10 +3520,7 @@ impl DefaultMQAdminExt {
 
     /// `GET_COLD_DATA_FLOW_CTR_INFO(2003)`: answered on the listening port only; the raw body
     /// text is returned as-is (`None` when the broker sends none).
-    pub async fn get_cold_data_flow_ctr_info(
-        &self,
-        broker_addr: &str,
-    ) -> Result<Option<String>> {
+    pub async fn get_cold_data_flow_ctr_info(&self, broker_addr: &str) -> Result<Option<String>> {
         let response = self
             .invoke_broker_plain(
                 broker_addr,
@@ -3588,11 +3597,9 @@ impl DefaultMQAdminExt {
             .body
             .as_deref()
             .filter(|b| !b.is_empty())
-            .ok_or_else(|| {
-                Error::Broker {
-                    response_code: response.code,
-                    message: format!("empty check result for topic {topic}"),
-                }
+            .ok_or_else(|| Error::Broker {
+                response_code: response.code,
+                message: format!("empty check result for topic {topic}"),
             })?;
         CheckRocksdbCqWriteResult::decode(body)
     }
@@ -3901,13 +3908,18 @@ impl DefaultMQAdminExt {
         if result.offset_table.is_empty() {
             const NOT_ONLINE_MSG: &str = "Not found the consumer group consume stats, because return offset table is empty, maybe the consumer not consume any message";
             const BROADCAST_MSG: &str = "Not found the consumer group consume stats, because return offset table is empty, the consumer is under the broadcast mode";
-            return match self.examine_consumer_connection_info(consumer_group, None).await {
-                Err(_) => {
-                    AdminToolResult::failure(AdminToolsResultCode::ConsumerNotOnline, NOT_ONLINE_MSG)
-                }
-                Ok(cc) if cc.connection_set.is_empty() => {
-                    AdminToolResult::failure(AdminToolsResultCode::ConsumerNotOnline, NOT_ONLINE_MSG)
-                }
+            return match self
+                .examine_consumer_connection_info(consumer_group, None)
+                .await
+            {
+                Err(_) => AdminToolResult::failure(
+                    AdminToolsResultCode::ConsumerNotOnline,
+                    NOT_ONLINE_MSG,
+                ),
+                Ok(cc) if cc.connection_set.is_empty() => AdminToolResult::failure(
+                    AdminToolsResultCode::ConsumerNotOnline,
+                    NOT_ONLINE_MSG,
+                ),
                 Ok(cc) if cc.message_model.as_deref() == Some("BROADCASTING") => {
                     AdminToolResult::failure(
                         AdminToolsResultCode::BroadcastConsumption,
@@ -4011,7 +4023,13 @@ impl DefaultMQAdminExt {
                     .and_then(|(_, qd)| qd.clone());
                 async move {
                     admin
-                        .reset_offset_new_for_broker(&addr, queue_data.as_ref(), &group, &topic, timestamp)
+                        .reset_offset_new_for_broker(
+                            &addr,
+                            queue_data.as_ref(),
+                            &group,
+                            &topic,
+                            timestamp,
+                        )
                         .await
                 }
             })
@@ -4045,13 +4063,29 @@ impl DefaultMQAdminExt {
         timestamp: i64,
     ) -> bool {
         match self
-            .invoke_broker_reset_offset(broker_addr, topic, group, timestamp, true, false, None, None)
+            .invoke_broker_reset_offset(
+                broker_addr,
+                topic,
+                group,
+                timestamp,
+                true,
+                false,
+                None,
+                None,
+            )
             .await
         {
             Ok(_) => true,
             Err(e) if e.response_code() == Some(response_code::CONSUMER_NOT_ONLINE) => {
                 match self
-                    .reset_offset_old_for_broker(broker_addr, queue_data, group, topic, timestamp, true)
+                    .reset_offset_old_for_broker(
+                        broker_addr,
+                        queue_data,
+                        group,
+                        topic,
+                        timestamp,
+                        true,
+                    )
                     .await
                 {
                     Ok(()) => true,
@@ -4085,7 +4119,9 @@ impl DefaultMQAdminExt {
         timestamp: i64,
         force: bool,
     ) -> Result<()> {
-        let stats = self.examine_consume_stats(broker_addr, group, None, None).await?;
+        let stats = self
+            .examine_consume_stats(broker_addr, group, None, None)
+            .await?;
         let mut has_consumed = false;
         for (key, wrapper) in &stats.offset_table {
             if key.topic != topic {
@@ -4100,9 +4136,13 @@ impl DefaultMQAdminExt {
             return Ok(());
         }
         let queue_data = queue_data.ok_or_else(|| {
-            Error::client(format!("no queue data for broker {broker_addr} while resetting {topic}"))
+            Error::client(format!(
+                "no queue data for broker {broker_addr} while resetting {topic}"
+            ))
         })?;
-        let status = self.examine_topic_stats_by_broker(broker_addr, topic).await?;
+        let status = self
+            .examine_topic_stats_by_broker(broker_addr, topic)
+            .await?;
         for queue_id in 0..queue_data.read_queue_nums {
             let Some((_, offset)) = status.offset_table.iter().find(|(k, _)| {
                 k.topic == topic
@@ -4148,7 +4188,13 @@ impl DefaultMQAdminExt {
         };
         if force || reset_offset <= wrapper.consumer_offset {
             client
-                .update_consumer_offset(group, mq, reset_offset, self.timeout_millis(), Some(broker_addr))
+                .update_consumer_offset(
+                    group,
+                    mq,
+                    reset_offset,
+                    self.timeout_millis(),
+                    Some(broker_addr),
+                )
                 .await?;
         }
         Ok(())
@@ -4182,7 +4228,11 @@ impl DefaultMQAdminExt {
         let parts = self
             .fan_out(addrs, move |admin, addr| {
                 let group = group_owned.clone();
-                async move { admin.query_topics_by_consumer_to_broker(&addr, &group).await }
+                async move {
+                    admin
+                        .query_topics_by_consumer_to_broker(&addr, &group)
+                        .await
+                }
             })
             .await;
         let mut result = TopicList::new();
@@ -4193,7 +4243,9 @@ impl DefaultMQAdminExt {
                         result.topic_list.push(topic.clone());
                     }
                 }
-                Err(e) => rmq_warn!("queryTopicsByConsumer error. group={group} broker={addr}: {e}"),
+                Err(e) => {
+                    rmq_warn!("queryTopicsByConsumer error. group={group} broker={addr}: {e}")
+                }
             }
         }
         AdminToolResult::success(result)
@@ -4391,7 +4443,9 @@ fn string_list(value: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::message_decoder::{create_message_id, encode_message_ext, ip_and_port_to_bytes};
+    use crate::common::message_decoder::{
+        create_message_id, encode_message_ext, ip_and_port_to_bytes,
+    };
     use crate::remoting::protocol::admin_body::{CheckRocksdbCqWriteStatus, TopicOffset};
     use crate::remoting::protocol::body::CMResult;
     use crate::remoting::protocol::route::QueueData;
@@ -4448,11 +4502,7 @@ mod tests {
         assert_eq!(admin.get_namespace_v2(), Some("NS_V2".to_string()));
         assert_eq!(admin.config().namespace_v2, Some("NS_V2".to_string()));
         admin.set_namespace_v2(None);
-        assert_eq!(
-            admin.get_namespace_v2(),
-            None,
-            "None = clears"
-        );
+        assert_eq!(admin.get_namespace_v2(), None, "None = clears");
     }
 
     /// VIP channel switch: takes effect after set (default false; together with mix_all's
@@ -4503,7 +4553,10 @@ mod tests {
     fn reset_offset_ext_key_is_isforce() {
         let ext = reset_offset_ext_pairs("T", "G", -1, true, None, None);
         assert_eq!(ext.get("isForce"), Some("true"));
-        assert!(!ext.contains_key("force"), "force is not the server-side field name");
+        assert!(
+            !ext.contains_key("force"),
+            "force is not the server-side field name"
+        );
         assert_eq!(ext.get("timestamp"), Some("-1"));
         assert_eq!(ext.get("offset"), Some("-1"));
         assert!(
@@ -4868,16 +4921,21 @@ mod tests {
         let inner = Arc::clone(&log);
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let log = Arc::clone(&inner);
                 let view_body = view_body.clone();
                 let direct = direct.clone();
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
                         if matches!(
                             request.code,
-                            request_code::VIEW_MESSAGE_BY_ID | request_code::CONSUME_MESSAGE_DIRECTLY
+                            request_code::VIEW_MESSAGE_BY_ID
+                                | request_code::CONSUME_MESSAGE_DIRECTLY
                         ) {
                             lock(&log).push((
                                 request.code,
@@ -4940,7 +4998,8 @@ mod tests {
         (
             encode_message_ext(&ext, false).expect("encode fixture message"),
             create_message_id(
-                &ip_and_port_to_bytes("127.0.0.1", u32::from(store_port), false).expect("fixture address"),
+                &ip_and_port_to_bytes("127.0.0.1", u32::from(store_port), false)
+                    .expect("fixture address"),
                 offset,
             ),
         )
@@ -4959,14 +5018,15 @@ mod tests {
     async fn started_direct_admin(addr: &str) -> DefaultMQAdminExt {
         let admin = DefaultMQAdminExt::new();
         admin.set_namesrv_addr(addr);
-        admin.start().await.expect("start against the mock broker should succeed");
+        admin
+            .start()
+            .await
+            .expect("start against the mock broker should succeed");
         admin
     }
 
     fn direct_ext(log: &DirectLog, n: usize) -> Vec<(String, String)> {
-        lock(log)[n]
-            .1
-            .clone()
+        lock(log)[n].1.clone()
     }
 
     /// End-to-end cross-check: msgId is a legal offset msgId → 33 fetches the message (with UNIQ_KEY) → 309 hits
@@ -5012,11 +5072,7 @@ mod tests {
         assert_eq!(snapshot[0].0, request_code::VIEW_MESSAGE_BY_ID);
         assert_eq!(snapshot[1].0, request_code::CONSUME_MESSAGE_DIRECTLY);
         let ext = direct_ext(&log, 1);
-        let get = |key: &str| {
-            ext.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-        };
+        let get = |key: &str| ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
         assert_eq!(get("consumerGroup"), Some("GID_A"));
         assert_eq!(get("clientId"), Some("cid-1"));
         assert_eq!(get("topic"), Some("T"));
@@ -5104,8 +5160,8 @@ mod tests {
             (listener, addr, port)
         };
         let (view_body, msg_id) = directly_view_body(port, 1024, true);
-        let log = spawn_direct_broker(listener, view_body, (response_code::SUCCESS, Vec::new()))
-            .await;
+        let log =
+            spawn_direct_broker(listener, view_body, (response_code::SUCCESS, Vec::new())).await;
         let admin = started_direct_admin(&addr).await;
 
         let err = admin
@@ -5114,7 +5170,8 @@ mod tests {
             .expect_err("an empty body must raise an error");
         assert_eq!(err.response_code(), None);
         assert!(
-            err.to_string().contains("no consume result for client cid-1"),
+            err.to_string()
+                .contains("no consume result for client cid-1"),
             "{err}"
         );
         assert_eq!(lock(&log).len(), 2);
@@ -5136,8 +5193,9 @@ mod tests {
     // ---------------- 3001-3010 auth user / ACL management (mock-broker cross-check) ----------------
 
     use crate::remoting::protocol::auth_body::{
-        AclEntry, AclPolicy, DECISION_ALLOW, DECISION_DENY, POLICY_TYPE_CUSTOM, POLICY_TYPE_DEFAULT,
-        USER_STATUS_DISABLE, USER_STATUS_ENABLE, USER_TYPE_NORMAL, USER_TYPE_SUPER,
+        AclEntry, AclPolicy, DECISION_ALLOW, DECISION_DENY, POLICY_TYPE_CUSTOM,
+        POLICY_TYPE_DEFAULT, USER_STATUS_DISABLE, USER_STATUS_ENABLE, USER_TYPE_NORMAL,
+        USER_TYPE_SUPER,
     };
 
     /// One auth request exactly as it left the wire: `(request code, extFields, body)`.
@@ -5172,19 +5230,26 @@ mod tests {
     /// Starts the auth cross-check mock broker: every request in 3001-3010 is recorded verbatim and
     /// answered from `replies` (matched by request code); everything else the start handshake and
     /// the route refreshers produce gets SUCCESS with no body, and is not recorded.
-    async fn spawn_auth_broker(listener: tokio::net::TcpListener, replies: Vec<(i32, AuthReply)>) -> AuthLog {
+    async fn spawn_auth_broker(
+        listener: tokio::net::TcpListener,
+        replies: Vec<(i32, AuthReply)>,
+    ) -> AuthLog {
         use tokio::io::AsyncWriteExt as _;
         let log: AuthLog = Arc::new(Mutex::new(Vec::new()));
         let inner = Arc::clone(&log);
         let replies = Arc::new(replies);
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let log = Arc::clone(&inner);
                 let replies = Arc::clone(&replies);
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
                         if (request_code::AUTH_CREATE_USER..=request_code::AUTH_LIST_ACL)
                             .contains(&request.code)
                         {
@@ -5255,12 +5320,12 @@ mod tests {
     }
 
     fn auth_record(log: &AuthLog, code: i32) -> AuthRecord {
-        let records: Vec<AuthRecord> = lock(log)
-            .iter()
-            .filter(|r| r.0 == code)
-            .cloned()
-            .collect();
-        assert_eq!(records.len(), 1, "code {code} must reach the wire exactly once");
+        let records: Vec<AuthRecord> = lock(log).iter().filter(|r| r.0 == code).cloned().collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "code {code} must reach the wire exactly once"
+        );
         records.into_iter().next().unwrap()
     }
 
@@ -5335,7 +5400,10 @@ mod tests {
             .expect("3002");
 
         let record = auth_record(&log, request_code::AUTH_UPDATE_USER);
-        assert_eq!(record.1, vec![("username".to_string(), "alice".to_string())]);
+        assert_eq!(
+            record.1,
+            vec![("username".to_string(), "alice".to_string())]
+        );
         assert_eq!(
             auth_body(&log, request_code::AUTH_UPDATE_USER),
             r#"{"username":"alice","password":"abcdefgh","userType":"Normal"}"#
@@ -5364,7 +5432,10 @@ mod tests {
             .expect("3003 must not touch the reply body");
 
         let record = auth_record(&log, request_code::AUTH_DELETE_USER);
-        assert_eq!(record.1, vec![("username".to_string(), "alice".to_string())]);
+        assert_eq!(
+            record.1,
+            vec![("username".to_string(), "alice".to_string())]
+        );
         assert!(record.2.is_empty(), "3003 has no request body");
         admin.shutdown();
     }
@@ -5530,7 +5601,10 @@ mod tests {
             .expect("3007 short form");
 
         let record = auth_record(&log, request_code::AUTH_UPDATE_ACL);
-        assert_eq!(record.1, vec![("subject".to_string(), "user:alice".to_string())]);
+        assert_eq!(
+            record.1,
+            vec![("subject".to_string(), "user:alice".to_string())]
+        );
         assert_eq!(
             String::from_utf8(record.2.clone()).unwrap(),
             concat!(
@@ -5587,7 +5661,10 @@ mod tests {
             .expect("the broker returned an acl");
         assert_eq!(acl.subject, "user:alice");
         assert_eq!(acl.policies.len(), 1);
-        assert_eq!(acl.policies[0].policy_type.as_deref(), Some(POLICY_TYPE_DEFAULT));
+        assert_eq!(
+            acl.policies[0].policy_type.as_deref(),
+            Some(POLICY_TYPE_DEFAULT)
+        );
         assert_eq!(acl.policies[0].entries[0].resource, "topic:T1");
         assert_eq!(acl.policies[0].entries[0].actions, vec!["ANY".to_string()]);
         assert_eq!(
@@ -5598,7 +5675,10 @@ mod tests {
 
         let (addr2, _) = auth_broker(vec![]).await;
         let empty_admin = started_auth_admin(&addr2, "get_acl_empty").await;
-        assert_eq!(empty_admin.get_acl(&addr2, "user:ghost").await.unwrap(), None);
+        assert_eq!(
+            empty_admin.get_acl(&addr2, "user:ghost").await.unwrap(),
+            None
+        );
         admin.shutdown();
         empty_admin.shutdown();
     }
@@ -5622,8 +5702,14 @@ mod tests {
             .expect("3010 with both filters");
         assert_eq!(both.len(), 2);
         assert_eq!(both[0].subject, "user:a");
-        assert!(both[0].policies.is_empty(), "an empty policy list stays empty");
-        assert_eq!(both[1].policies[0].entries[0].decision.as_deref(), Some(DECISION_DENY));
+        assert!(
+            both[0].policies.is_empty(),
+            "an empty policy list stays empty"
+        );
+        assert_eq!(
+            both[1].policies[0].entries[0].decision.as_deref(),
+            Some(DECISION_DENY)
+        );
         assert_eq!(
             auth_record(&log, request_code::AUTH_LIST_ACL).1,
             vec![
@@ -5664,7 +5750,11 @@ mod tests {
         let admin = started_auth_admin(&addr, "empty_lists").await;
 
         assert!(admin.list_user(&addr, Some("*")).await.unwrap().is_empty());
-        assert!(admin.list_acl(&addr, Some("*"), None).await.unwrap().is_empty());
+        assert!(admin
+            .list_acl(&addr, Some("*"), None)
+            .await
+            .unwrap()
+            .is_empty());
         admin.shutdown();
     }
 
@@ -5758,7 +5848,8 @@ mod tests {
         ] {
             let err = outcome.unwrap_or_else(|| panic!("{name} must refuse before start()"));
             assert!(
-                err.to_string().starts_with("MQClientException: admin not started"),
+                err.to_string()
+                    .starts_with("MQClientException: admin not started"),
                 "{name}: {err}"
             );
         }
@@ -5786,9 +5877,18 @@ mod tests {
         ] {
             assert!(ext.contains_key(key), "{key} missing");
         }
-        assert!(!ext.contains_key("userName"), "no camel-case drift on username");
-        assert!(!ext.contains_key("subjects"), "the subject header is singular");
-        assert!(!ext.contains_key("resourceFilters"), "the filter headers are singular");
+        assert!(
+            !ext.contains_key("userName"),
+            "no camel-case drift on username"
+        );
+        assert!(
+            !ext.contains_key("subjects"),
+            "the subject header is singular"
+        );
+        assert!(
+            !ext.contains_key("resourceFilters"),
+            "the filter headers are singular"
+        );
     }
 
     // ---------------------------------------------------------------- metadata paging
@@ -5936,7 +6036,12 @@ mod tests {
             requests.iter().map(|ext| ext.get("dataVersion")).collect();
         assert_eq!(
             versions,
-            vec![Some(""), Some(v1.as_str()), Some(v2.as_str()), Some(v2.as_str())]
+            vec![
+                Some(""),
+                Some(v1.as_str()),
+                Some(v2.as_str()),
+                Some(v2.as_str())
+            ]
         );
     }
 
@@ -6034,20 +6139,20 @@ mod tests {
 
         let requests = paging_requests(&client, request_code::GET_ALL_SUBSCRIPTIONGROUP_CONFIG);
         assert_eq!(requests.len(), 4);
-        let seqs: Vec<Option<&str>> = requests
-            .iter()
-            .map(|ext| ext.get("groupSeq"))
-            .collect();
+        let seqs: Vec<Option<&str>> = requests.iter().map(|ext| ext.get("groupSeq")).collect();
         assert_eq!(seqs, vec![Some("0"), Some("1"), Some("0"), Some("1")]);
         let v1 = RemotingSerializable::to_json_string(&version_value(1));
         let v2 = RemotingSerializable::to_json_string(&version_value(2));
-        let versions: Vec<Option<&str>> = requests
-            .iter()
-            .map(|ext| ext.get("dataVersion"))
-            .collect();
+        let versions: Vec<Option<&str>> =
+            requests.iter().map(|ext| ext.get("dataVersion")).collect();
         assert_eq!(
             versions,
-            vec![Some(""), Some(v1.as_str()), Some(v2.as_str()), Some(v2.as_str())]
+            vec![
+                Some(""),
+                Some(v1.as_str()),
+                Some(v2.as_str()),
+                Some(v2.as_str())
+            ]
         );
     }
 
@@ -6226,7 +6331,10 @@ mod tests {
             .expect("metadata");
         assert_eq!(meta.group.as_deref(), Some("ctr-group"));
         assert_eq!(meta.controller_leader_id.as_deref(), Some("ctr-1"));
-        assert_eq!(meta.controller_leader_address.as_deref(), Some("10.9.9.9:9878"));
+        assert_eq!(
+            meta.controller_leader_address.as_deref(),
+            Some("10.9.9.9:9878")
+        );
         assert!(meta.is_leader);
         assert_eq!(
             meta.peers.as_deref(),
@@ -6273,7 +6381,10 @@ mod tests {
         assert!(state.replicas_info_table.is_empty());
         let codes = log_codes(&log);
         assert_eq!(
-            codes.iter().filter(|c| **c == request_code::CONTROLLER_GET_METADATA_INFO).count(),
+            codes
+                .iter()
+                .filter(|c| **c == request_code::CONTROLLER_GET_METADATA_INFO)
+                .count(),
             1,
             "phase one: the metadata query"
         );
@@ -6372,7 +6483,10 @@ mod tests {
         let mut props = StringMap::new();
         props.insert("ctrSyncTopicEnable".to_string(), "false".to_string());
         let err = admin
-            .update_controller_config(&props, &["10.9.9.9:9878".to_string(), "10.9.9.10:9878".to_string()])
+            .update_controller_config(
+                &props,
+                &["10.9.9.9:9878".to_string(), "10.9.9.10:9878".to_string()],
+            )
             .await
             .expect_err("both controllers rejected");
         assert_eq!(err.response_code(), Some(3), "the last non-SUCCESS wins");
@@ -6393,13 +6507,7 @@ mod tests {
         let admin = admin_on(&client, 2000);
 
         admin
-            .clean_controller_broker_data(
-                "10.9.9.1:9878",
-                None,
-                "broker-a",
-                None,
-                false,
-            )
+            .clean_controller_broker_data("10.9.9.1:9878", None, "broker-a", None, false)
             .await
             .expect("clean broker data");
 
@@ -6466,7 +6574,11 @@ mod tests {
             .expect("remove cold data config");
         let (ext, body) = logged_request(&log, request_code::REMOVE_COLD_DATA_FLOW_CTR_CONFIG);
         assert!(ext.is_empty());
-        assert_eq!(body.as_deref(), Some(b"GID_a".as_ref()), "the plain group string, not JSON");
+        assert_eq!(
+            body.as_deref(),
+            Some(b"GID_a".as_ref()),
+            "the plain group string, not JSON"
+        );
 
         // Empty payloads skip the RPC entirely.
         let before = lock(&log).len();
@@ -6527,7 +6639,11 @@ mod tests {
             .set_commit_log_read_ahead_mode("10.0.0.10:10911", "NORMAL")
             .await
             .expect("read ahead mode");
-        assert_eq!(remark.as_deref(), Some("NORMAL"), "the remark is the result");
+        assert_eq!(
+            remark.as_deref(),
+            Some("NORMAL"),
+            "the remark is the result"
+        );
 
         let none = admin
             .set_commit_log_read_ahead_mode("10.0.0.10:10911", "UNKNOWN")
@@ -6591,7 +6707,10 @@ mod tests {
         admin
             .export_rocksdb_config_to_json(
                 "10.0.0.10:10911",
-                &[RocksdbConfigType::Topics, RocksdbConfigType::SubscriptionGroups],
+                &[
+                    RocksdbConfigType::Topics,
+                    RocksdbConfigType::SubscriptionGroups,
+                ],
             )
             .await
             .expect("export rocksdb config");
@@ -6628,10 +6747,22 @@ mod tests {
         let admin = admin_on(&client, 2000);
         let addr = "10.0.0.10:10911";
 
-        admin.get_broker_lite_info(addr).await.expect("broker lite info");
-        admin.get_parent_topic_info(addr, "T").await.expect("parent topic info");
-        admin.get_lite_topic_info(addr, "T", Some("L1")).await.expect("lite topic info");
-        admin.get_lite_topic_info(addr, "T", None).await.expect("lite topic info, no lite filter");
+        admin
+            .get_broker_lite_info(addr)
+            .await
+            .expect("broker lite info");
+        admin
+            .get_parent_topic_info(addr, "T")
+            .await
+            .expect("parent topic info");
+        admin
+            .get_lite_topic_info(addr, "T", Some("L1"))
+            .await
+            .expect("lite topic info");
+        admin
+            .get_lite_topic_info(addr, "T", None)
+            .await
+            .expect("lite topic info, no lite filter");
         admin
             .get_lite_client_info(addr, "T", "GID_a", Some("cid-1"))
             .await
@@ -6640,7 +6771,10 @@ mod tests {
             .get_lite_client_info(addr, "T", "GID_a", None)
             .await
             .expect("lite client info without client");
-        admin.get_lite_group_info(addr, "GID_a", None, 7).await.expect("lite group info");
+        admin
+            .get_lite_group_info(addr, "GID_a", None, 7)
+            .await
+            .expect("lite group info");
         admin
             .trigger_lite_dispatch(addr, "GID_a", Some("cid-1"))
             .await
@@ -6656,7 +6790,8 @@ mod tests {
         assert_eq!(lite_topic[0].get("parentTopic"), Some("T"));
         assert_eq!(lite_topic[0].get("liteTopic"), Some("L1"));
         assert_eq!(
-            lite_topic[1].get("liteTopic"), None,
+            lite_topic[1].get("liteTopic"),
+            None,
             "the optional lite filter is omitted when absent"
         );
 
@@ -6763,13 +6898,14 @@ mod tests {
         assert!(group_json.get("topicConfigList").is_none());
 
         // Empty lists are refused before any IO.
-        assert!(admin.create_and_update_topic_config_list(&addr, &[]).await.is_err());
-        assert!(
-            admin
-                .create_and_update_subscription_group_config_list(&addr, &[])
-                .await
-                .is_err()
-        );
+        assert!(admin
+            .create_and_update_topic_config_list(&addr, &[])
+            .await
+            .is_err());
+        assert!(admin
+            .create_and_update_subscription_group_config_list(&addr, &[])
+            .await
+            .is_err());
         admin.shutdown();
     }
 

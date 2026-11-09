@@ -33,9 +33,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
-use rocketmq_client_remoting::client::consumer::{
-    mq_key, ConsumerConfig, DefaultMQPushConsumer,
-};
+use rocketmq_client_remoting::client::consumer::{mq_key, ConsumerConfig, DefaultMQPushConsumer};
 use rocketmq_client_remoting::client::mq_client::RegisteredConsumer;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::result::{
@@ -187,7 +185,8 @@ impl MessageListenerConcurrently for SteppingListener {
         _context: &mut ConsumeConcurrentlyContext,
     ) -> ConsumeConcurrentlyStatus {
         let mut st = lock(&self.state);
-        st.batches.push(msgs.iter().map(|m| m.queue_offset).collect());
+        st.batches
+            .push(msgs.iter().map(|m| m.queue_offset).collect());
         // The cap only guards against deadlock: the normal path is the test calling release() batch by batch; the one that wakes resets the gate (semantically the same as
         // a one-shot event's set() + clear()).
         let deadline = Instant::now() + Duration::from_secs(90);
@@ -336,7 +335,11 @@ impl Fixture {
         };
         let mut out = Vec::new();
         for mq in self.queues(topic).await {
-            let off = self.admin.examine_consumer_offset(group, &mq).await.unwrap_or(None);
+            let off = self
+                .admin
+                .examine_consumer_offset(group, &mq)
+                .await
+                .unwrap_or(None);
             let max_off = client.get_max_offset(&mq, 10_000, None).await.unwrap_or(-1);
             out.push((mq, max_off, off));
         }
@@ -413,7 +416,8 @@ fn fmt(rows: &[(MessageQueue, i64, Option<i64>)]) -> String {
             format!(
                 "q{}:{}/max{}",
                 mq.queue_id,
-                off.map(|o| o.to_string()).unwrap_or_else(|| "None".to_string()),
+                off.map(|o| o.to_string())
+                    .unwrap_or_else(|| "None".to_string()),
                 max
             )
         })
@@ -859,7 +863,11 @@ async fn run(namesrv: &str) -> Checker {
             return ck;
         }
     };
-    ck.check("cluster liveness", true, &format!("broker={}", fx.broker_addr));
+    ck.check(
+        "cluster liveness",
+        true,
+        &format!("broker={}", fx.broker_addr),
+    );
 
     let off = fx.set_server_side_reset("false").await;
     let cfg = fx
@@ -889,7 +897,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("\n== result: {} PASS / {} FAIL ==", ck.passed, ck.failed.len());
+    println!(
+        "\n== result: {} PASS / {} FAIL ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("  FAILED: {f}");
     }

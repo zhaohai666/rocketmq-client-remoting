@@ -424,6 +424,18 @@ public:
                                                    bool uniqKey = false,
                                                    int32_t timeoutMillis = 15000);
 
+    // Java MQAdminImpl#viewMessage(topic, msgId) parity (MQAdminImpl.java:267): a
+    // SINGLE leg — decode the offset msgId and ask the broker that stamped it
+    // VIEW_MESSAGE_BY_ID(33) straight away. A decode failure maps to the
+    // NO_MESSAGE client error Java raises there; every other leg failure
+    // surfaces as-is. The uniq-key fallback is NOT part of this layer — it
+    // belongs to the admin facade only (DefaultMQAdminExtImpl#viewMessage),
+    // while the producer / push / pull facades ride this single-leg path.
+    // timeoutMillis defaults to MQAdminImpl's own RPC budget
+    // (MQAdminImpl.java:67, 6000).
+    MessageExt viewMessage(const std::string& topic, const std::string& msgId,
+                           int32_t timeoutMillis = 6000);
+
     // ---------------- Utilities ----------------
     std::string brokerAddrOf(const std::string& brokerName);
     // Resolve the broker address of mq (public version; throws MQClientException when not found)

@@ -1010,6 +1010,19 @@ func (p *DefaultMQProducer) requireClient() (*Instance, error) {
 	return p.mqClient, nil
 }
 
+// ViewMessage is Java DefaultMQProducerImpl#viewMessage (DefaultMQProducerImpl.java:517)
+// parity: the facade rides the MQAdminImpl single-leg path — offset msgId only,
+// decoded and asked VIEW_MESSAGE_BY_ID(33) on the broker that stamped it. A
+// msgId that does not decode as an offset id surfaces the NO_MESSAGE client
+// error (no uniq-key fallback at this layer).
+func (p *DefaultMQProducer) ViewMessage(topic, msgID string) (*common.MessageExt, error) {
+	client, err := p.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.ViewMessage(topic, msgID, defaultViewMessageTimeoutMillis)
+}
+
 // checkMessage runs the local message validation — purely local,
 // runs before any network I/O.
 func (p *DefaultMQProducer) checkMessage(msg *common.Message) error {

@@ -626,7 +626,13 @@ impl Fixture {
     }
 
     /// Send to the given topic (optionally pinned to a queue). SendResult's status must be SEND_OK.
-    async fn produce(&self, topic: &str, tag: &str, n: usize, queue: Option<i32>) -> Vec<(String, i32, i64)> {
+    async fn produce(
+        &self,
+        topic: &str,
+        tag: &str,
+        n: usize,
+        queue: Option<i32>,
+    ) -> Vec<(String, i32, i64)> {
         let mut out = Vec::new();
         for i in 0..n {
             let body = format!("{topic}-{i:03}");
@@ -798,7 +804,10 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
 
     if DefaultTopAddressing::is_configured() {
-        ck.skip("C1 missing name server is rejected", "domain addressing is configured in this environment");
+        ck.skip(
+            "C1 missing name server is rejected",
+            "domain addressing is configured in this environment",
+        );
     } else {
         let cfg = ConsumerConfig {
             consumer_group: fx.group_name("no-namesrv"),
@@ -824,14 +833,24 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
 
     let c = fx.plain_consumer(&group).unwrap();
-    let err = c.start().await.err().map(|e| e.to_string()).unwrap_or_default();
+    let err = c
+        .start()
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "C1 start() without any subscription is rejected",
         err.contains("subscription"),
         &err,
     );
     c.subscribe(&topic, "*").unwrap();
-    let err = c.start().await.err().map(|e| e.to_string()).unwrap_or_default();
+    let err = c
+        .start()
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "C1 start() without a message listener is rejected",
         err.contains("listener"),
@@ -913,7 +932,11 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
 
     let client_id = c.client_id();
     c.shutdown();
-    ck.check("C1 shutdown() clears the started flag", !c.is_started(), "still started");
+    ck.check(
+        "C1 shutdown() clears the started flag",
+        !c.is_started(),
+        "still started",
+    );
     ck.check(
         "C1 shutdown() removes the consumer from its MQClientInstance registry",
         MQClientInstance::find_instance(&client_id)
@@ -984,14 +1007,16 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
             d.msg_id.len() == 32
                 && d.msg_id == d.offset_msg_id
                 && d.msg_id != d.uniq_key
-                && d.msg_id.get(16..).and_then(|o| i64::from_str_radix(o, 16).ok()).is_some_and(|commit_log_offset| commit_log_offset > 0)
-        })
-            && got
-                .iter()
-                .map(|d| d.msg_id.get(..16).unwrap_or_default())
-                .collect::<BTreeSet<&str>>()
-                .len()
-                == 1,
+                && d.msg_id
+                    .get(16..)
+                    .and_then(|o| i64::from_str_radix(o, 16).ok())
+                    .is_some_and(|commit_log_offset| commit_log_offset > 0)
+        }) && got
+            .iter()
+            .map(|d| d.msg_id.get(..16).unwrap_or_default())
+            .collect::<BTreeSet<&str>>()
+            .len()
+            == 1,
         &format!(
             "first msgId={:?} uniqKey={:?}",
             got.first().map(|d| d.msg_id.clone()),
@@ -1021,7 +1046,8 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
     );
     ck.check(
         "C2 nothing was retried: reconsumeTimes stays 0 and no RETRY_TOPIC property appears",
-        got.iter().all(|d| d.reconsume_times == 0 && d.retry_topic_prop.is_none()),
+        got.iter()
+            .all(|d| d.reconsume_times == 0 && d.retry_topic_prop.is_none()),
         &format!("{:?}", got.iter().find(|d| d.reconsume_times != 0)),
     );
     ck.check(
@@ -1037,8 +1063,7 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
     let status = c.get_consumer_status(Some(&topic));
     ck.check(
         "C2 consume offsets are tracked per assigned queue and cover all 24",
-        status.len() == QUEUE_NUMS as usize
-            && status.iter().map(|(_, o)| *o).sum::<i64>() == 24,
+        status.len() == QUEUE_NUMS as usize && status.iter().map(|(_, o)| *o).sum::<i64>() == 24,
         &format!("{status:?}"),
     );
     let committed = fx.wait_committed(&group, &topic, QUEUE_NUMS, 24).await;
@@ -1100,7 +1125,12 @@ async fn c3_tag_filter(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C3 create topic", &e);
     }
     let inbox = Arc::new(Inbox::default());
-    let c = match fx.consumer(&group, &topic, "TagA", LiveListener::collecting(inbox.clone())) {
+    let c = match fx.consumer(
+        &group,
+        &topic,
+        "TagA",
+        LiveListener::collecting(inbox.clone()),
+    ) {
         Ok(v) => v,
         Err(e) => return ck.abort("C3 build consumer", &e),
     };
@@ -1119,7 +1149,11 @@ async fn c3_tag_filter(ck: &mut Checker, fx: &Fixture) {
         settled && got.len() == 10,
         &format!("delivered={}", got.len()),
     );
-    let foreign: Vec<String> = got.iter().filter(|d| d.tags != "TagA").map(|d| d.body.clone()).collect();
+    let foreign: Vec<String> = got
+        .iter()
+        .filter(|d| d.tags != "TagA")
+        .map(|d| d.body.clone())
+        .collect();
     ck.check(
         "C3 no message of the other tag leaks through",
         foreign.is_empty(),
@@ -1171,7 +1205,10 @@ async fn c4_retry_and_topic_reset(ck: &mut Checker, fx: &Fixture) {
         ck.check(
             "C4 the redelivery carries an increased reconsumeTimes",
             second.reconsume_times >= 1 && second.reconsume_times > first.reconsume_times,
-            &format!("first={} second={}", first.reconsume_times, second.reconsume_times),
+            &format!(
+                "first={} second={}",
+                first.reconsume_times, second.reconsume_times
+            ),
         );
         ck.check(
             "C4 the listener sees the ORIGINAL topic, not %RETRY%<group> (resetRetryAndNamespace)",
@@ -1296,7 +1333,10 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
         first_batch: Mutex::new(Vec::new()),
     });
     let mut pairs = Vec::new();
-    for (g, l) in [(&group, listener.clone()), (&control_group, control_listener.clone())] {
+    for (g, l) in [
+        (&group, listener.clone()),
+        (&control_group, control_listener.clone()),
+    ] {
         match partial_ack_consumer(fx, &topic, g, l) {
             Ok(c) => pairs.push(c),
             Err(e) => return ck.abort("C4c build consumer", &e),
@@ -1394,7 +1434,12 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
 ///
 /// Returns `(has route, dead letters)`: in the negative case "the broker never created the DLQ topic" is itself the
 /// correct conclusion, so it must not be merged into the same empty result as "route never showed up".
-async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) -> Result<(bool, Vec<Delivered>), String> {
+async fn read_dlq(
+    fx: &Fixture,
+    group: &str,
+    reader_kind: &str,
+    wait_secs: u64,
+) -> Result<(bool, Vec<Delivered>), String> {
     let dlq_topic = MixAll::get_dlq_topic(group);
     let mut route = None;
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
@@ -1419,14 +1464,15 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         .sum::<i32>()
         .max(1);
     let mqs = fx.queues(&dlq_topic, nums);
-    let lite = fx.lite(LitePullConsumerConfig {
-        consumer_group: fx.group_name(reader_kind),
-        name_server_addrs: vec![fx.namesrv.clone()],
-        instance_name: format!("live-{reader_kind}-{}", fx.stamp),
-        poll_timeout_millis: 1000,
-        ..Default::default()
-    })
-    .map_err(|e| format!("build lite pull failed: {e}"))?;
+    let lite = fx
+        .lite(LitePullConsumerConfig {
+            consumer_group: fx.group_name(reader_kind),
+            name_server_addrs: vec![fx.namesrv.clone()],
+            instance_name: format!("live-{reader_kind}-{}", fx.stamp),
+            poll_timeout_millis: 1000,
+            ..Default::default()
+        })
+        .map_err(|e| format!("build lite pull failed: {e}"))?;
     // assign must happen before start: the rebalance right after start only honors subscriptions and would compute an empty assignment
     lite.assign(&mqs)
         .map_err(|e| format!("lite assign of the DLQ queues failed: {e}"))?;
@@ -1524,7 +1570,11 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
     );
     // Counter-proof: after the DLQ the original group gets no 4th delivery (writing `>` instead of `>=` would show here)
     tokio::time::sleep(Duration::from_secs(15)).await;
-    let final_times: Vec<i32> = inbox.matching(&victim).iter().map(|d| d.reconsume_times).collect();
+    let final_times: Vec<i32> = inbox
+        .matching(&victim)
+        .iter()
+        .map(|d| d.reconsume_times)
+        .collect();
     ck.check(
         "C4b no delivery after exhaustion (only 3 within the observation window)",
         final_times.len() == 3,
@@ -1756,7 +1806,9 @@ async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
 // ------------------------------------------------------- C6 broadcasting + local offset files
 
 async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C6 BROADCASTING: each instance consumes everything + offsets land in a local file");
+    println!(
+        "-- C6 BROADCASTING: each instance consumes everything + offsets land in a local file"
+    );
     let topic = fx.topic_name("Bcast");
     let group = fx.group_name("bcast");
     if let Err(e) = fx.create_topic(&topic, 2).await {
@@ -1906,7 +1958,9 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
 
 /// Extract the offset list from `{"offsetTable":{{...}:7,{...}:9}}`; returns `None` on a malformed format.
 fn canonical_format_offsets(text: &str) -> Option<Vec<i64>> {
-    let body = text.strip_prefix("{\"offsetTable\":{")?.strip_suffix("}}")?;
+    let body = text
+        .strip_prefix("{\"offsetTable\":{")?
+        .strip_suffix("}}")?;
     let mut offs = Vec::new();
     for (i, seg) in body.split("}:").enumerate() {
         if i == 0 {
@@ -1994,7 +2048,11 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
     if let Err(e) = b.start().await {
         return ck.abort("C7 takeover start", &format!("{e}"));
     }
-    let took_over = poll_until(|| main_queues(&b.locked_queue_keys()).len() == 2, WAIT_SECONDS).await;
+    let took_over = poll_until(
+        || main_queues(&b.locked_queue_keys()).len() == 2,
+        WAIT_SECONDS,
+    )
+    .await;
     let _ = fx.produce(&topic, "TagA", 2, Some(0)).await;
     let _ = fx.produce(&topic, "TagA", 2, Some(1)).await;
     let got_new = poll_until(|| inbox_b.count() >= 4, WAIT_SECONDS).await;
@@ -2031,7 +2089,12 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
     }
     let inbox_a = Arc::new(Inbox::default());
     let inbox_b = Arc::new(Inbox::default());
-    let a = match fx.consumer(&group, &topic, "*", LiveListener::collecting(inbox_a.clone())) {
+    let a = match fx.consumer(
+        &group,
+        &topic,
+        "*",
+        LiveListener::collecting(inbox_a.clone()),
+    ) {
         Ok(v) => v,
         Err(e) => return ck.abort("C8 build A", &e),
     };
@@ -2139,8 +2202,7 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
         &format!("B assigned={:?}", main_queues(&b.assigned_queue_keys())),
     );
     // The takeover must not depend only on the 20s timed rebalance: when A's connection drops the broker pushes 40 down B's long connection.
-    let survivor_notified =
-        poll_until(|| ids_changed_count(&id_b) > b_before, WAIT_SECONDS).await;
+    let survivor_notified = poll_until(|| ids_changed_count(&id_b) > b_before, WAIT_SECONDS).await;
     ck.check(
         "C8 the survivor is pushed NOTIFY_CONSUMER_IDS_CHANGED(40) when a member leaves",
         survivor_notified,
@@ -2152,15 +2214,16 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
     );
     let before_b = inbox_b.count();
     let _ = fx.produce(&topic, "TagA", 4, None).await;
-    let still_consuming =
-        poll_until(|| inbox_b.count() > before_b, WAIT_SECONDS).await;
+    let still_consuming = poll_until(|| inbox_b.count() > before_b, WAIT_SECONDS).await;
     ck.check(
         "C8 the survivor keeps consuming after the takeover (its pull loops were re-spawned)",
         still_consuming,
         &format!("B delivered={} before={}", inbox_b.count(), before_b),
     );
     let broker_total = fx.broker_total(&topic, QUEUE_NUMS).await;
-    let committed = fx.wait_committed(&group, &topic, QUEUE_NUMS, broker_total).await;
+    let committed = fx
+        .wait_committed(&group, &topic, QUEUE_NUMS, broker_total)
+        .await;
     ck.check(
         "C8 the surviving member's committed offsets cover every message on the broker",
         committed == broker_total,
@@ -2197,7 +2260,11 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
     ck.check(
         "C9 flow control pauses pulling but never drops a message",
         got_all && inbox.bodies().len() == 30,
-        &format!("delivered={} distinct={}", inbox.count(), inbox.bodies().len()),
+        &format!(
+            "delivered={} distinct={}",
+            inbox.count(),
+            inbox.bodies().len()
+        ),
     );
     ck.check(
         "C9 the flow-control counter fired (pullThresholdForQueue=1)",
@@ -2333,7 +2400,9 @@ async fn heal_once(c: &DefaultMQPushConsumer, key: &str) -> bool {
 }
 
 async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C11 pull loop stalls → one rebalance retires and rebuilds it, no duplicates no losses");
+    println!(
+        "-- C11 pull loop stalls → one rebalance retires and rebuilds it, no duplicates no losses"
+    );
     let topic = fx.topic_name("Heal");
     let group = fx.group_name("heal");
     if let Err(e) = fx.create_topic(&topic, 1).await {
@@ -2348,12 +2417,20 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C11 start", &format!("{e}"));
     }
     // 1 queue: exactly one loop, a unique injection point, and a unique offset criterion (multiple queues would be shared out to other instances)
-    let assigned = poll_until(|| main_queues(&c.assigned_queue_keys()).len() == 1, WAIT_SECONDS).await;
+    let assigned = poll_until(
+        || main_queues(&c.assigned_queue_keys()).len() == 1,
+        WAIT_SECONDS,
+    )
+    .await;
     let key = main_queues(&c.assigned_queue_keys())
         .first()
         .cloned()
         .unwrap_or_default();
-    ck.check("C11 the single queue is assigned", assigned && !key.is_empty(), &key);
+    ck.check(
+        "C11 the single queue is assigned",
+        assigned && !key.is_empty(),
+        &key,
+    );
     if !assigned {
         c.shutdown();
         return ck.abort("C11 assign", "no queue was assigned to this consumer");
@@ -2367,12 +2444,14 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
     ck.check(
         "C11 baseline: 3 messages sent and consumed, offset committed to the broker",
         sent == 3 && got && committed == 3,
-        &format!("sent={sent} arrivals={} committed={committed}", inbox.count()),
+        &format!(
+            "sent={sent} arrivals={} committed={committed}",
+            inbox.count()
+        ),
     );
     ck.check(
         "C11 consumerRunningInfo reports the real lastPullTimestamp",
-        pull_clock_age_ms(&c.consumer_running_info())
-            .is_some_and(|age| (0..60_000).contains(&age)),
+        pull_clock_age_ms(&c.consumer_running_info()).is_some_and(|age| (0..60_000).contains(&age)),
         &format!("ageMs={:?}", pull_clock_age_ms(&c.consumer_running_info())),
     );
 
@@ -2466,7 +2545,11 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
     fx.produce(&topic, "TagA", 2, Some(0)).await;
 
     let three = poll_until(|| inbox.matching(&poison).len() >= 3, 60).await;
-    let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
+    let times: Vec<i32> = inbox
+        .matching(&poison)
+        .iter()
+        .map(|d| d.reconsume_times)
+        .collect();
     ck.check(
         "C12 the poison message is delivered exactly 3 times (each +1 done client-side: reconsumeTimes 0/1/2)",
         three && times.starts_with(&[0, 1, 2]),
@@ -2564,7 +2647,11 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     // Surpassing the concurrent side's 16 is enough to prove the right constant is used. The window is 90s: on the wrong
     // path the 17th attempt's delay level is level20 (2h) and once sent it never comes back, so the only grip is "local delivery count + empty %DLQ%" clamping from both ends.
     let uncapped = poll_until(|| inbox.matching(&poison).len() >= 18, 90).await;
-    let times: Vec<i32> = inbox.matching(&poison).iter().map(|d| d.reconsume_times).collect();
+    let times: Vec<i32> = inbox
+        .matching(&poison)
+        .iter()
+        .map(|d| d.reconsume_times)
+        .collect();
     let max_times = times.iter().copied().max().unwrap_or(-1);
     ck.check(
         "C12b -1 means no cap for orderly consumption (delivered >=18 times, the 16 cap did not apply)",

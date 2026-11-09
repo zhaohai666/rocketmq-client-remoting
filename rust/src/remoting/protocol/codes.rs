@@ -1,4 +1,3 @@
-
 /// `RequestCode`
 pub mod request_code {
     pub const SEND_MESSAGE: i32 = 10;

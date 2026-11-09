@@ -58,7 +58,7 @@ import { MixAll } from '../common/mixAll.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { BoundaryType } from '../common/boundary_type.ts';
-import { decodeMessage, decodeMessageId, decodeMessages } from '../common/messageDecoder.ts';
+import { decodeMessage, decodeMessages } from '../common/messageDecoder.ts';
 import { QueryResult } from '../remoting/bodies.ts';
 import { getLogger } from '../logging.ts';
 import {
@@ -1902,57 +1902,32 @@ export class DefaultMQAdminExt {
     return merged;
   }
 
-  // viewMessage: try the offset-msgId decode first; a client UNIQ_KEY is NOT
-  // an offset id and the decode throws (or yields a bogus port) — the caller
-  // catches that and falls back
-  // to the U-index query across the route's brokers. Keep the same contract:
-  // never let a uniq key die inside decodeMessageId.
-  async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
-    let addr = '';
-    let offset = BigInt(0);
-    let offsetIdOk = true;
-    try {
-      const parsed = decodeMessageId(msgId);
-      if (parsed.port <= 0 || parsed.port > 65535) {
-        offsetIdOk = false;
-      } else {
-        addr = `${parsed.ip}:${parsed.port}`;
-        offset = BigInt(parsed.offset);
-      }
-    } catch {
-      offsetIdOk = false;
-    }
-    if (!offsetIdOk) {
-      return this.viewMessageByUniqKey(topic, msgId);
-    }
+  // viewMessage is Java DefaultMQAdminExtImpl#viewMessage
+  // (DefaultMQAdminExtImpl.java:578): try the offset-msgId leg first, and
+  // when it fails for any reason (the msgId "maybe created by new client")
+  // fall back to the U-index query across the route's brokers. When neither
+  // leg matches, Java returns null here instead of raising — so does this.
+  async viewMessage(topic: string, msgId: string): Promise<MessageExt | null> {
     const client = this._requireClient();
-    const request = this._request(RequestCode.VIEW_MESSAGE_BY_ID, adminExt({
-      offset: String(offset),
-      topic,
-    }));
-    const target = this._vipChannel(addr);
-    const response = await client.remotingClient.invokeSync(target, request, this._timeout());
-    if (response.code !== ResponseCode.SUCCESS) {
-      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, target);
+    try {
+      return await client.viewMessage(topic, msgId, this._timeout());
+    } catch {
+      // The offset-msgId leg failed — the uniq-key leg decides.
     }
-    if (response.body == null || response.body.length === 0) {
-      throw new MQClientException(`message not found: ${msgId}`);
-    }
-    const msg = decodeMessage(response.body, true, true);
-    if (msg == null) throw new MQClientException(`message not found: ${msgId}`);
-    return msg;
+    return this.viewMessageByUniqKey(topic, msgId);
   }
 
   // The uniq-key leg of the viewMessage fallback: the
   // U-index query is sent across every broker in
   // the route, first hit wins, verified against the UNIQ_KEY property so a
-  // stray key collision can't satisfy the lookup.
-  async viewMessageByUniqKey(topic: string, uniqKey: string): Promise<MessageExt> {
+  // stray key collision can't satisfy the lookup. Java's queryMessageByUniqKey
+  // returns null when nothing matches — so does this.
+  async viewMessageByUniqKey(topic: string, uniqKey: string): Promise<MessageExt | null> {
     const result = await this.queryMessageFromRoute(topic, uniqKey, 32, 0, 0, 'U');
     for (const m of result.messageList) {
       if (m.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) === uniqKey) return m;
     }
-    throw new MQClientException(`message not found by uniq key: ${uniqKey}`);
+    return null;
   }
 
   // consumeMessageDirectly sends CONSUME_MESSAGE_DIRECTLY(309)
@@ -1966,6 +1941,11 @@ export class DefaultMQAdminExt {
     let outMsgId = msgId;
     if (addr == null || addr === '') {
       const msg = await this.viewMessage(topic, msgId);
+      // Java dereferences the viewMessage null unguarded here (a latent NPE);
+      // fail with a clear client error instead.
+      if (msg == null) {
+        throw new MQClientException(`message ${msgId} of ${topic} not found`);
+      }
       addr = msg.getStoreHostString();
       if (msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) != null && msg.getOffsetMsgId() != null) {
         outMsgId = msg.getOffsetMsgId();

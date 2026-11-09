@@ -106,8 +106,7 @@ impl MessageListenerConcurrently for Inbox {
         _context: &mut ConsumeConcurrentlyContext,
     ) -> ConsumeConcurrentlyStatus {
         for msg in msgs {
-            lock(&self.bodies)
-                .push(String::from_utf8_lossy(msg.get_body()).into_owned());
+            lock(&self.bodies).push(String::from_utf8_lossy(msg.get_body()).into_owned());
         }
         ConsumeConcurrentlyStatus::ConsumeSuccess
     }
@@ -184,7 +183,10 @@ impl Env {
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("cluster probe", "name server returned no broker within the budget");
+                ck.abort(
+                    "cluster probe",
+                    "name server returned no broker within the budget",
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -215,7 +217,13 @@ impl Env {
     ///
     /// `unit_mode` must be passed in: U3 verifies exactly this; hardcoding false would keep the broker
     /// from ever creating the UNIT bit and make the test fail spuriously.
-    async fn send_as(&self, kind: &str, unit_mode: bool, topic: &str, body: &str) -> Result<(), String> {
+    async fn send_as(
+        &self,
+        kind: &str,
+        unit_mode: bool,
+        topic: &str,
+        body: &str,
+    ) -> Result<(), String> {
         let producer = self.make_producer(&format!("{kind}-{body}"), None, unit_mode, false)?;
         producer.start().await.map_err(|e| e.to_string())?;
         let mut msg = Message::new(topic, Some(body.as_bytes()));
@@ -339,7 +347,10 @@ async fn u2_broker_sees_unit_and_stream(ck: &mut Checker, env: &Env) {
         return;
     }
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U2 warmup topic route visible", "route did not appear within the budget");
+        ck.abort(
+            "U2 warmup topic route visible",
+            "route did not appear within the budget",
+        );
         return;
     }
 
@@ -467,7 +478,10 @@ async fn u4_heartbeat_sets_retry_unit_sub(ck: &mut Checker, env: &Env) {
         return;
     }
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U4 warmup topic route visible", "route did not appear within the budget");
+        ck.abort(
+            "U4 warmup topic route visible",
+            "route did not appear within the budget",
+        );
         return;
     }
     let consumer = match DefaultMQPushConsumer::with_config(ConsumerConfig {
@@ -533,11 +547,18 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
             Err(e) => println!("  [WARN] send u5-{i} failed: {e}"),
         }
     }
-    ck.check("U5 sending works with ReqT=0 on every request", sent == 3, &format!("sent={sent}"));
+    ck.check(
+        "U5 sending works with ReqT=0 on every request",
+        sent == 3,
+        &format!("sent={sent}"),
+    );
     producer.shutdown();
 
     if !wait_route_visible(env, &topic, WAIT_SECONDS).await {
-        ck.abort("U5 topic route visible", "route did not appear within the budget");
+        ck.abort(
+            "U5 topic route visible",
+            "route did not appear within the budget",
+        );
         return;
     }
     let lite = match DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
@@ -615,7 +636,11 @@ async fn cleanup(ck: &mut Checker, env: &Env) {
             println!("  [WARN] delete_subscription_group({group}) failed: {e}");
         }
     }
-    ck.check("cleaned up this run's topics / subscription groups", true, "");
+    ck.check(
+        "cleaned up this run's topics / subscription groups",
+        true,
+        "",
+    );
 }
 
 // ------------------------------------------------------------------ driver

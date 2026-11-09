@@ -200,7 +200,10 @@ impl Fixture {
             namesrv: namesrv.to_string(),
             stamp,
             producer,
-            admin: MQClientInstance::new(&format!("rust-live-fc-admin-{stamp}"), vec![namesrv.to_string()]),
+            admin: MQClientInstance::new(
+                &format!("rust-live-fc-admin-{stamp}"),
+                vec![namesrv.to_string()],
+            ),
             broker_addr: String::new(),
         })
     }
@@ -449,18 +452,8 @@ async fn run(namesrv: &str) -> Checker {
         topic_count: None,
         single_consumer: true,
     };
-    if let Some((sink, c)) = run_gate_case(
-        &mut ck,
-        &fx,
-        "S1",
-        "Size",
-        1,
-        big8,
-        300,
-        size_gates,
-        None,
-    )
-    .await
+    if let Some((sink, c)) =
+        run_gate_case(&mut ck, &fx, "S1", "Size", 1, big8, 300, size_gates, None).await
     {
         // The buffered-count peak is printed alongside: the byte gate's input is exactly this buffer, and a peak <3 messages
         // (3×400KB>1MiB) means no backlog formed, so firing or not is moot -- when the fire assertion fails, look at this
@@ -504,15 +497,7 @@ async fn run(namesrv: &str) -> Checker {
     };
     let small14: Vec<Vec<u8>> = (0..14).map(|i| format!("s-{i:03}").into_bytes()).collect();
     if let Some((sink, c)) = run_gate_case(
-        &mut ck,
-        &fx,
-        "S2",
-        "Span",
-        4,
-        small14,
-        300,
-        span_gates,
-        None,
+        &mut ck, &fx, "S2", "Span", 4, small14, 300, span_gates, None,
     )
     .await
     {
@@ -579,7 +564,10 @@ async fn run(namesrv: &str) -> Checker {
         ck.check(
             "S3 an off topic budget leaves its per-queue knob alone",
             size_untouched,
-            &format!("pullThresholdSizeForQueue={}", c.config().pull_threshold_size_for_queue),
+            &format!(
+                "pullThresholdSizeForQueue={}",
+                c.config().pull_threshold_size_for_queue
+            ),
         );
         // Control for "the numerator is always the topic knob": dividing does not consume the budget,
         // so repeating the division over the same queue count rewrites the same number.
@@ -587,7 +575,10 @@ async fn run(namesrv: &str) -> Checker {
         ck.check(
             "S3 the topic budget keeps the configured value",
             budget_intact,
-            &format!("pullThresholdForTopic={}", c.config().pull_threshold_for_topic),
+            &format!(
+                "pullThresholdForTopic={}",
+                c.config().pull_threshold_for_topic
+            ),
         );
         // (2) the gate fires on the queue's own buffer once that buffer passes its divided share.
         let hit = poll_until(|| c.flow_control_triggered() > 0, 30).await;
@@ -764,7 +755,11 @@ async fn run(namesrv: &str) -> Checker {
                                     }
                                     Err(e) => (false, format!("probe request failed: {e}")),
                                 };
-                                ck.check("S5 broker never heard of the rejected group", absent, &detail);
+                                ck.check(
+                                    "S5 broker never heard of the rejected group",
+                                    absent,
+                                    &detail,
+                                );
                                 let ok_ids = fx
                                     .admin
                                     .get_consumer_list_by_group(&s5_group, 5000, Some(&addr))

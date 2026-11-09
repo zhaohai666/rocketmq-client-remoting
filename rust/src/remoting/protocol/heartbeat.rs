@@ -130,7 +130,10 @@ impl SubscriptionData {
                 Value::Array(self.code_set.iter().map(|c| Value::from(*c)).collect()),
             ),
             ("subVersion", Value::from(self.sub_version)),
-            ("expressionType", Value::String(self.expression_type.clone())),
+            (
+                "expressionType",
+                Value::String(self.expression_type.clone()),
+            ),
         ])
     }
 
@@ -230,7 +233,11 @@ impl FilterAPI {
     /// empty**, which is also what switches off the client-side re-filter when a pull result is
     /// post-processed (that one only runs when `tagsSet` is non-empty).
     /// An empty expression for a non-tag type is rejected.
-    pub fn build(topic: &str, sub_string: &str, expression_type: Option<&str>) -> Result<SubscriptionData> {
+    pub fn build(
+        topic: &str,
+        sub_string: &str,
+        expression_type: Option<&str>,
+    ) -> Result<SubscriptionData> {
         let type_ = match expression_type {
             None => return Self::build_subscription_data(topic, Some(sub_string)),
             Some(t) => t,
@@ -430,7 +437,9 @@ impl HeartbeatV2Result {
     /// Parses the two boolean extFields of a `HEART_BEAT` response. Absent, empty or non-"true"
     /// values all read as false: these flags are lenient strings on the wire, and
     /// anything the broker did not echo as "true" is not set.
-    pub fn from_response(response: &crate::remoting::protocol::remoting_command::RemotingCommand) -> HeartbeatV2Result {
+    pub fn from_response(
+        response: &crate::remoting::protocol::remoting_command::RemotingCommand,
+    ) -> HeartbeatV2Result {
         HeartbeatV2Result::new(
             response.version,
             is_ext_true(response, crate::common::mix_all::MixAll::IS_SUB_CHANGE),
@@ -525,7 +534,10 @@ impl HeartbeatData {
                         .collect(),
                 ),
             ),
-            ("heartbeatFingerprint", Value::from(i64::from(self.heartbeat_fingerprint))),
+            (
+                "heartbeatFingerprint",
+                Value::from(i64::from(self.heartbeat_fingerprint)),
+            ),
             (
                 "producerDataSet",
                 Value::Array(
@@ -592,14 +604,23 @@ mod tests {
         let text = RemotingSerializable::to_json_string(&sd.to_json_value());
         assert!(text.contains(r#""classFilterMode":false"#));
         assert!(text.contains(r#""subString":"TagA||TagB"#));
-        assert!(text.contains(r#""subVersion":1700000000000"#), "subVersion must be an integer");
+        assert!(
+            text.contains(r#""subVersion":1700000000000"#),
+            "subVersion must be an integer"
+        );
         assert!(text.contains(r#""expressionType":"TAG""#));
         assert!(text.contains(r#""topic":"TopicProbe""#));
         assert!(text.contains(r#""tagsSet":["TagA","TagB"]"#));
         assert!(text.contains(r#""codeSet":[2598919,2598920]"#));
         assert!(!text.contains("filterClassSource"));
-        assert!(!text.contains("class_filter_mode"), "no snake_case keys allowed");
-        assert_eq!(SubscriptionData::from_json_value(&sd.to_json_value()).unwrap(), sd);
+        assert!(
+            !text.contains("class_filter_mode"),
+            "no snake_case keys allowed"
+        );
+        assert_eq!(
+            SubscriptionData::from_json_value(&sd.to_json_value()).unwrap(),
+            sd
+        );
 
         let mut other = sd.clone();
         other.sub_version = 1700000000001;
@@ -609,7 +630,10 @@ mod tests {
     #[test]
     fn subscription_data_sub_version_defaults_to_now() {
         let fresh = SubscriptionData::default();
-        assert!(fresh.sub_version > 1_600_000_000_000, "default should be on the order of current milliseconds");
+        assert!(
+            fresh.sub_version > 1_600_000_000_000,
+            "default should be on the order of current milliseconds"
+        );
         assert_eq!(fresh.expression_type, "TAG");
         assert!(fresh.tags_set.is_empty() && fresh.code_set.is_empty());
     }
@@ -640,7 +664,11 @@ mod tests {
         sd.sub_version = 1700000000000;
         cd.add_subscription_data(sd.clone());
         cd.add_subscription_data(sd);
-        assert_eq!(cd.subscription_data_set.len(), 1, "duplicate subscription folded (set semantics)");
+        assert_eq!(
+            cd.subscription_data_set.len(),
+            1,
+            "duplicate subscription folded (set semantics)"
+        );
         let text = RemotingSerializable::to_json_string(&cd.to_json_value());
         assert!(text.contains(r#""groupName":"cg_probe""#));
         assert!(text.contains(r#""consumeType":"CONSUME_PASSIVELY""#));
@@ -648,9 +676,18 @@ mod tests {
         assert!(text.contains(r#""consumeFromWhere":"CONSUME_FROM_LAST_OFFSET""#));
         assert!(text.contains(r#""unitMode":false"#));
         assert!(text.contains(r#""subscriptionDataSet":["#));
-        assert!(!text.contains("consumeTimestamp"), "server 5.x has no such field");
-        assert!(!text.contains("maxReconsumeTimes"), "server 5.x has no such field");
-        assert_eq!(ConsumerData::from_json_value(&cd.to_json_value()).unwrap(), cd);
+        assert!(
+            !text.contains("consumeTimestamp"),
+            "server 5.x has no such field"
+        );
+        assert!(
+            !text.contains("maxReconsumeTimes"),
+            "server 5.x has no such field"
+        );
+        assert_eq!(
+            ConsumerData::from_json_value(&cd.to_json_value()).unwrap(),
+            cd
+        );
         assert_eq!(
             consumer_data_summary(&cd),
             "ConsumerData [groupName=cg_probe, consumeType=CONSUME_PASSIVELY, messageModel=CLUSTERING, consumeFromWhere=CONSUME_FROM_LAST_OFFSET]"
@@ -677,11 +714,17 @@ mod tests {
         assert!(text.contains(r#""clientID":"10.0.0.1@12345""#));
         assert!(text.contains(r#""heartbeatFingerprint":0"#));
         assert!(text.contains(r#""withoutSub":false"#));
-        assert!(!text.contains("isWithoutSub"), "writes withoutSub, not isWithoutSub");
+        assert!(
+            !text.contains("isWithoutSub"),
+            "writes withoutSub, not isWithoutSub"
+        );
 
         let decoded = HeartbeatData::decode(&full.encode()).unwrap();
         assert_eq!(decoded.client_id, full.client_id);
-        assert_eq!(decoded.producer_data_set, vec![ProducerData::new("pg_probe")]);
+        assert_eq!(
+            decoded.producer_data_set,
+            vec![ProducerData::new("pg_probe")]
+        );
         assert_eq!(decoded.consumer_data_set.len(), 1);
         assert_eq!(decoded.consumer_data_set[0].group_name, "cg_probe");
         assert_eq!(decoded.consumer_data_set[0].subscription_data_set, vec![sd]);
@@ -709,7 +752,12 @@ mod tests {
     #[test]
     fn heartbeat_fingerprint_ignores_sub_version_client_id_and_its_own_fields() {
         let mut base = HeartbeatData::new("10.0.0.1@1");
-        let mut cd = ConsumerData::new("cg", ConsumeType::CONSUME_PASSIVELY, MessageModel::CLUSTERING, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        let mut cd = ConsumerData::new(
+            "cg",
+            ConsumeType::CONSUME_PASSIVELY,
+            MessageModel::CLUSTERING,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+        );
         cd.add_subscription_data(SubscriptionData {
             sub_version: 1,
             ..SubscriptionData::new("TopicA", "TagA")
@@ -718,7 +766,10 @@ mod tests {
         base.add_producer_data(ProducerData::new("pg"));
 
         let first = base.compute_heartbeat_fingerprint();
-        assert_ne!(first, 0, "a real subscription set must not hash to the V1 marker");
+        assert_ne!(
+            first, 0,
+            "a real subscription set must not hash to the V1 marker"
+        );
 
         // Same subscriptions, different subVersion / clientId / fingerprint / withoutSub.
         let mut moved = base.clone();
@@ -745,7 +796,12 @@ mod tests {
     #[test]
     fn without_sub_copy_keeps_registration_and_marks_the_body() {
         let mut hb = HeartbeatData::new("cid");
-        let mut cd = ConsumerData::new("cg", ConsumeType::CONSUME_PASSIVELY, MessageModel::CLUSTERING, ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
+        let mut cd = ConsumerData::new(
+            "cg",
+            ConsumeType::CONSUME_PASSIVELY,
+            MessageModel::CLUSTERING,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+        );
         cd.add_subscription_data(SubscriptionData::new("TopicA", "*"));
         cd.add_subscription_data(SubscriptionData::new("TopicB", "TagB"));
         hb.add_consumer_data(cd);
@@ -769,8 +825,14 @@ mod tests {
         // recomputing over a subscription-stripped body deliberately differs (the subscriptions are
         // part of what the fingerprint identifies), so a sender that recomputed it would tell the
         // broker "subscriptions changed" every single round and the optimization would buy nothing.
-        assert_eq!(light.heartbeat_fingerprint, hb.compute_heartbeat_fingerprint());
-        assert_ne!(light.compute_heartbeat_fingerprint(), hb.compute_heartbeat_fingerprint());
+        assert_eq!(
+            light.heartbeat_fingerprint,
+            hb.compute_heartbeat_fingerprint()
+        );
+        assert_ne!(
+            light.compute_heartbeat_fingerprint(),
+            hb.compute_heartbeat_fingerprint()
+        );
     }
 
     #[test]
@@ -788,19 +850,17 @@ mod tests {
             crate::common::mix_all::MixAll::IS_SUPPORT_HEART_BEAT_V2,
             "true",
         );
-        response.ext_fields_mut().insert(
-            crate::common::mix_all::MixAll::IS_SUB_CHANGE,
-            "TRUE",
-        );
+        response
+            .ext_fields_mut()
+            .insert(crate::common::mix_all::MixAll::IS_SUB_CHANGE, "TRUE");
         assert_eq!(
             HeartbeatV2Result::from_response(&response),
             HeartbeatV2Result::new(403, true, true)
         );
 
-        response.ext_fields_mut().insert(
-            crate::common::mix_all::MixAll::IS_SUB_CHANGE,
-            "",
-        );
+        response
+            .ext_fields_mut()
+            .insert(crate::common::mix_all::MixAll::IS_SUB_CHANGE, "");
         assert!(
             !HeartbeatV2Result::from_response(&response).sub_change,
             "empty is not true"
@@ -845,17 +905,26 @@ mod tests {
 
     #[test]
     fn missing_and_tolerant_pieces() {
-        let hb = HeartbeatData::decode(br#"{"clientID":"c","producerDataSet":null,"subscriptionDataSet":[{"topic":"T"}]}"#).unwrap();
+        let hb = HeartbeatData::decode(
+            br#"{"clientID":"c","producerDataSet":null,"subscriptionDataSet":[{"topic":"T"}]}"#,
+        )
+        .unwrap();
         assert_eq!(hb, HeartbeatData::new("c"));
         // Booleans in numeric form and numbers in string form both parse.
         let cd = ConsumerData::from_json_value(
             &serde_json::json!({"groupName":"g","unitMode":1,"subscriptionDataSet":[{"subVersion":"5","codeSet":["7"],"tagsSet":["A"],"classFilterMode":"no"}]}),
         )
         .unwrap();
-        assert!(cd.unit_mode, "numeric 1 counts as true (lenient boolean semantics)");
+        assert!(
+            cd.unit_mode,
+            "numeric 1 counts as true (lenient boolean semantics)"
+        );
         assert_eq!(cd.subscription_data_set[0].sub_version, 5);
         assert_eq!(cd.subscription_data_set[0].code_set, vec![7]);
-        assert!(!cd.subscription_data_set[0].class_filter_mode, "\"no\" is not true");
+        assert!(
+            !cd.subscription_data_set[0].class_filter_mode,
+            "\"no\" is not true"
+        );
     }
 
     #[test]
@@ -881,7 +950,13 @@ mod tests {
     #[test]
     fn filter_api_matches_the_golden_reference_vector_by_vector() {
         /// (case name, subscription expression, expected subString, expected tagsSet, expected codeSet)
-        type Case = (&'static str, Option<&'static str>, &'static str, &'static [&'static str], &'static [i32]);
+        type Case = (
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            &'static [&'static str],
+            &'static [i32],
+        );
         let cases: &[Case] = &[
             ("none", None, "*", &[], &[]),
             ("empty", Some(""), "*", &[], &[]),
@@ -903,9 +978,27 @@ mod tests {
                 &[2598919, 2598920],
             ),
             ("only-separators", Some("|||"), "|||", &["|"], &[124]),
-            ("trailing-empty-dropped", Some("a||||"), "a||||", &["a"], &[97]),
-            ("leading-empty-dropped", Some("||TagA"), "||TagA", &["TagA"], &[2598919]),
-            ("duplicates-collapse", Some("TagA||TagA"), "TagA||TagA", &["TagA"], &[2598919]),
+            (
+                "trailing-empty-dropped",
+                Some("a||||"),
+                "a||||",
+                &["a"],
+                &[97],
+            ),
+            (
+                "leading-empty-dropped",
+                Some("||TagA"),
+                "||TagA",
+                &["TagA"],
+                &[2598919],
+            ),
+            (
+                "duplicates-collapse",
+                Some("TagA||TagA"),
+                "TagA||TagA",
+                &["TagA"],
+                &[2598919],
+            ),
         ];
         for (what, expression, sub_string, tags, codes) in cases {
             let sub = FilterAPI::build_subscription_data("T", *expression)

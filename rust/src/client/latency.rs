@@ -24,7 +24,10 @@ pub trait PublishInfo: Send + Sync {
     fn reset_index(&self);
 
     /// Selects one queue with filters applied.
-    fn select_one_message_queue(&self, filters: &[&QueueFilter<'_>]) -> Result<Option<MessageQueue>>;
+    fn select_one_message_queue(
+        &self,
+        filters: &[&QueueFilter<'_>],
+    ) -> Result<Option<MessageQueue>>;
 }
 
 // ---------------------------------------------------------------- FaultItem
@@ -54,7 +57,8 @@ impl FaultItem {
     }
 
     pub fn update_not_available_duration(&mut self, not_available_duration: i64, now_millis: i64) {
-        if not_available_duration > 0 && now_millis + not_available_duration > self.start_timestamp {
+        if not_available_duration > 0 && now_millis + not_available_duration > self.start_timestamp
+        {
             self.start_timestamp = now_millis + not_available_duration;
         }
     }
@@ -186,10 +190,7 @@ impl LatencyFaultToleranceImpl {
 
     /// Which brokers the table currently records (for troubleshooting only).
     pub fn fault_item_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = read_guard(&self.fault_item_table)
-            .keys()
-            .cloned()
-            .collect();
+        let mut names: Vec<String> = read_guard(&self.fault_item_table).keys().cloned().collect();
         names.sort();
         names
     }
@@ -271,10 +272,7 @@ impl MQFaultStrategy {
     }
 
     /// Constructor with a fake clock (tests pin the isolation window with it).
-    pub fn with_clock(
-        send_latency_fault_enable: bool,
-        now_millis: NowFn,
-    ) -> MQFaultStrategy {
+    pub fn with_clock(send_latency_fault_enable: bool, now_millis: NowFn) -> MQFaultStrategy {
         MQFaultStrategy {
             send_latency_fault_enable: AtomicBool::new(send_latency_fault_enable),
             latency_fault_tolerance: LatencyFaultToleranceImpl::with_clock(now_millis),
@@ -288,7 +286,8 @@ impl MQFaultStrategy {
     }
 
     pub fn set_send_latency_fault_enable(&self, enable: bool) {
-        self.send_latency_fault_enable.store(enable, Ordering::Relaxed);
+        self.send_latency_fault_enable
+            .store(enable, Ordering::Relaxed);
     }
 
     pub fn latency_fault_tolerance(&self) -> &LatencyFaultToleranceImpl {
@@ -296,11 +295,13 @@ impl MQFaultStrategy {
     }
 
     pub fn available_filter(&self, mq: &MessageQueue) -> bool {
-        self.latency_fault_tolerance.is_available(mq.get_broker_name())
+        self.latency_fault_tolerance
+            .is_available(mq.get_broker_name())
     }
 
     pub fn reachable_filter(&self, mq: &MessageQueue) -> bool {
-        self.latency_fault_tolerance.is_reachable(mq.get_broker_name())
+        self.latency_fault_tolerance
+            .is_reachable(mq.get_broker_name())
     }
 
     /// Semantics of `broker_filter`: when `last_broker_name` is `None`, **everything passes**;
@@ -349,10 +350,18 @@ impl MQFaultStrategy {
         if !self.is_send_latency_fault_enable() {
             return;
         }
-        let latency = if isolation { ISOLATION_LATENCY } else { current_latency };
+        let latency = if isolation {
+            ISOLATION_LATENCY
+        } else {
+            current_latency
+        };
         let duration = self.compute_not_available_duration(latency);
-        self.latency_fault_tolerance
-            .update_fault_item(broker_name, current_latency, duration, reachable);
+        self.latency_fault_tolerance.update_fault_item(
+            broker_name,
+            current_latency,
+            duration,
+            reachable,
+        );
     }
 
     /// The threshold tables are indexed directly by subscript, so mismatched lengths would go out of bounds;
@@ -384,7 +393,8 @@ fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 }
 
 fn write_guard<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -409,7 +419,10 @@ mod tests {
 
     impl FakePublishInfo {
         fn new(queues: Vec<MessageQueue>) -> FakePublishInfo {
-            FakePublishInfo { queues, index: AtomicUsize::new(0) }
+            FakePublishInfo {
+                queues,
+                index: AtomicUsize::new(0),
+            }
         }
 
         fn index(&self) -> usize {
@@ -590,7 +603,10 @@ mod tests {
     fn update_fault_item_isolation_uses_ten_second_window_but_real_latency() {
         let strategy = MQFaultStrategy::with_clock(true, fixed_now);
         strategy.update_fault_item("broker-a", 123, true, false);
-        let item = strategy.latency_fault_tolerance().get_fault_item("broker-a").unwrap();
+        let item = strategy
+            .latency_fault_tolerance()
+            .get_fault_item("broker-a")
+            .unwrap();
         assert_eq!(item.current_latency, 123);
         assert_eq!(item.start_timestamp, NOW + 10_000);
         assert!(!item.reachable_flag);
@@ -599,13 +615,21 @@ mod tests {
         // non-isolation: the tier is looked up by the real latency
         strategy.update_fault_item("broker-b", 7_000, false, true);
         assert_eq!(
-            strategy.latency_fault_tolerance().get_fault_item("broker-b").unwrap().start_timestamp,
+            strategy
+                .latency_fault_tolerance()
+                .get_fault_item("broker-b")
+                .unwrap()
+                .start_timestamp,
             NOW + 10_000
         );
         // low latency builds no window
         strategy.update_fault_item("broker-c", 10, false, true);
         assert_eq!(
-            strategy.latency_fault_tolerance().get_fault_item("broker-c").unwrap().start_timestamp,
+            strategy
+                .latency_fault_tolerance()
+                .get_fault_item("broker-c")
+                .unwrap()
+                .start_timestamp,
             0
         );
     }
@@ -615,13 +639,22 @@ mod tests {
         let strategy = MQFaultStrategy::default();
         assert!(!strategy.is_send_latency_fault_enable());
         strategy.update_fault_item("broker-z", 99_999, true, false);
-        assert!(strategy.latency_fault_tolerance().get_fault_item("broker-z").is_none());
-        assert!(strategy.latency_fault_tolerance().fault_item_names().is_empty());
+        assert!(strategy
+            .latency_fault_tolerance()
+            .get_fault_item("broker-z")
+            .is_none());
+        assert!(strategy
+            .latency_fault_tolerance()
+            .fault_item_names()
+            .is_empty());
 
         strategy.set_send_latency_fault_enable(true);
         assert!(strategy.is_send_latency_fault_enable());
         strategy.update_fault_item("broker-z", 99_999, true, false);
-        assert!(strategy.latency_fault_tolerance().get_fault_item("broker-z").is_some());
+        assert!(strategy
+            .latency_fault_tolerance()
+            .get_fault_item("broker-z")
+            .is_some());
     }
 
     #[test]
@@ -654,12 +687,20 @@ mod tests {
         ]);
         let seq: Vec<(String, i32)> = (0..3)
             .map(|_| {
-                short(&strategy.select_one_message_queue(&tp, Some("broker-a"), false).unwrap())
+                short(
+                    &strategy
+                        .select_one_message_queue(&tp, Some("broker-a"), false)
+                        .unwrap(),
+                )
             })
             .collect();
         assert_eq!(
             seq,
-            vec![("broker-a".into(), 0), ("broker-a".into(), 1), ("broker-a".into(), 0)]
+            vec![
+                ("broker-a".into(), 0),
+                ("broker-a".into(), 1),
+                ("broker-a".into(), 0)
+            ]
         );
         assert_eq!(tp.index(), 9);
     }
@@ -712,7 +753,9 @@ mod tests {
             MessageQueue::new("T", "broker-a", 0),
             MessageQueue::new("T", "broker-b", 0),
         ]);
-        let picked = strategy.select_one_message_queue(&tp, Some("broker-a"), false).unwrap();
+        let picked = strategy
+            .select_one_message_queue(&tp, Some("broker-a"), false)
+            .unwrap();
         assert_eq!(short(&picked), ("broker-b".into(), 0));
         assert_eq!(tp.index(), 4);
     }
@@ -744,7 +787,9 @@ mod tests {
         let strategy = MQFaultStrategy::with_clock(true, fixed_now);
         strategy.update_fault_item("broker-a", 20_000, true, false);
         let tp = FakePublishInfo::new(vec![MessageQueue::new("T", "broker-a", 0)]);
-        let picked = strategy.select_one_message_queue(&tp, Some("broker-a"), false).unwrap();
+        let picked = strategy
+            .select_one_message_queue(&tp, Some("broker-a"), false)
+            .unwrap();
         assert_eq!(short(&picked), ("broker-a".into(), 0));
         assert_eq!(tp.index(), 3);
     }
@@ -772,8 +817,14 @@ mod tests {
     fn empty_publish_info_is_an_error() {
         let strategy = MQFaultStrategy::with_clock(true, fixed_now);
         let tp = FakePublishInfo::new(Vec::new());
-        let err = strategy.select_one_message_queue(&tp, None, false).err().unwrap();
-        assert_eq!(err.to_string(), "MQClientException: no message queue for publish info");
+        let err = strategy
+            .select_one_message_queue(&tp, None, false)
+            .err()
+            .unwrap();
+        assert_eq!(
+            err.to_string(),
+            "MQClientException: no message queue for publish info"
+        );
         // the same error when disabled
         let off = MQFaultStrategy::new(false);
         assert!(off.select_one_message_queue(&tp, None, false).is_err());
@@ -783,7 +834,10 @@ mod tests {
     fn threshold_tables_are_per_instance_and_mutable() {
         let mut strategy = MQFaultStrategy::new(true);
         assert_eq!(strategy.latency_max, LATENCY_MAX.to_vec());
-        assert_eq!(strategy.not_available_duration, NOT_AVAILABLE_DURATION.to_vec());
+        assert_eq!(
+            strategy.not_available_duration,
+            NOT_AVAILABLE_DURATION.to_vec()
+        );
         strategy.not_available_duration = vec![0, 1, 2, 3, 4, 5, 6];
         assert_eq!(strategy.compute_not_available_duration(100), 1);
         assert_eq!(strategy.compute_not_available_duration(550), 2);
@@ -828,7 +882,10 @@ mod tests {
 
     impl ScriptedDetector {
         fn new(ok: bool) -> ScriptedDetector {
-            ScriptedDetector { ok: AtomicBool::new(ok), calls: AtomicUsize::new(0) }
+            ScriptedDetector {
+                ok: AtomicBool::new(ok),
+                calls: AtomicUsize::new(0),
+            }
         }
 
         fn calls(&self) -> usize {
@@ -862,8 +919,15 @@ mod tests {
             .await;
 
         let item = tolerance.get_fault_item("broker-a").unwrap();
-        assert!(item.is_reachable(), "a successful probe must bring the broker back");
-        assert_eq!(item.check_stamp, NOW + 2_000, "check_stamp is stamped as soon as work starts");
+        assert!(
+            item.is_reachable(),
+            "a successful probe must bring the broker back"
+        );
+        assert_eq!(
+            item.check_stamp,
+            NOW + 2_000,
+            "check_stamp is stamped as soon as work starts"
+        );
         assert_eq!(detector.calls(), 1);
         // the isolation window belongs to the send path; probing does not touch it
         assert_eq!(item.start_timestamp, NOW + 10_000);
@@ -872,7 +936,11 @@ mod tests {
         tolerance
             .detect_by_one_round(&resolver, &detector, 200, 2_000)
             .await;
-        assert_eq!(detector.calls(), 1, "no repeated probing within detect_interval");
+        assert_eq!(
+            detector.calls(),
+            1,
+            "no repeated probing within detect_interval"
+        );
     }
 
     #[tokio::test]
@@ -891,7 +959,11 @@ mod tests {
             .detect_by_one_round(&resolver, &detector, 200, 2_000)
             .await;
 
-        assert_eq!(detector.calls(), 2, "every due item must be probed (regardless of reachability)");
+        assert_eq!(
+            detector.calls(),
+            2,
+            "every due item must be probed (regardless of reachability)"
+        );
         assert!(
             !tolerance.is_reachable("broker-a"),
             "a failed probe writes nothing: broker-a stays unreachable"
@@ -902,8 +974,15 @@ mod tests {
         );
         let item = tolerance.get_fault_item("broker-a").unwrap();
         assert_eq!(item.check_stamp, NOW + 2_000);
-        assert_eq!(item.start_timestamp, NOW + 10_000, "the isolation window is untouched by probing");
-        assert_eq!(item.current_latency, 123, "the latency field is untouched by probing");
+        assert_eq!(
+            item.start_timestamp,
+            NOW + 10_000,
+            "the isolation window is untouched by probing"
+        );
+        assert_eq!(
+            item.current_latency, 123,
+            "the latency field is untouched by probing"
+        );
     }
 
     #[tokio::test]
@@ -922,7 +1001,11 @@ mod tests {
             tolerance.get_fault_item("broker-gone").is_none(),
             "a broker absent from the route must have its fault item removed with it (faultItemTable.remove semantics)"
         );
-        assert_eq!(detector.calls(), 0, "an unresolvable address continues directly, no probing");
+        assert_eq!(
+            detector.calls(),
+            0,
+            "an unresolvable address continues directly, no probing"
+        );
         assert!(tolerance.fault_item_names().is_empty());
 
         // an empty table idles: no probing, no error

@@ -577,6 +577,14 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     return extInt(response, "timestamp", 0);
 }
 
+// Java DefaultMQPullConsumerImpl#viewMessage: the MQAdminImpl single leg (see pull_consumer.h).
+MessageExt DefaultMQPullConsumer::viewMessage(const std::string& topic, const std::string& msgId) {
+    if (mqClient_ == nullptr) {
+        throw MQClientException("consumer not started, call start() first");
+    }
+    return mqClient_->viewMessage(topic, msgId);
+}
+
 namespace {
 
 // The retry copy a failed send-back degrades to: the original body and properties, re-addressed to

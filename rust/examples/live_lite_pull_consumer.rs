@@ -22,8 +22,8 @@ use rocketmq_client_remoting::client::consumer::mq_key;
 use rocketmq_client_remoting::client::mq_client::MQClientInstance;
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::pull_consumer::{
-    DefaultLitePullConsumer, DefaultMQPullConsumer, LitePullConsumerConfig, MAX_POLL_BATCH_SIZE,
-    PullConsumerConfig,
+    DefaultLitePullConsumer, DefaultMQPullConsumer, LitePullConsumerConfig, PullConsumerConfig,
+    MAX_POLL_BATCH_SIZE,
 };
 use rocketmq_client_remoting::client::result::SendStatus;
 use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueue};
@@ -326,14 +326,22 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         }
     };
     match c.start().await {
-        Ok(()) => ck.check("L1 start fails without a subscription", false, "start unexpectedly succeeded"),
+        Ok(()) => ck.check(
+            "L1 start fails without a subscription",
+            false,
+            "start unexpectedly succeeded",
+        ),
         Err(e) => ck.check(
             "L1 start fails without a subscription",
             e.to_string().contains("subscription is not set"),
             &e.to_string(),
         ),
     }
-    ck.check("L1 no started state left behind after failure", !c.is_started(), "");
+    ck.check(
+        "L1 no started state left behind after failure",
+        !c.is_started(),
+        "",
+    );
     ck.check(
         "L1 poll refuses before start",
         c.poll(Some(100)).await.is_err(),
@@ -349,14 +357,22 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
     c.set_consume_timestamp("1789000000000");
     match c.start().await {
-        Ok(()) => ck.check("L1 invalid consumeTimestamp is rejected", false, "start unexpectedly succeeded"),
+        Ok(()) => ck.check(
+            "L1 invalid consumeTimestamp is rejected",
+            false,
+            "start unexpectedly succeeded",
+        ),
         Err(e) => ck.check(
             "L1 invalid consumeTimestamp is rejected",
             e.to_string().contains("consumeTimestamp is invalid"),
             &e.to_string(),
         ),
     }
-    ck.check("L1 back to not-started after the validation failure", !c.is_started(), "");
+    ck.check(
+        "L1 back to not-started after the validation failure",
+        !c.is_started(),
+        "",
+    );
 
     // Assign mode (no subscription table needed) + idempotency.
     let c2 = match fx.consumer("life") {
@@ -380,7 +396,11 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         return;
     }
     ck.check("L1 is_started after start", c2.is_started(), "");
-    ck.check("L1 repeated start is idempotent", c2.start().await.is_ok(), "");
+    ck.check(
+        "L1 repeated start is idempotent",
+        c2.start().await.is_ok(),
+        "",
+    );
     ck.check(
         "L1 client_id = local IP@instanceName (buildMQClientId semantics)",
         c2.client_id()
@@ -390,7 +410,11 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     );
     c2.shutdown();
     c2.shutdown();
-    ck.check("L1 shutdown is idempotent and does not panic", !c2.is_started(), "");
+    ck.check(
+        "L1 shutdown is idempotent and does not panic",
+        !c2.is_started(),
+        "",
+    );
     ck.check("L1 is_running resets after shutdown", !c2.is_running(), "");
 }
 
@@ -401,7 +425,14 @@ async fn l2_subscribe_poll(ck: &mut Checker, fx: &Fixture, topic: &str) {
     // does not rebalance synchronously); with LAST, whether "offset resolution" or "message send" goes
     // first is indeterminate -- resolving after sending parks the cursor at the queue tail and the 12 messages are never received. LAST is covered by L4 (assign mode).
     let c = match fx
-        .subscribed(ck, "sub", topic, "*", Some(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET), None)
+        .subscribed(
+            ck,
+            "sub",
+            topic,
+            "*",
+            Some(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET),
+            None,
+        )
         .await
     {
         Some(c) => c,
@@ -429,8 +460,7 @@ async fn l2_subscribe_poll(ck: &mut Checker, fx: &Fixture, topic: &str) {
         m.topic == topic && m.queue_id >= 0 && m.queue_offset >= 0 && m.reconsume_times == 0
     });
     ck.check("L2 delivery fields come from the broker", per_queue_ok, "");
-    let mut by_queue: std::collections::BTreeMap<i32, Vec<i64>> =
-        std::collections::BTreeMap::new();
+    let mut by_queue: std::collections::BTreeMap<i32, Vec<i64>> = std::collections::BTreeMap::new();
     for m in &got {
         by_queue.entry(m.queue_id).or_default().push(m.queue_offset);
     }
@@ -486,9 +516,7 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
     if !err.is_empty() {
         ck.abort("L3 committed read-back", &err);
     } else {
-        let advanced = committed
-            .iter()
-            .all(|(_, off)| off.unwrap_or(0) > 0);
+        let advanced = committed.iter().all(|(_, off)| off.unwrap_or(0) > 0);
         ck.check(
             "L3 with auto_commit=true the offset persists on its own after polling past the period (nobody called commit)",
             advanced,
@@ -597,7 +625,9 @@ async fn l4_assign_seek(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[Mess
         &format!("L4 after seek_to_begin replays that queue's {per_queue} messages"),
         got.len() == per_queue
             && got.iter().all(|m| m.queue_id == mqs[0].queue_id)
-            && got_bodies.iter().all(|b| expected_bodies(topic).contains(b)),
+            && got_bodies
+                .iter()
+                .all(|b| expected_bodies(topic).contains(b)),
         &format!("n={} got={got_bodies:?}", got.len()),
     );
     if let Err(e) = c.seek_to_end(&mqs[0]).await {
@@ -667,7 +697,10 @@ async fn l5_tag_filter(ck: &mut Checker, fx: &Fixture, topic: &str) {
     let got = poll_bounded(ck, &c, N_MSG / 2, WAIT_SECONDS).await;
     let got_bodies = bodies(&got);
     ck.check(
-        &format!("L5 subscribe(\"TagA\") receives only {} messages", N_MSG / 2),
+        &format!(
+            "L5 subscribe(\"TagA\") receives only {} messages",
+            N_MSG / 2
+        ),
         got_bodies == want,
         &format!("n={} got={got_bodies:?}", got.len()),
     );
@@ -685,7 +718,9 @@ async fn l5_tag_filter(ck: &mut Checker, fx: &Fixture, topic: &str) {
     let sub_data = c.subscriptions();
     ck.check(
         "L5 subscriptions() holds the parsed SubscriptionData (what the heartbeat carries)",
-        sub_data.iter().any(|s| s.topic == topic && s.sub_string == "TagA"),
+        sub_data
+            .iter()
+            .any(|s| s.topic == topic && s.sub_string == "TagA"),
         &format!("{sub_data:?}"),
     );
     // After unsubscribe the subscription table is empty (the heartbeat carries one item fewer).
@@ -892,10 +927,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
     );
     let mq = &mqs[0];
     let min = c.offset_for_timestamp(mq, 1).await.unwrap_or(-1);
-    let at_now = c
-        .offset_for_timestamp(mq, now_ms())
-        .await
-        .unwrap_or(-1);
+    let at_now = c.offset_for_timestamp(mq, now_ms()).await.unwrap_or(-1);
     ck.check(
         "L9 offset_for_timestamp is monotonic in time",
         min >= 0 && at_now >= min,
@@ -1152,7 +1184,10 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         }
     };
     ck.check(
-        &format!("L11c the {} messages left in the buffer are still delivered after rewinding to 5", N_BIG - cap),
+        &format!(
+            "L11c the {} messages left in the buffer are still delivered after rewinding to 5",
+            N_BIG - cap
+        ),
         tail.len() as i64 == N_BIG - cap,
         &format!("got={}", tail.len()),
     );
@@ -1228,7 +1263,10 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     o.resume(std::slice::from_ref(&q0));
 
     let Some(foreign) = mqs.get(1).cloned() else {
-        ck.abort("L11g get foreign queue", "main topic has fewer than 2 queues");
+        ck.abort(
+            "L11g get foreign queue",
+            "main topic has fewer than 2 queues",
+        );
         o.shutdown();
         probe.shutdown();
         return;
@@ -1277,7 +1315,10 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     ck.check(
         "L11g after the clear, the read-back is the broker's cell (and it backfills the table)",
         after_prune == Some(60) && o.pending_commit_of(&q0) == 60,
-        &format!("committed={after_prune:?} pending={}", o.pending_commit_of(&q0)),
+        &format!(
+            "committed={after_prune:?} pending={}",
+            o.pending_commit_of(&q0)
+        ),
     );
     let broker_after_prune = broker_offset(&probe, &q0).await;
     ck.check(
@@ -1287,7 +1328,10 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     );
     // commit(Set) takes the current consumed cursor, not the in-memory cell
     if let Err(e) = o.commit_offsets(&memory_only2, false).await {
-        ck.abort("L11g commit(map, persist=false) second round", &e.to_string());
+        ck.abort(
+            "L11g commit(map, persist=false) second round",
+            &e.to_string(),
+        );
     }
     if let Err(e) = o.commit_queues(std::slice::from_ref(&q0), true).await {
         ck.abort("L11g commit(set)", &e.to_string());
@@ -1391,7 +1435,10 @@ async fn l12_cache_gate(ck: &mut Checker, fx: &Fixture) {
         let to = (from + 50).min(N_GATE);
         let mut chunk = Vec::new();
         for i in from..to {
-            chunk.push(Message::new(&topic, Some(format!("gate-{i:04}").as_bytes())));
+            chunk.push(Message::new(
+                &topic,
+                Some(format!("gate-{i:04}").as_bytes()),
+            ));
         }
         match fx.producer.send_batch(chunk, Some(&q0), Some(5_000)).await {
             Ok(r) if r.status == SendStatus::SendOk => landed += to - from,
@@ -1408,7 +1455,8 @@ async fn l12_cache_gate(ck: &mut Checker, fx: &Fixture) {
 
     // Only the count gate is under test; the aggregate gate needs threshold*batch to stay clear of a
     // 200-message backlog, and the size (100 MiB) and span (2000) gates cannot trip on 200 tiny messages.
-    let Some(gated) = gate_consumer(ck, fx, "litegate", &fx.group_name("gate"), THRESHOLD, &q0).await
+    let Some(gated) =
+        gate_consumer(ck, fx, "litegate", &fx.group_name("gate"), THRESHOLD, &q0).await
     else {
         return;
     };
@@ -1455,7 +1503,8 @@ async fn l12_cache_gate(ck: &mut Checker, fx: &Fixture) {
         (N_GATE + 100) as i32,
         &q0,
     )
-    .await else {
+    .await
+    else {
         gated.shutdown();
         return;
     };

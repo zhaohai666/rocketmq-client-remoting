@@ -395,28 +395,32 @@ fn main() -> ExitCode {
         // these 20 is the discriminator for "Round A's in-flight send-back landed before shutdown returned";
         // failing everything advances the round, rt=1 >= cap 1 ⇒ the broker reroutes to %DLQ%; exit immediately
         // after collecting everything again, and Round B's own in-flight send-backs must land too, or Phase C can never collect all 20.
-        let (b_got_all, b_seen) = run_isolated("S1-B v2 second round consuming %RETRY% + immediate process exit", async {
-            let inbox = Inbox::new();
-            let retry_topic = MixAll::get_retry_topic(&s1_group);
-            let v2 = DefaultMQPushConsumer::with_config(consumer_config(
-                &s1_group,
-                &format!("live-shdn-race-s1-v2-{stamp}"),
-                &namesrv,
-                false,
-                1,
-                MSG_COUNT as i32,
-            ))
-            .unwrap();
-            v2.subscribe(&retry_topic, "*").unwrap();
-            v2.set_message_listener_concurrently(Arc::new(FailAllConcurrent {
-                inbox: inbox.clone(),
-            }));
-            v2.start().await.unwrap();
-            let got = inbox.wait_for_bodies(Instant::now() + ROUND_TRIP_WINDOW, &s1_expect, None);
-            let seen = inbox.count_bodies(None);
-            v2.shutdown();
-            (got, seen)
-        });
+        let (b_got_all, b_seen) = run_isolated(
+            "S1-B v2 second round consuming %RETRY% + immediate process exit",
+            async {
+                let inbox = Inbox::new();
+                let retry_topic = MixAll::get_retry_topic(&s1_group);
+                let v2 = DefaultMQPushConsumer::with_config(consumer_config(
+                    &s1_group,
+                    &format!("live-shdn-race-s1-v2-{stamp}"),
+                    &namesrv,
+                    false,
+                    1,
+                    MSG_COUNT as i32,
+                ))
+                .unwrap();
+                v2.subscribe(&retry_topic, "*").unwrap();
+                v2.set_message_listener_concurrently(Arc::new(FailAllConcurrent {
+                    inbox: inbox.clone(),
+                }));
+                v2.start().await.unwrap();
+                let got =
+                    inbox.wait_for_bodies(Instant::now() + ROUND_TRIP_WINDOW, &s1_expect, None);
+                let seen = inbox.count_bodies(None);
+                v2.shutdown();
+                (got, seen)
+            },
+        );
         check!(
             "S1-A send-back landed before shutdown returned: v2 collected all 20 original bodies from %RETRY%",
             b_got_all,
@@ -465,51 +469,53 @@ fn main() -> ExitCode {
         let s2_prefix = format!("s2-{stamp}");
         let s2_expect: Vec<String> = (0..MSG_COUNT).map(|i| format!("{s2_prefix}-{i}")).collect();
 
-        let a_deliveries = run_isolated("S2-A orderly all-suspend + immediate process exit", async {
-            let producer = DefaultMQProducer::with_config(ProducerConfig {
-                producer_group: s2_prod_group.clone(),
-                name_server_addrs: vec![namesrv.clone()],
-                instance_name: format!("live-shdn-race-s2-prod-{stamp}"),
-                ..Default::default()
-            })
-            .unwrap();
-            producer.start().await.unwrap();
-            producer.create_topic(&s2_topic, 1, 0).await.unwrap();
-            produce_n(&producer, &s2_topic, &s2_prefix, MSG_COUNT).await;
+        let a_deliveries =
+            run_isolated("S2-A orderly all-suspend + immediate process exit", async {
+                let producer = DefaultMQProducer::with_config(ProducerConfig {
+                    producer_group: s2_prod_group.clone(),
+                    name_server_addrs: vec![namesrv.clone()],
+                    instance_name: format!("live-shdn-race-s2-prod-{stamp}"),
+                    ..Default::default()
+                })
+                .unwrap();
+                producer.start().await.unwrap();
+                producer.create_topic(&s2_topic, 1, 0).await.unwrap();
+                produce_n(&producer, &s2_topic, &s2_prefix, MSG_COUNT).await;
 
-            let v1 = DefaultMQPushConsumer::with_config(consumer_config(
-                &s2_group,
-                &format!("live-shdn-race-s2-v1-{stamp}"),
-                &namesrv,
-                true,
-                2,
-                1,
-            ))
-            .unwrap();
-            v1.subscribe(&s2_topic, "*").unwrap();
-            let deliveries = Arc::new(AtomicUsize::new(0));
-            v1.set_message_listener_orderly(Arc::new(SuspendAllOrderlyShared(Arc::clone(
-                &deliveries,
-            ))));
-            v1.start().await.unwrap();
-            // Wait for delivery rounds to build up: one queue cycling suspend per message, so 45 rounds means the
-            // first few messages have crossed the retry cap and orderly send-back is running -- shut down now.
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while deliveries.load(Ordering::SeqCst) < 45 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let seen = deliveries.load(Ordering::SeqCst);
-            v1.shutdown();
-            seen
-        });
+                let v1 = DefaultMQPushConsumer::with_config(consumer_config(
+                    &s2_group,
+                    &format!("live-shdn-race-s2-v1-{stamp}"),
+                    &namesrv,
+                    true,
+                    2,
+                    1,
+                ))
+                .unwrap();
+                v1.subscribe(&s2_topic, "*").unwrap();
+                let deliveries = Arc::new(AtomicUsize::new(0));
+                v1.set_message_listener_orderly(Arc::new(SuspendAllOrderlyShared(Arc::clone(
+                    &deliveries,
+                ))));
+                v1.start().await.unwrap();
+                // Wait for delivery rounds to build up: one queue cycling suspend per message, so 45 rounds means the
+                // first few messages have crossed the retry cap and orderly send-back is running -- shut down now.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while deliveries.load(Ordering::SeqCst) < 45 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let seen = deliveries.load(Ordering::SeqCst);
+                v1.shutdown();
+                seen
+            });
         check!(
             "S2-A orderly suspend rounds are underway (triggering the immediate shutdown)",
             a_deliveries >= 45,
             "deliveries={a_deliveries}"
         );
 
-        let (b_got_all, b_seen, b_dlq) =
-            run_isolated("S2-B joint reproduction check + immediate process exit", async {
+        let (b_got_all, b_seen, b_dlq) = run_isolated(
+            "S2-B joint reproduction check + immediate process exit",
+            async {
                 let inbox = Inbox::new();
                 let dlq_topic = MixAll::get_dlq_topic(&s2_group);
                 let v2 = DefaultMQPushConsumer::with_config(consumer_config(
@@ -538,7 +544,8 @@ fn main() -> ExitCode {
                 let dlq_n = inbox.count_bodies(Some(&dlq_topic));
                 v2.shutdown();
                 (got, seen, dlq_n)
-            });
+            },
+        );
         check!(
             "S2 all 20 original bodies reproduced after immediate process exit (topic∪RETRY∪DLQ)",
             b_got_all,
@@ -553,29 +560,32 @@ fn main() -> ExitCode {
 
     // ============ T: short-lived trace producer + immediate process exit ============
     if want("t") {
-        let t_msg_ids = run_isolated("T-A short-lived trace producer + immediate process exit", async {
-            let producer = DefaultMQProducer::with_config(ProducerConfig {
-                producer_group: t_group.clone(),
-                name_server_addrs: vec![namesrv.clone()],
-                instance_name: format!("live-shdn-race-t-prod-{stamp}"),
-                enable_trace: true,
-                ..Default::default()
-            })
-            .unwrap();
-            producer.start().await.unwrap();
-            producer.create_topic(&t_topic, 1, 0).await.unwrap();
-            let mut msg_ids = Vec::new();
-            for i in 0..TRACE_COUNT {
-                let body = format!("t-{stamp}-{i}");
-                let id = send_with_route_retry(&producer, &t_topic, &body)
-                    .await
-                    .unwrap_or_else(|| panic!("still unsent after 60s: {body}"));
-                msg_ids.push(id);
-            }
-            // Immediate shutdown: the flush period (5s) has not fired, the whole trace batch is still queued/in flight
-            producer.shutdown();
-            msg_ids
-        });
+        let t_msg_ids = run_isolated(
+            "T-A short-lived trace producer + immediate process exit",
+            async {
+                let producer = DefaultMQProducer::with_config(ProducerConfig {
+                    producer_group: t_group.clone(),
+                    name_server_addrs: vec![namesrv.clone()],
+                    instance_name: format!("live-shdn-race-t-prod-{stamp}"),
+                    enable_trace: true,
+                    ..Default::default()
+                })
+                .unwrap();
+                producer.start().await.unwrap();
+                producer.create_topic(&t_topic, 1, 0).await.unwrap();
+                let mut msg_ids = Vec::new();
+                for i in 0..TRACE_COUNT {
+                    let body = format!("t-{stamp}-{i}");
+                    let id = send_with_route_retry(&producer, &t_topic, &body)
+                        .await
+                        .unwrap_or_else(|| panic!("still unsent after 60s: {body}"));
+                    msg_ids.push(id);
+                }
+                // Immediate shutdown: the flush period (5s) has not fired, the whole trace batch is still queued/in flight
+                producer.shutdown();
+                msg_ids
+            },
+        );
 
         let (t_got_all, t_pubs) = run_isolated("T-B read back traces", async {
             let inbox = Inbox::new();

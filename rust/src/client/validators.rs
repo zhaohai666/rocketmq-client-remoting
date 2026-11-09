@@ -6,9 +6,8 @@
 use crate::common::message::Message;
 use crate::common::message_const::PROPERTY_INNER_MULTI_DISPATCH;
 use crate::common::topic_validator::{
-    GROUP_MAX_LENGTH, TOPIC_MAX_LENGTH, VALID_CHAR_PATTERN,
     is_not_allowed_send_topic as in_forbidden_send_set, is_system_topic as in_system_topic_set,
-    is_topic_or_group_illegal,
+    is_topic_or_group_illegal, GROUP_MAX_LENGTH, TOPIC_MAX_LENGTH, VALID_CHAR_PATTERN,
 };
 use crate::common::util_all::is_blank;
 use crate::error::{Error, Result};
@@ -121,7 +120,10 @@ mod tests {
     /// Extracts (message, response_code) from `Error::Client`; any other variant fails the test.
     fn client_err(e: Error) -> (String, Option<i32>) {
         match e {
-            Error::Client { response_code, message } => (message, response_code),
+            Error::Client {
+                response_code,
+                message,
+            } => (message, response_code),
             other => panic!("expected Error::Client, got {other:?}"),
         }
     }
@@ -155,7 +157,10 @@ mod tests {
         assert_eq!(m, "The specified topic is blank");
         check_topic(&repeated('a', 127)).expect("127 should pass");
         let (m, _) = client_err(check_topic(&repeated('a', 128)).unwrap_err());
-        assert_eq!(m, "The specified topic is longer than topic max length 127.");
+        assert_eq!(
+            m,
+            "The specified topic is longer than topic max length 127."
+        );
         let (m, _) = client_err(check_topic("bad.topic").unwrap_err());
         assert_eq!(
             m,
@@ -166,7 +171,10 @@ mod tests {
     #[test]
     fn system_and_forbidden_topics_throw_with_client_side_code() {
         let (m, code) = client_err(is_system_topic("rmq_sys_watermark").unwrap_err());
-        assert_eq!(m, "The topic[rmq_sys_watermark] is conflict with system topic.");
+        assert_eq!(
+            m,
+            "The topic[rmq_sys_watermark] is conflict with system topic."
+        );
         assert_eq!(code, None);
         is_system_topic("MyTopic").expect("not a system topic");
 
@@ -188,11 +196,13 @@ mod tests {
         assert_eq!(m, "the message body length is zero");
         assert_eq!(code, Some(MESSAGE_ILLEGAL));
 
-        let (m, code) = client_err(check_message(&msg("T1", Some(&[7u8; 4097])), 4096).unwrap_err());
+        let (m, code) =
+            client_err(check_message(&msg("T1", Some(&[7u8; 4097])), 4096).unwrap_err());
         assert_eq!(m, "the message body size over max value, MAX: 4096");
         assert_eq!(code, Some(MESSAGE_ILLEGAL));
 
-        check_message(&msg("T1", Some(&[7u8; 4096])), 4096).expect("equal to the threshold should pass");
+        check_message(&msg("T1", Some(&[7u8; 4096])), 4096)
+            .expect("equal to the threshold should pass");
     }
 
     #[test]
@@ -209,7 +219,10 @@ mod tests {
         check_message(&msg("%DLQ%myGroup", Some(&[1])), 4096).expect("%DLQ% should pass");
 
         let mut m = msg("T1", Some(&[1]));
-        m.put_property(PROPERTY_INNER_MULTI_DISPATCH, &format!("queueA{FILE_SEPARATOR}extra"));
+        m.put_property(
+            PROPERTY_INNER_MULTI_DISPATCH,
+            &format!("queueA{FILE_SEPARATOR}extra"),
+        );
         let (text, code) = client_err(check_message(&m, 4096).unwrap_err());
         assert_eq!(
             text,

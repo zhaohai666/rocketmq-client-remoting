@@ -43,25 +43,46 @@ pub fn clone_error(err: &Error) -> Error {
     match err {
         Error::RemotingCommand(m) => Error::RemotingCommand(m.clone()),
         Error::Connect { addr } => Error::Connect { addr: addr.clone() },
-        Error::SendRequest { addr, message } => {
-            Error::SendRequest { addr: addr.clone(), message: message.clone() }
-        }
-        Error::Timeout { addr, timeout_millis } => {
-            Error::Timeout { addr: addr.clone(), timeout_millis: *timeout_millis }
-        }
+        Error::SendRequest { addr, message } => Error::SendRequest {
+            addr: addr.clone(),
+            message: message.clone(),
+        },
+        Error::Timeout {
+            addr,
+            timeout_millis,
+        } => Error::Timeout {
+            addr: addr.clone(),
+            timeout_millis: *timeout_millis,
+        },
         Error::TooMuchRequest(m) => Error::TooMuchRequest(m.clone()),
-        Error::Server { response_code, remark } => {
-            Error::Server { response_code: *response_code, remark: remark.clone() }
-        }
-        Error::Client { response_code, message } => {
-            Error::Client { response_code: *response_code, message: message.clone() }
-        }
-        Error::Broker { response_code, message } => {
-            Error::Broker { response_code: *response_code, message: message.clone() }
-        }
-        Error::RequestTimeout { topic, timeout_millis } => {
-            Error::RequestTimeout { topic: topic.clone(), timeout_millis: *timeout_millis }
-        }
+        Error::Server {
+            response_code,
+            remark,
+        } => Error::Server {
+            response_code: *response_code,
+            remark: remark.clone(),
+        },
+        Error::Client {
+            response_code,
+            message,
+        } => Error::Client {
+            response_code: *response_code,
+            message: message.clone(),
+        },
+        Error::Broker {
+            response_code,
+            message,
+        } => Error::Broker {
+            response_code: *response_code,
+            message: message.clone(),
+        },
+        Error::RequestTimeout {
+            topic,
+            timeout_millis,
+        } => Error::RequestTimeout {
+            topic: topic.clone(),
+            timeout_millis: *timeout_millis,
+        },
         Error::Decode(m) => Error::Decode(m.clone()),
         Error::Encode(m) => Error::Encode(m.clone()),
         Error::Io(e) => Error::client(e.to_string()),
@@ -80,8 +101,18 @@ pub struct AggregateKey {
 }
 
 impl AggregateKey {
-    pub fn new(topic: &str, mq: Option<MessageQueue>, wait_store_msg_ok: bool, tag: Option<String>) -> AggregateKey {
-        AggregateKey { topic: topic.to_string(), mq, wait_store_msg_ok, tag }
+    pub fn new(
+        topic: &str,
+        mq: Option<MessageQueue>,
+        wait_store_msg_ok: bool,
+        tag: Option<String>,
+    ) -> AggregateKey {
+        AggregateKey {
+            topic: topic.to_string(),
+            mq,
+            wait_store_msg_ok,
+            tag,
+        }
     }
 
     pub fn of_message(msg: &Message) -> AggregateKey {
@@ -126,7 +157,11 @@ pub struct MessageAccumulation {
 }
 
 impl MessageAccumulation {
-    fn new(key: AggregateKey, sender: Arc<dyn AccumulatorSender>, owner: Weak<AccumulatorInner>) -> MessageAccumulation {
+    fn new(
+        key: AggregateKey,
+        sender: Arc<dyn AccumulatorSender>,
+        owner: Weak<AccumulatorInner>,
+    ) -> MessageAccumulation {
         MessageAccumulation {
             key,
             owner,
@@ -238,7 +273,10 @@ impl MessageAccumulation {
                 self.send_sync()?;
                 break;
             }
-            guard = self.wait_cond.wait(guard).unwrap_or_else(|e| e.into_inner());
+            guard = self
+                .wait_cond
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
         }
         drop(guard);
         Ok(index)
@@ -268,7 +306,9 @@ impl MessageAccumulation {
         let st = lock(&self.state);
         let mut batch = MessageBatch::new(st.messages.clone());
         batch.message.set_topic(&self.key.topic);
-        batch.message.set_wait_store_msg_ok(self.key.wait_store_msg_ok);
+        batch
+            .message
+            .set_wait_store_msg_ok(self.key.wait_store_msg_ok);
         // Written unconditionally (an empty set means KEYS="", see item 5 of the file header)
         let mut keys: Vec<&str> = st.keys.iter().map(String::as_str).collect();
         keys.sort_unstable();
@@ -288,7 +328,12 @@ impl MessageAccumulation {
         let mut results = Vec::with_capacity(count);
         if msg_id.contains(',') {
             let ids: Vec<&str> = msg_id.split(',').collect();
-            let offsets: Vec<&str> = send_result.offset_msg_id.as_deref().unwrap_or("").split(',').collect();
+            let offsets: Vec<&str> = send_result
+                .offset_msg_id
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .collect();
             if ids.len() != count || offsets.len() != count {
                 return Err(Error::client("sendResult is illegal"));
             }
@@ -327,7 +372,10 @@ impl MessageAccumulation {
 
         let batch = self.build_batch();
         let size = self.messages_size();
-        let outcome = match self.sender.send_direct_blocking(batch, self.key.mq.as_ref()) {
+        let outcome = match self
+            .sender
+            .send_direct_blocking(batch, self.key.mq.as_ref())
+        {
             Ok(result) => self.split_send_results(&result),
             Err(e) => Err(e),
         };
@@ -353,7 +401,10 @@ impl MessageAccumulation {
             callbacks: callbacks.clone(),
             size,
         });
-        if let Err(e) = self.sender.send_direct_async(batch, self.key.mq.as_ref(), resolver) {
+        if let Err(e) = self
+            .sender
+            .send_direct_async(batch, self.key.mq.as_ref(), resolver)
+        {
             for cb in &callbacks {
                 cb.on_exception(clone_error(&e));
             }
@@ -488,14 +539,20 @@ impl ProduceAccumulator {
         let sync_this = self.clone();
         guards.sync = Some(
             std::thread::Builder::new()
-                .name(format!("Client_{}_GuardForSyncSend", self.inner.instance_name))
+                .name(format!(
+                    "Client_{}_GuardForSyncSend",
+                    self.inner.instance_name
+                ))
                 .spawn(move || sync_this.guard_loop(true))
                 .expect("spawn guard for sync send"),
         );
         let async_this = self.clone();
         guards.asynchronous = Some(
             std::thread::Builder::new()
-                .name(format!("Client_{}_GuardForAsyncSend", self.inner.instance_name))
+                .name(format!(
+                    "Client_{}_GuardForAsyncSend",
+                    self.inner.instance_name
+                ))
                 .spawn(move || async_this.guard_loop(false))
                 .expect("spawn guard for async send"),
         );
@@ -550,7 +607,9 @@ impl ProduceAccumulator {
                 "totalBatchMaxBytes must bigger then 0, but get {total_hold_size}!"
             )));
         }
-        self.inner.total_hold_size.store(total_hold_size, Ordering::Release);
+        self.inner
+            .total_hold_size
+            .store(total_hold_size, Ordering::Release);
         Ok(())
     }
 
@@ -667,7 +726,11 @@ impl ProduceAccumulator {
 
     fn guard_once(&self, sync: bool) {
         let sleep_ms = std::cmp::max(1, self.get_batch_max_delay_ms() / 2);
-        let batches = if sync { self.sync_batches_snapshot() } else { self.async_batches_snapshot() };
+        let batches = if sync {
+            self.sync_batches_snapshot()
+        } else {
+            self.async_batches_snapshot()
+        };
         for v in batches {
             if sync {
                 v.wakeup();

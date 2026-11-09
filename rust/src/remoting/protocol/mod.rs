@@ -8,13 +8,16 @@ pub mod auth_body;
 pub mod body;
 pub mod extra_info;
 pub mod headers;
-pub mod namespace_util;
 pub mod heartbeat;
+pub mod namespace_util;
 pub mod query_assignment_body;
 pub mod route;
 pub mod subscription;
 
-pub use codes::{language_code, request_code, request_source, request_type, remoting_sys_response_code, response_code, serialize_type};
+pub use codes::{
+    language_code, remoting_sys_response_code, request_code, request_source, request_type,
+    response_code, serialize_type,
+};
 pub use ext_fields::{CustomHeader, ExtFields};
 pub use remoting_command::RemotingCommand;
 pub use serialize::{RemotingSerializable, RocketMQSerializable};

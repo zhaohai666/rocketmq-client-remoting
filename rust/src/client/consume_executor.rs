@@ -565,7 +565,11 @@ mod tests {
             tokio::time::advance(Duration::from_millis(300)).await;
             tokio::task::yield_now().await;
         }
-        assert_eq!(ex.worker_count(), 1, "the over-core worker should exit after keep_alive");
+        assert_eq!(
+            ex.worker_count(),
+            1,
+            "the over-core worker should exit after keep_alive"
+        );
 
         for _ in 0..10 {
             tokio::time::advance(Duration::from_millis(300)).await;
@@ -701,7 +705,11 @@ mod tests {
             SHORT_MAX_VALUE,
             "max is lifted to core along with it"
         );
-        assert_eq!(ex.worker_count(), 0, "empty queue → not a single worker is built");
+        assert_eq!(
+            ex.worker_count(),
+            0,
+            "empty queue → not a single worker is built"
+        );
     }
 
     #[tokio::test]
@@ -802,6 +810,9 @@ mod tests {
         done_rx.await.expect("clone shares the same workers");
         assert_eq!(ex.worker_count(), 1);
         ex.shutdown_gracefully().await;
-        assert!(other.submit(task(async {})).is_err(), "the shutdown applies to both sides");
+        assert!(
+            other.submit(task(async {})).is_err(),
+            "the shutdown applies to both sides"
+        );
     }
 }

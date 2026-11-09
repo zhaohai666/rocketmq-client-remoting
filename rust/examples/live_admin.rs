@@ -215,7 +215,10 @@ impl Env {
                 }
             }
             if Instant::now() > deadline {
-                ck.abort("cluster liveness probe", "the nameServer returned no broker within the budget");
+                ck.abort(
+                    "cluster liveness probe",
+                    "the nameServer returned no broker within the budget",
+                );
                 return false;
             }
             sleep_millis(1000).await;
@@ -332,7 +335,10 @@ async fn a1_private_instance_isolation(ck: &mut Checker, env: &Env) {
             result.status == SendStatus::SendOk,
             &format!("status={}", result.status),
         ),
-        Err(e) => ck.abort("A1 after admin shutdown the producer still sends normally", &e.to_string()),
+        Err(e) => ck.abort(
+            "A1 after admin shutdown the producer still sends normally",
+            &e.to_string(),
+        ),
     }
     ck.check(
         "A1 a second admin shutdown is idempotent",
@@ -438,7 +444,10 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         sleep_millis(1000).await;
     }
     let Some(route) = route else {
-        ck.abort("A3 examineTopicRoute", "the route of the new topic is not visible within the budget");
+        ck.abort(
+            "A3 examineTopicRoute",
+            "the route of the new topic is not visible within the budget",
+        );
         return;
     };
     let read_nums: Vec<i32> = route
@@ -621,9 +630,9 @@ async fn a4_broker_config(ck: &mut Checker, env: &Env) {
     );
     ck.check(
         "A4 brokerName matches the broker in the route",
-        props
-            .get("brokerName")
-            .map_or(true, |v| v == env.broker_name() || env.broker_name().is_empty()),
+        props.get("brokerName").map_or(true, |v| {
+            v == env.broker_name() || env.broker_name().is_empty()
+        }),
         &format!(
             "brokerName={:?} route={:?}",
             props.get("brokerName"),
@@ -716,7 +725,11 @@ async fn a5_kv_config(ck: &mut Checker, env: &Env) {
         match admin.get_kv_config(&ns, "k1").await {
             Ok(value) => {
                 let gone = value.as_ref().filter(|v| !v.is_empty()).is_none();
-                ck.check("A5 the KV no longer exists after deletion", gone, &format!("value={value:?}"));
+                ck.check(
+                    "A5 the KV no longer exists after deletion",
+                    gone,
+                    &format!("value={value:?}"),
+                );
             }
             Err(e) => ck.abort("A5 read back the KV after deletion", &e.to_string()),
         }
@@ -754,7 +767,11 @@ async fn a6_subscription_group(ck: &mut Checker, env: &Env) {
                 found.retry_max_times, found.consume_enable
             ),
         ),
-        Ok(None) => ck.check("A6 a single lookup round-trips retryMaxTimes", false, "the group just created cannot be found"),
+        Ok(None) => ck.check(
+            "A6 a single lookup round-trips retryMaxTimes",
+            false,
+            "the group just created cannot be found",
+        ),
         Err(e) => ck.abort("A6 getSubscriptionGroupConfig", &e.to_string()),
     }
     match admin.examine_subscription_group_config(&addr, &group).await {
@@ -1250,10 +1267,9 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
         return;
     };
     let now = now_millis();
-    // queryMessage only asserts "the request is reachable, the broker replies normally, and the
-    // return type is correct": msgId is a uniqKey, and the broker-side uniqKey inverted index is
-    // only supported by the RocksDB index implementation while this machine uses the default file
-    // index ⇒ not finding it is a broker configuration difference, not a client bug.
+    // The KEYS query walks the broker's index file; the messages sent here carry
+    // no KEYS, so zero hits is the expected answer. The UNIQ query walks the
+    // broker's commitlog by the UNIQUE index type and must hit.
     let by_key = admin
         .query_message(&topic, &first.uniq_key, 32, now - 60_000, now + 60_000)
         .await;
@@ -1263,7 +1279,10 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
             msgs.iter().all(|m| m.get_topic() == topic),
             &format!("hits={}", msgs.len()),
         ),
-        Err(e) => ck.abort("A9 the queryMessage request is reachable and replies normally", &e.to_string()),
+        Err(e) => ck.abort(
+            "A9 the queryMessage request is reachable and replies normally",
+            &e.to_string(),
+        ),
     }
     match admin
         .query_message_by_key(&topic, &first.uniq_key, 32)
@@ -1281,18 +1300,18 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
         .await
     {
         Ok(found) => ck.check(
-            "A9 queryMessageByUniqKey is reachable (on a hit it must be the original message)",
-            found.map_or(true, |m| m.get_topic() == topic),
-            "",
+            "A9 queryMessageByUniqKey fetches the original message back",
+            found.as_ref().is_some_and(|m| m.get_topic() == topic),
+            found.map_or("no match (client-visible id filter failed)", |_| ""),
         ),
         Err(e) => ck.abort("A9 queryMessage_by_uniq_key", &e.to_string()),
     }
     ck.skip(
-        "A9 queryMessage hits",
-        "the local broker uses the default file index and the message carries no KEYS, so an empty uniqKey query result is expected",
+        "A9 queryMessage KEYS hits",
+        "the messages sent here carry no KEYS, so zero KEYS-query hits is expected (the uniq query above must hit)",
     );
     match admin.view_message(&topic, &first.offset_msg_id).await {
-        Ok(msg) => ck.check(
+        Ok(Some(msg)) => ck.check(
             "A9 viewMessage(offsetMsgId) fetches the original message back",
             String::from_utf8_lossy(msg.get_body()) == first.body,
             &format!(
@@ -1301,20 +1320,31 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
                 String::from_utf8_lossy(msg.get_body())
             ),
         ),
+        Ok(None) => ck.abort("A9 viewMessage(offsetMsgId)", "no message matched"),
         Err(e) => ck.abort("A9 viewMessage(offsetMsgId)", &e.to_string()),
     }
     // The client-side uniqKey is likewise 32 hex digits, and decoding it blindly yields a bogus
-    // address; it must take the fallback path and end with a clean NO_MESSAGE(208) instead of a raw
-    // overflow/connection exception.
+    // address; the admin takes the uniq-key fallback (Java DefaultMQAdminExtImpl#viewMessage).
+    // The broker's UNIQUE-index query hits the original message, so the leg must fetch it back
+    // with an unchanged body.
     match admin.view_message(&topic, &first.uniq_key).await {
-        Ok(_) => ck.check(
-            "A9 viewMessage(uniqKey) takes the fallback and yields a clean exception",
+        Ok(Some(msg)) => ck.check(
+            "A9 viewMessage(uniqKey) fetches the original message back",
+            String::from_utf8_lossy(msg.get_body()) == first.body,
+            &format!(
+                "expected {:?} actual {:?}",
+                first.body,
+                String::from_utf8_lossy(msg.get_body())
+            ),
+        ),
+        Ok(None) => ck.check(
+            "A9 viewMessage(uniqKey) fetches the original message back",
             false,
-            "the uniqKey was actually found (the uniqKey index is enabled locally), treating it as a hit",
+            "no match (client-visible id filter failed)",
         ),
         Err(e) => ck.check(
-            "A9 viewMessage(uniqKey) takes the fallback and yields a clean exception",
-            client_code(&e) == Some(response_code::NO_MESSAGE),
+            "A9 viewMessage(uniqKey) takes the fallback and yields a clean answer",
+            false,
             &e.to_string(),
         ),
     }
@@ -1323,10 +1353,15 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
     match admin.view_message(&topic, "not-a-hex-msg-id").await {
         Err(e) => ck.check(
             "A9 viewMessage(illegal msgId) also falls back to 208",
-            client_code(&e) == Some(response_code::NO_MESSAGE),
-            &e.to_string(),
+            false,
+            &format!("the parse error leaked out: {e}"),
         ),
-        Ok(_) => ck.check(
+        Ok(None) => ck.check(
+            "A9 viewMessage(illegal msgId) also falls back to 208",
+            true,
+            "clean no-match (the Java null)",
+        ),
+        Ok(Some(_)) => ck.check(
             "A9 viewMessage(illegal msgId) also falls back to 208",
             false,
             "it was actually found",
@@ -1392,7 +1427,10 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
         }
     }
     if let Err(e) = admin.update_consumer_offset(&fresh, &mq, 0).await {
-        ck.abort("A10 updateConsumerOffset (address resolved via the route)", &e.to_string());
+        ck.abort(
+            "A10 updateConsumerOffset (address resolved via the route)",
+            &e.to_string(),
+        );
     } else {
         match admin.examine_consumer_offset(&fresh, &mq).await {
             Ok(offset) => ck.check(
@@ -1430,24 +1468,36 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
     }
     match env.produce(&bnd_topic, 0, 3).await.len() {
         3 => println!("  [INFO] A10.5 boundary topic has sent 3 messages"),
-        n => ck.check("A10.5 boundary topic sent 3 messages", false, &format!("ok={n}")),
+        n => ck.check(
+            "A10.5 boundary topic sent 3 messages",
+            false,
+            &format!("ok={n}"),
+        ),
     }
     sleep_millis(2000).await;
     let bmq = MessageQueue::new(&bnd_topic, &env.broker_name(), 0);
     let bmax = step!(ck, "A10.5 maxOffset", admin.max_offset(&bmq).await);
     let future = now_millis() + 600_000;
-    let lo = step!(ck, "A10.5 searchLowerBoundaryOffset", admin
-        .search_lower_boundary_offset(&bmq, future)
-        .await);
-    let up = step!(ck, "A10.5 searchUpperBoundaryOffset", admin
-        .search_upper_boundary_offset(&bmq, future)
-        .await);
-    let lo_past = step!(ck, "A10.5 LOWER(the past)", admin
-        .search_lower_boundary_offset(&bmq, 1)
-        .await);
-    let up_past = step!(ck, "A10.5 UPPER(the past)", admin
-        .search_upper_boundary_offset(&bmq, 1)
-        .await);
+    let lo = step!(
+        ck,
+        "A10.5 searchLowerBoundaryOffset",
+        admin.search_lower_boundary_offset(&bmq, future).await
+    );
+    let up = step!(
+        ck,
+        "A10.5 searchUpperBoundaryOffset",
+        admin.search_upper_boundary_offset(&bmq, future).await
+    );
+    let lo_past = step!(
+        ck,
+        "A10.5 LOWER(the past)",
+        admin.search_lower_boundary_offset(&bmq, 1).await
+    );
+    let up_past = step!(
+        ck,
+        "A10.5 UPPER(the past)",
+        admin.search_upper_boundary_offset(&bmq, 1).await
+    );
     if let Some(bmax) = bmax {
         ck.check(
             "A10.5 boundary topic maxOffset == 3",
@@ -1528,7 +1578,10 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
         }
     };
     let Some(mq) = mqs.first() else {
-        ck.abort("A11 fetch_subscribe_message_queues", "the topic has no queue");
+        ck.abort(
+            "A11 fetch_subscribe_message_queues",
+            "the topic has no queue",
+        );
         consumer.shutdown();
         return;
     };
@@ -1584,7 +1637,9 @@ async fn a11_send_back(ck: &mut Checker, env: &Env) {
     ck.check(
         &format!("A11 sendMessageBack landed in {retry_topic}"),
         max_sum > 0,
-        &format!("maxOffsetSum={max_sum} (polled {waited}s; the broker rewrites delayLevel=0 into 3)"),
+        &format!(
+            "maxOffsetSum={max_sum} (polled {waited}s; the broker rewrites delayLevel=0 into 3)"
+        ),
     );
 }
 
@@ -1662,8 +1717,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     {
         Ok(table) => ck.check(
             "A12 resetOffsetByQueueId reaches the broker successfully",
-            table.is_empty()
-                || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
+            table.is_empty() || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
             &format!("returnedTable={} (may be empty)", table.len()),
         ),
         Err(e) => {
@@ -1677,7 +1731,10 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
             offset == Some(min_reset),
             &format!("consumerOffset={offset:?} target={min_reset}"),
         ),
-        Err(e) => ck.abort("A12 read back the offset after resetOffsetByQueueId", &e.to_string()),
+        Err(e) => ck.abort(
+            "A12 read back the offset after resetOffsetByQueueId",
+            &e.to_string(),
+        ),
     }
     {
         let consumer = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
@@ -1688,7 +1745,10 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         }) {
             Ok(c) => Some(c),
             Err(e) => {
-                ck.abort("A12 re-pull after the reset: build consumer", &e.to_string());
+                ck.abort(
+                    "A12 re-pull after the reset: build consumer",
+                    &e.to_string(),
+                );
                 None
             }
         };
@@ -1785,7 +1845,10 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
                     result.status == SendStatus::SendOk,
                     &format!("status={}", result.status),
                 ),
-                Err(e) => ck.abort("A13 after the permission is restored the producer still sends normally", &e.to_string()),
+                Err(e) => ck.abort(
+                    "A13 after the permission is restored the producer still sends normally",
+                    &e.to_string(),
+                ),
             }
         }
         Err(e) => ck.abort("A13 addWritePermOfBroker", &e.to_string()),
@@ -1828,8 +1891,14 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     // until the budget runs out.
     let deadline = Instant::now() + Duration::from_secs(15);
     for (label, name) in [
-        ("A13 the group cannot be found after deleteSubscriptionGroup", group.clone()),
-        ("A13 the target group is deleted as well", env.dest_group.clone()),
+        (
+            "A13 the group cannot be found after deleteSubscriptionGroup",
+            group.clone(),
+        ),
+        (
+            "A13 the target group is deleted as well",
+            env.dest_group.clone(),
+        ),
     ] {
         let mut gone = false;
         let mut detail = String::new();

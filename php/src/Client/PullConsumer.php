@@ -495,6 +495,16 @@ final class DefaultMQPullConsumer
         return $this->mqClient;
     }
 
+    /**
+     * Java DefaultMQPullConsumerImpl#viewMessage parity
+     * (DefaultMQPullConsumerImpl.java:838): the MQAdminImpl single-leg path —
+     * offset msgId only, no uniq-key fallback at this layer.
+     */
+    public function viewMessage(string $topic, string $msgId): MessageExt
+    {
+        return $this->requireClient()->viewMessage($topic, $msgId);
+    }
+
     // ---------------- Pulling ----------------
 
     /** @return list<MessageQueue> */

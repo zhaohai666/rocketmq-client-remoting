@@ -202,6 +202,10 @@ public:
     int64_t maxOffset(const MessageQueue& mq);
     int64_t minOffset(const MessageQueue& mq);
     int64_t earliestMsgStoreTime(const MessageQueue& mq);
+    // Java DefaultMQPullConsumerImpl#viewMessage parity
+    // (DefaultMQPullConsumerImpl.java:838): the MQAdminImpl single-leg path —
+    // offset msgId only, no uniq-key fallback at this layer.
+    MessageExt viewMessage(const std::string& topic, const std::string& msgId);
 
     void sendMessageBack(const MessageExt& msg, int32_t delayLevel);
 

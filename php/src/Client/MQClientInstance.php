@@ -2991,7 +2991,17 @@ class MQClientInstance
             foreach (MessageDecoder::decodeMessages($body) as $m) {
                 $m->brokerName = $brokerData->brokerName;
                 if ($uniqKey) {
-                    if ($m->msgId === $key) {
+                    // Java decodes query results as MessageClientExt, whose
+                    // getMsgId() returns the UNIQ_KEY property (offset id only
+                    // as fallback) — the client-visible id the hit is verified
+                    // against. The php decoder keeps msgId = offset id, so
+                    // resolve the client-visible id here (csharp does the same
+                    // swap inside its decoder; node verifies the property).
+                    $visible = $m->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+                    if ($visible === null || $visible === '') {
+                        $visible = $m->msgId;
+                    }
+                    if ($visible === $key) {
                         $messages[] = $m;
                     }
                 } else {
@@ -3009,6 +3019,44 @@ class MQClientInstance
         }
         usort($messages, static fn(MessageExt $a, MessageExt $b): int => ($a->queueOffset ?? 0) <=> ($b->queueOffset ?? 0));
         return $maxNum > 0 ? array_slice($messages, 0, $maxNum) : $messages;
+    }
+
+    /**
+     * Java MQAdminImpl#viewMessage(topic, msgId) parity (MQAdminImpl.java:267):
+     * a SINGLE leg — decode the offset msgId and ask the broker that stamped it
+     * VIEW_MESSAGE_BY_ID(33) straight away. A decode failure maps to the
+     * NO_MESSAGE client error Java raises there; every other leg failure
+     * surfaces as-is. The uniq-key fallback is NOT part of this layer — it
+     * belongs to the admin facade only (DefaultMQAdminExtImpl#viewMessage, see
+     * Admin::viewMessage), while the producer / push / pull facades ride this
+     * single-leg path. $timeoutMillis defaults to MQAdminImpl's own RPC budget
+     * (MQAdminImpl.java:67, 6000).
+     */
+    public function viewMessage(string $topic, string $msgId, int $timeoutMillis = 6000): MessageExt
+    {
+        try {
+            [$ip, $port, $offset] = MessageDecoder::decodeMessageId($msgId);
+        } catch (\Throwable $e) {
+            throw new MQClientException('query message by id finished, but no message.', ResponseCode::NO_MESSAGE, $e);
+        }
+        if (!($port > 0 && $port <= 65535)) {
+            throw new MQClientException(sprintf('not a valid offset msgId: %s', $msgId));
+        }
+        // The address is the store host:port the broker stamped into the offset
+        // msgId — a broker address, so the VIP-channel rewrite applies to it
+        // like to any other query request.
+        $request = RemotingCommand::createRequestCommand(RequestCode::VIEW_MESSAGE_BY_ID, null);
+        $request->extFields['topic'] = $topic;
+        $request->extFields['offset'] = (string) $offset;
+        $response = $this->invokeSync($this->vipAddrFor(sprintf('%s:%d', $ip, $port)), $request, $timeoutMillis);
+        $this->checkResponse($response);
+        if ($response->body !== null && $response->body !== '') {
+            $msg = MessageDecoder::decodeMessage($response->body);
+            if ($msg !== null) {
+                return $msg;
+            }
+        }
+        throw new MQBrokerException(ResponseCode::NO_MESSAGE, sprintf('message not found: %s', $msgId));
     }
 
     private function brokerAddrForTopic(string $topic): string

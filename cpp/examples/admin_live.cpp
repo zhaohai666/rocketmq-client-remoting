@@ -379,36 +379,46 @@ int main(int argc, char** argv) {
                   "key=" + std::to_string(byKey.size())
                   + " normal=" + std::to_string(byKey2.size())
                   + " uniq=" + std::string(uniqFound ? "1" : "0"));
-            skip("queryMessage hit result (requires broker RocksDB/KEYS index)",
-                 "this machine uses the default file index and the messages carry no KEYS; an empty uniqKey query is expected");
+            // The uniq query walks the broker's commitlog directly (UNIQUE index
+            // type), so it hits even on the default file index — the messages do
+            // carry UNIQ_KEY. Only the KEYS query is expected to miss (no KEYS set).
+            check("queryMessageByUniqKey fetches the message back", uniqFound && uniq.body == sent[0].first,
+                  uniqFound ? "body=" + bytes2str(uniq.body)
+                            : "no match (client-visible id filter failed)");
         } catch (const std::exception& e) {
             check("queryMessage request reachable with a normal answer", false, e.what());
         }
     }
 
-    // viewMessage(byOffsetMsgId): only the broker-assigned offsetMsgId decodes to a commitLog offset
+    // viewMessage(byOffsetMsgId): only the broker-assigned offsetMsgId decodes to a commitLog offset;
+    // the admin viewMessage is two-leg (offset decode+view, then uniqKey query) and returns nullopt on no match (Java parity)
     try {
         const std::string viewId = offsetIds.empty() ? sent[0].second : offsetIds[0];
-        MessageExt vm = admin.viewMessage(topic, viewId);
-        check("viewMessage(byOffsetMsgId)", true,
-              "topic=" + vm.topic + " offset=" + std::to_string(vm.queueOffset)
-              + " body=" + bytes2str(vm.body).substr(0, 32));
-        check("viewMessage body matches what was sent", vm.body == sent[0].first,
-              "expected " + bytes2str(sent[0].first) + " actual " + bytes2str(vm.body));
+        std::optional<MessageExt> vmOpt = admin.viewMessage(topic, viewId);
+        check("viewMessage(byOffsetMsgId)", vmOpt.has_value(), vmOpt.has_value() ? "" : "no match");
+        if (vmOpt.has_value()) {
+            const MessageExt& vm = *vmOpt;
+            check("viewMessage detail", true,
+                  "topic=" + vm.topic + " offset=" + std::to_string(vm.queueOffset)
+                  + " body=" + bytes2str(vm.body).substr(0, 32));
+            check("viewMessage body matches what was sent", vm.body == sent[0].first,
+                  "expected " + bytes2str(sent[0].first) + " actual " + bytes2str(vm.body));
+        }
     } catch (const std::exception& e) {
         check("viewMessage(byOffsetMsgId)", false, e.what());
     }
 
-    // viewMessage(uniqKey): a 5.x msgId decodes to no offset, so it must take the uniqKey fallback path and raise a clean exception,
-    // instead of going connect with a garbage port
+    // viewMessage(uniqKey): a 5.x msgId decodes to no offset, so it takes the uniqKey
+    // fallback path, which walks the broker's UNIQUE index and fetches the message back
+    // (same observable outcome as the csharp/go/php admin live legs on this cluster).
     try {
-        admin.viewMessage(topic, sent[0].second);
-        check("viewMessage(uniqKey) takes the fallback and raises a clean exception", false, "no exception thrown");
-    } catch (const MQClientException& e) {
-        check("viewMessage(uniqKey) takes the fallback and raises a clean exception", true,
-              "code=" + std::to_string(e.getResponseCode()));
+        std::optional<MessageExt> vmUniq = admin.viewMessage(topic, sent[0].second);
+        check("viewMessage(uniqKey) takes the fallback and fetches the message",
+              vmUniq.has_value() && vmUniq->body == sent[0].first,
+              vmUniq.has_value() ? "body=" + bytes2str(vmUniq->body)
+                                 : "no match (client-visible id filter failed)");
     } catch (const std::exception& e) {
-        check("viewMessage(uniqKey) takes the fallback and raises a clean exception", false,
+        check("viewMessage(uniqKey) takes the fallback and fetches the message", false,
               std::string(typeid(e).name()) + ": " + e.what());
     }
 

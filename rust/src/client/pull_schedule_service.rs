@@ -276,7 +276,12 @@ impl Drop for ScheduleInner {
         {
             task.handle.abort();
         }
-        for h in self.retired.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        for h in self
+            .retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
             h.abort();
         }
     }
@@ -368,10 +373,7 @@ impl std::fmt::Debug for MQPullConsumerScheduleService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MQPullConsumerScheduleService")
             .field("consumer_group", &self.inner.consumer.consumer_group())
-            .field(
-                "started",
-                &self.inner.started.load(Ordering::Acquire),
-            )
+            .field("started", &self.inner.started.load(Ordering::Acquire))
             .field(
                 "callbacks",
                 &self
@@ -506,7 +508,11 @@ impl MQPullConsumerScheduleService {
         if let Some(h) = lock(&self.inner.reconcile_task).take() {
             handles.push(h);
         }
-        handles.extend(std::mem::take(&mut *lock(&self.inner.tasks)).into_values().map(|t| t.handle));
+        handles.extend(
+            std::mem::take(&mut *lock(&self.inner.tasks))
+                .into_values()
+                .map(|t| t.handle),
+        );
         handles.extend(lock(&self.inner.retired).drain(..));
         if !handles.is_empty() {
             match self.inner.runtime_handle() {
@@ -708,7 +714,10 @@ mod tests {
         }
 
         fn max_depth_for(&self, key: &str) -> usize {
-            lockm(&self.in_flight).get(key).map(|(_, max)| *max).unwrap_or(0)
+            lockm(&self.in_flight)
+                .get(key)
+                .map(|(_, max)| *max)
+                .unwrap_or(0)
         }
 
         fn enter(&self, key: &str) {
@@ -793,22 +802,35 @@ mod tests {
         let ctx = PullTaskContext::new(consumer.clone(), Some(Duration::from_millis(700)));
         ctx.set_pull_interval(Duration::from_millis(700));
         ctx.pull_message_later(Duration::from_millis(500));
-        assert_eq!(ctx.resolve(Some(Duration::from_millis(300))), Duration::from_millis(300));
+        assert_eq!(
+            ctx.resolve(Some(Duration::from_millis(300))),
+            Duration::from_millis(300)
+        );
         // Channel 2 beats the standing interval
         assert_eq!(ctx.resolve(None), Duration::from_millis(500));
-        assert_eq!(ctx.pull_next_delay_millis(), 500, "the delay getter reports channel 2");
+        assert_eq!(
+            ctx.pull_next_delay_millis(),
+            500,
+            "the delay getter reports channel 2"
+        );
         // Channel 3 alone
         let ctx2 = PullTaskContext::new(consumer.clone(), Some(Duration::from_millis(700)));
         assert_eq!(ctx2.resolve(None), Duration::from_millis(700));
         assert_eq!(ctx2.pull_interval(), Some(Duration::from_millis(700)));
         // Nothing set: the 200ms default
         let ctx3 = PullTaskContext::new(consumer.clone(), None);
-        assert_eq!(ctx3.resolve(None), Duration::from_millis(DEFAULT_PULL_NEXT_DELAY_MILLIS));
+        assert_eq!(
+            ctx3.resolve(None),
+            Duration::from_millis(DEFAULT_PULL_NEXT_DELAY_MILLIS)
+        );
         assert_eq!(ctx3.pull_next_delay_millis(), 200);
         // The Throwable branch overwrites the one-shot channel with 1000ms
         ctx3.pull_message_later(Duration::from_millis(50));
         ctx3.mark_exception();
-        assert_eq!(ctx3.resolve(None), Duration::from_millis(PULL_TASK_EXCEPTION_DELAY_MILLIS));
+        assert_eq!(
+            ctx3.resolve(None),
+            Duration::from_millis(PULL_TASK_EXCEPTION_DELAY_MILLIS)
+        );
         // The consumer is reachable from the context
         assert_eq!(ctx3.pull_consumer().consumer_group(), "PG_CtxPrio");
     }
@@ -825,9 +847,11 @@ mod tests {
         svc.put_task("T", &[q(0), q(1), q(2)]);
         wait_until(|| svc.task_queues().len() == 3, "three queue tasks").await;
         wait_until(
-            || rec.count_for(&mq_key(&q(0))) >= 1
-                && rec.count_for(&mq_key(&q(1))) >= 1
-                && rec.count_for(&mq_key(&q(2))) >= 1,
+            || {
+                rec.count_for(&mq_key(&q(0))) >= 1
+                    && rec.count_for(&mq_key(&q(1))) >= 1
+                    && rec.count_for(&mq_key(&q(2))) >= 1
+            },
             "every queue got its own loop",
         )
         .await;
@@ -848,7 +872,10 @@ mod tests {
             at_shrink,
             "a retired queue must stop pulling"
         );
-        assert!(rec.count_for(&mq_key(&q(0))) > before, "the kept queue keeps running");
+        assert!(
+            rec.count_for(&mq_key(&q(0))) > before,
+            "the kept queue keeps running"
+        );
         assert!(svc.task_alive(&q(0)));
         svc.shutdown();
     }
@@ -871,7 +898,10 @@ mod tests {
         );
         assert_eq!(svc.callback_topics(), vec!["T".to_string()]);
         svc.put_task("T", std::slice::from_ref(&q));
-        assert!(!svc.task_alive(&q), "a dead entry is not respawned by an unchanged set");
+        assert!(
+            !svc.task_alive(&q),
+            "a dead entry is not respawned by an unchanged set"
+        );
         let rec = Arc::new(Recorder::default());
         svc.register_pull_task_callback(
             "T",
@@ -896,7 +926,11 @@ mod tests {
             Box::pin(async { Some(Duration::from_millis(30)) })
         });
         svc.put_task("T", &[queue("T", "broker-a", 0)]);
-        wait_until(|| rec.call_count() >= 3, "return value overrides the interval").await;
+        wait_until(
+            || rec.call_count() >= 3,
+            "return value overrides the interval",
+        )
+        .await;
         assert!(
             rec.elapsed_since_first_call() < Duration::from_secs(5),
             "three rounds inside the wait budget prove the 30s interval lost"
@@ -971,8 +1005,16 @@ mod tests {
             "both queues ran several rounds",
         )
         .await;
-        assert_eq!(rec.max_depth_for(&mq_key(&q0)), 1, "queue 0 never overlaps itself");
-        assert_eq!(rec.max_depth_for(&mq_key(&q1)), 1, "queue 1 never overlaps itself");
+        assert_eq!(
+            rec.max_depth_for(&mq_key(&q0)),
+            1,
+            "queue 0 never overlaps itself"
+        );
+        assert_eq!(
+            rec.max_depth_for(&mq_key(&q1)),
+            1,
+            "queue 1 never overlaps itself"
+        );
         svc.shutdown();
     }
 
@@ -1031,7 +1073,10 @@ mod tests {
         });
         svc.shutdown();
         opener.await.unwrap();
-        assert!(done.load(Ordering::Acquire), "shutdown returned only after the in-flight round completed");
+        assert!(
+            done.load(Ordering::Acquire),
+            "shutdown returned only after the in-flight round completed"
+        );
         assert!(!svc.is_started());
         let calls = rec.call_count();
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1060,9 +1105,13 @@ mod tests {
 
     impl FakeCluster {
         async fn start(read_queues: i32) -> FakeCluster {
-            let broker = TcpListener::bind("127.0.0.1:0").await.expect("bind fake broker");
+            let broker = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake broker");
             let broker_addr = broker.local_addr().expect("broker addr").to_string();
-            let namesrv = TcpListener::bind("127.0.0.1:0").await.expect("bind fake namesrv");
+            let namesrv = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake namesrv");
             let namesrv_addr = namesrv.local_addr().expect("namesrv addr").to_string();
             let read_queues = Arc::new(AtomicI32::new(read_queues));
             let cid_list = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1131,7 +1180,10 @@ mod tests {
             broker_datas: vec![BrokerData::new(
                 "MockCluster",
                 "broker-a".to_string(),
-                vec![(i64::from(crate::common::mix_all::MixAll::MASTER_ID), broker_addr.to_string())],
+                vec![(
+                    i64::from(crate::common::mix_all::MixAll::MASTER_ID),
+                    broker_addr.to_string(),
+                )],
                 "",
             )],
             ..Default::default()
@@ -1146,12 +1198,16 @@ mod tests {
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let addr = broker_addr.clone();
                 let read_queues = Arc::clone(&read_queues);
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
                         let mut response = if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
                             let mut r = answer_for(&request, response_code::SUCCESS);
                             let n = read_queues.load(Ordering::Acquire);
@@ -1170,11 +1226,15 @@ mod tests {
     fn spawn_broker(listener: TcpListener, cid_list: Arc<Mutex<Vec<String>>>) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let cid_list = Arc::clone(&cid_list);
                 tokio::spawn(async move {
                     while let Some(frame) = read_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
                         let mut response = answer_for(&request, response_code::SUCCESS);
                         if request.code == request_code::GET_CONSUMER_LIST_BY_GROUP {
                             let body = GetConsumerListByGroupResponseBody {
@@ -1222,9 +1282,15 @@ mod tests {
         );
         svc.reconcile().await;
         let tasks = svc.task_queues();
-        assert_eq!(tasks.len(), 4, "single instance in the group -> all 4 read queues");
+        assert_eq!(
+            tasks.len(),
+            4,
+            "single instance in the group -> all 4 read queues"
+        );
         assert!(
-            tasks.iter().all(|mq| mq.topic == "T" && mq.broker_name == "broker-a"),
+            tasks
+                .iter()
+                .all(|mq| mq.topic == "T" && mq.broker_name == "broker-a"),
             "tasks carry the routed queues: {tasks:?}"
         );
         wait_until(|| rec.call_keys().len() >= 4, "every expanded queue pulls").await;
@@ -1246,10 +1312,20 @@ mod tests {
         svc.set_reconcile_interval_millis(300);
         // start() reconciles immediately, and the periodic loop must then pick the route
         // scale-out up without further help.
-        svc.start().await.expect("service start on the fake cluster");
-        wait_until(|| svc.task_queues().len() == 2, "the immediate round expands to 2").await;
+        svc.start()
+            .await
+            .expect("service start on the fake cluster");
+        wait_until(
+            || svc.task_queues().len() == 2,
+            "the immediate round expands to 2",
+        )
+        .await;
         cluster.scale_to(5);
-        wait_until(|| svc.task_queues().len() == 5, "the reconcile loop follows the route").await;
+        wait_until(
+            || svc.task_queues().len() == 5,
+            "the reconcile loop follows the route",
+        )
+        .await;
         // A second instance joins the group: the AVG strategy shrinks this instance's share
         // (5 queues over 2 sorted clients -> 2 or 3 for this one, never all 5).
         let other = format!("{}-other", consumer.client_id());
@@ -1280,7 +1356,11 @@ mod tests {
         );
         // No cid list on purpose: broadcasting never asks the broker for the group.
         svc.reconcile().await;
-        assert_eq!(svc.task_queues().len(), 3, "broadcasting takes all read queues");
+        assert_eq!(
+            svc.task_queues().len(),
+            3,
+            "broadcasting takes all read queues"
+        );
         svc.shutdown();
     }
 }

@@ -1,4 +1,3 @@
-
 /// Bit meanings (low -> high):
 /// ```text
 /// bit0   COMPRESSED
@@ -47,7 +46,8 @@ impl MessageSysFlag {
     /// Overwrites the compression type bits (all other bits are left unchanged).
     pub fn set_compression_type(sys_flag: i32, compression_type: i32) -> i32 {
         (sys_flag & !Self::COMPRESSION_TYPE_COMPARATOR)
-            | ((compression_type << Self::COMPRESSION_TYPE_SHIFT) & Self::COMPRESSION_TYPE_COMPARATOR)
+            | ((compression_type << Self::COMPRESSION_TYPE_SHIFT)
+                & Self::COMPRESSION_TYPE_COMPARATOR)
     }
 
     pub fn is_compressed(sys_flag: i32) -> bool {
@@ -215,9 +215,21 @@ impl PermName {
 
     pub fn perm_to_string(perm: i32) -> String {
         let mut sb = String::with_capacity(3);
-        sb.push(if Self::PERM_READ == (perm & Self::PERM_READ) { 'R' } else { '-' });
-        sb.push(if Self::PERM_WRITE == (perm & Self::PERM_WRITE) { 'W' } else { '-' });
-        sb.push(if Self::PERM_INHERIT == (perm & Self::PERM_INHERIT) { 'X' } else { '-' });
+        sb.push(if Self::PERM_READ == (perm & Self::PERM_READ) {
+            'R'
+        } else {
+            '-'
+        });
+        sb.push(if Self::PERM_WRITE == (perm & Self::PERM_WRITE) {
+            'W'
+        } else {
+            '-'
+        });
+        sb.push(if Self::PERM_INHERIT == (perm & Self::PERM_INHERIT) {
+            'X'
+        } else {
+            '-'
+        });
         sb
     }
 
@@ -272,8 +284,11 @@ mod tests {
 
     #[test]
     fn compression_type_roundtrip() {
-        for ctype in [MessageSysFlag::LZ4_TYPE, MessageSysFlag::ZSTD_TYPE, MessageSysFlag::ZLIB_TYPE]
-        {
+        for ctype in [
+            MessageSysFlag::LZ4_TYPE,
+            MessageSysFlag::ZSTD_TYPE,
+            MessageSysFlag::ZLIB_TYPE,
+        ] {
             let flag = MessageSysFlag::set_compression_type(0, ctype);
             assert_eq!(MessageSysFlag::get_compression_type(flag), ctype);
         }
@@ -281,19 +296,29 @@ mod tests {
 
     #[test]
     fn get_compression_type_masks_other_bits() {
-        let flag =
-            MessageSysFlag::set_compression_type(MessageSysFlag::COMPRESSED_FLAG, MessageSysFlag::ZLIB_TYPE);
-        assert_eq!(MessageSysFlag::get_compression_type(flag), MessageSysFlag::ZLIB_TYPE);
+        let flag = MessageSysFlag::set_compression_type(
+            MessageSysFlag::COMPRESSED_FLAG,
+            MessageSysFlag::ZLIB_TYPE,
+        );
+        assert_eq!(
+            MessageSysFlag::get_compression_type(flag),
+            MessageSysFlag::ZLIB_TYPE
+        );
         assert!(MessageSysFlag::is_compressed(flag));
     }
 
     #[test]
     fn clear_compressed_flag_keeps_compression_type() {
-        let flag =
-            MessageSysFlag::set_compression_type(MessageSysFlag::COMPRESSED_FLAG, MessageSysFlag::ZLIB_TYPE);
+        let flag = MessageSysFlag::set_compression_type(
+            MessageSysFlag::COMPRESSED_FLAG,
+            MessageSysFlag::ZLIB_TYPE,
+        );
         let cleared = MessageSysFlag::clear_compressed_flag(flag);
         assert!(!MessageSysFlag::is_compressed(cleared));
-        assert_eq!(MessageSysFlag::get_compression_type(cleared), MessageSysFlag::ZLIB_TYPE);
+        assert_eq!(
+            MessageSysFlag::get_compression_type(cleared),
+            MessageSysFlag::ZLIB_TYPE
+        );
     }
 
     #[test]
@@ -302,8 +327,14 @@ mod tests {
             MessageSysFlag::get_transaction_value(MessageSysFlag::TRANSACTION_PREPARED_TYPE),
             0x4
         );
-        assert_eq!(MessageSysFlag::get_transaction_value(MessageSysFlag::TRANSACTION_COMMIT_TYPE), 0x8);
-        assert_eq!(MessageSysFlag::get_transaction_value(MessageSysFlag::TRANSACTION_ROLLBACK_TYPE), 0xC);
+        assert_eq!(
+            MessageSysFlag::get_transaction_value(MessageSysFlag::TRANSACTION_COMMIT_TYPE),
+            0x8
+        );
+        assert_eq!(
+            MessageSysFlag::get_transaction_value(MessageSysFlag::TRANSACTION_ROLLBACK_TYPE),
+            0xC
+        );
         assert_eq!(MessageSysFlag::reset_transaction_value(0xFF, 0), 0xF3);
     }
 
@@ -318,12 +349,30 @@ mod tests {
 
     #[test]
     fn pull_sys_flag_build() {
-        assert_eq!(PullSysFlag::build_sys_flag_basic(true, false, false, false), 0x1);
-        assert_eq!(PullSysFlag::build_sys_flag_basic(false, true, false, false), 0x2);
-        assert_eq!(PullSysFlag::build_sys_flag_basic(false, false, true, false), 0x4);
-        assert_eq!(PullSysFlag::build_sys_flag_basic(false, false, false, true), 0x8);
-        assert_eq!(PullSysFlag::build_sys_flag(true, true, true, true, false), 0xF);
-        assert_eq!(PullSysFlag::build_sys_flag(true, true, true, true, true), 0x1F);
+        assert_eq!(
+            PullSysFlag::build_sys_flag_basic(true, false, false, false),
+            0x1
+        );
+        assert_eq!(
+            PullSysFlag::build_sys_flag_basic(false, true, false, false),
+            0x2
+        );
+        assert_eq!(
+            PullSysFlag::build_sys_flag_basic(false, false, true, false),
+            0x4
+        );
+        assert_eq!(
+            PullSysFlag::build_sys_flag_basic(false, false, false, true),
+            0x8
+        );
+        assert_eq!(
+            PullSysFlag::build_sys_flag(true, true, true, true, false),
+            0xF
+        );
+        assert_eq!(
+            PullSysFlag::build_sys_flag(true, true, true, true, true),
+            0x1F
+        );
     }
 
     #[test]
@@ -334,17 +383,25 @@ mod tests {
         assert!(PullSysFlag::has_subscription_flag(flag));
         assert!(PullSysFlag::has_class_filter_flag(flag));
         assert!(PullSysFlag::has_lite_pull_flag(flag));
-        assert!(!PullSysFlag::has_commit_offset_flag(PullSysFlag::clear_commit_offset_flag(flag)));
-        assert!(!PullSysFlag::has_suspend_flag(PullSysFlag::clear_suspend_flag(flag)));
+        assert!(!PullSysFlag::has_commit_offset_flag(
+            PullSysFlag::clear_commit_offset_flag(flag)
+        ));
+        assert!(!PullSysFlag::has_suspend_flag(
+            PullSysFlag::clear_suspend_flag(flag)
+        ));
         assert_eq!(PullSysFlag::build_sys_flag_with_subscription(0), 0x4);
     }
 
     #[test]
     fn pull_sys_flag_hashing_bit() {
-        assert!(!PullSysFlag::has_support_filter_and_compute_hashing_flag(0x1F));
+        assert!(!PullSysFlag::has_support_filter_and_compute_hashing_flag(
+            0x1F
+        ));
         let with = PullSysFlag::build_sys_flag_with_hashing(0x1F, true);
         assert_eq!(with, 0x1F | (0x1 << 10));
-        assert!(PullSysFlag::has_support_filter_and_compute_hashing_flag(with));
+        assert!(PullSysFlag::has_support_filter_and_compute_hashing_flag(
+            with
+        ));
         assert_eq!(PullSysFlag::build_sys_flag_with_hashing(with, false), with);
     }
 
@@ -354,8 +411,14 @@ mod tests {
             assert_eq!(PermName::perm_to_string(perm), expected);
             assert_eq!(PermName::perm2string(perm), expected);
         }
-        assert!(PermName::check_perm(PermName::PERM_READ | PermName::PERM_WRITE, PermName::PERM_READ));
-        assert!(!PermName::check_perm(PermName::PERM_READ, PermName::PERM_WRITE));
+        assert!(PermName::check_perm(
+            PermName::PERM_READ | PermName::PERM_WRITE,
+            PermName::PERM_READ
+        ));
+        assert!(!PermName::check_perm(
+            PermName::PERM_READ,
+            PermName::PERM_WRITE
+        ));
         assert!(PermName::is_valid(0));
         assert!(PermName::is_valid(7));
         assert!(!PermName::is_valid(8));

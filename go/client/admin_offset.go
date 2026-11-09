@@ -370,10 +370,9 @@ func (a *DefaultMQAdminExt) QueryMessageByKey(topic, key string, maxNum int32) (
 
 // QueryMessageByUniqKey queries by UNIQ_KEY.
 //
-// Note the broker-side uniqKey index is only supported by the RocksDB index
-// implementation (IndexRocksDBStore); with the default file index this can
-// legitimately return nothing. That is a broker-configuration difference, not
-// a client bug.
+// The broker-side U-index query walks the commitlog directly (UNIQUE index
+// type), so it hits on the default file index too; a miss here is a real
+// no-match, not a broker-configuration difference.
 func (a *DefaultMQAdminExt) QueryMessageByUniqKey(topic, uniqKey string) (*common.MessageExt, error) {
 	messages, err := a.queryMessageAllBrokers(topic, uniqKey, 32, 0,
 		time.Now().UnixMilli()+3600_000, common.IndexUniqueType, true)
@@ -415,7 +414,17 @@ func (a *DefaultMQAdminExt) queryMessageAllBrokers(topic, key string, maxNum int
 		for _, m := range common.DecodeMessages(body) {
 			m.BrokerName = bd.BrokerName
 			if uniqKey {
-				if m.MsgID == key {
+				// Java decodes query results as MessageClientExt, whose
+				// getMsgId() returns the UNIQ_KEY property (offset id only as
+				// fallback) — the client-visible id the hit is verified
+				// against. The go decoder keeps MsgID = offset id, so resolve
+				// the client-visible id here (csharp does the same swap inside
+				// its decoder; node verifies the property).
+				visible, ok := m.GetProperty(common.PropertyUniqKey)
+				if !ok || visible == "" {
+					visible = m.MsgID
+				}
+				if visible == key {
 					messages = append(messages, m)
 				}
 				continue
@@ -475,8 +484,17 @@ func (a *DefaultMQAdminExt) queryMessageOneBroker(addr, topic, key string, maxNu
 	return response.Body, nil
 }
 
+// ViewMessage mirrors Java DefaultMQAdminExtImpl#viewMessage
+// (DefaultMQAdminExtImpl.java:578): try the offset-msgId leg first, and when
+// it fails for any reason (the msgId "maybe created by new client") fall back
+// to the uniq-key query across brokers. When neither leg matches, Java
+// returns null here instead of raising — so does this method.
 func (a *DefaultMQAdminExt) ViewMessage(topic, msgID string) (*common.MessageExt, error) {
-	msg, err := a.viewMessageByID(topic, msgID)
+	instance, err := a.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	msg, err := instance.ViewMessage(topic, msgID, a.timeout(0))
 	if err == nil && msg != nil {
 		return msg, nil
 	}
@@ -484,44 +502,7 @@ func (a *DefaultMQAdminExt) ViewMessage(topic, msgID string) (*common.MessageExt
 	if qErr != nil {
 		return nil, qErr
 	}
-	if found != nil {
-		return found, nil
-	}
-	return nil, common.ClientError(fmt.Sprintf(
-		"viewMessage failed: neither offset msgId nor uniq key matched message %s of %s",
-		msgID, topic))
-}
-
-// viewMessageByID performs the VIEW_MESSAGE_BY_ID(33) attempt.
-func (a *DefaultMQAdminExt) viewMessageByID(topic, msgID string) (*common.MessageExt, error) {
-	instance, err := a.requireClient()
-	if err != nil {
-		return nil, err
-	}
-	ip, port, offset, err := common.DecodeMessageID(msgID)
-	if err != nil {
-		return nil, err
-	}
-	if port == 0 || port > 65535 {
-		return nil, common.ClientError(fmt.Sprintf("not a valid offset msgId: %s", msgID))
-	}
-	// The address is the store host:port the broker stamped into the offset
-	// msgId — a broker address, so the VIP-channel rewrite applies to it like to
-	// any other query request.
-	addr := fmt.Sprintf("%s:%d", ip, port)
-	response, err := instance.invokeSync(a.brokerVIPAddr(addr), adminRequest(remoting.ReqViewMessageByID,
-		adminExt("topic", topic, "offset", offset)), a.timeout(0))
-	if err != nil {
-		return nil, err
-	}
-	if err := instance.checkResponse(response); err != nil {
-		return nil, err
-	}
-	if len(response.Body) == 0 {
-		return nil, common.BrokerError(remoting.RespNoMessage,
-			fmt.Sprintf("message not found: %s", msgID))
-	}
-	return common.DecodeMessage(response.Body)
+	return found, nil
 }
 
 // QueryConsumeQueue sends QUERY_CONSUME_QUEUE(321).
@@ -545,6 +526,12 @@ func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topi
 	msg, err := a.ViewMessage(topic, msgID)
 	if err != nil {
 		return nil, err
+	}
+	// Java dereferences the viewMessage null unguarded here (a latent NPE);
+	// fail with a clear client error instead.
+	if msg == nil {
+		return nil, common.ClientError(fmt.Sprintf(
+			"message %s of %s not found", msgID, topic))
 	}
 	outMsgID := msgID
 	if _, uniq := msg.GetProperty(common.PropertyUniqKey); uniq && msg.OffsetMsgID != "" {

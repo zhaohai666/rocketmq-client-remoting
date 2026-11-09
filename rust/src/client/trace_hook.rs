@@ -234,7 +234,9 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
                 match consume_return_code(context_type) {
                     Some(code) => sub_after.context_code = code,
                     None => {
-                        rmq_debug!("unknown ConsumeContextType {context_type:?}, keep contextCode=0")
+                        rmq_debug!(
+                            "unknown ConsumeContextType {context_type:?}, keep contextCode=0"
+                        )
                     }
                 }
             }
@@ -329,11 +331,7 @@ fn held_trace_context(holder: &Option<AnyHolder>) -> Option<TraceContext> {
 
 /// Hands over one record and syncs it back into `mq_trace_context` (the caller reads the object hung there,
 /// so after the hooks run the caller must see the "filled-in" copy).
-fn publish(
-    sink: &Arc<dyn TraceReportSink>,
-    holder: &mut Option<AnyHolder>,
-    context: TraceContext,
-) {
+fn publish(sink: &Arc<dyn TraceReportSink>, holder: &mut Option<AnyHolder>, context: TraceContext) {
     *holder = Some(Arc::new(context.clone()));
     report(sink, context);
 }
@@ -408,7 +406,10 @@ impl RecordingSink {
 
     /// A recording sink that always "refuses" (dispatcher stopped / queue full).
     fn refusing(trace_topic: &str) -> Self {
-        RecordingSink { accept: false, ..Self::new(trace_topic, "10.0.0.9@inst-1#0") }
+        RecordingSink {
+            accept: false,
+            ..Self::new(trace_topic, "10.0.0.9@inst-1#0")
+        }
     }
 
     fn reported(&self) -> Vec<TraceContext> {
@@ -424,7 +425,9 @@ impl RecordingSink {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<TraceContext>> {
-        self.reported.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.reported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -489,7 +492,10 @@ mod tests {
 
     fn transfer(ctx: &TraceContext) -> (String, Vec<String>) {
         let tb = TraceDataEncoder::encoder_from_context_bean(Some(ctx)).unwrap_or_default();
-        (tb.trans_data.clone(), tb.trans_key.iter().cloned().collect())
+        (
+            tb.trans_data.clone(),
+            tb.trans_key.iter().cloned().collect(),
+        )
     }
 
     /// Splits one `trans_data` into "records -> fields".
@@ -668,7 +674,10 @@ mod tests {
         );
         let (data, keys) = transfer(&emitted);
         assert_eq!(data, render(GOLDEN_PUB, &emitted));
-        assert_eq!(keys, vec![MSG_ID.to_string(), "KeyA".to_string(), "KeyB".to_string()]);
+        assert_eq!(
+            keys,
+            vec![MSG_ID.to_string(), "KeyA".to_string(), "KeyB".to_string()]
+        );
         // the copy hung on the context must equal the one handed over (the same object)
         assert_eq!(held_trace_context(&context.mq_trace_context), Some(emitted));
     }
@@ -683,8 +692,14 @@ mod tests {
         let held = held_trace_context(&context.mq_trace_context).expect("test-only");
         assert_eq!(sink.count(), 0, "before does not report");
         assert_eq!(held.trace_type, Some(TraceType::Pub));
-        assert_eq!(held.group_name, "GID_test", "producerGroup has NS1% stripped");
-        assert_eq!(held.region_id, "", "region waits for the SendResult to fill it in");
+        assert_eq!(
+            held.group_name, "GID_test",
+            "producerGroup has NS1% stripped"
+        );
+        assert_eq!(
+            held.region_id, "",
+            "region waits for the SendResult to fill it in"
+        );
         assert!(held.is_success, "isSuccess defaults to true");
         assert_eq!(held.cost_time, 0);
         let bean = &held.trace_beans[0];
@@ -766,7 +781,10 @@ mod tests {
         context.send_result = Some(result);
         hook.send_message_after(&mut context).unwrap();
         assert_eq!(sink.count(), 0, "TRACE_ON=false does not report");
-        assert!(context.mq_trace_context.is_some(), "the shell on the context is still there");
+        assert!(
+            context.mq_trace_context.is_some(),
+            "the shell on the context is still there"
+        );
 
         // MSG_REGION missing
         let mut context = send_context("TopicTest");
@@ -874,7 +892,12 @@ mod tests {
     /// Recomputes storeTime independently with the same rounding rules (no dependence on hook internals).
     fn render_store(ctx: &TraceContext) -> i64 {
         let cost = ctx.cost_time;
-        ctx.time_stamp + if cost >= 0 { (cost / 2) as i64 } else { -(((-cost + 1) / 2) as i64) }
+        ctx.time_stamp
+            + if cost >= 0 {
+                (cost / 2) as i64
+            } else {
+                -(((-cost + 1) / 2) as i64)
+            }
     }
 
     #[test]
@@ -935,13 +958,23 @@ mod tests {
         );
         assert_eq!(before.trace_type, Some(TraceType::SubBefore));
         assert_eq!(before.group_name, "GID_test");
-        assert_eq!(before.region_id, "cn-shanghai", "the last non-skipped message wins");
+        assert_eq!(
+            before.region_id, "cn-shanghai",
+            "the last non-skipped message wins"
+        );
         assert!(before.time_stamp > 0);
-        assert_eq!(before.trace_beans.len(), 2, "the TRACE_ON=false message is not recorded");
+        assert_eq!(
+            before.trace_beans.len(),
+            2,
+            "the TRACE_ON=false message is not recorded"
+        );
         assert_eq!(before.trace_beans[0].topic, "TopicTest");
         assert_eq!(before.trace_beans[0].store_time, 1_700_000_000_111);
         assert_eq!(before.trace_beans[0].body_length, 100);
-        assert_eq!(before.trace_beans[1].topic, "%RETRY%GID_test", "the %RETRY% prefix is kept");
+        assert_eq!(
+            before.trace_beans[1].topic, "%RETRY%GID_test",
+            "the %RETRY% prefix is kept"
+        );
         assert_eq!(before.trace_beans[1].retry_times, 3);
         assert_eq!(before.trace_beans[1].body_length, 200);
 
@@ -955,12 +988,18 @@ mod tests {
             encode(&after)
         );
         assert_eq!(after.trace_type, Some(TraceType::SubAfter));
-        assert_eq!(after.request_id, before.request_id, "the two records share request_id");
+        assert_eq!(
+            after.request_id, before.request_id,
+            "the two records share request_id"
+        );
         assert_eq!(after.region_id, before.region_id);
         assert_eq!(after.context_code, ConsumeReturnType::ReturnNull.code());
         assert!(!after.is_success);
         assert_eq!(after.access_channel, Some(AccessChannel::Local));
-        assert_eq!(after.trace_beans, before.trace_beans, "beans come from the same source as SubBefore");
+        assert_eq!(
+            after.trace_beans, before.trace_beans,
+            "beans come from the same source as SubBefore"
+        );
         assert_eq!(records(&encode(&after)).len(), 2);
         // the context still holds the SubBefore copy (after only created a new SubAfter)
         assert_eq!(
@@ -976,7 +1015,11 @@ mod tests {
         let mut context = consume_context(scenario_msgs_for_reference_vector());
         hook.consume_message_before(&mut context).unwrap();
         let before = sink.last().expect("test-only");
-        assert_eq!(before.trace_beans.len(), 2, "the third message is blocked by TRACE_ON");
+        assert_eq!(
+            before.trace_beans.len(),
+            2,
+            "the third message is blocked by TRACE_ON"
+        );
         // Wind the SubBefore timestamp back by 3 seconds (the hook's own private slot; equivalent to "this batch started
         // consuming 3 seconds ago"), then check whether costTime divides by 3 or by 2
         let mut stale = before.clone();
@@ -1028,7 +1071,10 @@ mod tests {
 
         let after = sink.last().expect("test-only");
         assert_eq!(after.access_channel, Some(AccessChannel::Cloud));
-        assert_eq!(after.context_code, 0, "an unrecognized ConsumeContextType keeps 0");
+        assert_eq!(
+            after.context_code, 0,
+            "an unrecognized ConsumeContextType keeps 0"
+        );
         assert_eq!(
             encode(&after),
             render(
@@ -1082,7 +1128,17 @@ mod tests {
         // the whole batch blocked by TRACE_ON=false: the shell is built but beans is empty, neither record reports
         let mut context = ConsumeMessageContext::new(
             "GID_test",
-            Some(vec![ext("T", "M", None, None, Some("r"), Some("false"), 1, 1, 0)]),
+            Some(vec![ext(
+                "T",
+                "M",
+                None,
+                None,
+                Some("r"),
+                Some("false"),
+                1,
+                1,
+                0,
+            )]),
             None,
         );
         hook.consume_message_before(&mut context).unwrap();
@@ -1190,15 +1246,31 @@ mod tests {
         );
         assert_eq!(emitted.trace_type, Some(TraceType::EndTransaction));
         let bean = &emitted.trace_beans[0];
-        assert_eq!(bean.client_host, CLIENT_ID, "clientHost takes the dispatcher's clientId");
-        assert_eq!(bean.msg_type, MessageType::TransMsgCommit, "msgType is hardcoded to 2");
+        assert_eq!(
+            bean.client_host, CLIENT_ID,
+            "clientHost takes the dispatcher's clientId"
+        );
+        assert_eq!(
+            bean.msg_type,
+            MessageType::TransMsgCommit,
+            "msgType is hardcoded to 2"
+        );
         assert_eq!(bean.transaction_state.as_deref(), Some("COMMIT_MESSAGE"));
         assert_eq!(bean.transaction_id.as_deref(), Some("TRAN-001"));
-        assert!(bean.from_transaction_check, "broker check-backs are recorded too");
+        assert!(
+            bean.from_transaction_check,
+            "broker check-backs are recorded too"
+        );
         assert_eq!(bean.store_host, BROKER);
-        assert_eq!(bean.body_length, 0, "EndTransaction leaves bodyLength empty");
+        assert_eq!(
+            bean.body_length, 0,
+            "EndTransaction leaves bodyLength empty"
+        );
         assert_eq!(bean.store_time, 0);
-        assert_eq!(emitted.region_id, "NS1%cn-hangzhou", "regionId keeps its namespace");
+        assert_eq!(
+            emitted.region_id, "NS1%cn-hangzhou",
+            "regionId keeps its namespace"
+        );
         assert_eq!(emitted.group_name, "GID_test");
     }
 
@@ -1274,7 +1346,11 @@ mod tests {
         // no message
         let mut context = EndTransactionContext::default();
         hook.end_transaction(&mut context).unwrap();
-        assert_eq!(sink.count(), 0, "neither the trace topic nor a missing message records anything");
+        assert_eq!(
+            sink.count(),
+            0,
+            "neither the trace topic nor a missing message records anything"
+        );
         assert_eq!(cloud.count(), 0);
     }
 
@@ -1287,8 +1363,7 @@ mod tests {
         let send: Arc<dyn SendMessageHook> = Arc::new(SendMessageTraceHook::new(sink.clone()));
         let consume: Arc<dyn ConsumeMessageHook> =
             Arc::new(ConsumeMessageTraceHook::new(sink.clone()));
-        let end: Arc<dyn EndTransactionHook> =
-            Arc::new(EndTransactionTraceHook::new(sink.clone()));
+        let end: Arc<dyn EndTransactionHook> = Arc::new(EndTransactionTraceHook::new(sink.clone()));
 
         let mut send_context = send_context("TopicTest");
         send.send_message_before(&mut send_context).unwrap();
@@ -1300,7 +1375,9 @@ mod tests {
             Some(vec![ext("T", "M", None, None, Some("r"), None, 1, 1, 0)]),
             None,
         );
-        consume.consume_message_before(&mut consume_context).unwrap();
+        consume
+            .consume_message_before(&mut consume_context)
+            .unwrap();
         consume.consume_message_after(&mut consume_context).unwrap();
 
         end.end_transaction(&mut end_tx_context(
@@ -1309,11 +1386,8 @@ mod tests {
         ))
         .unwrap();
 
-        let types: Vec<Option<TraceType>> = sink
-            .reported()
-            .iter()
-            .map(|ctx| ctx.trace_type)
-            .collect();
+        let types: Vec<Option<TraceType>> =
+            sink.reported().iter().map(|ctx| ctx.trace_type).collect();
         assert_eq!(
             types,
             vec![
@@ -1351,7 +1425,11 @@ mod tests {
         assert_eq!(access_channel_of(Some("LOCAL")), Some(AccessChannel::Local));
         assert_eq!(access_channel_of(Some("CLOUD")), Some(AccessChannel::Cloud));
         assert_eq!(access_channel_of(Some("cloud")), None);
-        assert_eq!(elapsed_per(1_000, 1_000, 0), 0, "count=0 fallback must not panic");
+        assert_eq!(
+            elapsed_per(1_000, 1_000, 0),
+            0,
+            "count=0 fallback must not panic"
+        );
         assert_eq!(elapsed_per(1_100, 1_000, 0), 100);
     }
 }

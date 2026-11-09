@@ -172,6 +172,7 @@ try {
 
     // ---------- 6) send message + topic stats + offset/timestamp queries ----------
     $sentMsg = null;
+    $sentUniqKey = null;
     try {
         $p = new DefaultMQProducer('PID_PhpAdmin_' . $stamp);
         $p->setNamesrvAddr($ns);
@@ -184,6 +185,9 @@ try {
             }
             if ($i === 0) {
                 $sentMsg = $m;
+                // The send's msgId is the client UNIQ_KEY — the id the uniq-key
+                // fallback of viewMessage resolves by.
+                $sentUniqKey = $r->msgId;
             }
         }
         $p->shutdown();
@@ -251,6 +255,16 @@ try {
             $view = $admin->viewMessage($topic, $msgs[0]->msgId);
             $check($view->getBody() === $sentMsg->getBody(), 'viewMessage body matches the index',
                 'body=' . substr((string) $view->getBody(), 0, 32));
+        }
+        // viewMessage(uniqKey): the send's msgId is the client UNIQ_KEY (it does not
+        // decode to an offset), so the admin takes the uniq-key fallback and must
+        // fetch the original message back.
+        if ($sentUniqKey !== null) {
+            $viewUniq = $admin->viewMessage($topic, $sentUniqKey);
+            $check($viewUniq !== null && $viewUniq->getBody() === $sentMsg->getBody(),
+                'viewMessage(uniqKey) fallback fetches the message',
+                $viewUniq !== null ? 'body=' . substr((string) $viewUniq->getBody(), 0, 32)
+                                   : 'no match (client-visible id filter failed)');
         }
     } catch (Throwable $e) {
         $check(false, 'QueryMessageByKey/viewMessage', $e->getMessage());

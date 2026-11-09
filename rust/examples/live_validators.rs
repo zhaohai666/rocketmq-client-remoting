@@ -121,7 +121,10 @@ async fn expect_local_reject(
     ck.check(
         name,
         text.contains(needle) && ms < LOCAL_BUDGET_MS && code_ok,
-        &format!("{text} in {ms:.2}ms code={:?} want={expect_code:?}", client_code(&err)),
+        &format!(
+            "{text} in {ms:.2}ms code={:?} want={expect_code:?}",
+            client_code(&err)
+        ),
     );
     ms
 }
@@ -137,7 +140,11 @@ fn expect_start_reject(
 ) {
     let ms = elapsed_ms(began);
     match err {
-        None => ck.check(name, false, &format!("no exception was thrown started={started}")),
+        None => ck.check(
+            name,
+            false,
+            &format!("no exception was thrown started={started}"),
+        ),
         Some(e) => {
             let text = e.to_string();
             ck.check(
@@ -244,7 +251,11 @@ async fn v3_batch_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
                 && elapsed_ms(began) < LOCAL_BUDGET_MS,
             &format!("{e} in {:.2}ms", elapsed_ms(began)),
         ),
-        None => ck.check("V3a an illegal sub-message in the batch => the whole batch fails locally", false, "no exception was thrown"),
+        None => ck.check(
+            "V3a an illegal sub-message in the batch => the whole batch fails locally",
+            false,
+            "no exception was thrown",
+        ),
     }
 
     let mut lmq = message("V3Lmq", b"x");
@@ -366,7 +377,11 @@ async fn v5_admin_negatives(ck: &mut Checker, p: &DefaultMQProducer) {
                 e.to_string().contains(needle) && elapsed_ms(began) < LOCAL_BUDGET_MS,
                 &format!("{e} in {:.2}ms", elapsed_ms(began)),
             ),
-            None => ck.check(&format!("V5 refuses to create topic {topic:?}"), false, "no exception was thrown"),
+            None => ck.check(
+                &format!("V5 refuses to create topic {topic:?}"),
+                false,
+                "no exception was thrown",
+            ),
         }
     }
 }
@@ -549,8 +564,14 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
 
     // V8b: instance level: when no address exists at all, the route API returns 10004, not
     // "no queue for this topic" (the 10005 wording). This is the config that `validate_name_server_setting` in the funnel reads.
-    let no_addr_client = MQClientInstance::new(&format!("rust-live-validators-noaddr-c-{stamp}"), Vec::new());
-    let err = no_addr_client.get_topic_publish_info("V8NoAddrTopic", false).await.err();
+    let no_addr_client = MQClientInstance::new(
+        &format!("rust-live-validators-noaddr-c-{stamp}"),
+        Vec::new(),
+    );
+    let err = no_addr_client
+        .get_topic_publish_info("V8NoAddrTopic", false)
+        .await
+        .err();
     let code = err.as_ref().and_then(|e| e.response_code());
     ck.check(
         "V8b a zero-address instance querying the route reports 10004 (not \"topic has no queue\")",
@@ -578,7 +599,11 @@ async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stam
         };
         mis.set_namesrv_addr(&dead);
         match mis.start().await {
-            Err(e) => ck.check("V8c start does not probe reachability and must not fail", false, &e.to_string()),
+            Err(e) => ck.check(
+                "V8c start does not probe reachability and must not fail",
+                false,
+                &e.to_string(),
+            ),
             Ok(()) => {
                 let began = Instant::now();
                 let mut m = message("V8DeadNamesrvTopic", b"x");

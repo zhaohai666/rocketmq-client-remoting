@@ -256,7 +256,6 @@ impl Message {
         self.properties.get(PROPERTY_WAIT_STORE_MSG_OK)
     }
 
-
     pub fn set_delay_time_sec(&mut self, sec: i64) {
         self.properties
             .insert(PROPERTY_TIMER_DELAY_SEC, sec.to_string());
@@ -1066,7 +1065,8 @@ mod tests {
             let mut tail = Message::new("T", Some(b"b"));
             tail.put_property(name, "3");
             assert!(
-                MessageBatch::generate_from_list(vec![Message::new("T", Some(b"a")), tail]).is_err(),
+                MessageBatch::generate_from_list(vec![Message::new("T", Some(b"a")), tail])
+                    .is_err(),
                 "{name} on a non-first member"
             );
 

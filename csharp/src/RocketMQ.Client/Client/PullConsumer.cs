@@ -1128,6 +1128,14 @@ public sealed class DefaultMQPullConsumer
         return c;
     }
 
+    /// <summary>
+    /// Java DefaultMQPullConsumerImpl#viewMessage parity
+    /// (DefaultMQPullConsumerImpl.java:838): the MQAdminImpl single-leg path —
+    /// offset msgId only, no uniq-key fallback at this layer.
+    /// </summary>
+    public MessageExt ViewMessage(string topic, string msgId) =>
+        RequireClient().ViewMessage(topic, msgId);
+
     private MessageQueue WrapMq(MessageQueue mq)
     {
         string topic = NamespaceUtil.WrapNamespace(_namespace, mq.Topic);

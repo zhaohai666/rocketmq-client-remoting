@@ -8,7 +8,6 @@ from typing import Dict, List, Optional, Set, Union
 
 from common.boundary_type import BoundaryType
 from common.message import MessageExt, MessageQueue
-from common.message_decoder import decode_message_id, decode_message, decode_messages
 from common.mix_all import MixAll
 from common.sysflag import PermName
 from common.topic_config import TopicConfig
@@ -858,6 +857,10 @@ class DefaultMQAdminExt:
             raise MQClientException("consumeMessageDirectly: consumerGroup/clientId required")
         from common.message_const import MessageConst
         msg = self.view_message(topic, msg_id)
+        # Java dereferences the viewMessage null unguarded here (a latent NPE);
+        # fail with a clear client error instead.
+        if msg is None:
+            raise MQClientException("message %s of %s not found" % (msg_id, topic))
         addr = broker_addr or msg.get_store_host_string()
         if not addr:
             raise MQClientException(
@@ -1249,29 +1252,27 @@ class DefaultMQAdminExt:
             topic, key, max_num, 0, int(time.time() * 1000) + 60 * 60 * 1000,
             index_type=MessageConst.INDEX_KEY_TYPE, uniq_key=False)
 
-    def view_message(self, topic: str, msg_id: str) -> MessageExt:
-        pass
-        by_id_error: Optional[Exception] = None
-        try:
-            ip, port, offset = decode_message_id(msg_id)
-            if not 0 < port <= 65535:
-                raise MQClientException("not a valid offset msgId: %s" % msg_id)
-            response = self._invoke_broker("%s:%d" % (ip, port),
-                                           RequestCode.VIEW_MESSAGE_BY_ID,
-                                           {"topic": topic, "offset": offset})
-            if response.body:
-                return decode_message(response.body)
-            by_id_error = MQBrokerException(ResponseCode.NO_MESSAGE,
-                                            "message not found: %s" % msg_id)
-        except Exception as e:
-            by_id_error = e
+    def view_message(self, topic: str, msg_id: str) -> Optional[MessageExt]:
+        """Java ``DefaultMQAdminExtImpl#viewMessage`` parity (DefaultMQAdminExtImpl.java:578).
 
-        found = self.query_message_by_uniq_key(topic, msg_id)
-        if found is not None:
-            return found
-        raise MQClientException(
-            "viewMessage failed: neither offset msgId nor uniq key matched message %s of %s"
-            % (msg_id, topic), ResponseCode.NO_MESSAGE, by_id_error)
+        Try the offset-msgId leg first; when it fails for any reason (the msgId
+        "maybe created by new client") fall back to the uniq-key query across
+        brokers. When neither leg matches, Java returns null here instead of
+        raising -- so does this method. (The single-leg core the producer /
+        pull / push facades share is ``MQClientInstance.view_message``.)
+        """
+        client = self._require_client()
+        try:
+            return client.view_message(
+                topic, msg_id, timeout_millis=self.timeout_millis,
+                vip_channel_enabled=self.vip_channel_enabled)
+        except Exception:  # noqa: BLE001 - Java logs "the msgId maybe created by new client" and falls through
+            pass
+        from common.message_const import MessageConst
+        messages = client.query_message_all_brokers(
+            topic, msg_id, 32, 0, int(time.time() * 1000) + 60 * 60 * 1000,
+            index_type=MessageConst.INDEX_UNIQUE_TYPE, uniq_key=True)
+        return messages[0] if messages else None
 
     def query_consume_queue(self, broker_addr: str, topic: str, queue_id: int,
                             index: int, count: int = 32,

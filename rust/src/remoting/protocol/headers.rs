@@ -115,7 +115,6 @@ impl fmt::Debug for dyn CustomHeader + '_ {
     }
 }
 
-
 //   GetMaxOffsetRequestHeader: server-side-only fields ["committed"]
 //   SearchOffsetRequestHeader: server-side-only fields ["liteTopic"]
 //   QueryMessageResponseHeader: server-side-only fields ["indexLastUpdatePhyoffset"]
@@ -907,98 +906,371 @@ header_struct! {
 
 #[cfg(test)]
 const PROTOCOL_HEADER_FIELDS: &[(&str, &[&str])] = &[
-    ("SendMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "maxReconsumeTimes", "batch", ]),
-    ("SendMessageRequestHeaderV2", &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", ]),
-    ("ReplyMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "bornHost", "storeHost", "storeTimestamp", ]),
-    ("SendMessageResponseHeader", &["msgId", "queueId", "queueOffset", "transactionId", "batchUniqId", "recallHandle", ]),
-    ("RecallMessageRequestHeader", &["producerGroup", "topic", "recallHandle", "bname", ]),
-    ("RecallMessageResponseHeader", &["msgId", ]),
-    ("PullMessageRequestHeader", &["consumerGroup", "topic", "liteTopic", "queueId", "queueOffset", "maxMsgNums", "sysFlag", "commitOffset", "suspendTimeoutMillis", "subscription", "subVersion", "expressionType", "maxMsgBytes", "requestSource", "proxyFrowardClientId", ]),
-    ("PullMessageResponseHeader", &["nextBeginOffset", "minOffset", "maxOffset", "suggestWhichBrokerId", "topicSysFlag", "groupSysFlag", "forbiddenType", "offsetDelta", ]),
-    ("QueryConsumerOffsetRequestHeader", &["consumerGroup", "topic", "queueId", "setZeroIfNotFound", ]),
-    ("QueryConsumerOffsetResponseHeader", &["offset", ]),
-    ("UpdateConsumerOffsetRequestHeader", &["consumerGroup", "topic", "queueId", "commitOffset", ]),
-    ("UpdateConsumerOffsetResponseHeader", &["offset", ]),
-    ("GetMaxOffsetRequestHeader", &["topic", "queueId", ]),
-    ("GetMaxOffsetResponseHeader", &["offset", ]),
-    ("GetMinOffsetRequestHeader", &["topic", "queueId", ]),
-    ("GetMinOffsetResponseHeader", &["offset", ]),
-    ("SearchOffsetRequestHeader", &["topic", "queueId", "timestamp", "boundaryType", ]),
-    ("SearchOffsetResponseHeader", &["offset", ]),
-    ("GetEarliestMsgStoretimeRequestHeader", &["topic", "queueId", ]),
-    ("GetEarliestMsgStoretimeResponseHeader", &["timestamp", ]),
-    ("QueryMessageRequestHeader", &["topic", "key", "maxNum", "beginTimestamp", "endTimestamp", "indexType", "lastKey", ]),
-    ("QueryMessageResponseHeader", &["indexLastUpdateTimestamp", ]),
-    ("ViewMessageRequestHeader", &["offset", ]),
+    (
+        "SendMessageRequestHeader",
+        &[
+            "producerGroup",
+            "topic",
+            "defaultTopic",
+            "defaultTopicQueueNums",
+            "queueId",
+            "sysFlag",
+            "bornTimestamp",
+            "flag",
+            "properties",
+            "reconsumeTimes",
+            "unitMode",
+            "maxReconsumeTimes",
+            "batch",
+        ],
+    ),
+    (
+        "SendMessageRequestHeaderV2",
+        &[
+            "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n",
+        ],
+    ),
+    (
+        "ReplyMessageRequestHeader",
+        &[
+            "producerGroup",
+            "topic",
+            "defaultTopic",
+            "defaultTopicQueueNums",
+            "queueId",
+            "sysFlag",
+            "bornTimestamp",
+            "flag",
+            "properties",
+            "reconsumeTimes",
+            "unitMode",
+            "bornHost",
+            "storeHost",
+            "storeTimestamp",
+        ],
+    ),
+    (
+        "SendMessageResponseHeader",
+        &[
+            "msgId",
+            "queueId",
+            "queueOffset",
+            "transactionId",
+            "batchUniqId",
+            "recallHandle",
+        ],
+    ),
+    (
+        "RecallMessageRequestHeader",
+        &["producerGroup", "topic", "recallHandle", "bname"],
+    ),
+    ("RecallMessageResponseHeader", &["msgId"]),
+    (
+        "PullMessageRequestHeader",
+        &[
+            "consumerGroup",
+            "topic",
+            "liteTopic",
+            "queueId",
+            "queueOffset",
+            "maxMsgNums",
+            "sysFlag",
+            "commitOffset",
+            "suspendTimeoutMillis",
+            "subscription",
+            "subVersion",
+            "expressionType",
+            "maxMsgBytes",
+            "requestSource",
+            "proxyFrowardClientId",
+        ],
+    ),
+    (
+        "PullMessageResponseHeader",
+        &[
+            "nextBeginOffset",
+            "minOffset",
+            "maxOffset",
+            "suggestWhichBrokerId",
+            "topicSysFlag",
+            "groupSysFlag",
+            "forbiddenType",
+            "offsetDelta",
+        ],
+    ),
+    (
+        "QueryConsumerOffsetRequestHeader",
+        &["consumerGroup", "topic", "queueId", "setZeroIfNotFound"],
+    ),
+    ("QueryConsumerOffsetResponseHeader", &["offset"]),
+    (
+        "UpdateConsumerOffsetRequestHeader",
+        &["consumerGroup", "topic", "queueId", "commitOffset"],
+    ),
+    ("UpdateConsumerOffsetResponseHeader", &["offset"]),
+    ("GetMaxOffsetRequestHeader", &["topic", "queueId"]),
+    ("GetMaxOffsetResponseHeader", &["offset"]),
+    ("GetMinOffsetRequestHeader", &["topic", "queueId"]),
+    ("GetMinOffsetResponseHeader", &["offset"]),
+    (
+        "SearchOffsetRequestHeader",
+        &["topic", "queueId", "timestamp", "boundaryType"],
+    ),
+    ("SearchOffsetResponseHeader", &["offset"]),
+    (
+        "GetEarliestMsgStoretimeRequestHeader",
+        &["topic", "queueId"],
+    ),
+    ("GetEarliestMsgStoretimeResponseHeader", &["timestamp"]),
+    (
+        "QueryMessageRequestHeader",
+        &[
+            "topic",
+            "key",
+            "maxNum",
+            "beginTimestamp",
+            "endTimestamp",
+            "indexType",
+            "lastKey",
+        ],
+    ),
+    ("QueryMessageResponseHeader", &["indexLastUpdateTimestamp"]),
+    ("ViewMessageRequestHeader", &["offset"]),
     ("ViewMessageResponseHeader", &[]),
-    ("HeartbeatRequestHeader", &["clientID", ]),
-    ("UnregisterClientRequestHeader", &["clientID", "producerGroup", "consumerGroup", ]),
-    ("ConsumerSendMsgBackRequestHeader", &["offset", "group", "delayLevel", "originMsgId", "originTopic", "unitMode", "maxReconsumeTimes", ]),
-    ("GetConsumerListByGroupRequestHeader", &["consumerGroup", ]),
+    ("HeartbeatRequestHeader", &["clientID"]),
+    (
+        "UnregisterClientRequestHeader",
+        &["clientID", "producerGroup", "consumerGroup"],
+    ),
+    (
+        "ConsumerSendMsgBackRequestHeader",
+        &[
+            "offset",
+            "group",
+            "delayLevel",
+            "originMsgId",
+            "originTopic",
+            "unitMode",
+            "maxReconsumeTimes",
+        ],
+    ),
+    ("GetConsumerListByGroupRequestHeader", &["consumerGroup"]),
     ("GetConsumerListByGroupResponseHeader", &[]),
-    ("NotifyConsumerIdsChangedRequestHeader", &["consumerGroup", ]),
-    ("GetConsumerConnectionListRequestHeader", &["consumerGroup", ]),
-    ("GetConsumerStatusRequestHeader", &["topic", "group", "clientAddr", ]),
-    ("GetConsumerRunningInfoRequestHeader", &["consumerGroup", "clientId", "jstackEnable", ]),
-    ("ConsumeMessageDirectlyResultRequestHeader", &["consumerGroup", "clientId", "msgId", "brokerName", ]),
-    ("ResetOffsetRequestHeader", &["topic", "group", "timestamp", "isForce", ]),
-    ("LockBatchMqRequestHeader", &["consumerGroup", "clientId", ]),
-    ("UnlockBatchMqRequestHeader", &["consumerGroup", "clientId", ]),
-    ("EndTransactionRequestHeader", &["topic", "producerGroup", "tranStateTableOffset", "commitLogOffset", "commitOrRollback", "fromTransactionCheck", "msgId", "transactionId", "bname", ]),
-    ("EndTransactionResponseHeader", &["msgId", "transactionId", ]),
-    ("CheckTransactionStateRequestHeader", &["topic", "tranStateTableOffset", "commitLogOffset", "msgId", "transactionId", "offsetMsgId", "bname", ]),
-    ("CheckTransactionStateResponseHeader", &["groupName", "transactionState", "offset", ]),
+    ("NotifyConsumerIdsChangedRequestHeader", &["consumerGroup"]),
+    ("GetConsumerConnectionListRequestHeader", &["consumerGroup"]),
+    (
+        "GetConsumerStatusRequestHeader",
+        &["topic", "group", "clientAddr"],
+    ),
+    (
+        "GetConsumerRunningInfoRequestHeader",
+        &["consumerGroup", "clientId", "jstackEnable"],
+    ),
+    (
+        "ConsumeMessageDirectlyResultRequestHeader",
+        &["consumerGroup", "clientId", "msgId", "brokerName"],
+    ),
+    (
+        "ResetOffsetRequestHeader",
+        &["topic", "group", "timestamp", "isForce"],
+    ),
+    ("LockBatchMqRequestHeader", &["consumerGroup", "clientId"]),
+    ("UnlockBatchMqRequestHeader", &["consumerGroup", "clientId"]),
+    (
+        "EndTransactionRequestHeader",
+        &[
+            "topic",
+            "producerGroup",
+            "tranStateTableOffset",
+            "commitLogOffset",
+            "commitOrRollback",
+            "fromTransactionCheck",
+            "msgId",
+            "transactionId",
+            "bname",
+        ],
+    ),
+    ("EndTransactionResponseHeader", &["msgId", "transactionId"]),
+    (
+        "CheckTransactionStateRequestHeader",
+        &[
+            "topic",
+            "tranStateTableOffset",
+            "commitLogOffset",
+            "msgId",
+            "transactionId",
+            "offsetMsgId",
+            "bname",
+        ],
+    ),
+    (
+        "CheckTransactionStateResponseHeader",
+        &["groupName", "transactionState", "offset"],
+    ),
     ("GetAllTopicConfigRequestHeader", &[]),
-    ("GetAllTopicConfigResponseHeader", &["dataVersion", ]),
-    ("GetTopicConfigRequestHeader", &["topic", ]),
-    ("CreateTopicRequestHeader", &["topic", "defaultTopic", "readQueueNums", "writeQueueNums", "perm", "topicFilterType", "topicSysFlag", "order", "attributes", "force", ]),
-    ("DeleteTopicRequestHeader", &["topic", ]),
-    ("GetTopicStatsInfoRequestHeader", &["topic", ]),
-    ("GetConsumeStatsRequestHeader", &["consumerGroup", "topic", ]),
+    ("GetAllTopicConfigResponseHeader", &["dataVersion"]),
+    ("GetTopicConfigRequestHeader", &["topic"]),
+    (
+        "CreateTopicRequestHeader",
+        &[
+            "topic",
+            "defaultTopic",
+            "readQueueNums",
+            "writeQueueNums",
+            "perm",
+            "topicFilterType",
+            "topicSysFlag",
+            "order",
+            "attributes",
+            "force",
+        ],
+    ),
+    ("DeleteTopicRequestHeader", &["topic"]),
+    ("GetTopicStatsInfoRequestHeader", &["topic"]),
+    ("GetConsumeStatsRequestHeader", &["consumerGroup", "topic"]),
     ("GetAllSubscriptionGroupConfigRequestHeader", &[]),
-    ("GetSubscriptionGroupConfigRequestHeader", &["group", ]),
-    ("InterviewGetConsumerStatusRequestHeader", &["consumerGroup", "topic", ]),
-    ("GetTopicsByClusterRequestHeader", &["cluster", ]),
-    ("GetBrokerConfigResponseHeader", &["version", ]),
+    ("GetSubscriptionGroupConfigRequestHeader", &["group"]),
+    (
+        "InterviewGetConsumerStatusRequestHeader",
+        &["consumerGroup", "topic"],
+    ),
+    ("GetTopicsByClusterRequestHeader", &["cluster"]),
+    ("GetBrokerConfigResponseHeader", &["version"]),
     ("GetTopicConfigResponseHeader", &[]),
     ("GetSubscriptionGroupResponseHeader", &[]),
-    ("GetTopicListResponseHeader", &["brokerAddr", ]),
-    ("RegisterBrokerRequestHeader", &["brokerName", "brokerAddr", "clusterName", "haServerAddr", "brokerId", "heartbeatTimeoutMillis", "enableActingMaster", "compressed", "bodyCrc32", ]),
-    ("RegisterBrokerResponseHeader", &["haServerAddr", "masterAddr", ]),
-    ("UnRegisterBrokerRequestHeader", &["brokerName", "brokerAddr", "clusterName", "brokerId", ]),
-    ("GetRouteInfoRequestHeader", &["topic", "acceptStandardJsonOnly", ]),
-    ("PutKVConfigRequestHeader", &["namespace", "key", "value", ]),
-    ("GetKVConfigRequestHeader", &["namespace", "key", ]),
-    ("GetKVConfigResponseHeader", &["value", ]),
-    ("DeleteKVConfigRequestHeader", &["namespace", "key", ]),
-    ("GetKVListByNamespaceRequestHeader", &["namespace", ]),
-    ("RegisterTopicRequestHeader", &["topic", ]),
-    ("RegisterOrderTopicRequestHeader", &["topic", "orderTopicString", ]),
-    ("DeleteTopicFromNamesrvRequestHeader", &["topic", "clusterName", ]),
-    ("GetBrokerMemberGroupRequestHeader", &["clusterName", "brokerName", ]),
-    ("WipeWritePermOfBrokerRequestHeader", &["brokerName", ]),
-    ("WipeWritePermOfBrokerResponseHeader", &["wipeTopicCount", ]),
-    ("AddWritePermOfBrokerRequestHeader", &["brokerName", ]),
-    ("AddWritePermOfBrokerResponseHeader", &["addTopicCount", ]),
-    ("BrokerHeartbeatRequestHeader", &["clusterName", "brokerAddr", "brokerName", "brokerId", "epoch", "maxOffset", "confirmOffset", "heartbeatTimeoutMills", "electionPriority", ]),
-    ("QueryDataVersionRequestHeader", &["brokerName", "brokerAddr", "clusterName", "brokerId", ]),
-    ("QueryDataVersionResponseHeader", &["changed", ]),
-    ("PopMessageRequestHeader", &["consumerGroup", "topic", "queueId", "maxMsgNums", "invisibleTime", "pollTime", "bornTime", "initMode", "expType", "exp", "order", "attemptId", ]),
-    ("PopMessageResponseHeader", &["popTime", "invisibleTime", "reviveQid", "restNum", "startOffsetInfo", "msgOffsetInfo", "orderCountInfo", ]),
-    ("AckMessageRequestHeader", &["consumerGroup", "topic", "queueId", "extraInfo", "offset", "liteTopic", ]),
-    ("ChangeInvisibleTimeRequestHeader", &["consumerGroup", "topic", "queueId", "extraInfo", "offset", "invisibleTime", "liteTopic", "suspend", ]),
-    ("ChangeInvisibleTimeResponseHeader", &["popTime", "invisibleTime", "reviveQid", ]),
+    ("GetTopicListResponseHeader", &["brokerAddr"]),
+    (
+        "RegisterBrokerRequestHeader",
+        &[
+            "brokerName",
+            "brokerAddr",
+            "clusterName",
+            "haServerAddr",
+            "brokerId",
+            "heartbeatTimeoutMillis",
+            "enableActingMaster",
+            "compressed",
+            "bodyCrc32",
+        ],
+    ),
+    (
+        "RegisterBrokerResponseHeader",
+        &["haServerAddr", "masterAddr"],
+    ),
+    (
+        "UnRegisterBrokerRequestHeader",
+        &["brokerName", "brokerAddr", "clusterName", "brokerId"],
+    ),
+    (
+        "GetRouteInfoRequestHeader",
+        &["topic", "acceptStandardJsonOnly"],
+    ),
+    ("PutKVConfigRequestHeader", &["namespace", "key", "value"]),
+    ("GetKVConfigRequestHeader", &["namespace", "key"]),
+    ("GetKVConfigResponseHeader", &["value"]),
+    ("DeleteKVConfigRequestHeader", &["namespace", "key"]),
+    ("GetKVListByNamespaceRequestHeader", &["namespace"]),
+    ("RegisterTopicRequestHeader", &["topic"]),
+    (
+        "RegisterOrderTopicRequestHeader",
+        &["topic", "orderTopicString"],
+    ),
+    (
+        "DeleteTopicFromNamesrvRequestHeader",
+        &["topic", "clusterName"],
+    ),
+    (
+        "GetBrokerMemberGroupRequestHeader",
+        &["clusterName", "brokerName"],
+    ),
+    ("WipeWritePermOfBrokerRequestHeader", &["brokerName"]),
+    ("WipeWritePermOfBrokerResponseHeader", &["wipeTopicCount"]),
+    ("AddWritePermOfBrokerRequestHeader", &["brokerName"]),
+    ("AddWritePermOfBrokerResponseHeader", &["addTopicCount"]),
+    (
+        "BrokerHeartbeatRequestHeader",
+        &[
+            "clusterName",
+            "brokerAddr",
+            "brokerName",
+            "brokerId",
+            "epoch",
+            "maxOffset",
+            "confirmOffset",
+            "heartbeatTimeoutMills",
+            "electionPriority",
+        ],
+    ),
+    (
+        "QueryDataVersionRequestHeader",
+        &["brokerName", "brokerAddr", "clusterName", "brokerId"],
+    ),
+    ("QueryDataVersionResponseHeader", &["changed"]),
+    (
+        "PopMessageRequestHeader",
+        &[
+            "consumerGroup",
+            "topic",
+            "queueId",
+            "maxMsgNums",
+            "invisibleTime",
+            "pollTime",
+            "bornTime",
+            "initMode",
+            "expType",
+            "exp",
+            "order",
+            "attemptId",
+        ],
+    ),
+    (
+        "PopMessageResponseHeader",
+        &[
+            "popTime",
+            "invisibleTime",
+            "reviveQid",
+            "restNum",
+            "startOffsetInfo",
+            "msgOffsetInfo",
+            "orderCountInfo",
+        ],
+    ),
+    (
+        "AckMessageRequestHeader",
+        &[
+            "consumerGroup",
+            "topic",
+            "queueId",
+            "extraInfo",
+            "offset",
+            "liteTopic",
+        ],
+    ),
+    (
+        "ChangeInvisibleTimeRequestHeader",
+        &[
+            "consumerGroup",
+            "topic",
+            "queueId",
+            "extraInfo",
+            "offset",
+            "invisibleTime",
+            "liteTopic",
+            "suspend",
+        ],
+    ),
+    (
+        "ChangeInvisibleTimeResponseHeader",
+        &["popTime", "invisibleTime", "reviveQid"],
+    ),
 ];
-
-
-
 
 // ============================== tests ==============================
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::PROTOCOL_HEADER_FIELDS;
+    use super::*;
     use crate::common::boundary_type::BoundaryType;
     use crate::remoting::protocol::codes::request_code;
     use crate::remoting::protocol::ext_fields::ExtFields;
@@ -1158,7 +1430,10 @@ mod tests {
         ext.insert("reviveQid", "3");
         let mut h = ChangeInvisibleTimeResponseHeader::default();
         h.from_ext_fields(&ext);
-        assert_eq!((h.pop_time, h.invisible_time, h.revive_qid), (Some(111), Some(222), Some(3)));
+        assert_eq!(
+            (h.pop_time, h.invisible_time, h.revive_qid),
+            (Some(111), Some(222), Some(3))
+        );
     }
 
     #[test]
@@ -1345,7 +1620,14 @@ mod tests {
         assert!(!ext.contains_key("lastKey"));
         assert_eq!(
             keys(&ext),
-            vec!["topic", "key", "maxNum", "beginTimestamp", "endTimestamp", "indexType"]
+            vec![
+                "topic",
+                "key",
+                "maxNum",
+                "beginTimestamp",
+                "endTimestamp",
+                "indexType"
+            ]
         );
         let mut back = QueryMessageRequestHeader::default();
         back.from_ext_fields(&ext);
@@ -1404,7 +1686,10 @@ mod tests {
             consumer_group: Some("cg".into()),
         }
         .to_ext_fields(&mut ext);
-        assert_eq!(keys(&ext), vec!["clientID", "producerGroup", "consumerGroup"]);
+        assert_eq!(
+            keys(&ext),
+            vec!["clientID", "producerGroup", "consumerGroup"]
+        );
     }
 
     #[test]
@@ -1492,12 +1777,17 @@ mod tests {
         let root = match std::env::var("ROCKETMQ_SERVER_SRC") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => {
-                eprintln!("ROCKETMQ_SERVER_SRC not set, skipping the server-side field-name cross-check");
+                eprintln!(
+                    "ROCKETMQ_SERVER_SRC not set, skipping the server-side field-name cross-check"
+                );
                 return;
             }
         };
         let root = std::path::PathBuf::from(root);
-        assert!(root.is_dir(), "ROCKETMQ_SERVER_SRC is not a directory: {root:?}");
+        assert!(
+            root.is_dir(),
+            "ROCKETMQ_SERVER_SRC is not a directory: {root:?}"
+        );
         for (class, fields) in PROTOCOL_HEADER_FIELDS {
             let declared = java_declared_fields(&root, class, 0);
             if declared.is_empty() {
@@ -1547,7 +1837,10 @@ mod tests {
             }
         }
         if depth < 3 {
-            if let Some(start) = text.find("class ").and_then(|i| text[i..].find("extends ").map(|j| i + j + 8)) {
+            if let Some(start) = text
+                .find("class ")
+                .and_then(|i| text[i..].find("extends ").map(|j| i + j + 8))
+            {
                 let tail = text[start..].trim_start();
                 let mut end = tail.len();
                 for (i, c) in tail.char_indices() {
@@ -1576,14 +1869,18 @@ mod tests {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
-                    if path.file_name().map(|n| n.to_string_lossy().into_owned()) == Some(target.clone())
+                    if path.file_name().map(|n| n.to_string_lossy().into_owned())
+                        == Some(target.clone())
                         && path.to_string_lossy().contains("/src/main/java/")
                     {
                         return Some(path);
                     }
                 } else if path.is_dir() {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                    if matches!(name.as_deref(), Some("target") | Some(".git") | Some("build")) {
+                    if matches!(
+                        name.as_deref(),
+                        Some("target") | Some(".git") | Some("build")
+                    ) {
                         continue;
                     }
                     stack.push(path);

@@ -281,7 +281,6 @@ pub fn scan_expired_request(holder: &RequestFutureHolder) -> usize {
     removed
 }
 
-
 static SCAN_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
 static SCAN_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -516,7 +515,10 @@ mod tests {
             msg.set_body(Some(b"pong"));
             filler.put_response_message(Some(msg));
         });
-        let got = f.wait_response_message(2000).await.expect("must be woken up");
+        let got = f
+            .wait_response_message(2000)
+            .await
+            .expect("must be woken up");
         assert_eq!(got.get_body(), b"pong");
         assert!(!f.is_timeout());
         handle.await.unwrap();
@@ -529,7 +531,10 @@ mod tests {
         let mut msg = MessageExt::new();
         msg.set_body(Some(b"early"));
         f.put_response_message(Some(msg));
-        let got = f.wait_response_message(10).await.expect("must not time out");
+        let got = f
+            .wait_response_message(10)
+            .await
+            .expect("must not time out");
         assert_eq!(got.get_body(), b"early");
     }
 
@@ -651,7 +656,6 @@ mod tests {
         ));
     }
 
-
     /// Counting callback (easier than Recorder to share counts through an `Arc`).
     struct SweepCounter {
         failures: AtomicUsize,
@@ -681,7 +685,10 @@ mod tests {
 
         let removed = scan_expired_request(&holder);
         assert_eq!(removed, 1);
-        assert!(holder.is_empty(), "timed-out entry must be removed from the table");
+        assert!(
+            holder.is_empty(),
+            "timed-out entry must be removed from the table"
+        );
         assert!(f.is_send_request_ok());
         assert_eq!(counter.failures.load(Ordering::SeqCst), 1);
         let logged = counter

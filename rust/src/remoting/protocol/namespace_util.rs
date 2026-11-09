@@ -41,7 +41,8 @@ impl NamespaceUtil {
         if namespace.is_empty() || resource.is_empty() || Self::is_system_resource(resource) {
             return false;
         }
-        Self::with_out_retry_and_dlq(resource).starts_with(&format!("{namespace}{NAMESPACE_SEPARATOR}"))
+        Self::with_out_retry_and_dlq(resource)
+            .starts_with(&format!("{namespace}{NAMESPACE_SEPARATOR}"))
     }
 
     /// `MQ_INST_XX%Topic` → `Topic`; `%RETRY%MQ_INST_XX%GID` → `%RETRY%GID`.
@@ -132,7 +133,10 @@ mod tests {
     #[test]
     fn separator_and_prefix_helpers() {
         assert_eq!(NAMESPACE_SEPARATOR, '%');
-        assert_eq!(NamespaceUtil::with_out_retry_and_dlq("%RETRY%MQ_INST_XX%GID"), "MQ_INST_XX%GID");
+        assert_eq!(
+            NamespaceUtil::with_out_retry_and_dlq("%RETRY%MQ_INST_XX%GID"),
+            "MQ_INST_XX%GID"
+        );
         assert_eq!(NamespaceUtil::with_out_retry_and_dlq("%DLQ%G"), "G");
         assert_eq!(NamespaceUtil::with_out_retry_and_dlq("Topic"), "Topic");
         assert_eq!(NamespaceUtil::with_out_retry_and_dlq(""), "");
@@ -155,12 +159,18 @@ mod tests {
             NamespaceUtil::without_namespace("rmq_sys_TRACE_DATA", ""),
             "rmq_sys_TRACE_DATA"
         );
-        assert_eq!(NamespaceUtil::get_namespace_from_resource("CID_RMQ_SYS_x"), "");
+        assert_eq!(
+            NamespaceUtil::get_namespace_from_resource("CID_RMQ_SYS_x"),
+            ""
+        );
     }
 
     #[test]
     fn wrap_namespace_matches_golden_cases() {
-        assert_eq!(NamespaceUtil::wrap_namespace("MQ_INST_XX", "Topic"), "MQ_INST_XX%Topic");
+        assert_eq!(
+            NamespaceUtil::wrap_namespace("MQ_INST_XX", "Topic"),
+            "MQ_INST_XX%Topic"
+        );
         assert_eq!(
             NamespaceUtil::wrap_namespace("MQ_INST_XX", "%RETRY%GID"),
             "%RETRY%MQ_INST_XX%GID"
@@ -178,12 +188,18 @@ mod tests {
         assert_eq!(NamespaceUtil::wrap_namespace("", "Topic"), "Topic");
         assert_eq!(NamespaceUtil::wrap_namespace("NS", ""), "");
         // A different namespace does not count as "already namespaced"
-        assert_eq!(NamespaceUtil::wrap_namespace("NS2", "NS1%Topic"), "NS2%NS1%Topic");
+        assert_eq!(
+            NamespaceUtil::wrap_namespace("NS2", "NS1%Topic"),
+            "NS2%NS1%Topic"
+        );
     }
 
     #[test]
     fn without_namespace_matches_golden_cases() {
-        assert_eq!(NamespaceUtil::without_namespace("MQ_INST_XX%Topic", ""), "Topic");
+        assert_eq!(
+            NamespaceUtil::without_namespace("MQ_INST_XX%Topic", ""),
+            "Topic"
+        );
         assert_eq!(
             NamespaceUtil::without_namespace("%RETRY%MQ_INST_XX%GID", ""),
             "%RETRY%GID"
@@ -195,7 +211,10 @@ mod tests {
         // Returns unchanged when there is no namespace
         assert_eq!(NamespaceUtil::without_namespace("Topic", ""), "Topic");
         // Explicit namespace: strip only on a match
-        assert_eq!(NamespaceUtil::without_namespace("MQ_INST_XX1%Topic1", "MQ_INST_XX1"), "Topic1");
+        assert_eq!(
+            NamespaceUtil::without_namespace("MQ_INST_XX1%Topic1", "MQ_INST_XX1"),
+            "Topic1"
+        );
         assert_eq!(
             NamespaceUtil::without_namespace("MQ_INST_XX2%Topic2", "MQ_INST_XX1"),
             "MQ_INST_XX2%Topic2"
@@ -210,7 +229,10 @@ mod tests {
         );
         // Empty namespace + no '%': unchanged
         assert_eq!(NamespaceUtil::without_namespace("", ""), "");
-        assert_eq!(NamespaceUtil::without_namespace("%RETRY%GID", ""), "%RETRY%GID");
+        assert_eq!(
+            NamespaceUtil::without_namespace("%RETRY%GID", ""),
+            "%RETRY%GID"
+        );
     }
 
     #[test]
@@ -219,7 +241,10 @@ mod tests {
             NamespaceUtil::wrap_namespace_and_retry("MQ_INST_XX", "GID"),
             "%RETRY%MQ_INST_XX%GID"
         );
-        assert_eq!(NamespaceUtil::wrap_namespace_and_retry("", "GID"), "%RETRY%GID");
+        assert_eq!(
+            NamespaceUtil::wrap_namespace_and_retry("", "GID"),
+            "%RETRY%GID"
+        );
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("NS", ""), "");
         // A group passed in that already carries %RETRY%: a double prefix is produced (callers should pass a bare group);
         // this behavior is pinned here so nobody "helpfully" deduplicates it.
@@ -247,11 +272,19 @@ mod tests {
     #[test]
     fn is_already_with_namespace_cases() {
         assert!(NamespaceUtil::is_already_with_namespace("NS%Topic", "NS"));
-        assert!(NamespaceUtil::is_already_with_namespace("%RETRY%NS%GID", "NS"));
+        assert!(NamespaceUtil::is_already_with_namespace(
+            "%RETRY%NS%GID",
+            "NS"
+        ));
         assert!(!NamespaceUtil::is_already_with_namespace("NS%Topic", ""));
         assert!(!NamespaceUtil::is_already_with_namespace("", "NS"));
-        assert!(!NamespaceUtil::is_already_with_namespace("NS%Topic", "Other"));
-        assert!(!NamespaceUtil::is_already_with_namespace("CID_RMQ_SYS_NS%g", "CID_RMQ_SYS_NS"));
+        assert!(!NamespaceUtil::is_already_with_namespace(
+            "NS%Topic", "Other"
+        ));
+        assert!(!NamespaceUtil::is_already_with_namespace(
+            "CID_RMQ_SYS_NS%g",
+            "CID_RMQ_SYS_NS"
+        ));
     }
 
     #[test]

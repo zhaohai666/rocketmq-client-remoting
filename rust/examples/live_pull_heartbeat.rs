@@ -15,9 +15,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::DefaultMQAdminExt;
-use rocketmq_client_remoting::client::pull_consumer::{
-    DefaultMQPullConsumer, PullConsumerConfig,
-};
+use rocketmq_client_remoting::client::pull_consumer::{DefaultMQPullConsumer, PullConsumerConfig};
 use rocketmq_client_remoting::client::result::PullStatus;
 use rocketmq_client_remoting::common::topic_config::DEFAULT_PERM;
 use rocketmq_client_remoting::remoting::protocol::body::ConsumerConnection;
@@ -148,7 +146,10 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
             c.register_topic(&topic);
             match c.start().await {
                 Ok(()) => {
-                    let queues = c.fetch_subscribe_message_queues(&topic).await.unwrap_or_default();
+                    let queues = c
+                        .fetch_subscribe_message_queues(&topic)
+                        .await
+                        .unwrap_or_default();
                     let pull = match queues.first() {
                         Some(mq) => Some(c.pull(mq, "*", 0, 32, None).await),
                         None => None,
@@ -160,7 +161,10 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
                     ck.check(
                         "A1 pull consumer starts and pulls one round successfully",
                         c.heartbeat_count() >= 1
-                            && matches!(pulled, Some(PullStatus::Found) | Some(PullStatus::NoNewMsg)),
+                            && matches!(
+                                pulled,
+                                Some(PullStatus::Found) | Some(PullStatus::NoNewMsg)
+                            ),
                         &format!(
                             "queues={} status={pulled:?} heartbeats={}",
                             queues.len(),
@@ -242,7 +246,10 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
                 true,
                 &format!("slave={slave} connections={}", conn.connection_set.len()),
             ),
-            Err(e) => ck.abort("A4 slave 203 also finds this group (heartbeat fans out to the slave)", &e),
+            Err(e) => ck.abort(
+                "A4 slave 203 also finds this group (heartbeat fans out to the slave)",
+                &e,
+            ),
         }
         match consumer_ids(&admin, &group, slave).await {
             Ok(ids) => ck.check(
@@ -273,7 +280,11 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
             ids.is_empty(),
             &format!("ids={ids:?}"),
         ),
-        Err(_) => ck.check("A5 control: the never-heartbeated ghost group gets an empty list from 38", true, "broker reports no consumer"),
+        Err(_) => ck.check(
+            "A5 control: the never-heartbeated ghost group gets an empty list from 38",
+            true,
+            "broker reports no consumer",
+        ),
     }
 
     // ---- A6 shutdown unregisters immediately (35) ----

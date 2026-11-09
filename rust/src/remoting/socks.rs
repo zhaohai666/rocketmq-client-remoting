@@ -1,4 +1,3 @@
-
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
@@ -420,7 +419,10 @@ mod tests {
     async fn read_method_selection(stream: &mut TokioTcpStream) -> Vec<u8> {
         let mut head = [0u8; 2];
         stream.read_exact(&mut head).await.unwrap();
-        assert_eq!(head[0], 0x05, "the client's method selection must start with VER=0x05");
+        assert_eq!(
+            head[0], 0x05,
+            "the client's method selection must start with VER=0x05"
+        );
         let mut methods = vec![0u8; head[1] as usize];
         stream.read_exact(&mut methods).await.unwrap();
         methods
@@ -551,8 +553,14 @@ mod tests {
         stream.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping", "data through the proxy must reach the target echo service unchanged");
-        assert!(log_has(&log, "methods:[0]"), "without credentials only the no-auth method is advertised");
+        assert_eq!(
+            &buf, b"ping",
+            "data through the proxy must reach the target echo service unchanged"
+        );
+        assert!(
+            log_has(&log, "methods:[0]"),
+            "without credentials only the no-auth method is advertised"
+        );
         assert!(
             log_has(&log, &format!("connect:{target}")),
             "the CONNECT target received by the proxy must be the original address"
@@ -586,7 +594,10 @@ mod tests {
             log_has(&log, "methods:[0, 2]"),
             "with credentials both the no-auth and username/password methods must be advertised"
         );
-        assert!(log_has(&log, "auth:alice:secret"), "credentials must go on the wire verbatim");
+        assert!(
+            log_has(&log, "auth:alice:secret"),
+            "credentials must go on the wire verbatim"
+        );
     }
 
     #[tokio::test]
@@ -613,7 +624,10 @@ mod tests {
             "the message must state that auth was rejected: {err}"
         );
         assert!(log_has(&log, "auth:alice:wrong"));
-        assert!(!log_has(&log, "connect:"), "auth failure must not proceed to CONNECT");
+        assert!(
+            !log_has(&log, "connect:"),
+            "auth failure must not proceed to CONNECT"
+        );
     }
 
     #[tokio::test]

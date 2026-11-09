@@ -40,15 +40,32 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
         if cond {
             self.passed += 1;
-            println!("  [PASS] {name}{}", if detail.is_empty() { String::new() } else { format!("  {detail}") });
+            println!(
+                "  [PASS] {name}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            );
         } else {
-            let label = format!("{name}{}", if detail.is_empty() { String::new() } else { format!("  {detail}") });
+            let label = format!(
+                "{name}{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            );
             self.failed.push(label.clone());
             println!("  [FAIL] {label}");
         }
@@ -88,7 +105,10 @@ async fn run(namesrv: &str) -> Checker {
     println!("== LatencyFaultTolerance live verification  namesrv={namesrv}  topic={topic} ==");
 
     // Pre-create the topic (neither consumer nor producer falls back to the default topic; create first, then send).
-    let admin = MQClientInstance::new(&format!("rust-live-lat-admin-{stamp}"), vec![namesrv.to_string()]);
+    let admin = MQClientInstance::new(
+        &format!("rust-live-lat-admin-{stamp}"),
+        vec![namesrv.to_string()],
+    );
     if let Err(e) = admin.start().await {
         ck.check("A0 admin start", false, &e.to_string());
         return ck;
@@ -97,7 +117,11 @@ async fn run(namesrv: &str) -> Checker {
     let (broker_name, broker_addr) = match route.as_ref().and_then(broker_of) {
         Some(v) => v,
         None => {
-            ck.check("A0 default topic route fetchable", false, "no route of TBW102");
+            ck.check(
+                "A0 default topic route fetchable",
+                false,
+                "no route of TBW102",
+            );
             return ck;
         }
     };
@@ -143,7 +167,11 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
     let n = send_ok(&p1, &topic, 10, "off").await;
-    ck.check("S1 with the flag off all 10 sends succeed", n == 10, &format!("ok={n}"));
+    ck.check(
+        "S1 with the flag off all 10 sends succeed",
+        n == 10,
+        &format!("ok={n}"),
+    );
     ck.check(
         "S1 with the flag off the fault table records nothing",
         p1.fault_strategy()
@@ -175,7 +203,11 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
     let n = send_ok(&p2, &topic, 20, "on").await;
-    ck.check("S2 with the flag on all 20 sends succeed", n == 20, &format!("ok={n}"));
+    ck.check(
+        "S2 with the flag on all 20 sends succeed",
+        n == 20,
+        &format!("ok={n}"),
+    );
     let item = p2
         .fault_strategy()
         .latency_fault_tolerance()
@@ -189,7 +221,9 @@ async fn run(namesrv: &str) -> Checker {
         );
         ck.check(
             "S3 the healthy broker is still available",
-            p2.fault_strategy().latency_fault_tolerance().is_available(&broker_name)
+            p2.fault_strategy()
+                .latency_fault_tolerance()
+                .is_available(&broker_name)
                 && item.is_reachable(),
             "",
         );
@@ -202,15 +236,22 @@ async fn run(namesrv: &str) -> Checker {
 
     // ---------------- S4 injected isolation → degradation chain ----------------
     println!("\nS4 injected isolation: the available→reachable→plain round-robin degradation chain still sends");
-    p2.fault_strategy().update_fault_item(&broker_name, 99999, true, false);
+    p2.fault_strategy()
+        .update_fault_item(&broker_name, 99999, true, false);
     ck.check(
         "S4 after injection broker-a is unavailable",
-        !p2.fault_strategy().latency_fault_tolerance().is_available(&broker_name),
+        !p2.fault_strategy()
+            .latency_fault_tolerance()
+            .is_available(&broker_name),
         "",
     );
     let n = send_ok(&p2, &topic, 5, "iso").await;
     // Single broker: none of the three filters can pick one → fall back to plain round-robin and messages still go out (isolation does not lose the send capability).
-    ck.check("S4 under isolation the single broker's fallback round-robin still sends 5", n == 5, &format!("ok={n}"));
+    ck.check(
+        "S4 under isolation the single broker's fallback round-robin still sends 5",
+        n == 5,
+        &format!("ok={n}"),
+    );
 
     // ---------------- S5 recovery when isolation expires ----------------
     println!("\nS5 recovery when isolation expires (after remove, inject 2000ms)");
@@ -223,13 +264,24 @@ async fn run(namesrv: &str) -> Checker {
         "",
     );
     tokio::time::sleep(Duration::from_millis(2300)).await;
-    ck.check("S5 available again after expiry", tolerance.is_available(&broker_name), "");
+    ck.check(
+        "S5 available again after expiry",
+        tolerance.is_available(&broker_name),
+        "",
+    );
     let n = send_ok(&p2, &topic, 3, "after").await;
-    ck.check("S5 sending normal after recovery", n == 3, &format!("ok={n}"));
+    ck.check(
+        "S5 sending normal after recovery",
+        n == 3,
+        &format!("ok={n}"),
+    );
     p2.shutdown();
 
     // Clean up this topic (a failure does not change the verdict, notice only).
-    if let Err(e) = admin.delete_topic_in_broker(&broker_addr, &topic, 5000).await {
+    if let Err(e) = admin
+        .delete_topic_in_broker(&broker_addr, &topic, 5000)
+        .await
+    {
         println!("  [WARN] deleting topic {topic} failed: {e}");
     }
 

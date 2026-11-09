@@ -21,7 +21,12 @@ pub struct HandleV1 {
     pub message_id: String,
 }
 
-pub fn build_handle(topic: &str, broker_name: &str, timestamp_str: &str, message_id: &str) -> String {
+pub fn build_handle(
+    topic: &str,
+    broker_name: &str,
+    timestamp_str: &str,
+    message_id: &str,
+) -> String {
     let raw = [VERSION_1, topic, broker_name, timestamp_str, message_id].join(SEPARATOR);
     base64::engine::general_purpose::URL_SAFE.encode(raw.as_bytes())
 }

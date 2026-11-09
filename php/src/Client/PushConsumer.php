@@ -961,6 +961,16 @@ final class DefaultMQPushConsumer
         return $this->mqClient;
     }
 
+    /**
+     * Java DefaultMQPushConsumerImpl#viewMessage parity
+     * (DefaultMQPushConsumerImpl.java:1329): the MQAdminImpl single-leg path —
+     * offset msgId only, no uniq-key fallback at this layer.
+     */
+    public function viewMessage(string $topic, string $msgId): MessageExt
+    {
+        return $this->requireClient()->viewMessage($topic, $msgId);
+    }
+
     /** @return bool */
     public function isStarted(): bool
     {

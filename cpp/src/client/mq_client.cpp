@@ -1851,7 +1851,14 @@ std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
         for (MessageExt& m : decoded) {
             m.brokerName = bd.brokerName;
             if (uniqKey) {
-                if (m.msgId == key) messages.push_back(m);
+                // Java decodes query results as MessageClientExt, whose getMsgId()
+                // returns the UNIQ_KEY property (offset id only as fallback) — the
+                // client-visible id the hit is verified against. cpp's decoder keeps
+                // msgId = offset id even in client mode, so resolve the client-visible
+                // id here (csharp does the same swap inside its decoder).
+                std::string visible = m.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+                if (visible.empty()) visible = m.msgId;
+                if (visible == key) messages.push_back(m);
             } else {
                 std::string keys = m.getKeys();
                 if (!keys.empty()) {
@@ -1881,6 +1888,38 @@ std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
         messages.resize(static_cast<size_t>(maxNum));
     }
     return messages;
+}
+
+// Java MQAdminImpl#viewMessage: a single leg (see mq_client.h for the contract).
+MessageExt MQClientInstance::viewMessage(const std::string& topic, const std::string& msgId,
+                                         int32_t timeoutMillis) {
+    std::string ip;
+    int32_t port = 0;
+    int64_t offset = 0;
+    if (!decodeMessageId(msgId, ip, port, offset)) {
+        throw MQClientException("query message by id finished, but no message.",
+                                ResponseCode::NO_MESSAGE);
+    }
+    if (port <= 0 || port > 65535) {
+        throw MQClientException("not a valid offset msgId: " + msgId);
+    }
+    // The address is the store host:port the broker stamped into the offset
+    // msgId — a broker address, so the VIP-channel rewrite applies to it like
+    // to any other query request.
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["offset"] = std::to_string(offset);
+    RemotingCommand response =
+        invokeSync(vipAddr(ip + ":" + std::to_string(port)), RequestCode::VIEW_MESSAGE_BY_ID, ext,
+                   Bytes(), false, timeoutMillis);
+    if (response.body.empty()) {
+        throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
+    }
+    std::vector<MessageExt> msgs = decodeMessages(response.body, true);
+    if (msgs.empty()) {
+        throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
+    }
+    return msgs[0];
 }
 
 // ---------------------------------------------------------------- Heartbeat / unregister

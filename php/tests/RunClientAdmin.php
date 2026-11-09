@@ -126,9 +126,23 @@ final class FakeClient extends MQClientInstance
     /** @var list<string> */
     public array $routeRefreshCalls = [];
 
+    /** @var callable(RemotingCommand, string): ?RemotingCommand|null instance-level RPC script (the viewMessage leg runs HERE, on the client instance, not on the admin) */
+    public $rpcHandler = null;
+
+    /** @var list<array{addr: string, cmd: RemotingCommand}> */
+    public array $rpcRequests = [];
+
     public function __construct()
     {
         parent::__construct('admin-test-client', ['10.0.0.1:9876']);
+    }
+
+    protected function invokeSync(string $addr, RemotingCommand $request, ?int $timeoutMillis = null): RemotingCommand
+    {
+        $this->rpcRequests[] = ['addr' => $addr, 'cmd' => $request];
+        $h = $this->rpcHandler;
+        $resp = $h !== null ? $h($request, $addr) : null;
+        return $resp ?? RemotingCommand::createResponseCommand(ResponseCode::SUCCESS);
     }
 
     public function getBrokerClusterInfo(int $timeoutMillis = 10000): ClusterInfo
@@ -1706,31 +1720,29 @@ final class RunClientAdmin
         $admin14->queryMessageByKey('T', 'k2', 5);
         $this->checkSame(5, $this->client->queryMessageCalls[3]['maxNum'], 'queryMessageByKey maxNum pass-through');
 
-        // viewMessage: offset msgId direct lookup
+        // viewMessage: offset msgId direct lookup — the leg runs on the CLIENT
+        // instance (MQClientInstance::viewMessage), so the script sits there.
         $admin15 = $this->newAdmin();
         $target = new MessageExt(topic: 'T', body: 'vb');
         $msgId = '7f00000100002a9f0000000000000064';
-        $admin15->handler = fn(RemotingCommand $cmd) => $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($target));
+        $this->client->rpcHandler = fn() => $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($target));
         $got15 = $admin15->viewMessage('T', $msgId);
-        $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $this->lastCmd($admin15)->code, 'VIEW_MESSAGE_BY_ID=33');
-        $this->checkSame('127.0.0.1:10911', $this->lastAddr($admin15), 'viewMessage decodes the broker address from msgId (decodes the address directly, no route lookup)');
-        $this->checkSame($target->getBody(), $got15->getBody(), 'viewMessage hits the offset msgId');
+        $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $this->client->rpcRequests[0]['cmd']->code, 'VIEW_MESSAGE_BY_ID=33');
+        $this->checkSame('127.0.0.1:10911', $this->client->rpcRequests[0]['addr'], 'viewMessage decodes the broker address from msgId (decodes the address directly, no route lookup)');
+        $this->checkSame($target->getBody(), $got15?->getBody(), 'viewMessage hits the offset msgId');
 
-        // viewMessage: port=0 (uniqKey shape) → falls back to the uniq query
+        // viewMessage: port=0 (uniqKey shape) → the instance leg dies on decode → falls back to the uniq query
         $admin16 = $this->newAdmin();
-        $admin16->handler = fn() => $this->okResponse(null);
         $this->client->queryMessageResult = [$target];
         $got16 = $admin16->viewMessage('T', '7f0000010000000000000000000064');
         $this->checkSame($target, $got16, 'viewMessage uniq-key fallback hit');
         $this->checkSame('U', $this->client->queryMessageCalls[0]['indexType'] ?? null, 'fallback goes through the uniq query');
 
-        // viewMessage: all fail
+        // viewMessage: all fail → null (the Java-parity no-match answer, not an exception)
         $admin17 = $this->newAdmin();
-        $admin17->handler = fn() => $this->okResponse(null);
         $this->client->queryMessageResult = [];
-        $e17 = $this->capture(fn() => $admin17->viewMessage('T', '7f00000100002a9f0000000000000064'));
-        $this->check($e17 instanceof MQClientException && $e17->responseCode === ResponseCode::NO_MESSAGE, 'viewMessage all fail → NO_MESSAGE');
-        $this->check($e17 !== null && $e17->getPrevious() !== null, 'viewMessage keeps the by-id failure cause');
+        $got17 = $admin17->viewMessage('T', '7f00000100002a9f0000000000000064');
+        $this->checkSame(null, $got17, 'viewMessage all fail → null (Java returns null here)');
 
         // queryConsumeQueue
         $admin18 = $this->newAdmin();
@@ -1746,23 +1758,20 @@ final class RunClientAdmin
         );
         $this->checkSame(88, $got18->maxQueueIndex, '321 parses');
 
-        // consumeMessageDirectly: offset msgId full chain → viewMessage locates storeHost + 309 dispatch
+        // consumeMessageDirectly: offset msgId full chain → viewMessage (on the
+        // client instance) locates storeHost + 309 dispatch (admin layer)
         $admin19 = $this->newAdmin();
         $stored = new MessageExt(topic: 'T', body: 'vb');
         $stored->setStoreHost('10.0.0.9');
         $stored->storeHostPort = 10911;
-        $admin19->handler = function (RemotingCommand $cmd) use ($stored) {
-            if ($cmd->code === RequestCode::VIEW_MESSAGE_BY_ID) {
-                return $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($stored));
-            }
-            return $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
-        };
+        $this->client->rpcHandler = fn() => $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($stored));
+        $admin19->handler = fn() => $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
         $res19 = $admin19->consumeMessageDirectly('G1', 'cid-1', 'T', '7f00000100002a9f0000000000000064');
-        $byId = $admin19->requests[0]['cmd'];
-        $direct = $admin19->requests[1]['cmd'];
+        $byId = $this->client->rpcRequests[0]['cmd'];
+        $direct = $admin19->requests[0]['cmd'];
         $this->checkSame(RequestCode::VIEW_MESSAGE_BY_ID, $byId->code, '309 preceded by viewMessage to locate');
         $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $direct->code, 'CONSUME_MESSAGE_DIRECTLY=309');
-        $this->checkSame('10.0.0.9:10911', $admin19->requests[1]['addr'], '309 sent to the message storeHost');
+        $this->checkSame('10.0.0.9:10911', $admin19->requests[0]['addr'], '309 sent to the message storeHost');
         $this->checkSame(
             ['consumerGroup' => 'G1', 'clientId' => 'cid-1', 'msgId' => '7f00000100002a9f0000000000000064', 'topic' => 'T'],
             $direct->extFields,
@@ -1779,12 +1788,7 @@ final class RunClientAdmin
         $uniqMsg->setOffsetMsgId('7f00000100002a9f0000000000000065');
         // Hard-decoding a uniqKey-shaped msgId must fail → viewMessage falls back to the uniq query; the double answers from there
         $this->client->queryMessageResult = [$uniqMsg];
-        $admin20->handler = function (RemotingCommand $cmd) use ($uniqMsg) {
-            if ($cmd->code === RequestCode::VIEW_MESSAGE_BY_ID) {
-                return $this->okResponse(\RocketMQ\Common\MessageDecoder::encodeMessageExt($uniqMsg));
-            }
-            return $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
-        };
+        $admin20->handler = fn() => $this->okResponse((new ConsumeMessageDirectlyResult())->encode());
         $admin20->consumeMessageDirectly('G1', 'cid-1', 'T', 'uniq-abc');
         $this->checkSame(1, count($admin20->requests), '309 uniqKey hard-decode failure → no VIEW_MESSAGE_BY_ID sent');
         $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $admin20->requests[0]['cmd']->code, '309 uniqKey fallback goes direct');

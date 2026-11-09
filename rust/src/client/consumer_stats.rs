@@ -73,7 +73,10 @@ pub fn compute_stats_data(cs_list: &[CallSnapshot]) -> StatsSnapshot {
     compute_stats_data_pair(cs_list.first(), cs_list.last())
 }
 
-fn compute_stats_data_pair(first: Option<&CallSnapshot>, last: Option<&CallSnapshot>) -> StatsSnapshot {
+fn compute_stats_data_pair(
+    first: Option<&CallSnapshot>,
+    last: Option<&CallSnapshot>,
+) -> StatsSnapshot {
     let mut ss = StatsSnapshot::default();
     let (first, last) = match (first, last) {
         (Some(f), Some(l)) => (f, l),
@@ -159,11 +162,9 @@ impl StatsItem {
     pub fn sample_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
         if state.minute.is_empty() {
-            state.minute.push_back((
-                ts_ms - (SAMPLING_INTERVAL_SECONDS as i64) * 1000,
-                0,
-                0,
-            ));
+            state
+                .minute
+                .push_back((ts_ms - (SAMPLING_INTERVAL_SECONDS as i64) * 1000, 0, 0));
         }
         let point = (ts_ms, state.value, state.times);
         state.minute.push_back(point);
@@ -182,11 +183,9 @@ impl StatsItem {
     pub fn sample_hour_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
         if state.hour.is_empty() {
-            state.hour.push_back((
-                ts_ms - (HOUR_SAMPLING_INTERVAL_SECONDS as i64) * 1000,
-                0,
-                0,
-            ));
+            state
+                .hour
+                .push_back((ts_ms - (HOUR_SAMPLING_INTERVAL_SECONDS as i64) * 1000, 0, 0));
         }
         let point = (ts_ms, state.value, state.times);
         state.hour.push_back(point);
@@ -205,11 +204,9 @@ impl StatsItem {
     pub fn sample_day_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
         if state.day.is_empty() {
-            state.day.push_back((
-                ts_ms - (DAY_SAMPLING_INTERVAL_SECONDS as i64) * 1000,
-                0,
-                0,
-            ));
+            state
+                .day
+                .push_back((ts_ms - (DAY_SAMPLING_INTERVAL_SECONDS as i64) * 1000, 0, 0));
         }
         let point = (ts_ms, state.value, state.times);
         state.day.push_back(point);
@@ -531,7 +528,6 @@ impl ConsumerStatsManager {
         }
     }
 
-
     /// The stats key: `topic@group`; note **topic comes first**.
     pub fn key(topic: &str, group: &str) -> String {
         format!("{topic}@{group}")
@@ -620,7 +616,12 @@ impl ConsumerStatsManager {
         if let Some(item) = self.inner.sets.topic_and_group_consume_ok_tps.find(&key) {
             cs.consume_ok_tps = item.get_stats_data_in_minute().tps;
         }
-        if let Some(item) = self.inner.sets.topic_and_group_consume_failed_tps.find(&key) {
+        if let Some(item) = self
+            .inner
+            .sets
+            .topic_and_group_consume_failed_tps
+            .find(&key)
+        {
             cs.consume_failed_tps = item.get_stats_data_in_minute().tps;
             cs.consume_failed_msgs = item.get_stats_data_in_hour().sum;
         }
@@ -651,11 +652,7 @@ fn sample_round(inner: &Inner, rounds: u64) {
 ///
 /// It strongly references only `StopSignal` and weakly `Inner`: once the manager is dropped the task exits by itself,
 /// without holding the process hostage.
-async fn sample_loop(
-    inner: Weak<Inner>,
-    stop: Arc<StopSignal>,
-    sampling_interval: Duration,
-) {
+async fn sample_loop(inner: Weak<Inner>, stop: Arc<StopSignal>, sampling_interval: Duration) {
     let mut ticker = tokio::time::interval_at(
         tokio::time::Instant::now() + sampling_interval,
         sampling_interval,
@@ -798,7 +795,7 @@ mod tests {
         let it = StatsItem::new("PULL_TPS", "T@G");
         it.add_value(10, 1);
         it.sample_at(10_000); // first cumulative point
-        // The first sample seeds a zero point one period earlier.
+                              // The first sample seeds a zero point one period earlier.
         assert_eq!(it.minute_len(), 2);
         it.add_value(15, 1);
         it.sample_at(20_000); // second cumulative point
@@ -947,10 +944,7 @@ mod tests {
         assert_eq!(item.times(), 2);
 
         m.inc_pull_rt(GROUP, TOPIC, 25);
-        let rt = m
-            .topic_and_group_pull_rt()
-            .find(KEY)
-            .expect("pull_rt item");
+        let rt = m.topic_and_group_pull_rt().find(KEY).expect("pull_rt item");
         assert_eq!(rt.value(), 25);
         assert_eq!(rt.times(), 1);
     }
@@ -1089,10 +1083,7 @@ mod tests {
         for rounds in 1..=3 {
             sample_round(&m.inner, rounds);
         }
-        let it = m
-            .topic_and_group_pull_tps()
-            .find(KEY)
-            .expect("item");
+        let it = m.topic_and_group_pull_tps().find(KEY).expect("item");
         assert_eq!(it.minute_len(), 4);
         assert_eq!(it.hour_len(), 2);
         assert_eq!(it.day_len(), 0);
@@ -1214,11 +1205,13 @@ mod tests {
                 >= 1
         })
         .await;
-        let it = m
-            .topic_and_group_consume_ok_tps()
-            .find(KEY)
-            .expect("item");
-        assert!(it.minute_len() + 1 >= it.hour_len() * 2, "{} / {}", it.minute_len(), it.hour_len());
+        let it = m.topic_and_group_consume_ok_tps().find(KEY).expect("item");
+        assert!(
+            it.minute_len() + 1 >= it.hour_len() * 2,
+            "{} / {}",
+            it.minute_len(),
+            it.hour_len()
+        );
         m.shutdown();
     }
 
@@ -1232,8 +1225,13 @@ mod tests {
         wait_for(|| minute_points(&m) >= 1).await;
         drop(m);
         let outcome = tokio::time::timeout(Duration::from_secs(5), task).await;
-        assert!(outcome.is_ok(), "the sampling task did not exit after the manager was dropped");
-        outcome.expect("joined").expect("sampler exits without panic");
+        assert!(
+            outcome.is_ok(),
+            "the sampling task did not exit after the manager was dropped"
+        );
+        outcome
+            .expect("joined")
+            .expect("sampler exits without panic");
     }
 
     #[test]

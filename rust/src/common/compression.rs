@@ -202,7 +202,10 @@ mod tests {
     #[test]
     fn zlib_round_trip_and_external_fixture() {
         let compressed = zlib_compress(&payload(), 5).unwrap();
-        assert!(compressed.len() < payload().len(), "repeated plaintext should compress");
+        assert!(
+            compressed.len() < payload().len(),
+            "repeated plaintext should compress"
+        );
         assert_eq!(compressed[0], 0x78, "first byte of the zlib stream is CMF");
         // Interop ground truth: the 47 bytes produced by external zlib (level 5) must decompress.
         // The reverse does not hold -- the exact deflate bytes are implementation-defined (this crate's

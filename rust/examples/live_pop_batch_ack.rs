@@ -131,7 +131,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -201,7 +204,10 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
 }
 
 /// The one broker of this cluster, found through the TBW102 default-topic route.
-async fn cluster_broker(client: &RemotingClient, namesrv: &str) -> Result<(String, String), String> {
+async fn cluster_broker(
+    client: &RemotingClient,
+    namesrv: &str,
+) -> Result<(String, String), String> {
     let resp = route_response(client, namesrv, MixAll::DEFAULT_TOPIC).await?;
     if resp.code != response_code::SUCCESS {
         return Err(format!(
@@ -266,8 +272,7 @@ fn parse_ck(raw: &str, body: &str) -> Result<Ck, String> {
         invisible_time: extra_info::get_invisible_time(&segments)
             .map_err(|e| format!("{raw:?}: {e}"))?,
         retry: extra_info::get_retry(&segments).map_err(|e| format!("{raw:?}: {e}"))?,
-        broker_name: extra_info::get_broker_name(&segments)
-            .map_err(|e| format!("{raw:?}: {e}"))?,
+        broker_name: extra_info::get_broker_name(&segments).map_err(|e| format!("{raw:?}: {e}"))?,
         queue_id: extra_info::get_queue_id(&segments).map_err(|e| format!("{raw:?}: {e}"))?,
         revive_qid: extra_info::get_revive_qid(&segments).map_err(|e| format!("{raw:?}: {e}"))?,
     })
@@ -310,7 +315,10 @@ fn sightings_to_cks(sightings: &[Sighting], problems: &mut Vec<String>) -> Vec<C
 
 /// The merge key of a checkpoint: entries of one key collapse into one batch-ack entry.
 fn merge_key(ck: &Ck) -> String {
-    format!("{}@{}@{}@{}", ck.retry, ck.queue_id, ck.ck_offset, ck.pop_time)
+    format!(
+        "{}@{}@{}@{}",
+        ck.retry, ck.queue_id, ck.ck_offset, ck.pop_time
+    )
 }
 
 /// The same key read off a built entry.
@@ -333,7 +341,9 @@ fn acked_offsets(ack: &BatchAck) -> Vec<i64> {
 }
 
 fn sorted_unique(values: &[String]) -> Vec<String> {
-    BTreeSet::from_iter(values.iter().cloned()).into_iter().collect()
+    BTreeSet::from_iter(values.iter().cloned())
+        .into_iter()
+        .collect()
 }
 
 /// Order-insensitive comparison of two offset sets, with duplicates on either side reported as
@@ -457,7 +467,10 @@ impl Harness {
             ));
         }
         if !self.wait_route(topic, ROUTE_BUDGET).await {
-            return Err(format!("the route of {topic} never reached {srv}", srv = self.namesrv));
+            return Err(format!(
+                "the route of {topic} never reached {srv}",
+                srv = self.namesrv
+            ));
         }
         self.instance.register_topic_in_use(topic);
 
@@ -536,15 +549,16 @@ impl Harness {
     /// A route the nameserver can serve for this topic: queueDatas plus the broker behind them.
     async fn route_exists(&self, topic: &str) -> bool {
         match route_response(&self.client, &self.namesrv, topic).await {
-            Ok(resp) if resp.code == response_code::SUCCESS => {
-                match decode_route(&resp, topic) {
-                    Ok(route) => {
-                        !route.queue_datas.is_empty()
-                            && route.broker_datas.iter().any(|b| b.broker_name == self.broker_name)
-                    }
-                    Err(_) => false,
+            Ok(resp) if resp.code == response_code::SUCCESS => match decode_route(&resp, topic) {
+                Ok(route) => {
+                    !route.queue_datas.is_empty()
+                        && route
+                            .broker_datas
+                            .iter()
+                            .any(|b| b.broker_name == self.broker_name)
                 }
-            }
+                Err(_) => false,
+            },
             _ => false,
         }
     }
@@ -553,7 +567,13 @@ impl Harness {
         wait_async(|| async { self.route_exists(topic).await }, budget).await
     }
 
-    async fn pop(&self, group: &str, topic: &str, queue_id: i32, max_msgs: i32) -> Result<PopResult, String> {
+    async fn pop(
+        &self,
+        group: &str,
+        topic: &str,
+        queue_id: i32,
+        max_msgs: i32,
+    ) -> Result<PopResult, String> {
         self.instance
             .pop_message(
                 group,
@@ -654,11 +674,11 @@ fn build_body(
     raws: &[String],
 ) -> Result<Built, String> {
     let refs: Vec<&str> = raws.iter().map(|r| r.as_str()).collect();
-    let body =
-        BatchAckMessageRequestBody::from_extra_info_list(group, topic, &refs).map_err(|e| e.to_string())?;
+    let body = BatchAckMessageRequestBody::from_extra_info_list(group, topic, &refs)
+        .map_err(|e| e.to_string())?;
     let encoded = body.encode();
-    let json: Value =
-        serde_json::from_slice(&encoded).map_err(|e| format!("the encoded body is not JSON: {e}"))?;
+    let json: Value = serde_json::from_slice(&encoded)
+        .map_err(|e| format!("the encoded body is not JSON: {e}"))?;
     let round = BatchAckMessageRequestBody::decode(&encoded);
     ck.check(
         &format!("{name} the body round-trips through the wire codec"),
@@ -750,7 +770,11 @@ async fn leg_one_request_whole_batch(h: &Harness, stamp: &str, ck: &mut Checker)
         uniform,
         &format!(
             "ckOffsets={ck_offsets:?} broker={:?} queueId={} retry={} invisible={} reviveQid={}",
-            cks[0].broker_name, cks[0].queue_id, cks[0].retry, cks[0].invisible_time, cks[0].revive_qid
+            cks[0].broker_name,
+            cks[0].queue_id,
+            cks[0].retry,
+            cks[0].invisible_time,
+            cks[0].revive_qid
         ),
     );
 
@@ -765,7 +789,10 @@ async fn leg_one_request_whole_batch(h: &Harness, stamp: &str, ck: &mut Checker)
     };
     let body = &built.body;
     if body.acks.is_empty() {
-        ck.abort("L1 the batch body produced at least one entry", "no entries at all");
+        ck.abort(
+            "L1 the batch body produced at least one entry",
+            "no entries at all",
+        );
         return;
     }
 
@@ -774,7 +801,10 @@ async fn leg_one_request_whole_batch(h: &Harness, stamp: &str, ck: &mut Checker)
         body.acks.len() == 1 && same_int_set(&acked_offsets(&body.acks[0]), &want_offsets),
         &format!(
             "acked={:?} want={:?}",
-            body.acks.iter().map(acked_offsets).collect::<Vec<Vec<i64>>>(),
+            body.acks
+                .iter()
+                .map(acked_offsets)
+                .collect::<Vec<Vec<i64>>>(),
             want_offsets
         ),
     );
@@ -782,7 +812,11 @@ async fn leg_one_request_whole_batch(h: &Harness, stamp: &str, ck: &mut Checker)
         "L1 the body has exactly one entry per merge key",
         body.acks.len() == keys.len()
             && sorted_unique(&body.acks.iter().map(merge_key_of).collect::<Vec<String>>()) == keys,
-        &format!("{} entries for {} keys {keys:?}", body.acks.len(), keys.len()),
+        &format!(
+            "{} entries for {} keys {keys:?}",
+            body.acks.len(),
+            keys.len()
+        ),
     );
 
     let ack = &body.acks[0];
@@ -950,12 +984,7 @@ async fn leg_one_checkpoint_left_out(h: &Harness, stamp: &str, ck: &mut Checker)
             return;
         }
     };
-    let partial_offsets: Vec<i64> = built
-        .body
-        .acks
-        .iter()
-        .flat_map(acked_offsets)
-        .collect();
+    let partial_offsets: Vec<i64> = built.body.acks.iter().flat_map(acked_offsets).collect();
     ck.check(
         "L2 the body acknowledges 5 of the 6 offsets and not the dropped one",
         built.body.acks.len() == 1
@@ -985,8 +1014,13 @@ async fn leg_one_checkpoint_left_out(h: &Harness, stamp: &str, ck: &mut Checker)
     let sighted = eyes.bodies();
     ck.check(
         "L2 the five acked messages stayed gone while the dropped one came back",
-        sighted.len() == 1 && sighted[0] == dropped.body && !sighted.iter().any(|b| kept_bodies.contains(b)),
-        &format!("sighted={sighted:?} kept={kept_bodies:?} dropped={}", dropped.body),
+        sighted.len() == 1
+            && sighted[0] == dropped.body
+            && !sighted.iter().any(|b| kept_bodies.contains(b)),
+        &format!(
+            "sighted={sighted:?} kept={kept_bodies:?} dropped={}",
+            dropped.body
+        ),
     );
     if !brought_back {
         return;
@@ -997,19 +1031,26 @@ async fn leg_one_checkpoint_left_out(h: &Harness, stamp: &str, ck: &mut Checker)
     ck.check(
         "L2 the revived checkpoints are parsable",
         revive_problems.is_empty() && !revived.is_empty(),
-        &format!("{} parsed, problems={}", revived.len(), revive_problems.join("; ")),
+        &format!(
+            "{} parsed, problems={}",
+            revived.len(),
+            revive_problems.join("; ")
+        ),
     );
     if revived.is_empty() {
         return;
     }
     ck.check(
         "L2 the revived checkpoints carry the retry marker (they live in the retry queue)",
-        revived
-            .iter()
-            .all(|c| c.retry == extra_info::RETRY_TOPIC),
+        revived.iter().all(|c| c.retry == extra_info::RETRY_TOPIC),
         &format!(
             "markers={:?} offsets={:?}",
-            sorted_unique(&revived.iter().map(|c| c.retry.clone()).collect::<Vec<String>>()),
+            sorted_unique(
+                &revived
+                    .iter()
+                    .map(|c| c.retry.clone())
+                    .collect::<Vec<String>>()
+            ),
             revived.iter().map(|c| c.queue_offset).collect::<Vec<i64>>()
         ),
     );
@@ -1032,9 +1073,7 @@ async fn leg_one_checkpoint_left_out(h: &Harness, stamp: &str, ck: &mut Checker)
     };
     let marker_ok = !retry_built.body.acks.is_empty()
         && retry_built.body.acks.iter().all(|a| {
-            a.topic == topic
-                && a.retry == extra_info::RETRY_TOPIC
-                && a.consumer_group == group
+            a.topic == topic && a.retry == extra_info::RETRY_TOPIC && a.consumer_group == group
         });
     ck.check(
         "L2 the retry body keeps the business topic and carries the retry marker on every entry",
@@ -1105,7 +1144,11 @@ async fn leg_two_rounds_one_request(h: &Harness, stamp: &str, ck: &mut Checker) 
         let popped = match h.pop(&group, &topic, 0, 2).await {
             Ok(popped) => popped,
             Err(e) => {
-                ck.check(&format!("L3 POP round {round} answers 2 messages"), false, &e);
+                ck.check(
+                    &format!("L3 POP round {round} answers 2 messages"),
+                    false,
+                    &e,
+                );
                 return;
             }
         };
@@ -1118,10 +1161,7 @@ async fn leg_two_rounds_one_request(h: &Harness, stamp: &str, ck: &mut Checker) 
         ck.check(
             &format!("L3 POP round {round} answers 2 messages with parsable checkpoints"),
             ok,
-            &format!(
-                "{popped} problems={}",
-                problems.join("; ")
-            ),
+            &format!("{popped} problems={}", problems.join("; ")),
         );
         if !ok {
             return;
@@ -1139,7 +1179,8 @@ async fn leg_two_rounds_one_request(h: &Harness, stamp: &str, ck: &mut Checker) 
                 .map(|o| o.to_string())
                 .collect::<Vec<String>>(),
         )
-        .len() == 4
+        .len()
+            == 4
             && flat.iter().all(|c| c.queue_id == 0),
         &format!("offsets={offsets:?}"),
     );
@@ -1166,7 +1207,12 @@ async fn leg_two_rounds_one_request(h: &Harness, stamp: &str, ck: &mut Checker) 
         &format!(
             "entries={} each={:?}",
             built.body.acks.len(),
-            built.body.acks.iter().map(acked_offsets).collect::<Vec<Vec<i64>>>()
+            built
+                .body
+                .acks
+                .iter()
+                .map(acked_offsets)
+                .collect::<Vec<Vec<i64>>>()
         ),
     );
 
@@ -1195,7 +1241,11 @@ async fn run(namesrv: &str) -> Checker {
     println!("   namesrv        = {namesrv}");
     println!("   stamp          = {run}");
     println!("   invisibleTime  = {INVISIBLE_MS} ms");
-    println!("   silence window = {} s, revive tail = {} s", SILENCE.as_secs(), REVIVE_TAIL.as_secs());
+    println!(
+        "   silence window = {} s, revive tail = {} s",
+        SILENCE.as_secs(),
+        REVIVE_TAIL.as_secs()
+    );
 
     let client = RemotingClient::new();
     let mut ck = Checker::new();
@@ -1241,7 +1291,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

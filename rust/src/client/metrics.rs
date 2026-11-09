@@ -149,7 +149,9 @@ struct MetricsState {
 
 impl Clone for ClientMetrics {
     fn clone(&self) -> Self {
-        ClientMetrics { inner: Mutex::new(self.locked()) }
+        ClientMetrics {
+            inner: Mutex::new(self.locked()),
+        }
     }
 }
 
@@ -214,8 +216,14 @@ impl ClientMetrics {
         let state = self.locked();
         let (send_count, send_failure_count, send_rt_sum, send_rt_max, send_rt_min, send_rt_avg) =
             state.send.parts();
-        let (consume_count, consume_failure_count, consume_rt_sum, consume_rt_max,
-             consume_rt_min, consume_rt_avg) = state.consume.parts();
+        let (
+            consume_count,
+            consume_failure_count,
+            consume_rt_sum,
+            consume_rt_max,
+            consume_rt_min,
+            consume_rt_avg,
+        ) = state.consume.parts();
         MetricsSnapshot {
             send_count,
             send_failure_count,
@@ -240,7 +248,11 @@ mod tests {
     /// Equivalent implementation of the public path driven with an injected clock (`record_*` only takes now_ms from the wall clock).
     fn record(metrics: &ClientMetrics, consume: bool, failed: bool, start_ms: f64, now_ms: f64) {
         let mut state = metrics.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let side = if consume { &mut state.consume } else { &mut state.send };
+        let side = if consume {
+            &mut state.consume
+        } else {
+            &mut state.send
+        };
         side.record(failed, now_ms - start_ms);
     }
 
@@ -300,7 +312,10 @@ mod tests {
         let metrics = ClientMetrics::new();
         let before = metrics.record_send_start();
         let after = metrics.record_consume_start();
-        assert!(before > 1_600_000_000_000.0, "millisecond timestamp magnitude: {before}");
+        assert!(
+            before > 1_600_000_000_000.0,
+            "millisecond timestamp magnitude: {before}"
+        );
         assert!(after >= before);
         // Neither start hook books anything
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());

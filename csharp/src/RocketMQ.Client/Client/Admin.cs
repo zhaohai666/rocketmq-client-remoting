@@ -1555,8 +1555,8 @@ public sealed class DefaultMQAdminExt
             topic, key, maxNum, begin, end, MessageConst.IndexKeyType, false);
 
     /// <summary>
-    /// Returns false when not hit (note: with the default file index, uniqKey queries need the
-    /// RocksDB index).
+    /// Returns false when not hit. The U-index query walks the broker's commitlog
+    /// directly (UNIQUE index type), so it hits on the default file index too.
     /// </summary>
     public bool QueryMessageByUniqKey(string topic, string uniqKey, out MessageExt outMsg)
     {
@@ -1580,42 +1580,24 @@ public sealed class DefaultMQAdminExt
             topic, key, maxNum, 0, now + 3600L * 1000, MessageConst.IndexKeyType, false);
     }
 
-    public MessageExt ViewMessage(string topic, string msgId)
+    /// <summary>
+    /// Java DefaultMQAdminExtImpl#viewMessage parity
+    /// (DefaultMQAdminExtImpl.java:578): try the offset-msgId leg first, and
+    /// when it fails for any reason (the msgId "maybe created by new client")
+    /// fall back to the uniq-key query across brokers. When neither leg
+    /// matches, Java returns null here instead of raising — so does this
+    /// method. (The single-leg core the producer / push / pull facades share
+    /// is MQClientInstance.ViewMessage.)
+    /// </summary>
+    public MessageExt? ViewMessage(string topic, string msgId)
     {
-        Exception? byIdError;
         try
         {
-            if (!MessageDecoder.DecodeMessageId(msgId, out string ip, out int port, out long offset)
-                || port <= 0 || port > ushort.MaxValue)
-            {
-                throw new MQClientException("not a valid offset msgId: " + msgId,
-                    ResponseCode.NoMessage);
-            }
-
-            PropertyMap ext = new()
-            {
-                ["topic"] = topic,
-                ["offset"] = I64Str(offset),
-            };
-            RemotingCommand response = RequireClient().InvokeSync(
-                AddrForRpc(ip + ":" + port.ToString(CultureInfo.InvariantCulture)),
-                RequestCode.ViewMessageById, ext, null, false, _timeoutMillis);
-            if (response.Body.Length == 0)
-            {
-                throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
-            }
-
-            List<MessageExt> msgs = MessageDecoder.DecodeMessages(response.Body, true);
-            if (msgs.Count == 0)
-            {
-                throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
-            }
-
-            return msgs[0];
+            return RequireClient().ViewMessage(topic, msgId, _timeoutMillis);
         }
-        catch (Exception e)
+        catch (Exception)
         {
-            byIdError = e;
+            // The offset-msgId leg failed — the uniq-key leg decides.
         }
 
         if (QueryMessageByUniqKey(topic, msgId, out MessageExt found))
@@ -1623,15 +1605,20 @@ public sealed class DefaultMQAdminExt
             return found;
         }
 
-        throw new MQClientException(
-            "viewMessage failed: neither offset msgId nor uniq key matched message " + msgId
-            + " of " + topic, byIdError, ResponseCode.NoMessage);
+        return null;
     }
 
     public ConsumeMessageDirectlyResult ConsumeMessageDirectly(string consumerGroup, string clientId,
         string topic, string msgId)
     {
-        MessageExt msg = ViewMessage(topic, msgId);
+        MessageExt? msg = ViewMessage(topic, msgId);
+        // Java dereferences the viewMessage null unguarded here (a latent NPE);
+        // fail with a clear client error instead.
+        if (msg is null)
+        {
+            throw new MQClientException("message " + msgId + " of " + topic + " not found");
+        }
+
         string outMsgId = msgId;
         if (msg.Properties.TryGetValue(MessageConst.PropertyUniqClientMessageIdKeyidx, out string? uniq)
             && !string.IsNullOrEmpty(uniq)

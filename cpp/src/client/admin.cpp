@@ -1621,41 +1621,20 @@ std::vector<MessageExt> DefaultMQAdminExt::queryMessageByKey(const std::string& 
                                                   MessageConst::INDEX_KEY_TYPE, false);
 }
 
-MessageExt DefaultMQAdminExt::viewMessage(const std::string& topic, const std::string& msgId) {
-    std::string byIdError;
+// Java DefaultMQAdminExtImpl#viewMessage: leg-1 failure (any) falls back to the
+// uniq-key query; neither leg matching returns nullopt (see admin.h).
+std::optional<MessageExt> DefaultMQAdminExt::viewMessage(const std::string& topic,
+                                                         const std::string& msgId) {
     try {
-        std::string ip;
-        int32_t port = 0;
-        int64_t offset = 0;
-        if (!decodeMessageId(msgId, ip, port, offset) || port <= 0 || port > 65535) {
-            throw MQClientException("not a valid offset msgId: " + msgId,
-                                    ResponseCode::NO_MESSAGE);
-        }
-        std::string addr = ip + ":" + std::to_string(port);
-        PropertyMap ext;
-        ext["topic"] = topic;
-        ext["offset"] = i64str(offset);
-        RemotingCommand response = requireClient().invokeSync(
-            vipAddr(addr), RequestCode::VIEW_MESSAGE_BY_ID, ext, Bytes(), false, timeoutMillis_);
-        if (response.body.empty()) {
-            throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
-        }
-        std::vector<MessageExt> msgs = decodeMessages(response.body, true);
-        if (msgs.empty()) {
-            throw MQBrokerException(ResponseCode::NO_MESSAGE, "message not found: " + msgId);
-        }
-        return msgs[0];
-    } catch (const std::exception& e) {
-        byIdError = e.what();
+        return requireClient().viewMessage(topic, msgId, timeoutMillis_);
+    } catch (const std::exception&) {
+        // The offset-msgId leg failed — the uniq-key leg decides.
     }
-
     MessageExt found;
     if (queryMessageByUniqKey(topic, msgId, found)) {
         return found;
     }
-    throw MQClientException(
-        "viewMessage failed: neither offset msgId nor uniq key matched message " + msgId
-        + " of " + topic + ", last error: " + byIdError, ResponseCode::NO_MESSAGE);
+    return std::nullopt;
 }
 
 QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(
@@ -1714,7 +1693,14 @@ ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
 ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
     const std::string& consumerGroup, const std::string& clientId, const std::string& topic,
     const std::string& msgId) {
-    MessageExt msg = viewMessage(topic, msgId);
+    std::optional<MessageExt> found = viewMessage(topic, msgId);
+    // Java dereferences the viewMessage null unguarded here (a latent NPE);
+    // fail with a clear client error instead.
+    if (!found.has_value()) {
+        throw MQClientException("message " + msgId + " of " + topic + " not found",
+                                ResponseCode::NO_MESSAGE);
+    }
+    MessageExt msg = *found;
     std::string outMsgId = msgId;
     if (!msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).empty()
         && !msg.getOffsetMsgId().empty()) {

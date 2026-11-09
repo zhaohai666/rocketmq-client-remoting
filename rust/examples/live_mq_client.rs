@@ -90,7 +90,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -184,7 +187,11 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
         ));
     }
     let route = decode_route(&resp, "TBW102")?;
-    let broker_addr = match route.broker_datas.first().and_then(|b| b.select_broker_addr()) {
+    let broker_addr = match route
+        .broker_datas
+        .first()
+        .and_then(|b| b.select_broker_addr())
+    {
         Some(a) => a,
         None => return Err("default route has no usable broker address".to_string()),
     };
@@ -432,7 +439,12 @@ impl RegisteredConsumer for StubConsumer {
     ) -> std::result::Result<ConsumeMessageDirectlyResult, Error> {
         let result = ConsumeMessageDirectlyResult {
             consume_result: Some(
-                if msg.body.is_some() { "SUCCESS" } else { "FAILED" }.to_string(),
+                if msg.body.is_some() {
+                    "SUCCESS"
+                } else {
+                    "FAILED"
+                }
+                .to_string(),
             ),
             ..Default::default()
         };
@@ -468,8 +480,13 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     );
     ck.check(
         "M1 the handle carries its clientId and the namesrv list it was built with",
-        instance.client_id() == client_id && instance.name_server_addrs() == vec![namesrv.to_string()],
-        &format!("{} / {:?}", instance.client_id(), instance.name_server_addrs()),
+        instance.client_id() == client_id
+            && instance.name_server_addrs() == vec![namesrv.to_string()],
+        &format!(
+            "{} / {:?}",
+            instance.client_id(),
+            instance.name_server_addrs()
+        ),
     );
 
     let reused = MQClientInstance::create_mq_client_instance(
@@ -549,7 +566,10 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     let fresh_started = fresh.start().await.is_ok();
     ck.check(
         "M1 a second clientId really is a second instance",
-        fresh_started && second.client_id() == other_id && fresh.is_started() && !second.is_started(),
+        fresh_started
+            && second.client_id() == other_id
+            && fresh.is_started()
+            && !second.is_started(),
         &format!(
             "id={} expected={other_id} freshStarted={} secondStarted={}",
             second.client_id(),
@@ -619,7 +639,9 @@ async fn m2_route_and_publish(
     );
     ck.check(
         "M2 get_route_of_all_brokers lists every broker of every cached route",
-        instance.get_route_of_all_brokers().contains(&broker_addr.to_string()),
+        instance
+            .get_route_of_all_brokers()
+            .contains(&broker_addr.to_string()),
         &format!("{:?}", instance.get_route_of_all_brokers()),
     );
 
@@ -639,7 +661,7 @@ async fn m2_route_and_publish(
         "M2 to_dict keeps the publish-info shape (orderTopic + messageQueueList only)",
         serde_json::to_string(&publish.to_dict())
             .unwrap_or_default()
-            .starts_with(r#"{"orderTopic":false,"messageQueueList":[{"topic":"#,),
+            .starts_with(r#"{"orderTopic":false,"messageQueueList":[{"topic":"#),
         &format!("{:?}", publish.to_dict()),
     );
 
@@ -790,8 +812,8 @@ async fn m3_send_and_pull(
             .as_ref()
             .map(|q| q.queue_id == mq.queue_id && q.broker_name == broker_name && q.topic == topic)
             .unwrap_or(false);
-        let region_ok = result.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID)
-            && result.trace_on;
+        let region_ok =
+            result.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID) && result.trace_on;
         ck.check(
             &format!("M3 send #{i} returns fully-shaped SendResult fields"),
             result.status == SendStatus::SendOk && ids_ok && queue_ok && region_ok,
@@ -802,9 +824,14 @@ async fn m3_send_and_pull(
     let mut bare = build_message(topic, b"needs-uniq-key", "", "mqKeyBare");
     ck.check(
         "M3 the caller only sets KEYS; UNIQ_KEY is still absent before send",
-        !bare.properties.contains_key(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+        !bare
+            .properties
+            .contains_key(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
             && bare.properties.get(PROPERTY_KEYS) == Some("mqKeyBare"),
-        &format!("{:?}", bare.properties.get(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)),
+        &format!(
+            "{:?}",
+            bare.properties.get(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+        ),
     );
     let bare_mq = MessageQueue::new(topic, broker_name, 0);
     let bare_result = send_one(instance, producer_group, &mut bare, &bare_mq).await?;
@@ -818,7 +845,10 @@ async fn m3_send_and_pull(
         stamped.len() > 30 && bare_result.msg_id.as_deref() == Some(stamped.as_str()),
         &format!("stamped={stamped} msgId={:?}", bare_result.msg_id),
     );
-    per_queue.entry(0).or_default().push("needs-uniq-key".to_string());
+    per_queue
+        .entry(0)
+        .or_default()
+        .push("needs-uniq-key".to_string());
 
     // ---- Batch message: one write; the broker's batchCQ gives each sub-message contiguous logical offsets
     let batch_bodies: Vec<String> = (0..3).map(|i| format!("batch-{i}")).collect();
@@ -846,9 +876,14 @@ async fn m3_send_and_pull(
         .await;
     match batch_result {
         Ok(result) => {
-            let mut pulled =
-                pull_from(instance, consumer_group, &batch_mq, result.queue_offset, broker_addr)
-                    .await?;
+            let mut pulled = pull_from(
+                instance,
+                consumer_group,
+                &batch_mq,
+                result.queue_offset,
+                broker_addr,
+            )
+            .await?;
             // The batchCQ's N sub-messages are written into the consumeQueue asynchronously by the broker's distribute thread,
             // so a pull right after the send may come back empty -- keep pulling until something lands (up to ~4s).
             for _ in 0..20 {
@@ -865,7 +900,11 @@ async fn m3_send_and_pull(
                 )
                 .await?;
             }
-            let offsets: Vec<i64> = pulled.msg_found_list.iter().map(|m| m.queue_offset).collect();
+            let offsets: Vec<i64> = pulled
+                .msg_found_list
+                .iter()
+                .map(|m| m.queue_offset)
+                .collect();
             let expected_offsets: Vec<i64> = (0..batch_bodies.len() as i64)
                 .map(|k| result.queue_offset + k)
                 .collect();
@@ -914,7 +953,9 @@ async fn m3_send_and_pull(
             let pulled = pull_from(instance, consumer_group, &oneway_mq, 0, broker_addr)
                 .await
                 .unwrap_or_default();
-            bodies(&pulled.msg_found_list).iter().any(|b| b == &oneway_body)
+            bodies(&pulled.msg_found_list)
+                .iter()
+                .any(|b| b == &oneway_body)
         },
         Duration::from_secs(15),
     )
@@ -935,7 +976,10 @@ async fn m3_send_and_pull(
         let missing: Vec<&String> = expected.iter().filter(|b| !got.contains(b)).collect();
         if pulled.status != PullStatus::Found || !missing.is_empty() {
             all_ok = false;
-            detail = format!("queue {queue_id}: status={:?} missing={missing:?}", pulled.status);
+            detail = format!(
+                "queue {queue_id}: status={:?} missing={missing:?}",
+                pulled.status
+            );
             break;
         }
         // The broker-side min/max must be consistent with the message count (M4 depends on it too).
@@ -961,14 +1005,20 @@ async fn m3_send_and_pull(
     );
     ck.check(
         "M3 pull stamps brokerName/queueId onto every decoded message",
-        pull_from(instance, consumer_group, &MessageQueue::new(topic, broker_name, 0), 0, broker_addr)
-            .await
-            .map(|r| {
-                r.msg_found_list
-                    .iter()
-                    .all(|m| m.broker_name.as_deref() == Some(broker_name) && m.queue_id == 0)
-            })
-            .unwrap_or(false),
+        pull_from(
+            instance,
+            consumer_group,
+            &MessageQueue::new(topic, broker_name, 0),
+            0,
+            broker_addr,
+        )
+        .await
+        .map(|r| {
+            r.msg_found_list
+                .iter()
+                .all(|m| m.broker_name.as_deref() == Some(broker_name) && m.queue_id == 0)
+        })
+        .unwrap_or(false),
         "stamping missing",
     );
 
@@ -984,7 +1034,10 @@ async fn m3_send_and_pull(
         empty.status == PullStatus::NoNewMsg
             && empty.msg_found_list.is_empty()
             && empty.next_begin_offset == max_offset,
-        &format!("status={:?} next={} max={}", empty.status, empty.next_begin_offset, max_offset),
+        &format!(
+            "status={:?} next={} max={}",
+            empty.status, empty.next_begin_offset, max_offset
+        ),
     );
 
     let moved = instance
@@ -1021,7 +1074,10 @@ async fn m3_send_and_pull(
     ck.check(
         "M3 an out-of-range offset maps PULL_OFFSET_MOVED to OFFSET_ILLEGAL with a fix-up offset",
         moved.status == PullStatus::OffsetIllegal && moved.next_begin_offset >= max_offset,
-        &format!("status={:?} next={} max={}", moved.status, moved.next_begin_offset, max_offset),
+        &format!(
+            "status={:?} next={} max={}",
+            moved.status, moved.next_begin_offset, max_offset
+        ),
     );
     Ok(())
 }
@@ -1056,7 +1112,12 @@ async fn m4_offsets(
         .await
         .map_err(|e| format!("search_offset_by_timestamp(past) failed: {e}"))?;
     let future = instance
-        .search_offset_by_timestamp(&mq, current_time_millis() + 600_000, 5000, Some(broker_addr))
+        .search_offset_by_timestamp(
+            &mq,
+            current_time_millis() + 600_000,
+            5000,
+            Some(broker_addr),
+        )
         .await
         .map_err(|e| format!("search_offset_by_timestamp(future) failed: {e}"))?;
     ck.check(
@@ -1111,7 +1172,10 @@ async fn m5_heartbeat(
     ck: &mut Checker,
 ) -> Live {
     let stub = StubConsumer::new(instance.client_id(), consumer_group, topic, broker_name);
-    instance.register_consumer(consumer_group, Arc::clone(&stub) as Arc<dyn RegisteredConsumer>);
+    instance.register_consumer(
+        consumer_group,
+        Arc::clone(&stub) as Arc<dyn RegisteredConsumer>,
+    );
     ck.check(
         "M5 find_consumer returns the same registration",
         instance
@@ -1119,7 +1183,12 @@ async fn m5_heartbeat(
             .map(|c| c.consumer_group())
             .as_deref()
             == Some(consumer_group),
-        &format!("{:?}", instance.find_consumer(consumer_group).map(|c| c.client_id())),
+        &format!(
+            "{:?}",
+            instance
+                .find_consumer(consumer_group)
+                .map(|c| c.client_id())
+        ),
     );
 
     let heartbeat = instance.prepare_heartbeat_data();
@@ -1190,10 +1259,14 @@ async fn m5_heartbeat(
         .map_err(|e| format!("get_consumer_list_by_group failed: {e}"))?;
     ck.check(
         "M5 get_consumer_list_by_group reads the same registry back",
-        via_instance.consumer_id_list.contains(&instance.client_id().to_string()),
+        via_instance
+            .consumer_id_list
+            .contains(&instance.client_id().to_string()),
         &format!("{:?}", via_instance.consumer_id_list),
     );
-    let ids = instance.get_consumer_id_list_by_group(topic, consumer_group, 5000).await;
+    let ids = instance
+        .get_consumer_id_list_by_group(topic, consumer_group, 5000)
+        .await;
     ck.check(
         "M5 get_consumer_id_list_by_group resolves the broker through the topic route",
         ids.as_ref()
@@ -1217,7 +1290,10 @@ async fn m5_heartbeat(
 
     instance.unregister_consumer(consumer_group);
     let dropped = instance.find_consumer(consumer_group).is_none();
-    instance.register_consumer(consumer_group, Arc::clone(&stub) as Arc<dyn RegisteredConsumer>);
+    instance.register_consumer(
+        consumer_group,
+        Arc::clone(&stub) as Arc<dyn RegisteredConsumer>,
+    );
     let back = instance.find_consumer(consumer_group).is_some();
     ck.check(
         "M5 unregister_consumer drops it and register_consumer puts it back",
@@ -1355,7 +1431,9 @@ async fn m6_pop(
         .await
         .map_err(|e| format!("change_invisible_time failed: {e}"))?;
     let new_ck = renewed.extra_info.clone().unwrap_or_default();
-    let new_segments = extra_info::split(&new_ck).map(|s| s.len()).unwrap_or_default();
+    let new_segments = extra_info::split(&new_ck)
+        .map(|s| s.len())
+        .unwrap_or_default();
     ck.check(
         "M6 change_invisible_time returns fresh popTime/invisibleTime and a usable new extraInfo",
         renewed.success
@@ -1388,16 +1466,26 @@ async fn m6_pop(
     let mut ack_detail = String::new();
     for (index, msg) in pop.msg_found_list.iter().enumerate().skip(1) {
         let value = ck_strings[index].clone();
-        let offset = match extra_info::split(&value).and_then(|s| extra_info::get_ck_queue_offset(&s)) {
-            Ok(offset) => offset,
-            Err(e) => {
-                all_acked = false;
-                ack_detail = format!("bad POP_CK at {index}: {e}");
-                break;
-            }
-        };
+        let offset =
+            match extra_info::split(&value).and_then(|s| extra_info::get_ck_queue_offset(&s)) {
+                Ok(offset) => offset,
+                Err(e) => {
+                    all_acked = false;
+                    ack_detail = format!("bad POP_CK at {index}: {e}");
+                    break;
+                }
+            };
         match instance
-            .ack_message(&pop_group, topic, msg.queue_id, &value, offset, None, 5000, None)
+            .ack_message(
+                &pop_group,
+                topic,
+                msg.queue_id,
+                &value,
+                offset,
+                None,
+                5000,
+                None,
+            )
             .await
         {
             Ok(code) if code == response_code::SUCCESS => {}
@@ -1467,7 +1555,9 @@ async fn m8_shared_factory(
     let a = DefaultMQProducer::new(group_a).map_err(|e| format!("A build failed: {e}"))?;
     a.set_namesrv_addr(namesrv);
     a.set_client_id(Some(&client_id));
-    a.start().await.map_err(|e| format!("A start failed: {e}"))?;
+    a.start()
+        .await
+        .map_err(|e| format!("A start failed: {e}"))?;
 
     let shared = match MQClientInstance::find_instance(&client_id) {
         Some(instance) => instance,
@@ -1483,7 +1573,9 @@ async fn m8_shared_factory(
     let b = DefaultMQProducer::new(group_b).map_err(|e| format!("B build failed: {e}"))?;
     b.set_namesrv_addr(namesrv);
     b.set_client_id(Some(&client_id));
-    b.start().await.map_err(|e| format!("B start failed: {e}"))?;
+    b.start()
+        .await
+        .map_err(|e| format!("B start failed: {e}"))?;
     ck.check(
         "M8 the second producer with the same clientId shares that one factory",
         shared.has_producer(group_b) && b.client().is_some(),
@@ -1529,11 +1621,17 @@ async fn m8_shared_factory(
     .map_err(|e| format!("lite build failed: {e}"))?;
     lite.subscribe(topic, "*")
         .map_err(|e| format!("lite subscribe failed: {e}"))?;
-    lite.start().await.map_err(|e| format!("lite start failed: {e}"))?;
+    lite.start()
+        .await
+        .map_err(|e| format!("lite start failed: {e}"))?;
     ck.check(
         "M8 a pull-mode consumer is a tenant of the factory too",
         shared.is_started() && shared.has_consumer_group(lite_group),
-        &format!("started={} groupRegistered={}", shared.is_started(), shared.has_consumer_group(lite_group)),
+        &format!(
+            "started={} groupRegistered={}",
+            shared.is_started(),
+            shared.has_consumer_group(lite_group)
+        ),
     );
 
     // B leaves next: the lite consumer is still using it, so the instance still must not be torn down.
@@ -1548,9 +1646,7 @@ async fn m8_shared_factory(
     // this time the teardown must be real, and the INSTANCE_MAP registration must come off.
     lite.shutdown();
     let gone = wait_async(
-        || async {
-            !shared.is_started() && MQClientInstance::find_instance(&client_id).is_none()
-        },
+        || async { !shared.is_started() && MQClientInstance::find_instance(&client_id).is_none() },
         Duration::from_secs(10),
     )
     .await;
@@ -1602,7 +1698,10 @@ async fn m7_admin_and_cleanup(
     let addrs = cluster.get_broker_addrs();
     ck.check(
         "M7 get_broker_cluster_info decodes the broker's ClusterInfo",
-        cluster.cluster_addr_table.iter().any(|(name, _)| name == "DefaultCluster")
+        cluster
+            .cluster_addr_table
+            .iter()
+            .any(|(name, _)| name == "DefaultCluster")
             && cluster
                 .broker_addr_table
                 .iter()
@@ -1665,7 +1764,13 @@ async fn m7_admin_and_cleanup(
     // Remove the consumer from the registry before unregistering: otherwise the 30s heartbeat loop re-registers the membership.
     instance.unregister_consumer(consumer_group);
     instance
-        .unregister_client(broker_addr, instance.client_id(), producer_group, consumer_group, 5000)
+        .unregister_client(
+            broker_addr,
+            instance.client_id(),
+            producer_group,
+            consumer_group,
+            5000,
+        )
         .await
         .map_err(|e| format!("unregister_client failed: {e}"))?;
     instance
@@ -1691,11 +1796,19 @@ async fn m7_admin_and_cleanup(
     for t in [topic, fallback_topic] {
         match instance.delete_topic_in_broker(broker_addr, t, 5000).await {
             Ok(()) => ck.check(&format!("M7 delete_topic_in_broker {t}"), true, ""),
-            Err(e) => ck.check(&format!("M7 delete_topic_in_broker {t}"), false, &e.to_string()),
+            Err(e) => ck.check(
+                &format!("M7 delete_topic_in_broker {t}"),
+                false,
+                &e.to_string(),
+            ),
         }
         match instance.delete_topic_in_namesrv(t, 5000).await {
             Ok(()) => ck.check(&format!("M7 delete_topic_in_namesrv {t}"), true, ""),
-            Err(e) => ck.check(&format!("M7 delete_topic_in_namesrv {t}"), false, &e.to_string()),
+            Err(e) => ck.check(
+                &format!("M7 delete_topic_in_namesrv {t}"),
+                false,
+                &e.to_string(),
+            ),
         }
         let after = get_route(client, namesrv, t).await?;
         ck.check(
@@ -1872,7 +1985,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

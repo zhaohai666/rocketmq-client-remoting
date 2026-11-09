@@ -1649,7 +1649,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(d.trace_producer_group(), group, "the injected name is kept verbatim");
+        assert_eq!(
+            d.trace_producer_group(),
+            group,
+            "the injected name is kept verbatim"
+        );
         assert_eq!(d.group(), "G", "the business group name is unaffected");
         // Only without injection does the process-wide counter get used (fixed name prefix, number > 0)
         let (built, _) = dispatcher();
@@ -1788,7 +1792,11 @@ mod tests {
             .await;
         let records = recorder.records();
         assert_eq!(records.len(), 2);
-        assert_eq!(record_count(&records[0].body), 2, "the TopicA group has 2 records");
+        assert_eq!(
+            record_count(&records[0].body),
+            2,
+            "the TopicA group has 2 records"
+        );
         assert_eq!(record_count(&records[1].body), 1);
         assert!(records[0].body.contains("TopicA"), "{}", records[0].body);
         assert!(records[1].body.contains("TopicB"), "{}", records[1].body);
@@ -2152,11 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn start_propagates_namespace_v2_to_inner_producer() {
         let (d, recorder) = dispatcher();
-        assert_eq!(
-            d.get_namespace_v2(),
-            "",
-            "defaults to unset (empty string)"
-        );
+        assert_eq!(d.get_namespace_v2(), "", "defaults to unset (empty string)");
         d.set_namespace_v2("NS_V2");
         assert_eq!(d.get_namespace_v2(), "NS_V2");
         d.start("127.0.0.1:9876", None).await.unwrap();
@@ -2301,7 +2305,11 @@ mod tests {
             1,
             "internal producer already closed on return"
         );
-        assert_eq!(recorder.records().len(), 1, "last trace batch already sent on return");
+        assert_eq!(
+            recorder.records().len(),
+            1,
+            "last trace batch already sent on return"
+        );
         assert_eq!(d.queue_size(), 0);
     }
 

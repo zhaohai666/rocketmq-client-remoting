@@ -103,10 +103,7 @@ impl FairSemaphore {
     fn grant_if_head(&self, id: u64, permits: i64) -> bool {
         let granted = {
             let mut state = lock(&self.state);
-            let at_head = state
-                .queue
-                .front()
-                .is_some_and(|pending| pending.id == id);
+            let at_head = state.queue.front().is_some_and(|pending| pending.id == id);
             if at_head && state.free >= permits {
                 state.queue.pop_front();
                 state.free -= permits;
@@ -201,8 +198,8 @@ pub fn back_pressure_permits(configured: i64, floor: i64, name: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::*;
 
@@ -354,7 +351,10 @@ mod tests {
         let (head_got, _) = head.await.unwrap();
         let (second_got, second_waited) = second.await.unwrap();
         assert!(head_got);
-        assert!(second_got, "the second waiter was left behind after the head took the permits (lost wakeup)");
+        assert!(
+            second_got,
+            "the second waiter was left behind after the head took the permits (lost wakeup)"
+        );
         assert!(
             second_waited < Duration::from_millis(2000),
             "second waited {second_waited:?}"
@@ -377,7 +377,10 @@ mod tests {
 
         let (head_got, _) = head.await.unwrap();
         let (second_got, second_waited) = second.await.unwrap();
-        assert!(!head_got, "asking for more than the total must not get a permit");
+        assert!(
+            !head_got,
+            "asking for more than the total must not get a permit"
+        );
         assert!(second_got, "not woken after the head exited (lost wakeup)");
         assert!(
             second_waited < Duration::from_millis(2000),
@@ -430,7 +433,11 @@ mod tests {
             1,
             "the permit an expired caller refused must stay free for the next one"
         );
-        assert_eq!(sem.waiting_count(), 0, "an abandoned ticket must not stay in the queue");
+        assert_eq!(
+            sem.waiting_count(),
+            0,
+            "an abandoned ticket must not stay in the queue"
+        );
     }
 
     #[tokio::test]
@@ -442,7 +449,11 @@ mod tests {
         // Now free is 0: a 0 budget fails immediately
         assert!(!sem.try_acquire(1, 0).await);
         assert!(!sem.try_acquire(1, -5).await);
-        assert_eq!(sem.waiting_count(), 0, "failing to acquire must not leave a ticket behind");
+        assert_eq!(
+            sem.waiting_count(),
+            0,
+            "failing to acquire must not leave a ticket behind"
+        );
     }
 
     #[tokio::test]

@@ -52,7 +52,8 @@ use crate::client::latency::{MQFaultStrategy, Resolver, ServiceDetector};
 use crate::client::metrics::ClientMetrics;
 use crate::client::mq_client::{
     default_concurrent_heartbeat_pool_size, MQClientInstance, MQClientInstanceConfig,
-    PublishMessage, TopicPublishInfo, TraceDispatcher, MQ_CLIENT_API_TIMEOUT_MILLIS,
+    PublishMessage, TopicPublishInfo, TraceDispatcher, DEFAULT_VIEW_MESSAGE_TIMEOUT_MILLIS,
+    MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::produce_accumulator::{
     get_or_create_produce_accumulator, AccumulatorSender, ProduceAccumulator, TIMER_DELAY_KEYS,
@@ -76,10 +77,10 @@ use crate::common::compression;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
 use crate::common::message_client_id_setter::set_uniq_id;
 use crate::common::message_const::{
-    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME_LEVEL,
-    PROPERTY_MESSAGE_REPLY_TO_CLIENT, PROPERTY_MESSAGE_TTL, PROPERTY_PRODUCER_GROUP,
-    PROPERTY_TRANSACTION_PREPARED, PROPERTY_TIMER_DELIVER_MS, PROPERTY_TIMER_DELAY_MS,
-    PROPERTY_TIMER_DELAY_SEC, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+    PROPERTY_CORRELATION_ID, PROPERTY_DELAY_TIME_LEVEL, PROPERTY_MESSAGE_REPLY_TO_CLIENT,
+    PROPERTY_MESSAGE_TTL, PROPERTY_PRODUCER_GROUP, PROPERTY_TIMER_DELAY_MS,
+    PROPERTY_TIMER_DELAY_SEC, PROPERTY_TIMER_DELIVER_MS, PROPERTY_TRANSACTION_PREPARED,
+    PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
 use crate::common::message_decoder::{decode_message, decode_message_id, decode_messages};
 use crate::common::message_type::MessageType;
@@ -152,7 +153,7 @@ pub const DEFAULT_RETRY_RESPONSE_CODES: [i32; 8] = [
 /// `arg` is a `&str`: the three built-in selectors only need
 /// string/integer semantics.
 pub trait MessageQueueSelector: Send + Sync + 'static {
-/// Pick the target queue out of `mqs`.
+    /// Pick the target queue out of `mqs`.
     fn select(&self, mqs: &[MessageQueue], msg: &Message, arg: &str) -> Result<MessageQueue>;
 }
 
@@ -161,8 +162,8 @@ pub trait MessageQueueSelector: Send + Sync + 'static {
 pub struct SelectMessageQueueByHash;
 
 impl MessageQueueSelector for SelectMessageQueueByHash {
-/// A shard key must be reproducible across processes: an environment-dependent string hash would put
-/// the same `arg` on different queues. This uses the classic 31-multiplier integer hash semantics
+    /// A shard key must be reproducible across processes: an environment-dependent string hash would put
+    /// the same `arg` on different queues. This uses the classic 31-multiplier integer hash semantics
     /// (deterministic, fit to serve as a shard key).
     fn select(&self, mqs: &[MessageQueue], _msg: &Message, arg: &str) -> Result<MessageQueue> {
         if mqs.is_empty() {
@@ -1506,7 +1507,11 @@ impl DefaultMQProducer {
                     };
                     let (enable, detect_timeout, detect_interval) = {
                         let cfg = inner.cfg.read().unwrap_or_else(|e| e.into_inner());
-                        (cfg.start_detector_enable, cfg.detect_timeout, cfg.detect_interval)
+                        (
+                            cfg.start_detector_enable,
+                            cfg.detect_timeout,
+                            cfg.detect_interval,
+                        )
                     };
                     if !enable {
                         continue;
@@ -1703,8 +1708,12 @@ async fn run_detect_round(
     detect_timeout: i64,
     detect_interval: i64,
 ) {
-    let resolver = PublishAddrResolver { client: client.clone() };
-    let detector = MaxOffsetServiceDetector { client: client.clone() };
+    let resolver = PublishAddrResolver {
+        client: client.clone(),
+    };
+    let detector = MaxOffsetServiceDetector {
+        client: client.clone(),
+    };
     inner
         .fault_strategy
         .latency_fault_tolerance()
@@ -2340,7 +2349,6 @@ impl DefaultMQProducer {
             }
         }
     }
-
 
     pub fn produce_accumulator(&self) -> Option<ProduceAccumulator> {
         self.inner
@@ -4138,12 +4146,16 @@ impl DefaultMQProducer {
         Ok(body.map(|b| decode_messages(&b)).unwrap_or_default())
     }
 
-    /// Read one message by msgId -- this also only raises an
-    /// `MQClientException` (it does not silently return an empty list).
-    pub fn view_message(&self, topic: &str, msg_id: &str) -> Result<Vec<MessageExt>> {
-        Err(Error::client(format!(
-            "viewMessage by msgId is not supported in Rust edition (topic={topic}, msgId={msg_id})"
-        )))
+    /// Java `DefaultMQProducerImpl#viewMessage` parity
+    /// (DefaultMQProducerImpl.java:517): the MQAdminImpl single-leg path —
+    /// offset msgId only, decoded and asked `VIEW_MESSAGE_BY_ID(33)` on the
+    /// broker that stamped it. A msgId that does not decode as an offset id
+    /// surfaces the NO_MESSAGE client error (no uniq-key fallback at this
+    /// layer).
+    pub async fn view_message(&self, topic: &str, msg_id: &str) -> Result<MessageExt> {
+        self.require_client()?
+            .view_message(topic, msg_id, DEFAULT_VIEW_MESSAGE_TIMEOUT_MILLIS)
+            .await
     }
 }
 
@@ -4301,7 +4313,8 @@ mod tests {
     #[test]
     fn producer_group_setter_works_before_start() {
         let p = producer("GID_keep");
-        p.set_producer_group("GID_new").expect("changing the group name is allowed before start");
+        p.set_producer_group("GID_new")
+            .expect("changing the group name is allowed before start");
         assert_eq!(p.producer_group(), "GID_new");
         // an empty group name is only validated at construction (the setter does not validate)
         assert!(DefaultMQProducer::new("").is_err());
@@ -4476,8 +4489,15 @@ mod tests {
         let before = msg.get_body().to_vec();
         let (flag, prev) = p.try_to_compress_message(&mut msg);
         assert_eq!(flag, 0);
-        assert!(prev.is_none(), "prevBody must not be handed over when nothing was compressed");
-        assert_eq!(msg.get_body(), before.as_slice(), "the body must stay untouched below the threshold");
+        assert!(
+            prev.is_none(),
+            "prevBody must not be handed over when nothing was compressed"
+        );
+        assert_eq!(
+            msg.get_body(),
+            before.as_slice(),
+            "the body must stay untouched below the threshold"
+        );
 
         let mut big = Message::new("T1", Some(&[b'a'; 4096]));
         let (flag, prev) = p.try_to_compress_message(&mut big);
@@ -4524,7 +4544,10 @@ mod tests {
         let (_flag, prev) = p.try_to_compress_message(&mut unguarded);
         drop(prev);
         let (again_flag, _prev) = p.try_to_compress_message(&mut unguarded);
-        assert_eq!(again_flag, 0, "without the restore the second compression is bound to fail");
+        assert_eq!(
+            again_flag, 0,
+            "without the restore the second compression is bound to fail"
+        );
     }
 
     #[test]
@@ -4571,7 +4594,11 @@ mod tests {
             )
         );
         assert_eq!(prev.as_deref(), Some(before.as_slice()));
-        assert_ne!(msg.get_body(), before.as_slice(), "the body has been replaced by the compressed bytes");
+        assert_ne!(
+            msg.get_body(),
+            before.as_slice(),
+            "the body has been replaced by the compressed bytes"
+        );
 
         // legal values (including 0, kept for old-version compatibility) set successfully and get normalized
         p.set_compress_type(0).unwrap();
@@ -4589,13 +4616,21 @@ mod tests {
         let mut batch = MessageBatch::new(vec![Message::new("T1", Some(&[b'x'; 4096]))]);
         let before = batch.message.get_body().len();
         assert_eq!(p.sys_flag_for(&mut PublishMessage::Batch(&mut batch)), 0);
-        assert_eq!(batch.message.get_body().len(), before, "the batch body is never rewritten");
+        assert_eq!(
+            batch.message.get_body().len(),
+            before,
+            "the batch body is never rewritten"
+        );
     }
 
     #[test]
     fn namespace_wraps_topic_once() {
         let p = producer("GID_ns");
-        assert_eq!(p.with_namespace("T1"), "T1", "unchanged when there is no namespace");
+        assert_eq!(
+            p.with_namespace("T1"),
+            "T1",
+            "unchanged when there is no namespace"
+        );
         p.set_namespace("ns1");
         assert_eq!(p.with_namespace("T1"), "ns1%T1");
         // wrap_namespace is idempotent: re-wrapping does not produce ns1%ns1%T1
@@ -4610,13 +4645,13 @@ mod tests {
         assert_eq!(p.get_namespace_v2(), Some("NS_V2".to_string()));
         assert_eq!(p.config().namespace_v2, Some("NS_V2".to_string()));
         p.set_namespace_v2(None);
+        assert_eq!(p.get_namespace_v2(), None, "None = cleared");
+        p.set_namespace("ns1");
         assert_eq!(
             p.get_namespace_v2(),
             None,
-            "None = cleared"
+            "the v1 namespace does not write the v2 field"
         );
-        p.set_namespace("ns1");
-        assert_eq!(p.get_namespace_v2(), None, "the v1 namespace does not write the v2 field");
     }
 
     #[test]
@@ -4633,7 +4668,11 @@ mod tests {
         assert_eq!(proxy.addr, "socks4://10.0.0.2:1080");
         assert_eq!(proxy.username, None);
         p.set_socks_proxy(None);
-        assert_eq!(p.get_socks_proxy(), None, "None = cleared (direct connection)");
+        assert_eq!(
+            p.get_socks_proxy(),
+            None,
+            "None = cleared (direct connection)"
+        );
     }
 
     // ---------------- Hook context ----------------
@@ -4727,11 +4766,21 @@ mod tests {
             )
             .await
             .expect_err("without a name server the send must fail");
-        assert!(hook.before.load(Ordering::SeqCst) >= 1, "the before hook must have run");
-        assert_eq!(hook.after.load(Ordering::SeqCst), 1, "the after hook exactly once");
+        assert!(
+            hook.before.load(Ordering::SeqCst) >= 1,
+            "the before hook must have run"
+        );
+        assert_eq!(
+            hook.after.load(Ordering::SeqCst),
+            1,
+            "the after hook exactly once"
+        );
         assert_eq!(hook.after_saw_exception.load(Ordering::SeqCst), 1);
         assert_eq!(hook.after_saw_result.load(Ordering::SeqCst), 0);
-        assert!(retryable(&err), "the send failure should be a retryable error kind: {err}");
+        assert!(
+            retryable(&err),
+            "the send failure should be a retryable error kind: {err}"
+        );
     }
 
     /// A forbidden-check hook that rejects every send.
@@ -4820,7 +4869,10 @@ mod tests {
             .get_property(TRACE_CONTEXT_PROPERTY)
             .expect("traceparent should be injected once the switch is on")
             .to_string();
-        assert!(injected.starts_with("00-"), "W3C version prefix: {injected}");
+        assert!(
+            injected.starts_with("00-"),
+            "W3C version prefix: {injected}"
+        );
 
         // an existing value is not overwritten
         let mut existing = Message::new("T1", Some(b"body"));
@@ -4884,7 +4936,9 @@ mod tests {
     async fn start_stamps_a_contract_style_client_id() {
         let p = producer("GID_clientid_shape");
         p.set_namesrv_addr("127.0.0.1:1");
-        p.start().await.expect("start must not fail with a static address");
+        p.start()
+            .await
+            .expect("start must not fail with a static address");
         let id = p.client_id().expect("clientId must exist after start");
         let (ip, instance) = id
             .split_once('@')
@@ -4895,13 +4949,18 @@ mod tests {
             "{id}"
         );
         let cfg = p.config();
-        assert_eq!(cfg.instance_name, instance, "instanceName must be written back into the config in place");
+        assert_eq!(
+            cfg.instance_name, instance,
+            "instanceName must be written back into the config in place"
+        );
         p.shutdown();
 
         // a second producer within the same second must get a different clientId (the old scheme collided here)
         let q = producer("GID_clientid_shape_2");
         q.set_namesrv_addr("127.0.0.1:1");
-        q.start().await.expect("start must not fail with a static address");
+        q.start()
+            .await
+            .expect("start must not fail with a static address");
         assert_ne!(q.client_id(), Some(id));
         q.shutdown();
     }
@@ -4927,7 +4986,10 @@ mod tests {
         );
         // guard: the first one to leave must not tear down the instance that is still in use
         a.shutdown();
-        assert!(shared.is_started(), "the first user to leave shut down the shared instance");
+        assert!(
+            shared.is_started(),
+            "the first user to leave shut down the shared instance"
+        );
         b.shutdown();
         // unregistering (35) and tearing the instance down now sit in the same spawned task; `shutdown()` only hands it over
         for _ in 0..200 {
@@ -4936,7 +4998,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(!shared.is_started(), "the instance was not torn down after the last user left");
+        assert!(
+            !shared.is_started(),
+            "the instance was not torn down after the last user left"
+        );
     }
 
     /// The offline version of a pitfall the real `live_producer` P1 (sending still works after a restart that follows shutdown) stepped in:
@@ -4960,7 +5025,8 @@ mod tests {
         );
 
         p.start().await.expect("the restart must not fail");
-        let fresh = MQClientInstance::find_instance(&client_id).expect("an instance must exist after the restart");
+        let fresh = MQClientInstance::find_instance(&client_id)
+            .expect("an instance must exist after the restart");
         assert!(fresh.has_producer(&p.config().producer_group));
         // let the tail of the previous shutdown (35 + teardown) finish first
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -4978,7 +5044,10 @@ mod tests {
         // (note: this only asserts "no panic and returns Err"; it can only pass when the env var is injected from outside)
         if std::env::var_os("ROCKETMQ_NAMESRV_DOMAIN").is_none() {
             assert!(p.start().await.is_err());
-            assert!(!p.is_started(), "a failed start must not leave the producer in the started state");
+            assert!(
+                !p.is_started(),
+                "a failed start must not leave the producer in the started state"
+            );
         }
     }
 
@@ -4994,11 +5063,18 @@ mod tests {
             (long_group.as_str(), "is longer than group max length"),
         ] {
             // construction only checks for whitespace; illegal characters are left to start()
-            let p = DefaultMQProducer::new(group).expect("construction must not reject it up front");
+            let p =
+                DefaultMQProducer::new(group).expect("construction must not reject it up front");
             p.set_namesrv_addr("127.0.0.1:9876");
-            let err = p.start().await.expect_err("an illegal group name must fail locally");
+            let err = p
+                .start()
+                .await
+                .expect_err("an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "{group}: {err}");
-            assert!(!p.is_started(), "{group}: a failed start must not stay in the started state");
+            assert!(
+                !p.is_started(),
+                "{group}: a failed start must not stay in the started state"
+            );
         }
     }
 
@@ -5012,7 +5088,9 @@ mod tests {
         );
         p.set_namesrv_addr("127.0.0.1:1");
         p.set_poll_name_server_interval_millis(1_500);
-        p.start().await.expect("start must not fail with a static address");
+        p.start()
+            .await
+            .expect("start must not fail with a static address");
 
         let client = p.client().expect("an instance must exist after start");
         assert_eq!(client.config().route_refresh_interval_millis, 1_500);
@@ -5025,7 +5103,10 @@ mod tests {
         let p = DefaultMQProducer::new(&"g".repeat(110)).unwrap();
         p.set_namespace("ns".repeat(30).as_str());
         // after the wrap it is ns...ns%g, length 90+1+110 > 120
-        let err = p.start().await.expect_err("over length after the wrap must report an error");
+        let err = p
+            .start()
+            .await
+            .expect_err("over length after the wrap must report an error");
         assert!(
             err.to_string().contains("is longer than group max length"),
             "{err}"
@@ -5096,13 +5177,14 @@ mod tests {
         assert_eq!(batch_back_pressure_msg_len(&[]), 1);
     }
 
-    #[test]
-    fn view_message_is_not_supported() {
+    #[tokio::test]
+    async fn view_message_requires_a_started_client() {
         let p = producer("GID_view");
         let err = p
             .view_message("T1", "ABCDEF")
-            .expect_err("view_message reports an error outright");
-        assert!(err.to_string().contains("not supported"));
+            .await
+            .expect_err("an unstarted producer must be rejected");
+        assert!(err.to_string().contains("not started"));
     }
 
     #[test]
@@ -5259,7 +5341,9 @@ mod tests {
             "127.0.0.1:10911",
             CommunicationMode::Async,
         );
-        let snapshot = ctx.message.expect("the context must carry the message snapshot");
+        let snapshot = ctx
+            .message
+            .expect("the context must carry the message snapshot");
         assert_eq!(snapshot.get_property(PROPERTY_TRANSFER_FLAG), Some("kv"));
         assert_eq!(snapshot.get_body(), b"body".as_slice());
         assert_eq!(ctx.namespace, "ns");
@@ -5288,7 +5372,10 @@ mod tests {
         // with trace_topic unset it falls back to the system trace topic
         assert_eq!(d.get_trace_topic_name(), "RMQ_SYS_TRACE_TOPIC");
         assert_eq!(d.dispatcher_type(), TraceDispatcherType::Produce);
-        assert!(!d.is_started(), "not started yet, so it must not claim to be started");
+        assert!(
+            !d.is_started(),
+            "not started yet, so it must not claim to be started"
+        );
 
         let d2 = auto_bridged_dispatcher(
             "GID_auto_produce",
@@ -5306,7 +5393,10 @@ mod tests {
         // the process-level counter increments: two ids taken for the same group must differ
         let n1: u64 = g1.rsplit('-').next().unwrap().parse().unwrap();
         let n2: u64 = g2.rsplit('-').next().unwrap().parse().unwrap();
-        assert!(n2 > n1, "the internal producer group name counter must increment: {g1} -> {g2}");
+        assert!(
+            n2 > n1,
+            "the internal producer group name counter must increment: {g1} -> {g2}"
+        );
         assert_eq!(d2.batch_num(), 3);
         assert_eq!(d2.get_trace_topic_name(), "CUSTOM_TRACE");
     }

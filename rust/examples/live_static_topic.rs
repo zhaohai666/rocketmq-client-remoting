@@ -16,17 +16,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
-use rocketmq_client_remoting::client::consumer::{DefaultMQPushConsumer, ConsumerConfig};
+use rocketmq_client_remoting::client::consumer::{ConsumerConfig, DefaultMQPushConsumer};
+use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, MessageListenerConcurrently, SendStatus,
 };
-use rocketmq_client_remoting::client::producer::DefaultMQProducer;
-use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueue};
-use rocketmq_client_remoting::common::topic_config::TopicConfig;
 use rocketmq_client_remoting::client::static_topic::{
     get_mock_broker_name, topic_route_data_2_endpoints_for_static_topic,
     LOGICAL_QUEUE_MOCK_NOT_EXIST,
 };
+use rocketmq_client_remoting::common::message::{Message, MessageExt, MessageQueue};
+use rocketmq_client_remoting::common::topic_config::TopicConfig;
 
 const PHYSICAL_QUEUES: i32 = 4;
 const TOTAL_QUEUES: i32 = 8;
@@ -163,7 +163,11 @@ async fn main() -> ExitCode {
         println!("  [FATAL] broker not registered");
         return ExitCode::FAILURE;
     }
-    tally.check("S1 broker address resolved", true, &format!("{broker_name}({broker_addr})"));
+    tally.check(
+        "S1 broker address resolved",
+        true,
+        &format!("{broker_name}({broker_addr})"),
+    );
 
     let detail = mapping_detail(&topic, &broker_name);
     let config = TopicConfig {
@@ -176,8 +180,11 @@ async fn main() -> ExitCode {
         .create_static_topic(&broker_addr, "TBW102", &config, &detail, true)
         .await
     {
-        Ok(()) => tally.check("S1 createStaticTopic(513) accepted", true,
-            &format!("totalQueues={TOTAL_QUEUES}")),
+        Ok(()) => tally.check(
+            "S1 createStaticTopic(513) accepted",
+            true,
+            &format!("totalQueues={TOTAL_QUEUES}"),
+        ),
         Err(e) => {
             tally.check("S1 createStaticTopic(513) accepted", false, &e.to_string());
             return ExitCode::FAILURE;
@@ -189,11 +196,11 @@ async fn main() -> ExitCode {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         match admin.examine_topic_route(&topic).await {
-            Ok(r) if r
-                .topic_queue_mapping_by_broker
-                .as_ref()
-                .map(|m| !m.is_empty())
-                .unwrap_or(false) =>
+            Ok(r)
+                if r.topic_queue_mapping_by_broker
+                    .as_ref()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false) =>
             {
                 route = Some(r);
                 break;
@@ -204,7 +211,11 @@ async fn main() -> ExitCode {
     match route {
         Some(_) => tally.check("S2 route carries TopicQueueMappingByBroker", true, ""),
         None => {
-            tally.check("S2 route carries TopicQueueMappingByBroker", false, "30s timeout");
+            tally.check(
+                "S2 route carries TopicQueueMappingByBroker",
+                false,
+                "30s timeout",
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -213,7 +224,11 @@ async fn main() -> ExitCode {
     match &endpoints {
         Some(_) => tally.check("S3 endpoint set is not empty", true, ""),
         None => {
-            tally.check("S3 endpoint set is not empty", false, "endpoint set is None");
+            tally.check(
+                "S3 endpoint set is not empty",
+                false,
+                "endpoint set is None",
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -242,7 +257,10 @@ async fn main() -> ExitCode {
             .unwrap_or(false)
     });
     tally.check(
-        &format!("S3 unhosted ids {PHYSICAL_QUEUES}-{} → __syslo__none__", TOTAL_QUEUES - 1),
+        &format!(
+            "S3 unhosted ids {PHYSICAL_QUEUES}-{} → __syslo__none__",
+            TOTAL_QUEUES - 1
+        ),
         unhosted_ok,
         "",
     );
@@ -275,11 +293,14 @@ async fn main() -> ExitCode {
     match consumer.mq_client() {
         Ok(inst) => {
             let rewrite_ok = (0..PHYSICAL_QUEUES).all(|gid| {
-                inst.get_broker_name_from_message_queue(&MessageQueue::new(
-                    &topic, &mock_name, gid,
-                )) == broker_name
+                inst.get_broker_name_from_message_queue(&MessageQueue::new(&topic, &mock_name, gid))
+                    == broker_name
             });
-            tally.check("S4 the instance rewrites mock queues to the real broker", rewrite_ok, "");
+            tally.check(
+                "S4 the instance rewrites mock queues to the real broker",
+                rewrite_ok,
+                "",
+            );
             let sentinel = inst.get_broker_name_from_message_queue(&MessageQueue::new(
                 &topic,
                 &mock_name,
@@ -290,16 +311,23 @@ async fn main() -> ExitCode {
                 sentinel == LOGICAL_QUEUE_MOCK_NOT_EXIST,
                 &sentinel,
             );
-            let outside = inst.get_broker_name_from_message_queue(&MessageQueue::new(
-                &topic, &mock_name, 99,
-            ));
-            tally.check("S4 out-of-table ids pass the mock name through", outside == mock_name, &outside);
+            let outside =
+                inst.get_broker_name_from_message_queue(&MessageQueue::new(&topic, &mock_name, 99));
+            tally.check(
+                "S4 out-of-table ids pass the mock name through",
+                outside == mock_name,
+                &outside,
+            );
             let plain = inst.get_broker_name_from_message_queue(&MessageQueue::new(
                 &format!("Plain{stamp}"),
                 &broker_name,
                 0,
             ));
-            tally.check("S4 non-static topics pass through unchanged", plain == broker_name, &plain);
+            tally.check(
+                "S4 non-static topics pass through unchanged",
+                plain == broker_name,
+                &plain,
+            );
         }
         Err(e) => tally.check("S4 instance access", false, &e.to_string()),
     }
@@ -327,8 +355,11 @@ async fn main() -> ExitCode {
         }
     }
     producer.shutdown();
-    tally.check(&format!("S5 sent {PHYSICAL_QUEUES} messages"), sent == PHYSICAL_QUEUES as usize,
-        &format!("sent={sent}"));
+    tally.check(
+        &format!("S5 sent {PHYSICAL_QUEUES} messages"),
+        sent == PHYSICAL_QUEUES as usize,
+        &format!("sent={sent}"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(40);
     while inbox.count() < PHYSICAL_QUEUES as usize && Instant::now() < deadline {

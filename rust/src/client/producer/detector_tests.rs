@@ -38,9 +38,13 @@ struct DetectCluster {
 
 impl DetectCluster {
     async fn start() -> DetectCluster {
-        let broker = TcpListener::bind("127.0.0.1:0").await.expect("bind mock broker");
+        let broker = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock broker");
         let broker_addr = broker.local_addr().expect("mock broker addr").to_string();
-        let namesrv = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
+        let namesrv = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock namesrv");
         let namesrv_addr = namesrv.local_addr().expect("mock namesrv addr").to_string();
         let state = Arc::new(DetectState {
             // default: immediate SUCCESS, the shape of a healthy broker
@@ -52,13 +56,18 @@ impl DetectCluster {
         // the tasks are aborted together when the test runtime drops.
         let _namesrv_task = spawn_namesrv(namesrv, broker_addr.clone());
         let _broker_task = spawn_broker(broker, state.clone());
-        DetectCluster { namesrv_addr, state }
+        DetectCluster {
+            namesrv_addr,
+            state,
+        }
     }
 
     /// Script the probe response: whether SUCCESS and how many milliseconds to delay before answering.
     fn set_probe(&self, ok: bool, delay_ms: u64) {
         self.state.max_offset_ok.store(ok, Ordering::SeqCst);
-        self.state.max_offset_delay_ms.store(delay_ms, Ordering::SeqCst);
+        self.state
+            .max_offset_delay_ms
+            .store(delay_ms, Ordering::SeqCst);
     }
 
     /// Number of GET_MAX_OFFSET requests the broker has received.
@@ -118,11 +127,15 @@ fn route_json(broker_addr: &str) -> Vec<u8> {
 fn spawn_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let addr = broker_addr.clone();
             tokio::spawn(async move {
                 while let Some(frame) = read_frame(&mut stream).await {
-                    let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                    let Ok(request) = RemotingCommand::decode(&frame) else {
+                        return;
+                    };
                     let mut response = if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
                         let mut r = response_for(&request, response_code::SUCCESS);
                         r.set_body(Some(route_json(&addr)));
@@ -141,11 +154,15 @@ fn spawn_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
 fn spawn_broker(listener: TcpListener, state: Arc<DetectState>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let state = Arc::clone(&state);
             tokio::spawn(async move {
                 while let Some(frame) = read_frame(&mut stream).await {
-                    let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                    let Ok(request) = RemotingCommand::decode(&frame) else {
+                        return;
+                    };
                     if request.code == request_code::GET_MAX_OFFSET {
                         state.max_offset_requests.fetch_add(1, Ordering::SeqCst);
                         let delay = state.max_offset_delay_ms.load(Ordering::SeqCst);
@@ -216,7 +233,10 @@ async fn started(
     assert_eq!(producer.is_start_detector_enable(), detector_enable);
     assert_eq!(producer.get_detect_timeout(), detect_timeout);
     assert_eq!(producer.get_detect_interval(), detect_interval);
-    producer.start().await.expect("start should succeed against the fake cluster");
+    producer
+        .start()
+        .await
+        .expect("start should succeed against the fake cluster");
     producer
 }
 
@@ -244,7 +264,10 @@ async fn wait_for(cond: impl Fn() -> bool, what: &str) {
 #[test]
 fn detector_config_defaults_match_golden_config() {
     let cfg = ProducerConfig::default();
-    assert!(!cfg.start_detector_enable, "startDetectorEnable defaults to false");
+    assert!(
+        !cfg.start_detector_enable,
+        "startDetectorEnable defaults to false"
+    );
     assert_eq!(cfg.detect_timeout, 200);
     assert_eq!(cfg.detect_interval, 2 * 1000);
 
@@ -266,7 +289,9 @@ async fn detector_disabled_by_default_sends_no_probes() {
     let producer = started("detector_off", &cluster, false, 200, 300).await;
     seed_route(&producer).await;
 
-    producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
+    producer
+        .fault_strategy()
+        .update_fault_item("broker-0", 100, true, false);
     assert!(!producer
         .fault_strategy()
         .latency_fault_tolerance()
@@ -274,7 +299,11 @@ async fn detector_disabled_by_default_sends_no_probes() {
 
     // the probe task is indeed running (first round after 3s), but with the switch off no GET_MAX_OFFSET may be sent
     tokio::time::sleep(Duration::from_secs(7)).await;
-    assert_eq!(cluster.requests(), 0, "no probe traffic while the detector is off");
+    assert_eq!(
+        cluster.requests(),
+        0,
+        "no probe traffic while the detector is off"
+    );
     assert!(
         !producer
             .fault_strategy()
@@ -294,7 +323,9 @@ async fn detector_restores_unreachable_broker_and_keeps_probing() {
     seed_route(&producer).await;
 
     let tolerance = producer.inner.fault_strategy.latency_fault_tolerance();
-    producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
+    producer
+        .fault_strategy()
+        .update_fault_item("broker-0", 100, true, false);
     assert!(!tolerance.is_reachable("broker-0"));
 
     wait_for(
@@ -302,7 +333,10 @@ async fn detector_restores_unreachable_broker_and_keeps_probing() {
         "broker-0 should be reachable again after a successful probe",
     )
     .await;
-    assert!(cluster.requests() >= 1, "the detector must actually have sent GET_MAX_OFFSET(30)");
+    assert!(
+        cluster.requests() >= 1,
+        "the detector must actually have sent GET_MAX_OFFSET(30)"
+    );
 
     // periodic triggering: after recovery the fault item stays in the table and later rounds keep probing (the request counter keeps rising)
     let seen = cluster.requests();
@@ -327,7 +361,9 @@ async fn detect_timeout_keeps_broker_unreachable_until_it_recovers() {
     seed_route(&producer).await;
 
     let tolerance = producer.inner.fault_strategy.latency_fault_tolerance();
-    producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
+    producer
+        .fault_strategy()
+        .update_fault_item("broker-0", 100, true, false);
     assert!(!tolerance.is_reachable("broker-0"));
 
     wait_for(

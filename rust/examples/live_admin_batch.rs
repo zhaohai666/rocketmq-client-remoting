@@ -129,7 +129,11 @@ async fn main() -> ExitCode {
             }
         }
     }
-    ck.check("batch create topics(18) effective with correct queue counts", ok, &detail);
+    ck.check(
+        "batch create topics(18) effective with correct queue counts",
+        ok,
+        &detail,
+    );
 
     // ---- 2. batch create subscription groups(225) ---------------------------------------------
     let mut grp_a = SubscriptionGroupConfig::new(&group_a);
@@ -141,7 +145,11 @@ async fn main() -> ExitCode {
         .await
     {
         Ok(()) => ck.check("batch create subscription groups(225) request", true, ""),
-        Err(e) => ck.check("batch create subscription groups(225) request", false, &e.to_string()),
+        Err(e) => ck.check(
+            "batch create subscription groups(225) request",
+            false,
+            &e.to_string(),
+        ),
     }
     let mut ok = true;
     let mut detail = String::new();
@@ -173,7 +181,11 @@ async fn main() -> ExitCode {
             }
         }
     }
-    ck.check("batch create subscription groups(225) effective with correct fields", ok, &detail);
+    ck.check(
+        "batch create subscription groups(225) effective with correct fields",
+        ok,
+        &detail,
+    );
 
     // ---- 3. read-forbidden(353) ----------------------------------------------------
     match admin
@@ -185,7 +197,11 @@ async fn main() -> ExitCode {
             fb.get("readable").and_then(serde_json::Value::as_bool) == Some(false),
             &format!("{fb}"),
         ),
-        Err(e) => ck.check("consumer group read-forbidden(353) set unreadable", false, &e.to_string()),
+        Err(e) => ck.check(
+            "consumer group read-forbidden(353) set unreadable",
+            false,
+            &e.to_string(),
+        ),
     }
     match admin
         .update_and_get_group_read_forbidden(&master, &group_a, &topic_a, None)
@@ -196,7 +212,11 @@ async fn main() -> ExitCode {
             fb.get("readable").and_then(serde_json::Value::as_bool) == Some(false),
             &format!("read-forbidden state changed by the query call: {fb}"),
         ),
-        Err(e) => ck.check("consumer group read-forbidden(353) query only, no change", false, &e.to_string()),
+        Err(e) => ck.check(
+            "consumer group read-forbidden(353) query only, no change",
+            false,
+            &e.to_string(),
+        ),
     }
     match admin
         .update_and_get_group_read_forbidden(&master, &group_a, &topic_a, Some(true))
@@ -207,7 +227,11 @@ async fn main() -> ExitCode {
             let fields_ok = fb.get("group").and_then(serde_json::Value::as_str)
                 == Some(group_a.as_str())
                 && fb.get("topic").and_then(serde_json::Value::as_str) == Some(topic_a.as_str());
-            ck.check("consumer group read-forbidden(353) restore readable", readable, &format!("{fb}"));
+            ck.check(
+                "consumer group read-forbidden(353) restore readable",
+                readable,
+                &format!("{fb}"),
+            );
             ck.check(
                 "consumer group read-forbidden(353) response carries group/topic",
                 fields_ok,
@@ -215,7 +239,11 @@ async fn main() -> ExitCode {
             );
         }
         Err(e) => {
-            ck.check("consumer group read-forbidden(353) restore readable", false, &e.to_string());
+            ck.check(
+                "consumer group read-forbidden(353) restore readable",
+                false,
+                &e.to_string(),
+            );
             ck.check(
                 "consumer group read-forbidden(353) response carries group/topic",
                 false,
@@ -229,7 +257,11 @@ async fn main() -> ExitCode {
         .resume_check_half_message(&master, &topic_a, "0A0F0000000000000000000000000000000000")
         .await
     {
-        Ok(false) => ck.check("resume half message(323) non-half-message returns false instead of an error", true, ""),
+        Ok(false) => ck.check(
+            "resume half message(323) non-half-message returns false instead of an error",
+            true,
+            "",
+        ),
         Ok(true) => ck.check(
             "resume half message(323) non-half-message returns false instead of an error",
             false,
@@ -280,7 +312,11 @@ async fn main() -> ExitCode {
                 &format!("stored={stored:?}"),
             );
         }
-        Err(e) => ck.check("order topic config merges two entries instead of overwriting", false, &e.to_string()),
+        Err(e) => ck.check(
+            "order topic config merges two entries instead of overwriting",
+            false,
+            &e.to_string(),
+        ),
     }
     match admin
         .create_or_update_order_conf(&order_key, &format!("{topic_a}:6"), false)
@@ -300,7 +336,11 @@ async fn main() -> ExitCode {
                 &format!("stored={stored:?}"),
             );
         }
-        Err(e) => ck.check("order topic config same key overwrites the old value", false, &e.to_string()),
+        Err(e) => ck.check(
+            "order topic config same key overwrites the old value",
+            false,
+            &e.to_string(),
+        ),
     }
 
     // ---- 6. cleanup operations ---------------------------------------------------------
@@ -352,7 +392,11 @@ async fn main() -> ExitCode {
             !spans.is_empty(),
             &format!("spans={} entries", spans.len()),
         ),
-        Err(e) => ck.check("consume time span(303) aggregated over the route fan-out", false, &e.to_string()),
+        Err(e) => ck.check(
+            "consume time span(303) aggregated over the route fan-out",
+            false,
+            &e.to_string(),
+        ),
     }
 
     // ---- 9. nameserver config(318/319) ---------------------------------------
@@ -380,15 +424,27 @@ async fn main() -> ExitCode {
                             &format!("got={val:?} want='true'"),
                         );
                     }
-                    Err(e) => ck.check("nameserver config(318/319) write-read loop", false, &e.to_string()),
+                    Err(e) => ck.check(
+                        "nameserver config(318/319) write-read loop",
+                        false,
+                        &e.to_string(),
+                    ),
                 },
-                Err(e) => ck.check("nameserver config(318/319) write-read loop", false, &e.to_string()),
+                Err(e) => ck.check(
+                    "nameserver config(318/319) write-read loop",
+                    false,
+                    &e.to_string(),
+                ),
             }
             let mut restore = StringMap::new();
             restore.insert("orderMessageEnable".to_string(), old_val.clone());
             let _ = admin.update_name_server_config(&restore, None).await;
         }
-        Err(e) => ck.check("nameserver config(318/319) write-read loop", false, &e.to_string()),
+        Err(e) => ck.check(
+            "nameserver config(318/319) write-read loop",
+            false,
+            &e.to_string(),
+        ),
     }
 
     // ---- cleanup ---------------------------------------------------------------

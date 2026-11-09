@@ -1839,7 +1839,9 @@ mod tests {
         // The two shapes never accept each other: feeding a map body to ForC only errors (and vice versa, see
         // malformed_bodies_return_decode_errors)
         assert!(matches!(
-            ResetOffsetBodyForC::decode(br#"{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"t"}:1}}"#),
+            ResetOffsetBodyForC::decode(
+                br#"{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"t"}:1}}"#
+            ),
             Err(Error::Decode(_))
         ));
     }
@@ -2166,7 +2168,11 @@ mod tests {
         // Each variant differs from CK_QUEUE3_BASE in exactly ONE component of the merge key, so a key
         // that ignored that component would silently merge two different pop groups.
         let only_retry = group_of(&[CK_QUEUE3_BASE, CK_QUEUE3_RETRY]);
-        assert_eq!(only_retry.acks.len(), 2, "the retry flag belongs to the key");
+        assert_eq!(
+            only_retry.acks.len(),
+            2,
+            "the retry flag belongs to the key"
+        );
         assert_eq!(only_retry.acks[0].retry, "0");
         assert_eq!(only_retry.acks[1].retry, "1");
 
@@ -2176,7 +2182,11 @@ mod tests {
         assert_eq!(only_queue.acks[1].queue_id, 4);
 
         let only_start = group_of(&[CK_QUEUE3_BASE, "99 1700000000000 60000 0 0 broker-a 3 100"]);
-        assert_eq!(only_start.acks.len(), 2, "the ck queue offset belongs to the key");
+        assert_eq!(
+            only_start.acks.len(),
+            2,
+            "the ck queue offset belongs to the key"
+        );
         assert_eq!(only_start.acks[1].start_offset, 99);
         assert_eq!(only_start.acks[1].bit_set, vec![1]);
 

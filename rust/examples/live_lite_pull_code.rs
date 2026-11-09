@@ -76,15 +76,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn lite_flag() -> i32 {
-    PullSysFlag::build_sys_flag(/*commit_offset=*/false, /*suspend=*/false,
-                                /*subscription=*/true, /*class_filter=*/false,
-                                /*lite_pull=*/true)
+    PullSysFlag::build_sys_flag(
+        /*commit_offset=*/ false, /*suspend=*/ false, /*subscription=*/ true,
+        /*class_filter=*/ false, /*lite_pull=*/ true,
+    )
 }
 
 /// The 4-argument variant used by the classic pull path; the lite bit must stay 0.
 fn classic_flag() -> i32 {
-    PullSysFlag::build_sys_flag_basic(/*commit_offset=*/false, /*suspend=*/false,
-                                      /*subscription=*/true, /*class_filter=*/false)
+    PullSysFlag::build_sys_flag_basic(
+        /*commit_offset=*/ false, /*suspend=*/ false, /*subscription=*/ true,
+        /*class_filter=*/ false,
+    )
 }
 
 struct BodySink {
@@ -317,7 +320,11 @@ async fn run(namesrv: &str) -> Checker {
             return ck;
         }
     };
-    ck.check("route visible: 1 queue", true, &format!("queueId={}", q0.queue_id));
+    ck.check(
+        "route visible: 1 queue",
+        true,
+        &format!("queueId={}", q0.queue_id),
+    );
 
     let mut c1: Option<DefaultLitePullConsumer> = None;
     let mut c2: Option<DefaultLitePullConsumer> = None;
@@ -339,7 +346,11 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
     if fx.read_flag().await.as_deref() != Some("true") {
-        ck.check("R0 the switch is not true, later checks are meaningless", false, "");
+        ck.check(
+            "R0 the switch is not true, later checks are meaningless",
+            false,
+            "",
+        );
         fx.shutdown();
         return ck;
     }
@@ -365,7 +376,11 @@ async fn run(namesrv: &str) -> Checker {
                                     .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
                             ),
                             Err(e) => {
-                                ck.check("S1 lite poll during the drain window", false, &e.to_string());
+                                ck.check(
+                                    "S1 lite poll during the drain window",
+                                    false,
+                                    &e.to_string(),
+                                );
                                 break;
                             }
                         }
@@ -406,7 +421,11 @@ async fn run(namesrv: &str) -> Checker {
     let client = match fx.admin.get_mq_client_instance() {
         Ok(c) => Some(c),
         Err(e) => {
-            ck.check("S2a fetch the admin's MQClientInstance", false, &e.to_string());
+            ck.check(
+                "S2a fetch the admin's MQClientInstance",
+                false,
+                &e.to_string(),
+            );
             None
         }
     };
@@ -422,9 +441,9 @@ async fn run(namesrv: &str) -> Checker {
                 "*",
                 0,
                 "TAG",
-                /*timeout_millis=*/30000,
-                /*max_msg_bytes=*/-1,
-                /*suspend_timeout_millis=*/15000,
+                /*timeout_millis=*/ 30000,
+                /*max_msg_bytes=*/ -1,
+                /*suspend_timeout_millis=*/ 15000,
                 Some(&fx.broker_addr),
                 0,
                 None,
@@ -451,7 +470,11 @@ async fn run(namesrv: &str) -> Checker {
                     &message,
                 );
             }
-            Err(e) => ck.check("S2a bare 361 rejected by the switch (NO_PERMISSION=16)", false, &e.to_string()),
+            Err(e) => ck.check(
+                "S2a bare 361 rejected by the switch (NO_PERMISSION=16)",
+                false,
+                &e.to_string(),
+            ),
         }
 
         // S2b: bare 11 on the same queue at the same offset => messages as usual (control leg)
@@ -466,9 +489,9 @@ async fn run(namesrv: &str) -> Checker {
                 "*",
                 0,
                 "TAG",
-                /*timeout_millis=*/30000,
-                /*max_msg_bytes=*/-1,
-                /*suspend_timeout_millis=*/15000,
+                /*timeout_millis=*/ 30000,
+                /*max_msg_bytes=*/ -1,
+                /*suspend_timeout_millis=*/ 15000,
                 Some(&fx.broker_addr),
                 0,
                 None,
@@ -483,11 +506,16 @@ async fn run(namesrv: &str) -> Checker {
                     .collect();
                 ck.check(
                     "S2b control: bare 11 is unaffected by the switch and gets messages",
-                    got.iter().any(|b| b == "lite-code-s1" || b == "lite-code-s2"),
+                    got.iter()
+                        .any(|b| b == "lite-code-s1" || b == "lite-code-s2"),
                     &format!("status={:?} got={}", r.status, join(&got)),
                 );
             }
-            Err(e) => ck.check("S2b control: bare 11 is unaffected by the switch", false, &e.to_string()),
+            Err(e) => ck.check(
+                "S2b control: bare 11 is unaffected by the switch",
+                false,
+                &e.to_string(),
+            ),
         }
     }
 
@@ -581,7 +609,11 @@ async fn run(namesrv: &str) -> Checker {
                                     .map(|m| String::from_utf8_lossy(m.get_body()).to_string()),
                             ),
                             Err(e) => {
-                                ck.check("S3 lite poll during the drain window", false, &e.to_string());
+                                ck.check(
+                                    "S3 lite poll during the drain window",
+                                    false,
+                                    &e.to_string(),
+                                );
                                 break;
                             }
                         }
@@ -619,9 +651,15 @@ async fn run(namesrv: &str) -> Checker {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let namesrv = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9876".to_string());
+    let namesrv = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:9876".to_string());
     let ck = run(&namesrv).await;
-    println!("\nLitePullCode(rust): {} passed, {} failed", ck.passed, ck.failed.len());
+    println!(
+        "\nLitePullCode(rust): {} passed, {} failed",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("  - {f}");
     }

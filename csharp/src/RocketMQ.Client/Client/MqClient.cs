@@ -3072,5 +3072,45 @@ public sealed class MQClientInstance : IDisposable
         return messages;
     }
 
+    /// <summary>
+    /// Java MQAdminImpl#viewMessage(topic, msgId) parity (MQAdminImpl.java:267):
+    /// a single leg — decode the offset msgId and ask the broker that stamped it
+    /// VIEW_MESSAGE_BY_ID(33) straight away. A decode failure maps to the
+    /// NO_MESSAGE client error Java raises there; every other leg failure
+    /// surfaces as-is. The uniq-key fallback is NOT part of this layer — it
+    /// belongs to the admin facade only (DefaultMQAdminExtImpl#viewMessage),
+    /// while the producer / push / pull facades ride this single-leg path.
+    /// timeoutMillis defaults to MQAdminImpl's own RPC budget
+    /// (MQAdminImpl.java:67, 6000).
+    /// </summary>
+    public MessageExt ViewMessage(string topic, string msgId, int timeoutMillis = 6000)
+    {
+        if (!MessageDecoder.DecodeMessageId(msgId, out string ip, out int port, out long offset)
+            || port <= 0 || port > ushort.MaxValue)
+        {
+            throw new MQClientException("query message by id finished, but no message.",
+                ResponseCode.NoMessage);
+        }
+
+        // The address is the store host:port the broker stamped into the offset
+        // msgId — a broker address, so the VIP-channel rewrite applies to it
+        // like to any other query request.
+        PropertyMap ext = new()
+        {
+            ["topic"] = topic,
+            ["offset"] = offset.ToString(CultureInfo.InvariantCulture),
+        };
+        RemotingCommand response = InvokeSync(
+            VipAddr(ip + ":" + port.ToString(CultureInfo.InvariantCulture)),
+            RequestCode.ViewMessageById, ext, null, false, timeoutMillis);
+        List<MessageExt> msgs = MessageDecoder.DecodeMessages(response.Body, true);
+        if (response.Body.Length == 0 || msgs.Count == 0)
+        {
+            throw new MQBrokerException(ResponseCode.NoMessage, "message not found: " + msgId);
+        }
+
+        return msgs[0];
+    }
+
     // ---------------- Utilities ----------------
 }

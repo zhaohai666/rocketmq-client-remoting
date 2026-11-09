@@ -16,7 +16,9 @@ pub struct ExtFields {
 
 impl ExtFields {
     pub fn new() -> ExtFields {
-        ExtFields { entries: Vec::new() }
+        ExtFields {
+            entries: Vec::new(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -118,15 +120,11 @@ impl ExtFields {
     }
 
     pub fn get_bool(&self, key: &str) -> Option<bool> {
-        self.get(key).map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        self.get(key)
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
     }
 
-    fn parse_num<T, F, E>(
-        &self,
-        key: &str,
-        parse: F,
-        kind: &str,
-    ) -> Result<Option<T>>
+    fn parse_num<T, F, E>(&self, key: &str, parse: F, kind: &str) -> Result<Option<T>>
     where
         F: FnOnce(&str) -> std::result::Result<T, E>,
         E: std::fmt::Display,
@@ -170,7 +168,9 @@ mod tests {
         ext.insert("b", "2");
         ext.insert("a", "3");
         assert_eq!(
-            ext.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+            ext.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
             vec![("a", "3"), ("b", "2")]
         );
         assert_eq!(ext.get("a"), Some("3"));

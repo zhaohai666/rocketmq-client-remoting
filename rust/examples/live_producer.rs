@@ -44,7 +44,6 @@ use rocketmq_client_remoting::client::producer::{
     DefaultMQProducer, SelectMessageQueueByHash, SendCallback, TransactionListener,
     TransactionMQProducer, DEFAULT_RETRY_RESPONSE_CODES,
 };
-use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::client::request_reply::request_future_holder;
 use rocketmq_client_remoting::client::result::{
     LocalTransactionState, SendResult, SendStatus, TransactionSendResult,
@@ -63,6 +62,7 @@ use rocketmq_client_remoting::common::recall_message_handle;
 use rocketmq_client_remoting::common::sysflag::{MessageSysFlag, PullSysFlag};
 use rocketmq_client_remoting::common::topic_config::{self, TopicFilterType};
 use rocketmq_client_remoting::common::util_all::current_time_millis;
+use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::client::RemotingClient;
 use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response_code};
 use rocketmq_client_remoting::remoting::protocol::ext_fields::StringMap;
@@ -73,9 +73,7 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
-use rocketmq_client_remoting::remoting::rpchook::{
-    AclClientRPCHook, RPCHook, SessionCredentials,
-};
+use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, SessionCredentials};
 
 /// Queue count of the main topic (P2's fixed-queue/selector assertions depend on it).
 const QUEUE_NUMS: i32 = 4;
@@ -104,7 +102,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -421,7 +422,11 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
         ));
     }
     let route = decode_route(&resp, "TBW102")?;
-    let addr = match route.broker_datas.first().and_then(|b| b.select_broker_addr()) {
+    let addr = match route
+        .broker_datas
+        .first()
+        .and_then(|b| b.select_broker_addr())
+    {
         Some(a) => a,
         None => return Err("default route has no usable broker address".to_string()),
     };
@@ -521,7 +526,9 @@ struct FakeDispatcherState {
 
 impl FakeDispatcher {
     fn new() -> Arc<FakeDispatcher> {
-        Arc::new(FakeDispatcher { inner: Arc::new(FakeDispatcherState::default()) })
+        Arc::new(FakeDispatcher {
+            inner: Arc::new(FakeDispatcherState::default()),
+        })
     }
 
     fn reported(&self) -> Vec<TraceContext> {
@@ -565,7 +572,9 @@ struct RecordingHook {
 
 impl RecordingHook {
     fn new() -> Arc<RecordingHook> {
-        Arc::new(RecordingHook { state: Mutex::new(Vec::new()) })
+        Arc::new(RecordingHook {
+            state: Mutex::new(Vec::new()),
+        })
     }
 
     fn log(&self, line: String) {
@@ -582,7 +591,10 @@ impl SendMessageHook for RecordingHook {
         "LiveRecordingHook"
     }
 
-    fn send_message_before(&self, ctx: &mut SendMessageContext) -> rocketmq_client_remoting::error::Result<()> {
+    fn send_message_before(
+        &self,
+        ctx: &mut SendMessageContext,
+    ) -> rocketmq_client_remoting::error::Result<()> {
         let topic = ctx
             .message
             .as_ref()
@@ -592,10 +604,16 @@ impl SendMessageHook for RecordingHook {
         Ok(())
     }
 
-    fn send_message_after(&self, ctx: &mut SendMessageContext) -> rocketmq_client_remoting::error::Result<()> {
+    fn send_message_after(
+        &self,
+        ctx: &mut SendMessageContext,
+    ) -> rocketmq_client_remoting::error::Result<()> {
         match &ctx.send_result {
             Some(r) => self.log(format!("after ok {:?}", r.status)),
-            None => self.log(format!("after err {:?}", ctx.exception.as_ref().map(|e| e.to_string()))),
+            None => self.log(format!(
+                "after err {:?}",
+                ctx.exception.as_ref().map(|e| e.to_string())
+            )),
         }
         Ok(())
     }
@@ -609,7 +627,10 @@ impl CheckForbiddenHook for ForbidTagA {
         "ForbidTagA"
     }
 
-    fn check_forbidden(&self, ctx: &mut CheckForbiddenContext) -> rocketmq_client_remoting::error::Result<()> {
+    fn check_forbidden(
+        &self,
+        ctx: &mut CheckForbiddenContext,
+    ) -> rocketmq_client_remoting::error::Result<()> {
         let tags = ctx
             .message
             .as_ref()
@@ -637,7 +658,10 @@ impl EndTransactionHook for EndTxnHook {
         "LiveEndTxnHook"
     }
 
-    fn end_transaction(&self, ctx: &mut EndTransactionContext) -> rocketmq_client_remoting::error::Result<()> {
+    fn end_transaction(
+        &self,
+        ctx: &mut EndTransactionContext,
+    ) -> rocketmq_client_remoting::error::Result<()> {
         self.called.fetch_add(1, Ordering::SeqCst);
         *lock(&self.last) = Some(format!(
             "{:?} fromCheck={}",
@@ -741,7 +765,9 @@ async fn p1_lifecycle(
     );
     // Idempotent: a second start neither rebuilds the instance nor errors
     let before = p.client().map(|c| c.client_id().to_string());
-    p.start().await.map_err(|e| format!("second start failed: {e}"))?;
+    p.start()
+        .await
+        .map_err(|e| format!("second start failed: {e}"))?;
     let after = p.client().map(|c| c.client_id().to_string());
     ck.check(
         "P1 start() is idempotent",
@@ -756,13 +782,20 @@ async fn p1_lifecycle(
         "still started",
     );
     // Restart allowed (the instance and heartbeat threads are started anew)
-    p.start().await.map_err(|e| format!("restart failed: {e}"))?;
+    p.start()
+        .await
+        .map_err(|e| format!("restart failed: {e}"))?;
     let mut m = msg(topic, b"after-restart", "", "");
     let sent = p.send(&mut m, Some(5000), None).await;
-    let err = sent.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    let err = sent
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "P1 a producer can be started again after shutdown and still sends",
-        sent.map(|r| r.status == SendStatus::SendOk).unwrap_or(false),
+        sent.map(|r| r.status == SendStatus::SendOk)
+            .unwrap_or(false),
         &err,
     );
     const DRAIN: usize = 10;
@@ -835,7 +868,9 @@ async fn p2_send_paths(
 
     // ---- sync send: SendResult field by field
     let mut m1 = msg(topic, b"sync-1", "TagSync", "keySync1");
-    let r1 = p.send(&mut m1, Some(5000), None).await
+    let r1 = p
+        .send(&mut m1, Some(5000), None)
+        .await
         .map_err(|e| format!("sync send failed: {e}"))?;
     let uniq = get_uniq_id(&m1).unwrap_or_default();
     let offset_ok = match (&r1.message_queue, r1.offset_msg_id.as_deref()) {
@@ -855,7 +890,9 @@ async fn p2_send_paths(
     // ---- fixed-queue send: must land in exactly the given queue
     let target = MessageQueue::new(topic, broker_name, 2);
     let mut m2 = msg(topic, b"fixed-queue", "TagFixed", "");
-    let r2 = p.send(&mut m2, Some(5000), Some(&target)).await
+    let r2 = p
+        .send(&mut m2, Some(5000), Some(&target))
+        .await
         .map_err(|e| format!("fixed send failed: {e}"))?;
     ck.check(
         "P2 sending to an explicit MessageQueue lands exactly there",
@@ -870,14 +907,23 @@ async fn p2_send_paths(
         .map(|b| msg(topic, b.as_bytes(), "TagBatch", ""))
         .collect();
     let rb = p
-        .send_batch(batch_msgs, Some(&MessageQueue::new(topic, broker_name, 1)), Some(5000))
+        .send_batch(
+            batch_msgs,
+            Some(&MessageQueue::new(topic, broker_name, 1)),
+            Some(5000),
+        )
         .await
         .map_err(|e| format!("batch send failed: {e}"))?;
     let pulled = wait_async(
         || async {
-            let r = pull_from(instance, &MessageQueue::new(topic, broker_name, 1), rb.queue_offset, broker_addr)
-                .await
-                .unwrap_or_default();
+            let r = pull_from(
+                instance,
+                &MessageQueue::new(topic, broker_name, 1),
+                rb.queue_offset,
+                broker_addr,
+            )
+            .await
+            .unwrap_or_default();
             let got = bodies(&r.msg_found_list);
             batch_bodies.iter().all(|b| got.contains(b))
         },
@@ -917,7 +963,12 @@ async fn p2_send_paths(
     for i in 0..6 {
         let mut m = msg(topic, format!("order-{i}").as_bytes(), "TagOrder", "");
         let r = p
-            .send_by_selector(&mut m, &SelectMessageQueueByHash, "same-shard-key", Some(5000))
+            .send_by_selector(
+                &mut m,
+                &SelectMessageQueueByHash,
+                "same-shard-key",
+                Some(5000),
+            )
             .await
             .map_err(|e| format!("selector send failed: {e}"))?;
         picked.push(r.message_queue.clone().map(|q| q.queue_id).unwrap_or(-1));
@@ -938,11 +989,7 @@ async fn p2_send_paths(
         None,
     )
     .map_err(|e| format!("async send failed: {e}"))?;
-    let called = wait_async(
-        || async { probe.done() >= 1 },
-        Duration::from_secs(10),
-    )
-    .await;
+    let called = wait_async(|| async { probe.done() >= 1 }, Duration::from_secs(10)).await;
     let first = probe.first();
     let shaped = first.as_ref().is_some_and(|r| {
         r.status == SendStatus::SendOk
@@ -964,7 +1011,14 @@ async fn p2_send_paths(
         .and_then(|r| r.message_queue.as_ref().map(|mq| (r, mq)))
     {
         Some((r, mq)) => {
-            body_at(instance, mq, r.queue_offset, broker_addr, Duration::from_secs(15)).await
+            body_at(
+                instance,
+                mq,
+                r.queue_offset,
+                broker_addr,
+                Duration::from_secs(15),
+            )
+            .await
                 == Some(b"async-1".to_vec())
         }
         None => false,
@@ -987,11 +1041,7 @@ async fn p2_send_paths(
         )
         .map_err(|e| format!("burst send {i} was rejected: {e}"))?;
     }
-    let all_back = wait_async(
-        || async { burst.done() >= BURST },
-        Duration::from_secs(30),
-    )
-    .await;
+    let all_back = wait_async(|| async { burst.done() >= BURST }, Duration::from_secs(30)).await;
     ck.check(
         "P2 30 concurrent async sends each get exactly one terminal callback, all SEND_OK",
         all_back && burst.done() == BURST && burst.ok() == BURST,
@@ -1005,7 +1055,15 @@ async fn p2_send_paths(
             continue;
         };
         slots.insert((mq.broker_name.clone(), mq.queue_id, r.queue_offset));
-        if let Some(body) = body_at(instance, mq, r.queue_offset, broker_addr, Duration::from_secs(15)).await {
+        if let Some(body) = body_at(
+            instance,
+            mq,
+            r.queue_offset,
+            broker_addr,
+            Duration::from_secs(15),
+        )
+        .await
+        {
             read_back.insert(body);
         }
     }
@@ -1033,18 +1091,21 @@ async fn p2_send_paths(
         Some(target.clone()),
     )
     .map_err(|e| format!("targeted async send failed: {e}"))?;
-    let aimed_back = wait_async(
-        || async { aimed.done() >= 1 },
-        Duration::from_secs(10),
-    )
-    .await;
+    let aimed_back = wait_async(|| async { aimed.done() >= 1 }, Duration::from_secs(10)).await;
     let aimed_result = aimed.first();
     let on_target = aimed_result
         .as_ref()
         .is_some_and(|r| r.message_queue.as_ref() == Some(&target));
     let aimed_landed = match aimed_result.as_ref() {
         Some(r) => {
-            body_at(instance, &target, r.queue_offset, broker_addr, Duration::from_secs(15)).await
+            body_at(
+                instance,
+                &target,
+                r.queue_offset,
+                broker_addr,
+                Duration::from_secs(15),
+            )
+            .await
                 == Some(b"async-on-mq".to_vec())
         }
         None => false,
@@ -1064,11 +1125,8 @@ async fn p2_send_paths(
         None,
     )
     .map_err(|e| format!("oversized async send was rejected at the door: {e}"))?;
-    let rejected_back = wait_async(
-        || async { rejected.done() >= 1 },
-        Duration::from_secs(20),
-    )
-    .await;
+    let rejected_back =
+        wait_async(|| async { rejected.done() >= 1 }, Duration::from_secs(20)).await;
     let rejected_errors = rejected.errors();
     let canonical_wording = rejected_errors
         .first()
@@ -1127,7 +1185,9 @@ async fn p2_send_paths(
         .msg_found_list
         .iter()
         .find(|m| m.queue_offset == rb2.queue_offset);
-    let decoded = stored.map(|m| m.body.clone().unwrap_or_default()).unwrap_or_default();
+    let decoded = stored
+        .map(|m| m.body.clone().unwrap_or_default())
+        .unwrap_or_default();
     // The broker stores the compressed stream we sent, so the whole message's storeSize is far below the raw body length.
     let plain_len = i32::try_from(COMPRESSIBLE_BODY_LEN).unwrap_or(i32::MAX);
     let went_compressed = stored.map(|m| m.store_size < plain_len).unwrap_or(false);
@@ -1174,7 +1234,11 @@ async fn p3_hooks(
     // Intercepted: the error surfaces as-is and the message never enters the broker
     let mut forbidden = msg(topic, b"must-not-land", "Forbidden", "");
     let err = p
-        .send(&mut forbidden, Some(5000), Some(&MessageQueue::new(topic, broker_name, 3)))
+        .send(
+            &mut forbidden,
+            Some(5000),
+            Some(&MessageQueue::new(topic, broker_name, 3)),
+        )
         .await
         .err()
         .map(|e| e.to_string())
@@ -1195,9 +1259,13 @@ async fn p3_hooks(
     // Passed through normally: one "before" then one "after ok"
     let before_len = hook.lines().len();
     let mut ok_msg = msg(topic, b"hook-passed", "TagAllowed", "");
-    p.send(&mut ok_msg, Some(5000), Some(&MessageQueue::new(topic, broker_name, 2)))
-        .await
-        .map_err(|e| format!("hook send failed: {e}"))?;
+    p.send(
+        &mut ok_msg,
+        Some(5000),
+        Some(&MessageQueue::new(topic, broker_name, 2)),
+    )
+    .await
+    .map_err(|e| format!("hook send failed: {e}"))?;
     let new_lines = hook.lines()[before_len..].to_vec();
     ck.check(
         "P3 SendMessageHook runs before then after, and after sees the SendResult",
@@ -1219,10 +1287,7 @@ async fn p3_hooks(
         .any(|b| b == "hook-fails");
     ck.check(
         "P3 a failing send still runs the after hook, with the exception on the context",
-        bad_err
-            .as_ref()
-            .and_then(|e| e.response_code())
-            == Some(response_code::INVALID_PARAMETER)
+        bad_err.as_ref().and_then(|e| e.response_code()) == Some(response_code::INVALID_PARAMETER)
             && err.contains("is illegal")
             && tail.len() == 2
             && tail[0].starts_with("before ")
@@ -1273,7 +1338,10 @@ async fn p4_trace_seam(
     ck.check(
         "P4 start() boots the injected dispatcher with the producer's namesrv",
         dispatcher.inner.started.load(Ordering::SeqCst) == 1,
-        &format!("started={}", dispatcher.inner.started.load(Ordering::SeqCst)),
+        &format!(
+            "started={}",
+            dispatcher.inner.started.load(Ordering::SeqCst)
+        ),
     );
 
     let mut m = msg(topic, b"traced-send", "TagTrace", "keyTrace");
@@ -1286,7 +1354,9 @@ async fn p4_trace_seam(
     )
     .await;
     let contexts = dispatcher.reported();
-    let pub_ctx = contexts.iter().find(|c| c.trace_type == Some(TraceType::Pub));
+    let pub_ctx = contexts
+        .iter()
+        .find(|c| c.trace_type == Some(TraceType::Pub));
     let bean_ok = pub_ctx
         .map(|c| {
             c.is_success
@@ -1326,7 +1396,10 @@ async fn p4_trace_seam(
     ck.check(
         "P4 shutdown() also shuts the injected dispatcher down",
         dispatcher.inner.shutdowns.load(Ordering::SeqCst) == 1,
-        &format!("shutdowns={}", dispatcher.inner.shutdowns.load(Ordering::SeqCst)),
+        &format!(
+            "shutdowns={}",
+            dispatcher.inner.shutdowns.load(Ordering::SeqCst)
+        ),
     );
     Ok(())
 }
@@ -1341,9 +1414,7 @@ async fn p5_request_reply(
     ck: &mut Checker,
 ) -> Live {
     let mut m = msg(topic, b"ping", "TagRpc", "keyRpc");
-    let correlation_before = m
-        .get_property(PROPERTY_CORRELATION_ID)
-        .map(str::to_string);
+    let correlation_before = m.get_property(PROPERTY_CORRELATION_ID).map(str::to_string);
     let result = p
         .send(
             &mut m,
@@ -1355,17 +1426,27 @@ async fn p5_request_reply(
     let _ = result;
     let mut req = msg(topic, b"ping-reply", "TagRpc", "keyRpc2");
     let err = p
-        .request(&mut req, Some(REQUEST_TIMEOUT_MS), Some(&MessageQueue::new(topic, broker_name, 0)))
+        .request(
+            &mut req,
+            Some(REQUEST_TIMEOUT_MS),
+            Some(&MessageQueue::new(topic, broker_name, 0)),
+        )
         .await
         .err();
     let code = err.as_ref().and_then(|e| e.response_code());
     let err = err.map(|e| e.to_string()).unwrap_or_default();
-    let cid = req.get_property(PROPERTY_CORRELATION_ID).unwrap_or_default().to_string();
+    let cid = req
+        .get_property(PROPERTY_CORRELATION_ID)
+        .unwrap_or_default()
+        .to_string();
     let reply_to = req
         .get_property(PROPERTY_MESSAGE_REPLY_TO_CLIENT)
         .unwrap_or_default()
         .to_string();
-    let ttl = req.get_property(PROPERTY_MESSAGE_TTL).unwrap_or_default().to_string();
+    let ttl = req
+        .get_property(PROPERTY_MESSAGE_TTL)
+        .unwrap_or_default()
+        .to_string();
     ck.check(
         "P5 the request message carries CORRELATION_ID, REPLY_TO_CLIENT and TTL",
         correlation_before.is_none()
@@ -1411,7 +1492,10 @@ async fn p6_transactions(
     p.register_end_transaction_hook(end_hook.clone());
 
     // ---- COMMIT: once the half message is committed, the consumer can read it
-    let commit_listener = LiveListener::new(LocalTransactionState::CommitMessage, LocalTransactionState::Unknow);
+    let commit_listener = LiveListener::new(
+        LocalTransactionState::CommitMessage,
+        LocalTransactionState::Unknow,
+    );
     let mut commit_msg = msg(topic, b"txn-commit", "TagTxn", "keyTxnCommit");
     let r = p
         .send_message_in_transaction(&mut commit_msg, Some(commit_listener.clone()), None)
@@ -1441,7 +1525,10 @@ async fn p6_transactions(
     );
 
     // ---- ROLLBACK: never readable
-    let rollback_listener = LiveListener::new(LocalTransactionState::RollbackMessage, LocalTransactionState::Unknow);
+    let rollback_listener = LiveListener::new(
+        LocalTransactionState::RollbackMessage,
+        LocalTransactionState::Unknow,
+    );
     let mut rb = msg(topic, b"txn-rollback", "TagTxn", "keyTxnRollback");
     let rr = p
         .send_message_in_transaction(&mut rb, Some(rollback_listener), None)
@@ -1457,16 +1544,20 @@ async fn p6_transactions(
     );
 
     // ---- UNKNOW → broker check-back (over the heartbeat-registered connection) → this time return COMMIT
-    let check_listener = LiveListener::new(LocalTransactionState::Unknow, LocalTransactionState::CommitMessage);
+    let check_listener = LiveListener::new(
+        LocalTransactionState::Unknow,
+        LocalTransactionState::CommitMessage,
+    );
     let mut unknown = msg(topic, b"txn-checked", "TagTxn", "keyTxnCheck");
     let ru = p
         .send_message_in_transaction(&mut unknown, Some(check_listener.clone()), None)
         .await
         .map_err(|e| format!("txn unknown failed: {e}"))?;
-    let immediately_visible = read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS)
-        .await
-        .iter()
-        .any(|b| b == "txn-checked");
+    let immediately_visible =
+        read_all_bodies(instance, topic, broker_name, broker_addr, QUEUE_NUMS)
+            .await
+            .iter()
+            .any(|b| b == "txn-checked");
     let checked = wait_async(
         || async { check_listener.check_count() >= 1 },
         CHECK_BACK_BUDGET,
@@ -1497,7 +1588,10 @@ async fn p6_transactions(
     );
     ck.check(
         "P6 the broker's check-back reaches our listener with the original message body",
-        check_listener.checked_bodies().iter().any(|b| b == "txn-checked"),
+        check_listener
+            .checked_bodies()
+            .iter()
+            .any(|b| b == "txn-checked"),
         &format!("{:?}", check_listener.checked_bodies()),
     );
     ck.check(
@@ -1515,13 +1609,19 @@ async fn p6_transactions(
     // ---- TransactionMQProducer: once a listener is preset, the send call need not pass one
     // (this fallback is the only extra thing this subclass does here; pin it down.)
     let txn_group = format!("PID_rust_producer_{run}_p6txn");
-    let txn = TransactionMQProducer::new(&txn_group).map_err(|e| format!("txn build failed: {e}"))?;
+    let txn =
+        TransactionMQProducer::new(&txn_group).map_err(|e| format!("txn build failed: {e}"))?;
     txn.set_rpc_hook(creds.hook());
     txn.set_namesrv_addr(namesrv);
     txn.set_instance_name(&format!("{run}-txn"));
-    let preset = LiveListener::new(LocalTransactionState::CommitMessage, LocalTransactionState::Unknow);
+    let preset = LiveListener::new(
+        LocalTransactionState::CommitMessage,
+        LocalTransactionState::Unknow,
+    );
     txn.set_transaction_listener(Some(preset.clone()));
-    txn.start().await.map_err(|e| format!("txn start failed: {e}"))?;
+    txn.start()
+        .await
+        .map_err(|e| format!("txn start failed: {e}"))?;
     let fallback_ok = txn.transaction_listener().is_some();
     let mut txn_msg = msg(topic, b"txn-preset-listener", "TagTxn", "keyTxnPreset");
     let rt: TransactionSendResult = txn
@@ -1592,26 +1692,44 @@ async fn p7_admin(
     );
     let mut into_new = msg(&created, b"into-created-topic", "", "");
     let sent_new = p.send(&mut into_new, Some(5000), None).await;
-    let new_err = sent_new.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+    let new_err = sent_new
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
     ck.check(
         "P7 the freshly created topic accepts sends through the same producer",
-        sent_new.map(|r| r.status == SendStatus::SendOk).unwrap_or(false),
+        sent_new
+            .map(|r| r.status == SendStatus::SendOk)
+            .unwrap_or(false),
         &new_err,
     );
 
     // ---- the four offset RPCs
     let mq = MessageQueue::new(topic, broker_name, 0);
-    let max_offset = p.max_offset(&mq).await.map_err(|e| format!("max_offset: {e}"))?;
-    let min_offset = p.min_offset(&mq).await.map_err(|e| format!("min_offset: {e}"))?;
+    let max_offset = p
+        .max_offset(&mq)
+        .await
+        .map_err(|e| format!("max_offset: {e}"))?;
+    let min_offset = p
+        .min_offset(&mq)
+        .await
+        .map_err(|e| format!("min_offset: {e}"))?;
     // The baseline cannot be "now minus one minute": by here this run may already be minutes old (on a real TLS machine
     // waiting for the transaction check-back alone eats 90s), and searchOffset would then jump past earlier messages -- the criterion is coupled to duration.
     // The topic name carries this run's second-level timestamp and belongs to this run alone, so the run start instant precedes the first message.
     let run_started_ms = run.parse::<i64>().unwrap_or_default() * 1000;
-    let past = p.search_offset(&mq, run_started_ms).await
+    let past = p
+        .search_offset(&mq, run_started_ms)
+        .await
         .map_err(|e| format!("search_offset(run start): {e}"))?;
-    let future = p.search_offset(&mq, current_time_millis() + 600_000).await
+    let future = p
+        .search_offset(&mq, current_time_millis() + 600_000)
+        .await
         .map_err(|e| format!("search_offset(future): {e}"))?;
-    let earliest = p.earliest_msg_store_time(&mq).await
+    let earliest = p
+        .earliest_msg_store_time(&mq)
+        .await
         .map_err(|e| format!("earliest_msg_store_time: {e}"))?;
     ck.check(
         "P7 the offset helpers agree with each other and with the queue contents",
@@ -1620,7 +1738,9 @@ async fn p7_admin(
             && future == max_offset
             && earliest > 0
             && earliest <= current_time_millis(),
-        &format!("min={min_offset} max={max_offset} past={past} future={future} earliest={earliest}"),
+        &format!(
+            "min={min_offset} max={max_offset} past={past} future={future} earliest={earliest}"
+        ),
     );
 
     // ---- query by key (the broker builds its index asynchronously, so poll until found)
@@ -1631,8 +1751,13 @@ async fn p7_admin(
         .map_err(|e| format!("send for query failed: {e}"))?;
     let found = wait_async(
         || async {
-            match p.query_message(topic, &key, 32, 0, current_time_millis() + 5000).await {
-                Ok(list) => list.iter().any(|m| m.body.clone().unwrap_or_default() == b"queried-by-key"),
+            match p
+                .query_message(topic, &key, 32, 0, current_time_millis() + 5000)
+                .await
+            {
+                Ok(list) => list
+                    .iter()
+                    .any(|m| m.body.clone().unwrap_or_default() == b"queried-by-key"),
                 Err(_) => false,
             }
         },
@@ -1659,15 +1784,18 @@ async fn p7_admin(
         &format!("len={missing}"),
     );
 
-    // ---- view_message: explicitly unsupported
+    // ---- view_message: the MQAdminImpl single leg. "0102030405" is not a valid
+    // offset msgId, so the decode failure must surface the NO_MESSAGE client
+    // error Java raises there -- without any network attempt.
     let err = p
         .view_message(topic, "0102030405")
+        .await
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
     ck.check(
-        "P7 view_message refuses instead of pretending",
-        err.contains("not supported"),
+        "P7 view_message decode failure is the NO_MESSAGE client error",
+        err.contains("query message by id finished, but no message"),
         &err,
     );
 
@@ -1675,11 +1803,19 @@ async fn p7_admin(
     for t in [&created] {
         match instance.delete_topic_in_broker(broker_addr, t, 5000).await {
             Ok(()) => ck.check(&format!("P7 delete_topic_in_broker {t}"), true, ""),
-            Err(e) => ck.check(&format!("P7 delete_topic_in_broker {t}"), false, &e.to_string()),
+            Err(e) => ck.check(
+                &format!("P7 delete_topic_in_broker {t}"),
+                false,
+                &e.to_string(),
+            ),
         }
         match instance.delete_topic_in_namesrv(t, 5000).await {
             Ok(()) => ck.check(&format!("P7 delete_topic_in_namesrv {t}"), true, ""),
-            Err(e) => ck.check(&format!("P7 delete_topic_in_namesrv {t}"), false, &e.to_string()),
+            Err(e) => ck.check(
+                &format!("P7 delete_topic_in_namesrv {t}"),
+                false,
+                &e.to_string(),
+            ),
         }
     }
     Ok(())
@@ -1743,11 +1879,8 @@ async fn p8_send_retry_kernel(
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.to_string())
         .unwrap_or_else(|| "127.0.0.1:1".to_string());
-    let orphan = DefaultMQProducer::with_rpc_hook(
-        &format!("PID_rust_orphan_{run}"),
-        creds.hook(),
-    )
-    .map_err(|e| format!("orphan producer: {e}"))?;
+    let orphan = DefaultMQProducer::with_rpc_hook(&format!("PID_rust_orphan_{run}"), creds.hook())
+        .map_err(|e| format!("orphan producer: {e}"))?;
     orphan.set_namesrv_addr(&dead_addr);
     orphan.set_instance_name(&format!("{run}-orphan"));
     if let Err(e) = orphan.start().await {
@@ -1778,7 +1911,8 @@ async fn p8_send_retry_kernel(
 
 /// Reads one broker config item (the `GET_BROKER_CONFIG` response body is properties text).
 async fn read_broker_flag(instance: &MQClientInstance, addr: &str, key: &str) -> Option<String> {
-    let mut request = RemotingCommand::create_request_command(request_code::GET_BROKER_CONFIG, None);
+    let mut request =
+        RemotingCommand::create_request_command(request_code::GET_BROKER_CONFIG, None);
     let response = instance
         .remoting_client()
         .invoke_sync(addr, &mut request, Some(5000))
@@ -1788,7 +1922,9 @@ async fn read_broker_flag(instance: &MQClientInstance, addr: &str, key: &str) ->
         return None;
     }
     let text = String::from_utf8_lossy(response.body().unwrap_or_default()).into_owned();
-    MixAll::string_to_properties(&text).get(key).map(str::to_string)
+    MixAll::string_to_properties(&text)
+        .get(key)
+        .map(str::to_string)
 }
 
 async fn write_broker_flag(
@@ -1799,8 +1935,11 @@ async fn write_broker_flag(
 ) -> Result<(), String> {
     let mut props = StringMap::new();
     props.insert(key, value);
-    let mut request = RemotingCommand::create_request_command(request_code::UPDATE_BROKER_CONFIG, None);
-    request.set_body(Some(MixAll::properties_to_string(&props, false).into_bytes()));
+    let mut request =
+        RemotingCommand::create_request_command(request_code::UPDATE_BROKER_CONFIG, None);
+    request.set_body(Some(
+        MixAll::properties_to_string(&props, false).into_bytes(),
+    ));
     let response = instance
         .remoting_client()
         .invoke_sync(addr, &mut request, Some(5000))
@@ -1854,7 +1993,10 @@ async fn p9_recall(
 
     ck.check(
         "P9 a timer send carries the broker's recallHandle",
-        recalled.recall_handle.as_deref().is_some_and(|h| !h.is_empty())
+        recalled
+            .recall_handle
+            .as_deref()
+            .is_some_and(|h| !h.is_empty())
             && kept.recall_handle.as_deref().is_some_and(|h| !h.is_empty()),
         &format!("{:?}", recalled.recall_handle),
     );
@@ -1870,9 +2012,14 @@ async fn p9_recall(
     ck.check(
         "P9 the handle the broker sent back decodes with our codec",
         decoded.as_ref().is_ok_and(|h| {
-            h.topic == topic && h.broker_name == broker_name && h.message_id == recalled.msg_id.clone().unwrap_or_default()
+            h.topic == topic
+                && h.broker_name == broker_name
+                && h.message_id == recalled.msg_id.clone().unwrap_or_default()
         }),
-        &format!("{decoded:?} topic={topic} broker={broker_name} msgId={:?}", recalled.msg_id),
+        &format!(
+            "{decoded:?} topic={topic} broker={broker_name} msgId={:?}",
+            recalled.msg_id
+        ),
     );
 
     let outcome = p.recall_message(topic, &handle).await;
@@ -1906,7 +2053,8 @@ async fn p9_recall(
         .unwrap_or_default();
     ck.check(
         "P9 a corrupt handle fails locally, before any IO",
-        bad_err.contains("recall handle is invalid") && started.elapsed() < Duration::from_millis(200),
+        bad_err.contains("recall handle is invalid")
+            && started.elapsed() < Duration::from_millis(200),
         &format!("{}ms {bad_err}", started.elapsed().as_millis()),
     );
 
@@ -1973,13 +2121,13 @@ async fn p11_producer_unregister(
     let group_a = format!("PID_rust_unreg_a_{run}");
     let group_b = format!("PID_rust_unreg_b_{run}");
 
-    let a =
-        DefaultMQProducer::with_rpc_hook(&group_a, creds.hook()).map_err(|e| format!("producer a: {e}"))?;
+    let a = DefaultMQProducer::with_rpc_hook(&group_a, creds.hook())
+        .map_err(|e| format!("producer a: {e}"))?;
     a.set_namesrv_addr(namesrv);
     a.set_instance_name(&shared);
     a.start().await.map_err(|e| format!("a start: {e}"))?;
-    let b =
-        DefaultMQProducer::with_rpc_hook(&group_b, creds.hook()).map_err(|e| format!("producer b: {e}"))?;
+    let b = DefaultMQProducer::with_rpc_hook(&group_b, creds.hook())
+        .map_err(|e| format!("producer b: {e}"))?;
     b.set_namesrv_addr(namesrv);
     b.set_instance_name(&shared);
     b.start().await.map_err(|e| format!("b start: {e}"))?;
@@ -2196,7 +2344,10 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
             "P3 hooks",
             p3_hooks(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
         ),
-        ("P4 trace seam", p4_trace_seam(namesrv, &topic, &run, &creds, &mut ck).await),
+        (
+            "P4 trace seam",
+            p4_trace_seam(namesrv, &topic, &run, &creds, &mut ck).await,
+        ),
         (
             "P5 request-reply",
             p5_request_reply(&p, &topic, &broker_name, &mut ck).await,
@@ -2218,7 +2369,17 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
         ),
         (
             "P7 admin",
-            p7_admin(&p, &instance, namesrv, &topic, &broker_name, &broker_addr, &run, &mut ck).await,
+            p7_admin(
+                &p,
+                &instance,
+                namesrv,
+                &topic,
+                &broker_name,
+                &broker_addr,
+                &run,
+                &mut ck,
+            )
+            .await,
         ),
         (
             "P8 send retry kernel",
@@ -2247,7 +2408,10 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
     }
 
     // Wrap-up: delete the main topic (broker config + name server route)
-    match instance.delete_topic_in_broker(&broker_addr, &topic, 5000).await {
+    match instance
+        .delete_topic_in_broker(&broker_addr, &topic, 5000)
+        .await
+    {
         Ok(()) => ck.check("P10 delete_topic_in_broker", true, ""),
         Err(e) => ck.check("P10 delete_topic_in_broker", false, &e.to_string()),
     }
@@ -2260,7 +2424,11 @@ async fn run(namesrv: &str, creds: Creds) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

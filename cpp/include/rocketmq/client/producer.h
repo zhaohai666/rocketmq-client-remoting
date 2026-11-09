@@ -292,6 +292,11 @@ public:
     std::vector<MessageExt> queryMessage(const std::string& topic, const std::string& key,
                                          int32_t maxNum, int64_t beginTimestamp,
                                          int64_t endTimestamp);
+    // Java DefaultMQProducerImpl#viewMessage parity (DefaultMQProducerImpl.java:517):
+    // the MQAdminImpl single-leg path — offset msgId only, no uniq-key fallback
+    // at this layer (a msgId that does not decode as an offset id surfaces the
+    // NO_MESSAGE client error).
+    MessageExt viewMessage(const std::string& topic, const std::string& msgId);
     std::vector<MessageQueue> fetchPublishMessageQueues(const std::string& topic);
 
     std::string recallMessage(const std::string& topic, const std::string& recallHandle);

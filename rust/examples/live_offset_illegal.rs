@@ -25,9 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
-use rocketmq_client_remoting::client::consumer::{
-    mq_key, ConsumerConfig, DefaultMQPushConsumer,
-};
+use rocketmq_client_remoting::client::consumer::{mq_key, ConsumerConfig, DefaultMQPushConsumer};
 use rocketmq_client_remoting::client::producer::DefaultMQProducer;
 use rocketmq_client_remoting::client::result::{
     ConsumeConcurrentlyContext, ConsumeConcurrentlyStatus, MessageListenerConcurrently,
@@ -273,7 +271,11 @@ impl Fixture {
     async fn committed(&self, group: &str, topic: &str) -> Vec<(MessageQueue, Option<i64>)> {
         let mut out = Vec::new();
         for mq in self.queues(topic).await {
-            let off = self.admin.examine_consumer_offset(group, &mq).await.unwrap_or(None);
+            let off = self
+                .admin
+                .examine_consumer_offset(group, &mq)
+                .await
+                .unwrap_or(None);
             out.push((mq, off));
         }
         out
@@ -323,7 +325,8 @@ fn fmt(rows: &[(MessageQueue, Option<i64>)]) -> String {
             format!(
                 "q{}:{}",
                 mq.queue_id,
-                off.map(|o| o.to_string()).unwrap_or_else(|| "None".to_string())
+                off.map(|o| o.to_string())
+                    .unwrap_or_else(|| "None".to_string())
             )
         })
         .collect::<Vec<String>>()
@@ -369,7 +372,9 @@ async fn s1_drop_and_rebuild(fx: &Fixture, ck: &mut Checker) {
             return;
         }
     }
-    println!("S1: sent {MSGS} messages (single queue), waiting for the listener to hold the 1st one...");
+    println!(
+        "S1: sent {MSGS} messages (single queue), waiting for the listener to hold the 1st one..."
+    );
 
     let ready = poll_until(
         || sink.arrivals().len() == 1 && c.cached_message_count(&key) == (MSGS - 1) as usize,
@@ -656,7 +661,11 @@ async fn run(namesrv: &str) -> Checker {
 }
 
 fn report(ck: &mut Checker) {
-    println!("\n== Result: {} PASS / {} FAIL ==", ck.passed, ck.failed.len());
+    println!(
+        "\n== Result: {} PASS / {} FAIL ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("  FAILED: {f}");
     }

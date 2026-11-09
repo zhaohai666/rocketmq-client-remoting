@@ -7,9 +7,7 @@
 
 use serde_json::{Map, Value};
 
-use super::admin_body::{
-    expect_object, jboolean, jfield, jint, jlong, jstring_or, json_object,
-};
+use super::admin_body::{expect_object, jboolean, jfield, jint, jlong, json_object, jstring_or};
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
@@ -54,7 +52,10 @@ impl SimpleSubscriptionData {
     pub fn to_json_value(&self) -> Value {
         json_object(vec![
             ("topic", Value::String(self.topic.clone())),
-            ("expressionType", Value::String(self.expression_type.clone())),
+            (
+                "expressionType",
+                Value::String(self.expression_type.clone()),
+            ),
             ("expression", Value::String(self.expression.clone())),
             ("version", Value::from(self.version)),
         ])
@@ -166,9 +167,18 @@ impl SubscriptionGroupConfig {
         let mut pairs = vec![
             ("groupName", Value::String(self.group_name.clone())),
             ("consumeEnable", Value::from(self.consume_enable)),
-            ("consumeFromMinEnable", Value::from(self.consume_from_min_enable)),
-            ("consumeBroadcastEnable", Value::from(self.consume_broadcast_enable)),
-            ("consumeMessageOrderly", Value::from(self.consume_message_orderly)),
+            (
+                "consumeFromMinEnable",
+                Value::from(self.consume_from_min_enable),
+            ),
+            (
+                "consumeBroadcastEnable",
+                Value::from(self.consume_broadcast_enable),
+            ),
+            (
+                "consumeMessageOrderly",
+                Value::from(self.consume_message_orderly),
+            ),
             ("retryQueueNums", Value::from(self.retry_queue_nums)),
             ("retryMaxTimes", Value::from(self.retry_max_times)),
             ("groupRetryPolicy", self.group_retry_policy.to_json_value()),
@@ -182,7 +192,10 @@ impl SubscriptionGroupConfig {
                 Value::from(self.notify_consumer_ids_changed_enable),
             ),
             ("groupSysFlag", Value::from(self.group_sys_flag)),
-            ("consumeTimeoutMinute", Value::from(self.consume_timeout_minute)),
+            (
+                "consumeTimeoutMinute",
+                Value::from(self.consume_timeout_minute),
+            ),
             ("attributes", self.attributes.to_json()),
         ];
         if let Some(set) = &self.subscription_data_set {
@@ -303,9 +316,10 @@ impl SubscriptionGroupWrapper {
         let mut wrapper = SubscriptionGroupWrapper::new();
         if let Some(Value::Object(entries)) = jfield(value, "subscriptionGroupTable") {
             for (name, item) in entries {
-                wrapper
-                    .subscription_group_table
-                    .push((name.clone(), SubscriptionGroupConfig::from_json_value(item)?));
+                wrapper.subscription_group_table.push((
+                    name.clone(),
+                    SubscriptionGroupConfig::from_json_value(item)?,
+                ));
             }
         }
         if let Some(v) = jfield(value, "forbiddenTable") {
@@ -349,9 +363,9 @@ impl TopicQueueCountTable {
         let mut table = Vec::new();
         if let Value::Object(map) = value {
             for (topic, count) in map {
-                let count = count
-                    .as_i64()
-                    .ok_or_else(|| Error::Decode(format!("topicQueueCount[{topic}] is not a number")))?;
+                let count = count.as_i64().ok_or_else(|| {
+                    Error::Decode(format!("topicQueueCount[{topic}] is not a number"))
+                })?;
                 table.push((topic.clone(), count));
             }
         }
@@ -461,7 +475,8 @@ mod tests {
         let mut a = SubscriptionGroupConfig::new("GroupA");
         a.retry_max_times = 3;
         wrapper.insert(a.clone());
-        wrapper.data_version = serde_json::json!({"stateVersion":1,"timestamp":1700000000000_i64,"counter":0});
+        wrapper.data_version =
+            serde_json::json!({"stateVersion":1,"timestamp":1700000000000_i64,"counter":0});
 
         let encoded = wrapper.encode();
         let text = String::from_utf8(encoded.clone()).unwrap();
@@ -492,9 +507,7 @@ mod tests {
         )
         .unwrap();
         assert!(w.subscription_group_table.is_empty());
-        assert!(
-            SubscriptionGroupWrapper::decode(br#"{"subscriptionGroupTable":"x"}"#).is_ok()
-        );
+        assert!(SubscriptionGroupWrapper::decode(br#"{"subscriptionGroupTable":"x"}"#).is_ok());
         assert!(matches!(
             SubscriptionGroupConfig::decode(b"[1,2]"),
             Err(Error::Decode(_))

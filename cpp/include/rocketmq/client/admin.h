@@ -353,7 +353,13 @@ public:
                                MessageExt& out);
     std::vector<MessageExt> queryMessageByKey(const std::string& topic, const std::string& key,
                                              int32_t maxNum = 32);
-    MessageExt viewMessage(const std::string& topic, const std::string& msgId);
+    // Java DefaultMQAdminExtImpl#viewMessage parity (DefaultMQAdminExtImpl.java:578):
+    // try the offset-msgId leg first, and when it fails for any reason (the msgId
+    // "maybe created by new client") fall back to the uniq-key query across
+    // brokers. When neither leg matches, Java returns null here instead of
+    // raising — so this resolves to nullopt. (The single-leg core the producer /
+    // push / pull facades share is MQClientInstance::viewMessage.)
+    std::optional<MessageExt> viewMessage(const std::string& topic, const std::string& msgId);
     QueryConsumeQueueResponseBody queryConsumeQueue(const std::string& brokerAddr,
                                                    const std::string& topic, int32_t queueId,
                                                    int64_t index, int32_t count = 32,

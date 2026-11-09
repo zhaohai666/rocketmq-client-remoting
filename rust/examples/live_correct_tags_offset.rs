@@ -281,7 +281,8 @@ fn fmt(rows: &[(MessageQueue, i64, Option<i64>)]) -> String {
             format!(
                 "q{}:{}/{}",
                 mq.queue_id,
-                off.map(|o| o.to_string()).unwrap_or_else(|| "None".to_string()),
+                off.map(|o| o.to_string())
+                    .unwrap_or_else(|| "None".to_string()),
                 max_off
             )
         })
@@ -350,7 +351,9 @@ async fn run(namesrv: &str) -> Checker {
             Ok(rows) => {
                 ctrl_rows = rows;
                 if !ctrl_rows.is_empty()
-                    && ctrl_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m))
+                    && ctrl_rows
+                        .iter()
+                        .all(|(_, m, o)| o.is_some() && o == &Some(*m))
                 {
                     break;
                 }
@@ -364,7 +367,10 @@ async fn run(namesrv: &str) -> Checker {
     }
     ck.check(
         "S1-the control group's committed offset == each queue's maxOffset (numeric convention)",
-        !ctrl_rows.is_empty() && ctrl_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m)),
+        !ctrl_rows.is_empty()
+            && ctrl_rows
+                .iter()
+                .all(|(_, m, o)| o.is_some() && o == &Some(*m)),
         &fmt(&ctrl_rows),
     );
     ck.check(
@@ -400,7 +406,9 @@ async fn run(namesrv: &str) -> Checker {
             Ok(rows) => {
                 test_rows = rows;
                 if !test_rows.is_empty()
-                    && test_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m))
+                    && test_rows
+                        .iter()
+                        .all(|(_, m, o)| o.is_some() && o == &Some(*m))
                 {
                     break;
                 }
@@ -424,11 +432,17 @@ async fn run(namesrv: &str) -> Checker {
     );
     ck.check(
         "S2-the corrected offset sum == the control group's (the max offsets of the same queues)",
-        test_rows.iter().map(|(_, _, o)| o.unwrap_or(-1)).sum::<i64>()
+        test_rows
+            .iter()
+            .map(|(_, _, o)| o.unwrap_or(-1))
+            .sum::<i64>()
             == ctrl_rows.iter().map(|(_, m, _)| *m).sum::<i64>(),
         &format!(
             "test={} ctrl={}",
-            test_rows.iter().map(|(_, _, o)| o.unwrap_or(-1)).sum::<i64>(),
+            test_rows
+                .iter()
+                .map(|(_, _, o)| o.unwrap_or(-1))
+                .sum::<i64>(),
             ctrl_rows.iter().map(|(_, m, _)| *m).sum::<i64>()
         ),
     );
@@ -443,7 +457,9 @@ async fn run(namesrv: &str) -> Checker {
             Ok(rows) => {
                 retry_rows = rows;
                 if !retry_rows.is_empty()
-                    && retry_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m))
+                    && retry_rows
+                        .iter()
+                        .all(|(_, m, o)| o.is_some() && o == &Some(*m))
                 {
                     break;
                 }
@@ -457,7 +473,10 @@ async fn run(namesrv: &str) -> Checker {
     }
     ck.check(
         &format!("S3-an offset record appears on {retry_topic} and equals maxOffset"),
-        !retry_rows.is_empty() && retry_rows.iter().all(|(_, m, o)| o.is_some() && o == &Some(*m)),
+        !retry_rows.is_empty()
+            && retry_rows
+                .iter()
+                .all(|(_, m, o)| o.is_some() && o == &Some(*m)),
         &fmt(&retry_rows),
     );
     ck.check(

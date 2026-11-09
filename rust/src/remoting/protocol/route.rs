@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 use super::admin_body::{
-    expect_object, jarray, jboolean, jentries, jfield, jint, jstring, jstring_or, json_object,
+    expect_object, jarray, jboolean, jentries, jfield, jint, json_object, jstring, jstring_or,
     MessageQueueKey,
 };
 use super::serialize::RemotingSerializable;
@@ -225,9 +225,17 @@ impl TopicRouteData {
             ),
             (
                 "brokerDatas",
-                Value::Array(self.broker_datas.iter().map(|b| b.to_json_value()).collect()),
+                Value::Array(
+                    self.broker_datas
+                        .iter()
+                        .map(|b| b.to_json_value())
+                        .collect(),
+                ),
             ),
-            ("filterServerTable", encode_string_list_map(&self.filter_server_table)),
+            (
+                "filterServerTable",
+                encode_string_list_map(&self.filter_server_table),
+            ),
         ];
         if let Some(mapping) = &self.topic_queue_mapping_by_broker {
             let mut map = Map::new();
@@ -269,7 +277,9 @@ impl TopicRouteData {
         // an explicit `{}` is Some(empty), and the key must be written back when re-encoding.
         let topic_queue_mapping_by_broker = match jfield(value, "topicQueueMappingByBroker") {
             None => None,
-            Some(Value::Object(map)) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            Some(Value::Object(map)) => {
+                Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
             Some(_) => {
                 return Err(Error::Decode(
                     "topicQueueMappingByBroker is not a json object".into(),
@@ -401,13 +411,12 @@ fn encode_string_list_map(table: &[(String, Vec<String>)]) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::serialize::fastjson;
+    use super::*;
 
     // The literals below are compact-JSON (no space separators) ground truths captured from the wire.
 
-    const WIRE_QUEUE_DATA: &str =
-        r#"{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}"#;
+    const WIRE_QUEUE_DATA: &str = r#"{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}"#;
 
     const WIRE_BROKER_DATA: &str = r#"{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911","1":"127.0.0.1:10912"},"zoneName":"zone-1","enableActingMaster":false}"#;
 
@@ -435,7 +444,10 @@ mod tests {
             RemotingSerializable::to_json_string(&qd.to_json_value()),
             WIRE_QUEUE_DATA
         );
-        assert_eq!(QueueData::from_json_value(&value(WIRE_QUEUE_DATA)).unwrap(), qd);
+        assert_eq!(
+            QueueData::from_json_value(&value(WIRE_QUEUE_DATA)).unwrap(),
+            qd
+        );
         assert_eq!(qd.clone().compare_to(&qd), Ordering::Equal);
         assert_eq!(
             QueueData::new("broker-b", 0, 0, 0, 0).compare_to(&qd),
@@ -463,7 +475,10 @@ mod tests {
             Some("127.0.0.1:10911"),
             "when brokerId=0 is in the table, master must be preferred"
         );
-        assert_eq!(BrokerData::from_json_value(&value(WIRE_BROKER_DATA)).unwrap(), bd);
+        assert_eq!(
+            BrokerData::from_json_value(&value(WIRE_BROKER_DATA)).unwrap(),
+            bd
+        );
         let decoded = BrokerData::decode(WIRE_BROKER_DATA.as_bytes()).unwrap();
         assert_eq!(decoded.zone_name, "zone-1");
         assert_eq!(decoded.broker_addrs.len(), 2);
@@ -543,8 +558,10 @@ mod tests {
 
         let without = TopicRouteData::decode(EMPTY_TOPIC_ROUTE.as_bytes()).unwrap();
         assert_eq!(without.topic_queue_mapping_by_broker, None);
-        assert!(!RemotingSerializable::to_json_string(&without.to_json_value())
-            .contains("topicQueueMappingByBroker"));
+        assert!(
+            !RemotingSerializable::to_json_string(&without.to_json_value())
+                .contains("topicQueueMappingByBroker")
+        );
 
         let trd = TopicRouteData::decode(ROUTE_WITH_MAPPING.as_bytes()).unwrap();
         assert_eq!(trd.order_topic_conf.as_deref(), Some("1 2 3"));
@@ -561,7 +578,10 @@ mod tests {
     fn nameserver_payload_with_bare_numeric_keys_decodes() {
         let trd = TopicRouteData::decode(NS_ROUTE.as_bytes()).unwrap();
         assert_eq!(trd.queue_datas.len(), 1);
-        assert_eq!(trd.broker_datas[0].broker_addrs, vec![(0, "127.0.0.1:10911".into())]);
+        assert_eq!(
+            trd.broker_datas[0].broker_addrs,
+            vec![(0, "127.0.0.1:10911".into())]
+        );
         assert!(trd.filter_server_table.is_empty());
         assert_eq!(
             RemotingSerializable::to_json_string(&trd.to_json_value()),
@@ -628,8 +648,7 @@ mod tests {
         // Negative control: put the master back and broker-a's 4 queues return immediately -- what gets skipped is "no master",
         // not the broker-a name.
         let mut with_master = ro.clone_topic_route_data();
-        with_master.broker_datas[0].broker_addrs =
-            vec![(0, "master".into()), (1, "slave".into())];
+        with_master.broker_datas[0].broker_addrs = vec![(0, "master".into()), (1, "slave".into())];
         assert_eq!(with_master.get_all_message_queue("T").len(), 8);
     }
 

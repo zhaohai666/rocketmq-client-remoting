@@ -1,4 +1,3 @@
-
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default, Clone)]
@@ -12,7 +11,9 @@ impl Writer {
     }
 
     pub fn with_capacity(cap: usize) -> Writer {
-        Writer { buf: Vec::with_capacity(cap) }
+        Writer {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -42,7 +43,8 @@ impl Writer {
     }
 
     pub fn i16(&mut self, v: i32) -> &mut Writer {
-        self.buf.extend_from_slice(&((v as i16) as u16).to_be_bytes());
+        self.buf
+            .extend_from_slice(&((v as i16) as u16).to_be_bytes());
         self
     }
 
@@ -138,7 +140,9 @@ impl<'a> Reader<'a> {
     }
 
     pub fn slice(&self, start: usize, len: usize) -> Result<&'a [u8]> {
-        let end = start.checked_add(len).ok_or_else(|| Error::Decode("slice overflow".into()))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::Decode("slice overflow".into()))?;
         if end > self.data.len() {
             return Err(Error::Decode(format!(
                 "buffer underflow: need {end} bytes, have {}",
@@ -226,7 +230,9 @@ impl<'a> Reader<'a> {
         }
         let text = String::from_utf8(self.bytes(n as usize)?.to_vec())
             .map_err(|e| Error::Decode(format!("invalid utf8: {e}")))?;
-        text.trim().parse::<i64>().map_err(|e| Error::Decode(format!("bad decimal {text:?}: {e}")))
+        text.trim()
+            .parse::<i64>()
+            .map_err(|e| Error::Decode(format!("bad decimal {text:?}: {e}")))
     }
 
     pub fn decimal_int(&mut self) -> Result<i32> {
@@ -241,7 +247,12 @@ mod tests {
     #[test]
     fn big_endian_round_trip() {
         let mut w = Writer::new();
-        w.i16(310).u8(12).i16(428).i32(-7).i32(0x1234_5678).i64(1 << 40);
+        w.i16(310)
+            .u8(12)
+            .i16(428)
+            .i32(-7)
+            .i32(0x1234_5678)
+            .i64(1 << 40);
         let mut r = Reader::new(w.as_slice());
         assert_eq!(r.i16().unwrap(), 310);
         assert_eq!(r.u8().unwrap(), 12);

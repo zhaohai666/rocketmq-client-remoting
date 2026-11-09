@@ -60,7 +60,13 @@ impl DefaultTopAddressing {
         } else {
             Self::get_ws_addr(&domain, None)
         };
-        Self { ws_addr, unit_name: String::new(), para: Vec::new(), timeout_millis: DEFAULT_TIMEOUT_MILLIS, ns_addr: None }
+        Self {
+            ws_addr,
+            unit_name: String::new(),
+            para: Vec::new(),
+            timeout_millis: DEFAULT_TIMEOUT_MILLIS,
+            ns_addr: None,
+        }
     }
 
     /// Gives the full WS address directly (for unit tests / special deployments).
@@ -106,7 +112,9 @@ impl DefaultTopAddressing {
 
     /// Whether dynamic address lookup is available (domain explicitly configured).
     pub fn is_configured() -> bool {
-        !std::env::var(NAMESRV_DOMAIN_ENV).unwrap_or_default().is_empty()
+        !std::env::var(NAMESRV_DOMAIN_ENV)
+            .unwrap_or_default()
+            .is_empty()
     }
 
     /// Mirrors the URL assembly in `fetchNSAddr` (unitName / para rules copied rule by rule).
@@ -119,8 +127,7 @@ impl DefaultTopAddressing {
             } else {
                 format!("{url}?")
             };
-            let parts: Vec<String> =
-                self.para.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let parts: Vec<String> = self.para.iter().map(|(k, v)| format!("{k}={v}")).collect();
             url.push_str(&parts.join("&"));
         } else if has_unit {
             url = format!("{url}-{}?nofix=1", self.unit_name);
@@ -166,7 +173,10 @@ impl DefaultTopAddressing {
         if addrs == self.ns_addr.as_deref().unwrap_or_default() {
             return None;
         }
-        crate::rmq_info!("name server address changed, old={:?}, new={addrs}", self.ns_addr);
+        crate::rmq_info!(
+            "name server address changed, old={:?}, new={addrs}",
+            self.ns_addr
+        );
         self.ns_addr = Some(addrs);
         self.ns_addr.clone()
     }
@@ -179,23 +189,32 @@ impl DefaultTopAddressing {
 
         let mut stream = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| Error::Timeout { addr: addr.clone(), timeout_millis: self.timeout_millis as i64 })?
+            .map_err(|_| Error::Timeout {
+                addr: addr.clone(),
+                timeout_millis: self.timeout_millis as i64,
+            })?
             .map_err(|_| Error::Connect { addr: addr.clone() })?;
 
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         );
-        stream.write_all(request.as_bytes()).await.map_err(|e| Error::SendRequest {
-            addr: addr.clone(),
-            message: e.to_string(),
-        })?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|e| Error::SendRequest {
+                addr: addr.clone(),
+                message: e.to_string(),
+            })?;
 
         let raw = read_to_end(&mut stream, timeout).await?;
         let (head, body) =
             split_headers(&raw).ok_or_else(|| Error::Decode("malformed http response".into()))?;
         let status = parse_status_line(head)?;
         if status != 200 {
-            return Err(Error::SendRequest { addr, message: format!("http status {status}") });
+            return Err(Error::SendRequest {
+                addr,
+                message: format!("http status {status}"),
+            });
         }
         Ok(String::from_utf8_lossy(body).into_owned())
     }
@@ -251,7 +270,10 @@ where
     };
     tokio::time::timeout(timeout, op)
         .await
-        .map_err(|_| Error::Timeout { addr: "address server".into(), timeout_millis: timeout.as_millis() as i64 })?
+        .map_err(|_| Error::Timeout {
+            addr: "address server".into(),
+            timeout_millis: timeout.as_millis() as i64,
+        })?
 }
 
 /// Splits header from body at the first `\r\n\r\n` (tolerating a bare `\n\n`). The separator is ASCII,
@@ -276,7 +298,9 @@ fn parse_status_line(head: &[u8]) -> Result<u16> {
     let first = text.lines().next().unwrap_or_default();
     let mut it = first.split_whitespace();
     let _version = it.next();
-    let code = it.next().ok_or_else(|| Error::Decode("http response has no status code".into()))?;
+    let code = it
+        .next()
+        .ok_or_else(|| Error::Decode("http response has no status code".into()))?;
     code.parse()
         .map_err(|_| Error::Decode(format!("bad http status code {code:?}")))
 }
@@ -313,7 +337,10 @@ mod tests {
             "http://h:8080/rocketmq/nsaddr-unitA?nofix=1"
         );
         // A blank unitName counts as unset
-        assert_eq!(base().with_unit_name("   ").build_url(), "http://h:8080/rocketmq/nsaddr");
+        assert_eq!(
+            base().with_unit_name("   ").build_url(),
+            "http://h:8080/rocketmq/nsaddr"
+        );
 
         let url = base()
             .with_para(vec![("k1".into(), "v1".into()), ("k2".into(), "v2".into())])
@@ -363,9 +390,15 @@ mod tests {
             ("h".to_string(), 9876, "/a?nofix=1".to_string())
         );
         assert!(matches!(split_http_url("https://h"), Err(Error::Encode(_))));
-        assert!(matches!(split_http_url("http://h:abc/"), Err(Error::Encode(_))));
+        assert!(matches!(
+            split_http_url("http://h:abc/"),
+            Err(Error::Encode(_))
+        ));
         assert!(matches!(split_http_url("http://h:80/x"), Ok((_, 80, _))));
-        assert!(matches!(split_http_url("http://@h/"), Err(Error::Encode(_))));
+        assert!(matches!(
+            split_http_url("http://@h/"),
+            Err(Error::Encode(_))
+        ));
     }
 
     #[test]
@@ -436,7 +469,13 @@ mod tests {
                     }
                 }
             });
-            Self { port, requests, respond, shutdown: Some(tx), task: Some(task) }
+            Self {
+                port,
+                requests,
+                respond,
+                shutdown: Some(tx),
+                task: Some(task),
+            }
         }
 
         fn top(&self) -> DefaultTopAddressing {
@@ -503,7 +542,10 @@ mod tests {
     async fn fetch_and_apply_only_reports_changes() {
         let server = MockAddrServer::start().await;
         let mut ta = server.top();
-        assert_eq!(ta.fetch_and_apply().await.as_deref(), Some("127.0.0.1:9876"));
+        assert_eq!(
+            ta.fetch_and_apply().await.as_deref(),
+            Some("127.0.0.1:9876")
+        );
         assert_eq!(ta.fetch_and_apply().await, None); // identical → not applied
         server.set_response(200, "10.0.0.9:9876");
         assert_eq!(ta.fetch_and_apply().await.as_deref(), Some("10.0.0.9:9876"));
@@ -528,8 +570,8 @@ mod tests {
             let (_sock, _) = listener.accept().await.unwrap();
             futures_sleep_forever().await;
         });
-        let ta = DefaultTopAddressing::from_domain(format!("127.0.0.1:{port}"))
-            .with_timeout_millis(150);
+        let ta =
+            DefaultTopAddressing::from_domain(format!("127.0.0.1:{port}")).with_timeout_millis(150);
         let started = std::time::Instant::now();
         assert_eq!(ta.fetch_ns_addr(false).await, None);
         assert!(started.elapsed() < Duration::from_secs(2));

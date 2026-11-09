@@ -43,7 +43,7 @@ use serde_json::Value;
 
 use rocketmq_client_remoting::common::message::Message;
 use rocketmq_client_remoting::common::message_client_id_setter;
-use rocketmq_client_remoting::common::message_const as message_const;
+use rocketmq_client_remoting::common::message_const;
 use rocketmq_client_remoting::common::message_decoder;
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::sysflag::PullSysFlag;
@@ -51,17 +51,20 @@ use rocketmq_client_remoting::common::topic_config::{self, TopicFilterType};
 use rocketmq_client_remoting::common::util_all;
 use rocketmq_client_remoting::remoting::client::RemotingClient;
 use rocketmq_client_remoting::remoting::protocol::body::GetConsumerListByGroupResponseBody;
-use rocketmq_client_remoting::remoting::protocol::codes::{request_code, response_code, serialize_type};
-use rocketmq_client_remoting::remoting::protocol::heartbeat::{
-    ConsumeFromWhere, ConsumeType, ConsumerData, ExpressionType, HeartbeatData, MessageModel,
-    ProducerData, SubscriptionData,
+use rocketmq_client_remoting::remoting::protocol::codes::{
+    request_code, response_code, serialize_type,
 };
 use rocketmq_client_remoting::remoting::protocol::headers::{
     CreateTopicRequestHeader, DeleteTopicRequestHeader, GetConsumerListByGroupRequestHeader,
     GetMaxOffsetRequestHeader, GetMinOffsetRequestHeader, GetRouteInfoRequestHeader,
     HeartbeatRequestHeader, PullMessageRequestHeader, PullMessageResponseHeader,
-    QueryConsumerOffsetRequestHeader, QueryConsumerOffsetResponseHeader, SendMessageRequestHeaderV2,
-    SendMessageResponseHeader, UnregisterClientRequestHeader, UpdateConsumerOffsetRequestHeader,
+    QueryConsumerOffsetRequestHeader, QueryConsumerOffsetResponseHeader,
+    SendMessageRequestHeaderV2, SendMessageResponseHeader, UnregisterClientRequestHeader,
+    UpdateConsumerOffsetRequestHeader,
+};
+use rocketmq_client_remoting::remoting::protocol::heartbeat::{
+    ConsumeFromWhere, ConsumeType, ConsumerData, ExpressionType, HeartbeatData, MessageModel,
+    ProducerData, SubscriptionData,
 };
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
@@ -92,7 +95,10 @@ struct Checker {
 
 impl Checker {
     fn new() -> Checker {
-        Checker { passed: 0, failed: Vec::new() }
+        Checker {
+            passed: 0,
+            failed: Vec::new(),
+        }
     }
 
     fn check(&mut self, name: &str, cond: bool, detail: &str) {
@@ -202,8 +208,8 @@ async fn s0_bootstrap(
         ));
     }
     let route = decode_route(&resp, "TBW102")?;
-    let (broker_name, broker_addr) =
-        first_broker(&route).ok_or_else(|| "default route has no usable broker address".to_string())?;
+    let (broker_name, broker_addr) = first_broker(&route)
+        .ok_or_else(|| "default route has no usable broker address".to_string())?;
     println!("        default topic broker = {broker_name} @ {broker_addr}");
 
     let req = RemotingCommand::create_request_command(
@@ -249,7 +255,10 @@ async fn s1_route(
     ck.check(
         "S1 route responseCode == SUCCESS",
         resp.code == response_code::SUCCESS,
-        &format!("code={} remark={:?} opaque={}", resp.code, resp.remark, resp.opaque),
+        &format!(
+            "code={} remark={:?} opaque={}",
+            resp.code, resp.remark, resp.opaque
+        ),
     );
     if resp.code != response_code::SUCCESS {
         return Err(format!(
@@ -302,7 +311,10 @@ async fn s1_route(
         Some(a) => a,
         None => return Err(format!("broker {} has no address", bd.broker_name)),
     };
-    println!("        brokerData: cluster={} brokerName={} addr={}", bd.cluster, bd.broker_name, addr);
+    println!(
+        "        brokerData: cluster={} brokerName={} addr={}",
+        bd.cluster, bd.broker_name, addr
+    );
     ck.check(
         "S1 broker name and addr not blank",
         util_all::is_not_blank_str(&bd.broker_name) && util_all::is_not_blank_str(&addr),
@@ -344,7 +356,11 @@ async fn s2_cluster_info(client: &RemotingClient, namesrv: &str, ck: &mut Checke
     let table = value.get("brokerAddrTable").and_then(Value::as_object);
     match table {
         Some(t) => {
-            ck.check("S2 brokerAddrTable not empty", !t.is_empty(), "brokerAddrTable is empty");
+            ck.check(
+                "S2 brokerAddrTable not empty",
+                !t.is_empty(),
+                "brokerAddrTable is empty",
+            );
             for (name, bd) in t {
                 let cluster = bd
                     .get("cluster")
@@ -405,7 +421,9 @@ async fn s3_send(
         sys_flag: Some(0),
         born_timestamp: Some(util_all::current_time_millis()),
         flag: Some(msg.get_flag()),
-        properties: Some(message_decoder::message_properties_2_string(msg.get_properties())),
+        properties: Some(message_decoder::message_properties_2_string(
+            msg.get_properties(),
+        )),
         reconsume_times: Some(0),
         unit_mode: Some(false),
         max_reconsume_times: Some(0),
@@ -454,7 +472,9 @@ async fn s3_send(
     ck.check(
         "S3 UNIQ_KEY is 32 uppercase hex chars",
         uniq_id.len() == 32
-            && uniq_id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
+            && uniq_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()),
         &format!("uniqId={uniq_id:?}"),
     );
     // store msgId and UNIQ_KEY are two independent identifiers; the broker only returns the former.
@@ -463,7 +483,12 @@ async fn s3_send(
         wire_msg_id != uniq_id,
         &format!("msgId={wire_msg_id} uniqId={uniq_id}"),
     );
-    Ok(Sent { uniq_id, msg_id: wire_msg_id, queue_offset, body })
+    Ok(Sent {
+        uniq_id,
+        msg_id: wire_msg_id,
+        queue_offset,
+        body,
+    })
 }
 
 /// S4: `PULL_MESSAGE(11)` -- verify the 17-section store format can decode back the message just sent.
@@ -505,7 +530,10 @@ async fn s4_pull(
     ck.check(
         "S4 pull responseCode == SUCCESS",
         resp.code == response_code::SUCCESS,
-        &format!("code={} remark={:?} (19=PULL_NOT_FOUND)", resp.code, resp.remark),
+        &format!(
+            "code={} remark={:?} (19=PULL_NOT_FOUND)",
+            resp.code, resp.remark
+        ),
     );
     if resp.code != response_code::SUCCESS {
         return Ok(());
@@ -522,7 +550,11 @@ async fn s4_pull(
         resp_header.max_offset.unwrap_or(-1),
         resp_header.next_begin_offset.unwrap_or(-1)
     );
-    ck.check("S4 pulled at least 1 message", !found.is_empty(), "body decoded 0 message");
+    ck.check(
+        "S4 pulled at least 1 message",
+        !found.is_empty(),
+        "body decoded 0 message",
+    );
     let first = match found.first() {
         Some(m) => m,
         None => return Ok(()),
@@ -576,7 +608,10 @@ async fn s4_pull(
     ck.check(
         "S4 offsets are consistent",
         min_offset >= 0 && max_offset >= min_offset && next > sent.queue_offset,
-        &format!("min={min_offset} max={max_offset} next={next} pulled_at={}", sent.queue_offset),
+        &format!(
+            "min={min_offset} max={max_offset} next={next} pulled_at={}",
+            sent.queue_offset
+        ),
     );
     Ok(())
 }
@@ -591,7 +626,10 @@ async fn s5_offsets(
     ck: &mut Checker,
 ) -> Live {
     let offset_of = |resp: &RemotingCommand| -> i64 {
-        resp.ext_fields().get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(-1)
+        resp.ext_fields()
+            .get("offset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(-1)
     };
 
     let min = rpc(
@@ -633,7 +671,10 @@ async fn s5_offsets(
         &format!("code={} remark={:?}", max.code, max.remark),
     );
     let max_offset = offset_of(&max);
-    println!("        queue 0: min={min_offset} max={max_offset} sent_at={}", sent.queue_offset);
+    println!(
+        "        queue 0: min={min_offset} max={max_offset} sent_at={}",
+        sent.queue_offset
+    );
     ck.check(
         "S5 maxOffset == sentOffset + 1",
         max_offset == sent.queue_offset + 1,
@@ -642,7 +683,10 @@ async fn s5_offsets(
     ck.check(
         "S5 minOffset <= sentOffset < maxOffset",
         min_offset >= 0 && min_offset <= sent.queue_offset && sent.queue_offset < max_offset,
-        &format!("min={min_offset} sent={} max={max_offset}", sent.queue_offset),
+        &format!(
+            "min={min_offset} sent={} max={max_offset}",
+            sent.queue_offset
+        ),
     );
 
     let update = rpc(
@@ -741,7 +785,9 @@ async fn s6_heartbeat(
     hb.add_consumer_data(cd);
     let mut req = RemotingCommand::create_request_command(
         request_code::HEART_BEAT,
-        Some(Box::new(HeartbeatRequestHeader { client_id: Some(client_id.to_string()) })),
+        Some(Box::new(HeartbeatRequestHeader {
+            client_id: Some(client_id.to_string()),
+        })),
     );
     req.set_body(Some(hb.encode()));
     let resp = rpc(client, broker_addr, req, 5000).await?;
@@ -824,7 +870,12 @@ async fn s6_heartbeat(
 }
 
 /// S7: RocketMQ binary header (`serializeType=ROCKETMQ`) against the real namesrv.
-async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &str, ck: &mut Checker) -> Live {
+async fn s7_rocketmq_serialize(
+    client: &RemotingClient,
+    namesrv: &str,
+    topic: &str,
+    ck: &mut Checker,
+) -> Live {
     let mut req = RemotingCommand::create_request_command(
         request_code::GET_ROUTEINFO_BY_TOPIC,
         Some(Box::new(GetRouteInfoRequestHeader {
@@ -835,7 +886,8 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
     req.serialize_type_current_rpc = serialize_type::ROCKETMQ;
 
     let wire = req.encode();
-    let (total_len, marked) = frame_prefix(&wire).ok_or_else(|| "frame shorter than 8 bytes".to_string())?;
+    let (total_len, marked) =
+        frame_prefix(&wire).ok_or_else(|| "frame shorter than 8 bytes".to_string())?;
     let header_len = header_length_of(marked);
     ck.check(
         "S7 frame carries the RMQ protocol mark",
@@ -879,14 +931,22 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
     // so this only prints and does not assert equality -- the client must pick the decoder by the response's own mark.
     println!(
         "        response serializeType={} (request used ROCKETMQ={})",
-        resp.serialize_type_current_rpc, serialize_type::ROCKETMQ
+        resp.serialize_type_current_rpc,
+        serialize_type::ROCKETMQ
     );
     let route = decode_route(&resp, "S7 route");
-    let usable = route.as_ref().map(|r| !r.broker_datas.is_empty()).unwrap_or(false);
+    let usable = route
+        .as_ref()
+        .map(|r| !r.broker_datas.is_empty())
+        .unwrap_or(false);
     ck.check(
         "S7 route decodes through the binary header path",
         usable,
-        &format!("err={:?} ok={}", route.as_ref().err().map(|e| e.as_str()), route.is_ok()),
+        &format!(
+            "err={:?} ok={}",
+            route.as_ref().err().map(|e| e.as_str()),
+            route.is_ok()
+        ),
     );
     Ok(())
 }
@@ -904,7 +964,9 @@ async fn s8_cleanup(
         broker_addr,
         RemotingCommand::create_request_command(
             request_code::DELETE_TOPIC_IN_BROKER,
-            Some(Box::new(DeleteTopicRequestHeader { topic: Some(topic.to_string()) })),
+            Some(Box::new(DeleteTopicRequestHeader {
+                topic: Some(topic.to_string()),
+            })),
         ),
         5000,
     )
@@ -915,7 +977,8 @@ async fn s8_cleanup(
         &format!("code={} remark={:?}", resp.code, resp.remark),
     );
 
-    let mut del = RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
+    let mut del =
+        RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
     del.add_ext_field("topic", topic);
     let resp = rpc(client, namesrv, del, 5000).await?;
     ck.check(
@@ -978,7 +1041,16 @@ async fn main() -> ExitCode {
     if let Err(e) = s2_cluster_info(&client, &namesrv, &mut ck).await {
         ck.abort("S2 cluster info", &e);
     }
-    let sent = match s3_send(&client, &broker_addr, &broker_name, &topic, &producer_group, &mut ck).await {
+    let sent = match s3_send(
+        &client,
+        &broker_addr,
+        &broker_name,
+        &topic,
+        &producer_group,
+        &mut ck,
+    )
+    .await
+    {
         Ok(s) => Some(s),
         Err(e) => {
             ck.abort("S3 send message", &e);
@@ -987,10 +1059,14 @@ async fn main() -> ExitCode {
     };
     match &sent {
         Some(s) => {
-            if let Err(e) = s4_pull(&client, &broker_addr, &topic, &consumer_group, s, &mut ck).await {
+            if let Err(e) =
+                s4_pull(&client, &broker_addr, &topic, &consumer_group, s, &mut ck).await
+            {
                 ck.abort("S4 pull message", &e);
             }
-            if let Err(e) = s5_offsets(&client, &broker_addr, &topic, &consumer_group, s, &mut ck).await {
+            if let Err(e) =
+                s5_offsets(&client, &broker_addr, &topic, &consumer_group, s, &mut ck).await
+            {
                 ck.abort("S5 offsets", &e);
             }
         }
@@ -1026,7 +1102,11 @@ async fn main() -> ExitCode {
 }
 
 fn report(ck: &mut Checker) {
-    println!("== summary: {} passed, {} failed ==", ck.passed, ck.failed.len());
+    println!(
+        "== summary: {} passed, {} failed ==",
+        ck.passed,
+        ck.failed.len()
+    );
     for f in &ck.failed {
         println!("   FAILED {f}");
     }

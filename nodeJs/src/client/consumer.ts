@@ -2871,6 +2871,15 @@ export class DefaultMQPushConsumer {
     for (const pq of this.popQueueTable.values()) total += pq.waitAckMsgCount();
     return total;
   }
+
+  // viewMessage is Java DefaultMQPushConsumerImpl#viewMessage
+  // (DefaultMQPushConsumerImpl.java:1329) parity: the MQAdminImpl single-leg
+  // path — offset msgId only, no uniq-key fallback at this layer.
+  async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
+    const client = this.mqClient;
+    if (!client) throw new Error('consumer not started');
+    return client.viewMessage(topic, msgId);
+  }
 }
 
 // ---------------------------------------------------------------- helpers

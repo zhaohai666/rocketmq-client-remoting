@@ -40,7 +40,7 @@ import { MessageType } from '../common/messageType.ts';
 import { ExpressionType } from '../common/subscriptionData.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
-import { messageProperties2String, decodeMessage, string2MessageProperties } from '../common/messageDecoder.ts';
+import { messageProperties2String, decodeMessage, decodeMessageId, string2MessageProperties } from '../common/messageDecoder.ts';
 import { getLogger } from '../logging.ts';
 import {
   MQClientException, MQBrokerException, RemotingException,
@@ -116,6 +116,16 @@ class FixedTaskExecutor {
 // TopicPublishInfo — holds the shared round-robin cursor used across calls.
 // ---------------------------------------------------------------------------
 export type FacadeProcessor = (cmd: RemotingCommand, addr: string) => RemotingCommand | null;
+
+// Verdict of CHANGE_MESSAGE_INVISIBLETIME(200053). Java parity
+// (MQClientAPIImpl#changeInvisibleTimeAsync:1018-1036): code SUCCESS is
+// AckStatus.OK and carries the decoded response header; ANY other code is
+// AckStatus.NO_EXIST — a result, not an error — and `header` is null.
+export interface ChangeInvisibleTimeOutcome {
+  code: number;
+  remark: string;
+  header: ChangeInvisibleTimeResponseHeader | null;
+}
 
 export class TopicPublishInfo {
   orderTopic: boolean;
@@ -1056,6 +1066,54 @@ export class MQClient {
       ? parseInt(response.extFields['timestamp'], 10) : -1;
   }
 
+  // viewMessage is the Java MQAdminImpl#viewMessage(topic, msgId) core
+  // (MQAdminImpl.java:267): a single leg — decode the offset msgId and ask
+  // the broker that stamped it VIEW_MESSAGE_BY_ID(33) straight away. Decode
+  // failure maps to the NO_MESSAGE client error Java raises there; every
+  // other leg failure surfaces as-is. The uniq-key fallback is NOT part of
+  // this layer — it belongs to the admin facade only
+  // (DefaultMQAdminExtImpl#viewMessage), while the producer / push / pull
+  // facades ride this single-leg path in Java.
+  //
+  // defaultViewMessageTimeoutMillis mirrors Java MQAdminImpl's own RPC budget
+  // (MQAdminImpl.java:67, `timeoutMillis = 6000`): the viewMessage facades
+  // run on it, not on the send timeout or the admin budget.
+  async viewMessage(topic: string, msgId: string, timeoutMillis = 6000): Promise<MessageExt> {
+    let addr = '';
+    let offset = BigInt(0);
+    let decodeError: unknown = null;
+    try {
+      const parsed = decodeMessageId(msgId);
+      if (parsed.port <= 0 || parsed.port > 65535) {
+        throw new MQClientException(`not a valid offset msgId: ${msgId}`);
+      }
+      addr = `${parsed.ip}:${parsed.port}`;
+      offset = BigInt(parsed.offset);
+    } catch (e) {
+      decodeError = e;
+    }
+    if (addr === '') {
+      throw new MQClientException('query message by id finished, but no message.', decodeError);
+    }
+    // The address is the store host:port the broker stamped into the offset
+    // msgId — a broker address, so the VIP-channel rewrite applies to it like
+    // to any other query request.
+    const target = this.vipChannel(addr);
+    const request = RemotingCommand.createRequestCommand(RequestCode.VIEW_MESSAGE_BY_ID, null);
+    request.addExtField('topic', topic);
+    request.addExtField('offset', offset.toString());
+    const response = await this.remotingClient.invokeSync(target, request, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`, target);
+    }
+    if (response.body == null || response.body.length === 0) {
+      throw new MQClientException(`message not found: ${msgId}`);
+    }
+    const msg = decodeMessage(response.body, true, true);
+    if (msg == null) throw new MQClientException(`message not found: ${msgId}`);
+    return msg;
+  }
+
   // ---------------------------------------------------------------- POP path
   // POP/ACK/CHANGE_INVISIBLE/BATCH_ACK/SET_MESSAGE_REQUEST_MODE primitives.
 
@@ -1076,16 +1134,18 @@ export class MQClient {
       this.decodeReadBody);
   }
 
-  // ackMessage sends ACK_MESSAGE(200051) synchronously. `offset` must be the
-  // checkpoint's segment 7 (the message's own queue offset).
-  async ackMessage(addr: string, header: AckMessageRequestHeader, timeoutMillis: number): Promise<void> {
+  // ackMessage sends ACK_MESSAGE(200051) synchronously and returns the broker's
+  // response code. `offset` must be the checkpoint's segment 7 (the message's
+  // own queue offset).
+  //
+  // Java parity (MQClientAPIImpl#ackMessageAsync:987-993): ANY non-SUCCESS code
+  // means the broker could not find the checkpoint (AckStatus.NO_EXIST on the
+  // wire) — a RESULT, not an error; only transport failures reject. The push
+  // consumer warns on non-SUCCESS and moves on (DefaultMQPushConsumerImpl:842).
+  async ackMessage(addr: string, header: AckMessageRequestHeader, timeoutMillis: number): Promise<number> {
     const request = RemotingCommand.createRequestCommand(RequestCode.ACK_MESSAGE, header);
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
-    if (response.code !== ResponseCode.SUCCESS) {
-      // Every non-SUCCESS code means the broker could not find the checkpoint
-      // (AckStatus.NO_EXIST on the wire) — a warning, not a hard error.
-      throw new MQBrokerException(response.code, response.remark || '', addr);
-    }
+    return response.code;
   }
 
   // batchAckMessage sends BATCH_ACK_MESSAGE(200151) with a pre-built body.
@@ -1105,22 +1165,24 @@ export class MQClient {
     }
   }
 
-  // changeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and returns
-  // the NEW popTime / invisibleTime the broker assigned.
-  //
-  // The returned values are not cosmetic: the caller rebuilds the checkpoint
-  // from them so a later ACK still matches the (now longer) invisibility
-  // window.
+  // changeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and reports
+  // the broker's verdict as a RESULT (Java parity:
+  // MQClientAPIImpl#changeInvisibleTimeAsync:1018-1036 — SUCCESS is
+  // AckStatus.OK with the NEW popTime / invisibleTime; ANY non-SUCCESS code is
+  // AckStatus.NO_EXIST, a result rather than an error; only transport failures
+  // reject). The returned values are not cosmetic: the caller rebuilds the
+  // checkpoint from `header` so a later ACK still matches the (now longer)
+  // invisibility window. `header` is null unless code === SUCCESS.
   async changeInvisibleTime(addr: string, header: ChangeInvisibleTimeRequestHeader,
-    timeoutMillis: number): Promise<ChangeInvisibleTimeResponseHeader> {
+    timeoutMillis: number): Promise<ChangeInvisibleTimeOutcome> {
     const request = RemotingCommand.createRequestCommand(RequestCode.CHANGE_MESSAGE_INVISIBLETIME, header);
     const response = await this.remotingClient.invokeSync(addr, request, timeoutMillis);
     if (response.code !== ResponseCode.SUCCESS) {
-      throw new MQBrokerException(response.code, response.remark || '', addr);
+      return { code: response.code, remark: response.remark || '', header: null };
     }
     const rh = new ChangeInvisibleTimeResponseHeader();
     rh.fromExtFields(response.extFields || {});
-    return rh;
+    return { code: response.code, remark: '', header: rh };
   }
 
   // setMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401) — the

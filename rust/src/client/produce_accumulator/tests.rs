@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::{
-    get_or_create_produce_accumulator, AggregateKey, AccumulatorSender, MessageAccumulation,
+    get_or_create_produce_accumulator, AccumulatorSender, AggregateKey, MessageAccumulation,
     ProduceAccumulator, DEFAULT_HOLD_MS, DEFAULT_HOLD_SIZE, DEFAULT_TOTAL_HOLD_SIZE,
 };
 use crate::client::producer::SendCallback;
@@ -310,11 +310,20 @@ fn param_guards_enforce_contract_ranges() {
     assert!(acc.total_batch_max_bytes(0).is_err());
 
     let err = acc.batch_max_delay_ms(0).unwrap_err().to_string();
-    assert!(err.contains("batchMaxDelayMs expect between 1ms and 30s, but get 0!"), "{err}");
+    assert!(
+        err.contains("batchMaxDelayMs expect between 1ms and 30s, but get 0!"),
+        "{err}"
+    );
     let err = acc.batch_max_bytes(0).unwrap_err().to_string();
-    assert!(err.contains("batchMaxBytes expect between 1B and 2MB, but get 0!"), "{err}");
+    assert!(
+        err.contains("batchMaxBytes expect between 1B and 2MB, but get 0!"),
+        "{err}"
+    );
     let err = acc.total_batch_max_bytes(0).unwrap_err().to_string();
-    assert!(err.contains("totalBatchMaxBytes must bigger then 0, but get 0!"), "{err}");
+    assert!(
+        err.contains("totalBatchMaxBytes must bigger then 0, but get 0!"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -468,7 +477,7 @@ fn async_batch_merges_and_fires_every_callback() {
 
     assert_eq!(sender.sent_count(), 1);
     assert!(sender.callback_at(0)); // the async path callback is not None
-    // single thread adds in turn → in-batch order is deterministic, so a byte-for-byte comparison is possible
+                                    // single thread adds in turn → in-batch order is deterministic, so a byte-for-byte comparison is possible
     assert_eq!(
         sender.batch_at(0).encode(),
         reference_batch_body(&make_messages(5))
@@ -536,7 +545,9 @@ fn send_with_message_queue_pins_the_batch() {
     let the_batch = wait_for_batch(&acc, 2, |_| true).expect("2 messages land in one batch");
     the_batch.force_sync_send().expect("forced sync send ok");
     for t in threads {
-        t.join().expect("sender thread joined").expect("sync send ok");
+        t.join()
+            .expect("sender thread joined")
+            .expect("sync send ok");
     }
     assert_eq!(sender.sent_count(), 1);
     assert_eq!(sender.mq_at(0), Some(mq.clone()));
@@ -565,7 +576,10 @@ fn batch_merges_keys_with_space_separator() {
     acc.batch_max_delay_ms(3000).unwrap();
     let m1 = Message::with_tags_and_keys(TOPIC, Some(b"aa"), None, Some("k1 k2"), 0);
     let m2 = Message::with_tags_and_keys(TOPIC, Some(b"bbb"), None, Some("k2 k3"), 0);
-    let threads: Vec<_> = [m1, m2].into_iter().map(|msg| spawn_send(&acc, msg, None)).collect();
+    let threads: Vec<_> = [m1, m2]
+        .into_iter()
+        .map(|msg| spawn_send(&acc, msg, None))
+        .collect();
     let the_batch = wait_for_batch(&acc, 2, |_| true).expect("2 messages land in one batch");
     // the batch's keys are the **union** (deduplicated)
     let mut keys: Vec<String> = the_batch.keys().into_iter().collect();
@@ -573,7 +587,9 @@ fn batch_merges_keys_with_space_separator() {
     assert_eq!(keys, vec!["k1", "k2", "k3"]);
     the_batch.force_sync_send().expect("forced sync send ok");
     for t in threads {
-        t.join().expect("sender thread joined").expect("sync send ok");
+        t.join()
+            .expect("sender thread joined")
+            .expect("sync send ok");
     }
 
     let raw = sender
@@ -617,8 +633,9 @@ fn aggregate_key_partitions_by_topic_mq_wait_and_tag() {
     assert_ne!(base, pinned);
 
     // HashSet semantics: differing in any of the four dimensions makes a different key
-    let keys: HashSet<AggregateKey> =
-        [base.clone(), tagged_key, no_wait_key, other_topic, pinned].into_iter().collect();
+    let keys: HashSet<AggregateKey> = [base.clone(), tagged_key, no_wait_key, other_topic, pinned]
+        .into_iter()
+        .collect();
     assert_eq!(keys.len(), 5);
 }
 
@@ -648,10 +665,18 @@ fn different_tags_do_not_merge() {
     assert!(both, "two distinct tags must produce two distinct batches");
 
     let mut tags: Vec<Option<String>> = (0..2)
-        .map(|i| sender.batch_at(i).get_property(PROPERTY_TAGS).map(str::to_string))
+        .map(|i| {
+            sender
+                .batch_at(i)
+                .get_property(PROPERTY_TAGS)
+                .map(str::to_string)
+        })
         .collect();
     tags.sort();
-    assert_eq!(tags, vec![Some("TagA".to_string()), Some("TagB".to_string())]);
+    assert_eq!(
+        tags,
+        vec![Some("TagA".to_string()), Some("TagB".to_string())]
+    );
     assert_eq!(sender.sent_count(), 2);
 }
 
@@ -668,11 +693,14 @@ fn guard_keeps_closed_batch_until_next_send() {
     let first_thread = spawn_send(&acc, msg.clone(), None);
     let first = wait_for_batch(&acc, 1, |_| true).expect("first batch");
     first.force_sync_send().expect("forced sync send ok");
-    first_thread.join().expect("sender thread joined").expect("sync send ok");
+    first_thread
+        .join()
+        .expect("sender thread joined")
+        .expect("sync send ok");
 
     assert!(first.is_closed());
     assert_eq!(first.messages_size(), 1); // only sets closed, does not reset size
-    // the guard thread sees size > 0 → does not remove it from the table
+                                          // the guard thread sees size > 0 → does not remove it from the table
     acc.run_guard_once(true);
     assert_eq!(acc.sync_batch_count(), 1);
 
@@ -683,7 +711,10 @@ fn guard_keeps_closed_batch_until_next_send() {
         .expect("a fresh batch replaces the closed one");
     assert!(!second.is_closed());
     second.force_sync_send().expect("forced sync send ok");
-    second_thread.join().expect("sender thread joined").expect("sync send ok");
+    second_thread
+        .join()
+        .expect("sender thread joined")
+        .expect("sync send ok");
 
     assert_eq!(sender.sent_count(), 2);
     assert_eq!(acc.currently_hold_size(), 0);
@@ -736,10 +767,15 @@ fn sync_send_failure_surfaces_and_returns_hold_size() {
     assert!(acc.try_add_message(&msg));
     let thread = spawn_send(&acc, msg, None);
     let batch = wait_for_batch(&acc, 1, |_| true).expect("batch");
-    let err = batch.force_sync_send().expect_err("sender must report the failure");
+    let err = batch
+        .force_sync_send()
+        .expect_err("sender must report the failure");
     assert!(err.to_string().contains("boom"), "{err}");
     let waiter = thread.join().expect("sender thread joined").unwrap_err();
-    assert!(waiter.to_string().contains("sendResult is illegal"), "{waiter}");
+    assert!(
+        waiter.to_string().contains("sendResult is illegal"),
+        "{waiter}"
+    );
     assert_eq!(acc.currently_hold_size(), 0);
 }
 
@@ -757,12 +793,18 @@ fn async_send_failure_reaches_every_callback() {
     }
     let done = wait_until(|| callbacks.iter().all(|cb| cb.total() == 1), deadline());
     acc.shutdown();
-    assert!(done, "guard thread must deliver the failure to every callback");
+    assert!(
+        done,
+        "guard thread must deliver the failure to every callback"
+    );
     for cb in &callbacks {
         assert_eq!(cb.msg_ids().len(), 0);
         assert_eq!(cb.error_count(), 1);
         let errors = cb.errors();
-        assert!(errors.iter().all(|e| e.contains("async boom")), "{errors:?}");
+        assert!(
+            errors.iter().all(|e| e.contains("async boom")),
+            "{errors:?}"
+        );
     }
     // async path: the quota is returned only when the callbacks are delivered
     assert_eq!(acc.currently_hold_size(), 0);

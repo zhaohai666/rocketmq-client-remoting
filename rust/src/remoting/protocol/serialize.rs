@@ -87,7 +87,11 @@ pub mod fastjson {
 
     impl<'a> FastJsonParser<'a> {
         fn new(text: &'a str) -> FastJsonParser<'a> {
-            FastJsonParser { bytes: text.as_bytes(), text, pos: 0 }
+            FastJsonParser {
+                bytes: text.as_bytes(),
+                text,
+                pos: 0,
+            }
         }
 
         fn eof(&self) -> bool {
@@ -242,38 +246,38 @@ pub mod fastjson {
                     }
                     b'\\' => {
                         self.pos += 1;
-                        let e = *self.bytes.get(self.pos).ok_or_else(|| {
-                            Error::Decode("unterminated escape".into())
-                        })?;
+                        let e = *self
+                            .bytes
+                            .get(self.pos)
+                            .ok_or_else(|| Error::Decode("unterminated escape".into()))?;
                         match e {
                             b'u' => {
                                 if self.pos + 4 >= self.bytes.len() {
                                     return Err(Error::Decode("bad \\u escape".into()));
                                 }
-                                let digits = std::str::from_utf8(&self.bytes[self.pos + 1..self.pos + 5])
-                                    .map_err(|_| Error::Decode("bad \\u escape".into()))?;
+                                let digits =
+                                    std::str::from_utf8(&self.bytes[self.pos + 1..self.pos + 5])
+                                        .map_err(|_| Error::Decode("bad \\u escape".into()))?;
                                 let code = u32::from_str_radix(digits, 16)
                                     .map_err(|_| Error::Decode("bad \\u escape".into()))?;
                                 // Surrogate pairs: the server emits the standard \uXXXX\uXXXX form
                                 let mut scalar = code;
                                 if (0xD800..0xDC00).contains(&code)
                                     && self.bytes.get(self.pos + 5) == Some(&b'\\')
-                                        && self.bytes.get(self.pos + 6) == Some(&b'u')
-                                    {
-                                        let low_str = &self.bytes[self.pos + 7..self.pos + 11];
-                                        let low = u32::from_str_radix(
-                                            std::str::from_utf8(low_str)
-                                                .map_err(|_| Error::Decode("bad \\u escape".into()))?,
-                                            16,
-                                        )
-                                        .map_err(|_| Error::Decode("bad \\u escape".into()))?;
-                                        if (0xDC00..0xE000).contains(&low) {
-                                            scalar = 0x10000
-                                                + ((code - 0xD800) << 10)
-                                                + (low - 0xDC00);
-                                            self.pos += 6;
-                                        }
+                                    && self.bytes.get(self.pos + 6) == Some(&b'u')
+                                {
+                                    let low_str = &self.bytes[self.pos + 7..self.pos + 11];
+                                    let low = u32::from_str_radix(
+                                        std::str::from_utf8(low_str)
+                                            .map_err(|_| Error::Decode("bad \\u escape".into()))?,
+                                        16,
+                                    )
+                                    .map_err(|_| Error::Decode("bad \\u escape".into()))?;
+                                    if (0xDC00..0xE000).contains(&low) {
+                                        scalar = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                        self.pos += 6;
                                     }
+                                }
                                 out.push(
                                     char::from_u32(scalar)
                                         .ok_or_else(|| Error::Decode("bad \\u escape".into()))?,
@@ -423,7 +427,10 @@ pub mod fastjson {
         if let Ok(v) = raw.parse::<u64>() {
             return Value::Number(Number::from(v));
         }
-        raw.parse::<f64>().ok().and_then(f64_to_value).unwrap_or(Value::Null)
+        raw.parse::<f64>()
+            .ok()
+            .and_then(f64_to_value)
+            .unwrap_or(Value::Null)
     }
 
     fn f64_to_value(v: f64) -> Option<Value> {
@@ -457,7 +464,11 @@ impl RocketMQSerializable {
         Some(w.into_inner())
     }
 
-    pub fn map_deserialize(buf: &[u8], mut offset: usize, length: usize) -> Result<(ExtFields, usize)> {
+    pub fn map_deserialize(
+        buf: &[u8],
+        mut offset: usize,
+        length: usize,
+    ) -> Result<(ExtFields, usize)> {
         let mut map = ExtFields::new();
         let end = offset + length;
         if end > buf.len() {
@@ -487,7 +498,8 @@ impl RocketMQSerializable {
 
     pub fn rocket_mq_protocol_encode(cmd: &RemotingCommand) -> Vec<u8> {
         let ext_bytes = RocketMQSerializable::map_serialize(cmd.ext_fields());
-        let total_len = RocketMQSerializable::cal_total_len(cmd.remark.as_deref(), ext_bytes.as_deref());
+        let total_len =
+            RocketMQSerializable::cal_total_len(cmd.remark.as_deref(), ext_bytes.as_deref());
         let mut w = Writer::with_capacity(total_len);
         w.i16(cmd.code);
         w.u8((cmd.language & 0xFF) as u8);
@@ -512,7 +524,11 @@ impl RocketMQSerializable {
                 w.i32(0);
             }
         }
-        debug_assert_eq!(w.len(), total_len, "rocketmq protocol encode length mismatch");
+        debug_assert_eq!(
+            w.len(),
+            total_len,
+            "rocketmq protocol encode length mismatch"
+        );
         w.into_inner()
     }
 
@@ -580,7 +596,8 @@ mod tests {
 
     #[test]
     fn tolerant_json_handles_object_keys() {
-        let text = r#"{"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{"brokerOffset":9}}}"#;
+        let text =
+            r#"{"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{"brokerOffset":9}}}"#;
         let v = fastjson::from_str(text).unwrap();
         let table = v["offsetTable"].as_object().unwrap();
         assert_eq!(table.len(), 1);
@@ -602,7 +619,8 @@ mod tests {
 
     #[test]
     fn tolerant_json_parses_numbers_like_golden() {
-        let v = fastjson::from_str(r#"{"i":-7,"f":1.5,"e":1e3,"big":18446744073709551615}"#).unwrap();
+        let v =
+            fastjson::from_str(r#"{"i":-7,"f":1.5,"e":1e3,"big":18446744073709551615}"#).unwrap();
         assert_eq!(v["i"], -7);
         assert_eq!(v["f"].as_f64(), Some(1.5));
         assert_eq!(v["e"].as_f64(), Some(1000.0));
@@ -633,7 +651,10 @@ mod tests {
         cmd.ext_fields_mut().insert("topic", "T");
         cmd.ext_fields_mut().insert("queueId", "7");
         let encoded = RocketMQSerializable::rocket_mq_protocol_encode(&cmd);
-        assert_eq!(encoded.len(), 2 + 1 + 2 + 4 + 4 + 4 + 5 + 4 + (3 + 5 + 4 + 1) + (7 + 1 + 4 + 1));
+        assert_eq!(
+            encoded.len(),
+            2 + 1 + 2 + 4 + 4 + 4 + 5 + 4 + (3 + 5 + 4 + 1) + (7 + 1 + 4 + 1)
+        );
         let decoded = RocketMQSerializable::rocket_mq_protocol_decode(&encoded).unwrap();
         assert_eq!(decoded.code, 310);
         assert_eq!(decoded.opaque, 42);
@@ -645,7 +666,10 @@ mod tests {
 
     #[test]
     fn protocol_type_bits() {
-        assert_eq!(mark_protocol_type(100, serialize_type::ROCKETMQ), 0x0100_0064);
+        assert_eq!(
+            mark_protocol_type(100, serialize_type::ROCKETMQ),
+            0x0100_0064
+        );
         assert_eq!(protocol_type_of(0x0100_0064), serialize_type::ROCKETMQ);
         assert_eq!(header_length_of(0x0100_0064), 100);
         assert_eq!(mark_protocol_type(100, serialize_type::JSON), 100);

@@ -59,7 +59,7 @@ use crate::client::hook::{
 };
 use crate::client::mq_client::{
     ConsumerFuture, MQClientInstance, MQClientInstanceConfig, PublishMessage, RegisteredConsumer,
-    MQ_CLIENT_API_TIMEOUT_MILLIS,
+    DEFAULT_VIEW_MESSAGE_TIMEOUT_MILLIS, MQ_CLIENT_API_TIMEOUT_MILLIS,
 };
 use crate::client::producer::{auto_bridged_dispatcher, SinkAdapter, TraceDispatcherChannel};
 use crate::client::result::{
@@ -2073,9 +2073,8 @@ impl DefaultMQPushConsumer {
         let orderly = lock(&self.inner.listener)
             .as_ref()
             .is_some_and(MessageListener::is_orderly);
-        let broker_assignment = cfg.pop_mode
-            && !orderly
-            && cfg.message_model == MessageModel::CLUSTERING;
+        let broker_assignment =
+            cfg.pop_mode && !orderly && cfg.message_model == MessageModel::CLUSTERING;
 
         let mut assigned: Vec<MessageQueue> = Vec::new();
         if cfg.message_model == MessageModel::BROADCASTING {
@@ -2251,11 +2250,7 @@ impl DefaultMQPushConsumer {
     /// The mode (POP / PULL) carried by an assignment item is only **observed, never obeyed**: this consumer's consume mode is fixed
     /// before start-up (`pop_mode`), and rebalance consumes the queue **set**; a mixed response only warns and is not split
     /// -- that shape almost always means `SET_MESSAGE_REQUEST_MODE` did not take effect fully.
-    async fn assigned_from_broker(
-        &self,
-        group: &str,
-        topic: &str,
-    ) -> Option<Vec<MessageQueue>> {
+    async fn assigned_from_broker(&self, group: &str, topic: &str) -> Option<Vec<MessageQueue>> {
         let client = self.client()?;
         let cfg = self.config();
         let strategy_name = self
@@ -2501,7 +2496,11 @@ pub(crate) enum StartOffsetPlan {
     SearchAtConfiguredTime,
 }
 
-pub(crate) fn plan_initial_offset(stored: i64, from_where: &str, is_retry_topic: bool) -> StartOffsetPlan {
+pub(crate) fn plan_initial_offset(
+    stored: i64,
+    from_where: &str,
+    is_retry_topic: bool,
+) -> StartOffsetPlan {
     if stored >= 0 {
         return StartOffsetPlan::Stored(stored);
     }
@@ -2555,7 +2554,11 @@ async fn resolve_initial_offset(
         }
     }
 
-    match plan_initial_offset(stored, &cfg.consume_from_where, NamespaceUtil::is_retry_topic(&mq.topic)) {
+    match plan_initial_offset(
+        stored,
+        &cfg.consume_from_where,
+        NamespaceUtil::is_retry_topic(&mq.topic),
+    ) {
         StartOffsetPlan::Stored(off) => Ok(off),
         StartOffsetPlan::FromZero => Ok(0),
         StartOffsetPlan::QueueTail => client.get_max_offset(mq, 5000, None).await,
@@ -3191,7 +3194,8 @@ pub(crate) fn changed_topics(
         .collect::<BTreeSet<String>>()
         .into_iter()
         .filter(|topic| {
-            before.get(topic).unwrap_or(&EMPTY_KEY_SET) != after.get(topic).unwrap_or(&EMPTY_KEY_SET)
+            before.get(topic).unwrap_or(&EMPTY_KEY_SET)
+                != after.get(topic).unwrap_or(&EMPTY_KEY_SET)
         })
         .collect()
 }
@@ -3211,22 +3215,14 @@ static EMPTY_KEY_SET: BTreeSet<String> = BTreeSet::new();
 /// One wall-clock millisecond stamp is shared by the round, so two moved topics never carry two
 /// versions from the same rebalance. The subscription table holds the very values the heartbeat
 /// builder serialises, so writing here is what makes the next beat carry the fresh version.
-fn restamp_subscription_versions(
-    inner: &Inner,
-    moved: &[String],
-    new_version: i64,
-) -> Vec<String> {
+fn restamp_subscription_versions(inner: &Inner, moved: &[String], new_version: i64) -> Vec<String> {
     let mut lines = Vec::new();
     if moved.is_empty() {
         return lines;
     }
     let mut state = lock(&inner.state);
     for topic in moved {
-        let Some((_, sub)) = state
-            .subscription_data
-            .iter_mut()
-            .find(|(k, _)| k == topic)
-        else {
+        let Some((_, sub)) = state.subscription_data.iter_mut().find(|(k, _)| k == topic) else {
             continue;
         };
         lines.push(format!(
@@ -4132,14 +4128,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         // there and then.
         let kept = if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
             pq.inc_found_msg(i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX));
-            prepare_pop_batch_for_delivery(
-                &inner,
-                &cfg,
-                &mq,
-                &sub,
-                &result.msg_found_list,
-                &pq,
-            )
+            prepare_pop_batch_for_delivery(&inner, &cfg, &mq, &sub, &result.msg_found_list, &pq)
         } else {
             Vec::new()
         };
@@ -4148,14 +4137,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         // is not counted at all and a dropped row counts as nothing but the round it cost.
         if let Some(stats) = lock(&inner.stats).clone() {
             let group = read_cfg(&inner).consumer_group;
-            record_pop_pull_stats(
-                &stats,
-                &group,
-                &mq.topic,
-                result.status,
-                kept.len(),
-                began,
-            );
+            record_pop_pull_stats(&stats, &group, &mq.topic, result.status, kept.len(), began);
         }
         let kept_len = kept.len();
         if !kept.is_empty() {
@@ -5229,7 +5211,6 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
     }
 }
 
-
 /// Register this batch into the "in the listener's hands" view (must pair with [`deregister_inflight_msgs`]).
 fn register_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     if batch.is_empty() {
@@ -5885,7 +5866,8 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 cached_msg_min_offset: cached_min,
                 cached_msg_max_offset: cached_max,
                 cached_msg_count: i32::try_from(cached.len()).unwrap_or(i32::MAX),
-                cached_msg_size_in_mib: i32::try_from(body_bytes / (1024 * 1024)).unwrap_or(i32::MAX),
+                cached_msg_size_in_mib: i32::try_from(body_bytes / (1024 * 1024))
+                    .unwrap_or(i32::MAX),
                 transaction_msg_min_offset: transaction_min,
                 transaction_msg_max_offset: transaction_max,
                 transaction_msg_count: transaction_count,
@@ -6012,6 +5994,15 @@ impl DefaultMQPushConsumer {
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
+    /// Java `DefaultMQPushConsumerImpl#viewMessage` parity
+    /// (DefaultMQPushConsumerImpl.java:1329): the MQAdminImpl single-leg path —
+    /// offset msgId only, no uniq-key fallback at this layer.
+    pub async fn view_message(&self, topic: &str, msg_id: &str) -> Result<MessageExt> {
+        require_client(&self.inner)?
+            .view_message(topic, msg_id, DEFAULT_VIEW_MESSAGE_TIMEOUT_MILLIS)
+            .await
+    }
+
     /// With a key, read the single-queue value; without, sum all queues.
     pub fn msg_acc_cnt(&self, key: Option<&str>) -> i64 {
         let state = lock(&self.inner.state);
@@ -6025,7 +6016,6 @@ impl DefaultMQPushConsumer {
     pub fn compute_accumulation_total(&self) -> i64 {
         self.msg_acc_cnt(None)
     }
-
 
     pub fn suspend(&self) {
         self.inner.pause.store(true, Ordering::SeqCst);
@@ -6041,7 +6031,6 @@ impl DefaultMQPushConsumer {
     pub fn is_pause(&self) -> bool {
         self.inner.pause.load(Ordering::SeqCst)
     }
-
 
     pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
         send_message_back(&self.inner, msg, delay_level, None).await
@@ -6210,17 +6199,14 @@ mod tests {
 
     #[test]
     fn namespace_v2_setter_getter_round_trip() {
-        let c = DefaultMQPushConsumer::new("GID_nsv2").expect("a legal group name must not fail to construct");
+        let c = DefaultMQPushConsumer::new("GID_nsv2")
+            .expect("a legal group name must not fail to construct");
         assert_eq!(c.get_namespace_v2(), None, "not set by default");
         c.set_namespace_v2(Some("NS_V2"));
         assert_eq!(c.get_namespace_v2(), Some("NS_V2".to_string()));
         assert_eq!(c.config().namespace_v2, Some("NS_V2".to_string()));
         c.set_namespace_v2(None);
-        assert_eq!(
-            c.get_namespace_v2(),
-            None,
-            "None = clears"
-        );
+        assert_eq!(c.get_namespace_v2(), None, "None = clears");
     }
 
     #[test]
@@ -6524,7 +6510,10 @@ mod tests {
         assert_eq!(c.get_core_pool_size(), 15);
         assert!(!c.update_core_pool_size(0));
         assert!(!c.update_core_pool_size(-1));
-        assert!(!c.update_core_pool_size(20), "== consume_thread_max is also rejected");
+        assert!(
+            !c.update_core_pool_size(20),
+            "== consume_thread_max is also rejected"
+        );
         assert!(
             !c.update_core_pool_size(30),
             "regression: the default max must not be 4.x's 64"
@@ -6533,7 +6522,10 @@ mod tests {
         assert_eq!(c.get_core_pool_size(), 19);
         c.update_config(|x| x.consume_thread_max = 40_000);
         assert!(!c.update_core_pool_size(32768), "above Short.MAX_VALUE");
-        assert!(c.update_core_pool_size(32767), "the upper bound itself is legal");
+        assert!(
+            c.update_core_pool_size(32767),
+            "the upper bound itself is legal"
+        );
         assert_eq!(c.get_core_pool_size(), 32767);
     }
 
@@ -6650,7 +6642,10 @@ mod tests {
             consumer.start().await.is_err(),
             "neither name server addresses nor domain addressing"
         );
-        assert!(!consumer.is_started(), "a failed start must roll back the started flag");
+        assert!(
+            !consumer.is_started(),
+            "a failed start must roll back the started flag"
+        );
 
         consumer.set_namesrv_addr("127.0.0.1:1");
         assert!(consumer.start().await.is_err(), "no subscription");
@@ -6660,7 +6655,6 @@ mod tests {
         assert!(consumer.start().await.is_err(), "no listener set");
         assert!(!consumer.is_started());
     }
-
 
     struct RangeGate {
         field: &'static str,
@@ -6813,7 +6807,8 @@ mod tests {
 
     #[test]
     fn defaults_pass_check_config_ranges() {
-        check_config_ranges(&ConsumerConfig::default()).expect("default config must pass checkConfig");
+        check_config_ranges(&ConsumerConfig::default())
+            .expect("default config must pass checkConfig");
     }
 
     #[test]
@@ -6942,7 +6937,10 @@ mod tests {
 
         // After fixing the value the same object still starts (validation leaves no dirty state)
         consumer.update_config(|c| c.pull_batch_size = 1024);
-        consumer.start().await.expect("must start once the value is fixed");
+        consumer
+            .start()
+            .await
+            .expect("must start once the value is fixed");
         consumer.shutdown();
     }
 
@@ -6988,7 +6986,10 @@ mod tests {
         consumer.set_poll_name_server_interval_millis(2_000);
         consumer.set_persist_consumer_offset_interval_millis(700);
 
-        consumer.start().await.expect("start must not fail with a static address");
+        consumer
+            .start()
+            .await
+            .expect("start must not fail with a static address");
         let client = lock(&consumer.inner.client)
             .clone()
             .expect("an instance must already exist after start");
@@ -7045,7 +7046,11 @@ mod tests {
         );
         clustering.shutdown();
         clustering.start().await.expect("restart");
-        assert_eq!(clustering.client_id(), id, "the restart changed the clientId");
+        assert_eq!(
+            clustering.client_id(),
+            id,
+            "the restart changed the clientId"
+        );
         let clustering_id = clustering.client_id();
         clustering.shutdown();
 
@@ -7062,7 +7067,10 @@ mod tests {
             c
         };
         let first = broadcast("CID-clientid-parity-broadcast-a");
-        first.start().await.expect("the broadcasting consumer should start");
+        first
+            .start()
+            .await
+            .expect("the broadcasting consumer should start");
         assert_eq!(
             first.client_id(),
             format!("{}@DEFAULT", MixAll::cached_ip_str()),
@@ -7072,9 +7080,13 @@ mod tests {
         assert_ne!(first.client_id(), clustering_id);
 
         let second = broadcast("CID-clientid-parity-broadcast-b");
-        second.start().await.expect("the second broadcasting consumer should start");
+        second
+            .start()
+            .await
+            .expect("the second broadcasting consumer should start");
         assert_eq!(second.client_id(), first.client_id());
-        let shared = MQClientInstance::find_instance(&first.client_id()).expect("the instance must be registered");
+        let shared = MQClientInstance::find_instance(&first.client_id())
+            .expect("the instance must be registered");
         assert!(
             shared
                 .find_consumer(&first.config().consumer_group)
@@ -7096,7 +7108,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        assert!(torn_down, "the instance was not torn down after the last tenant left");
+        assert!(
+            torn_down,
+            "the instance was not torn down after the last tenant left"
+        );
     }
 
     /// Group-name validation is the first of the three gates: with address, subscription and listener all present it
@@ -7112,11 +7127,15 @@ mod tests {
             ("bad group", "contains illegal characters"),
             (long_group.as_str(), "is longer than group max length"),
         ] {
-            let consumer = DefaultMQPushConsumer::new(group).expect("construction must not reject early");
+            let consumer =
+                DefaultMQPushConsumer::new(group).expect("construction must not reject early");
             consumer.set_namesrv_addr("127.0.0.1:1");
             consumer.subscribe("T", "TagA").unwrap();
             consumer.set_message_listener_concurrently(Arc::new(NoopListener));
-            let err = consumer.start().await.expect_err("an illegal group name must fail locally");
+            let err = consumer
+                .start()
+                .await
+                .expect_err("an illegal group name must fail locally");
             assert!(err.to_string().contains(needle), "{group}: {err}");
             assert!(
                 !consumer.is_started(),
@@ -7198,11 +7217,7 @@ mod tests {
     /// Put a batch into the listener's hands without settling it: exactly what the dispatch window
     /// does between "handed over" and "ack/complete", and the part of the held set a buffer-only gate
     /// cannot see.
-    fn stage_listener(
-        consumer: &DefaultMQPushConsumer,
-        mq: &MessageQueue,
-        msgs: Vec<MessageExt>,
-    ) {
+    fn stage_listener(consumer: &DefaultMQPushConsumer, mq: &MessageQueue, msgs: Vec<MessageExt>) {
         let key = mq_key(mq);
         let mut state = lock(&consumer.inner.state);
         state.mq_map.insert(key.clone(), mq.clone());
@@ -7279,15 +7294,16 @@ mod tests {
             !flow_control_hit(&consumer.inner, &key),
             "1.9 MiB of body truncates to 1 MiB, which is not above a 1 MiB budget"
         );
-        stage(&consumer, &mq, vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)]);
+        stage(
+            &consumer,
+            &mq,
+            vec![sized_msg(1024 * 1024, 0), sized_msg(1024 * 1024, 1)],
+        );
         assert!(flow_control_hit(&consumer.inner, &key), "2MiB > 1MiB");
 
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
-        assert!(
-            flow_control_hit(&consumer.inner, &key),
-            "span 100 > 10"
-        );
+        assert!(flow_control_hit(&consumer.inner, &key), "span 100 > 10");
         only(&consumer, |c| c.consume_concurrently_max_span = 100);
         assert!(
             !flow_control_hit(&consumer.inner, &key),
@@ -7342,11 +7358,7 @@ mod tests {
         );
 
         // The dispatch window hands the LOWER offsets to the listener and does not settle them.
-        stage_listener(
-            &consumer,
-            &mq,
-            vec![sized_msg(1, 8), sized_msg(1, 9)],
-        );
+        stage_listener(&consumer, &mq, vec![sized_msg(1, 8), sized_msg(1, 9)]);
         assert!(
             flow_control_hit(&consumer.inner, &key),
             "2 buffered + 2 unsettled listener rows is 4 held against a 3-message gate"
@@ -7410,11 +7422,7 @@ mod tests {
         );
 
         // The mirror image: a 2 MiB body the broker reports as 10 stored bytes must pause.
-        stage(
-            &consumer,
-            &mq,
-            vec![split_size_msg(2 * 1024 * 1024, 10, 0)],
-        );
+        stage(&consumer, &mq, vec![split_size_msg(2 * 1024 * 1024, 10, 0)]);
         assert!(
             flow_control_hit(&consumer.inner, &key),
             "2MiB of body is 2MiB to a 1MiB budget whatever the stored size says"
@@ -7548,7 +7556,11 @@ mod tests {
         let consumer = DefaultMQPushConsumer::new("G_fc_per_queue_only").unwrap();
         let queues = owned_queue_set("T", 4);
         for mq in &queues {
-            stage(&consumer, mq, (0..250_i64).map(|i| sized_msg(100, i)).collect());
+            stage(
+                &consumer,
+                mq,
+                (0..250_i64).map(|i| sized_msg(100, i)).collect(),
+            );
         }
         consumer.update_config(|c| {
             c.pull_threshold_for_topic = 1000;
@@ -7562,7 +7574,8 @@ mod tests {
         own_pull_queues(&consumer, &queues);
         consumer.divide_topic_thresholds();
         assert_eq!(
-            consumer.config().pull_threshold_for_queue, 250,
+            consumer.config().pull_threshold_for_queue,
+            250,
             "1000 divided over the 4 owned queues is the gate the pull path reads"
         );
         for mq in &queues {
@@ -7572,7 +7585,11 @@ mod tests {
                 mq_key(mq)
             );
         }
-        assert_eq!(consumer.flow_control_triggered(), 0, "1000 buffered in total, none over budget");
+        assert_eq!(
+            consumer.flow_control_triggered(),
+            0,
+            "1000 buffered in total, none over budget"
+        );
 
         // Control: one queue over its **own** share pauses, on the per-queue count reason.
         let hot = &queues[1];
@@ -7585,7 +7602,11 @@ mod tests {
             flow_control_hit(&consumer.inner, &mq_key(hot)),
             "251 > the divided 250 pauses that queue"
         );
-        assert_eq!(consumer.flow_control_triggered(), 1, "only the one over-budget queue counts");
+        assert_eq!(
+            consumer.flow_control_triggered(),
+            1,
+            "only the one over-budget queue counts"
+        );
         for mq in queues.iter().filter(|q| mq_key(q) != mq_key(hot)) {
             assert!(
                 !flow_control_hit(&consumer.inner, &mq_key(mq)),
@@ -7719,7 +7740,10 @@ mod tests {
         pq.inc_found_msg(1);
         stage(&consumer, &mq, vec![sized_msg(100, 0), sized_msg(100, 1)]);
 
-        assert!(flow_control_hit(&consumer.inner, &key), "buffered 2 > 1 pauses the pull");
+        assert!(
+            flow_control_hit(&consumer.inner, &key),
+            "buffered 2 > 1 pauses the pull"
+        );
         assert_eq!(consumer.flow_control_triggered(), 1);
         assert!(
             pop_flow_control_hit(&consumer.inner, &key, &pq),
@@ -7832,7 +7856,13 @@ mod tests {
             ..Default::default()
         };
         let lines = apply_topic_threshold_division(&mut cfg, 4);
-        assert_eq!((cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue), (250, 25));
+        assert_eq!(
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
+            (250, 25)
+        );
         assert_eq!(
             lines,
             vec![
@@ -7874,7 +7904,10 @@ mod tests {
         let lines = apply_topic_threshold_division(&mut cfg, 4);
         assert!(lines.is_empty(), "an off budget logs nothing at all");
         assert_eq!(
-            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
             (77, 9),
             "off budgets must not rewrite the knobs"
         );
@@ -7889,7 +7922,13 @@ mod tests {
         own_pull_queues(&consumer, &owned_queue_set("T", 3));
         consumer.divide_topic_thresholds();
         let cfg = consumer.config();
-        assert_eq!((cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue), (77, 9));
+        assert_eq!(
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
+            (77, 9)
+        );
     }
 
     /// A budget smaller than the owned queue count floors at **1, never 0**: the count gate pauses a
@@ -7903,8 +7942,14 @@ mod tests {
             ..Default::default()
         };
         let lines = apply_topic_threshold_division(&mut cfg, 8);
-        assert_eq!(cfg.pull_threshold_for_queue, 1, "3 / 8 = 0 must be floored to 1");
-        assert_eq!(cfg.pull_threshold_size_for_queue, 1, "1 / 8 = 0 must be floored to 1");
+        assert_eq!(
+            cfg.pull_threshold_for_queue, 1,
+            "3 / 8 = 0 must be floored to 1"
+        );
+        assert_eq!(
+            cfg.pull_threshold_size_for_queue, 1,
+            "1 / 8 = 0 must be floored to 1"
+        );
         assert_eq!(
             lines,
             vec![
@@ -7955,7 +8000,10 @@ mod tests {
         consumer.divide_topic_thresholds();
         let cfg = consumer.config();
         assert_eq!(
-            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
             (1000, 100),
             "no owned queue = no division, the user's values survive"
         );
@@ -7964,7 +8012,10 @@ mod tests {
         consumer.divide_topic_thresholds();
         let cfg = consumer.config();
         assert_eq!(
-            (cfg.pull_threshold_for_queue, cfg.pull_threshold_size_for_queue),
+            (
+                cfg.pull_threshold_for_queue,
+                cfg.pull_threshold_size_for_queue
+            ),
             (2000, 50),
             "control: one owned queue divides both budgets"
         );
@@ -8011,10 +8062,16 @@ mod tests {
         assert_eq!(consumer.config().pull_threshold_for_queue, 250);
         consumer.divide_topic_thresholds();
         assert_eq!(
-            consumer.config().pull_threshold_for_queue, 250,
+            consumer.config().pull_threshold_for_queue,
+            250,
             "repeating with an unchanged owned set writes the same number"
         );
-        own_pull_queues(&consumer, &(4..8).map(|id| queue("T", "broker-a", id)).collect::<Vec<_>>());
+        own_pull_queues(
+            &consumer,
+            &(4..8)
+                .map(|id| queue("T", "broker-a", id))
+                .collect::<Vec<_>>(),
+        );
         consumer.divide_topic_thresholds();
         assert_eq!(consumer.config().pull_threshold_for_queue, 125);
     }
@@ -8058,7 +8115,8 @@ mod tests {
         own_pop_queues(&consumer, &owned_queue_set("T", 2));
         consumer.divide_topic_thresholds();
         assert_eq!(
-            consumer.config().pull_threshold_for_queue, 500,
+            consumer.config().pull_threshold_for_queue,
+            500,
             "POP divides over the 2 POP queues; 250 would mean it read the pull table"
         );
 
@@ -8093,7 +8151,10 @@ mod tests {
 
         // A growth and a shrink each name the topic once.
         assert_eq!(
-            changed_topics(&by_topic(&t1()), &by_topic(&[t1(), vec![q("T1", "broker-a", 2)]].concat())),
+            changed_topics(
+                &by_topic(&t1()),
+                &by_topic(&[t1(), vec![q("T1", "broker-a", 2)]].concat())
+            ),
             vec!["T1".to_string()],
             "one queue added"
         );
@@ -8114,10 +8175,7 @@ mod tests {
 
         // A topic that appears and one that vanishes are both moves (the empty side is the before).
         assert_eq!(
-            changed_topics(
-                &by_topic(&[] as &[MessageQueue]),
-                &by_topic(&t1())
-            ),
+            changed_topics(&by_topic(&[] as &[MessageQueue]), &by_topic(&t1())),
             vec!["T1".to_string()],
             "a topic the instance had no queues for now has some"
         );
@@ -8176,10 +8234,20 @@ mod tests {
 
         // A moved topic with no subscription entry (a share that vanished with its subscribe) is
         // skipped rather than invented, and an empty moved list writes nothing at all.
-        assert!(restamp_subscription_versions(&consumer.inner, &["T3".to_string()], 1000).is_empty());
-        assert_eq!(subscription_versions(&consumer).len(), 2, "no subscription was created");
+        assert!(
+            restamp_subscription_versions(&consumer.inner, &["T3".to_string()], 1000).is_empty()
+        );
+        assert_eq!(
+            subscription_versions(&consumer).len(),
+            2,
+            "no subscription was created"
+        );
         assert!(restamp_subscription_versions(&consumer.inner, &[], 1000).is_empty());
-        assert_eq!(subscription_version(&consumer, "T2"), 999, "an empty list restamps nothing");
+        assert_eq!(
+            subscription_version(&consumer, "T2"),
+            999,
+            "an empty list restamps nothing"
+        );
     }
 
     /// The division is **change-gated** and runs **after** the pull-state update, through the real
@@ -8205,7 +8273,8 @@ mod tests {
             "the divisor source table is filled by this round's pull-state update"
         );
         assert_eq!(
-            c.config().pull_threshold_for_queue, 500,
+            c.config().pull_threshold_for_queue,
+            500,
             "1000 / the 2 queues this round owns"
         );
 
@@ -8213,7 +8282,8 @@ mod tests {
         c.update_config(|cfg| cfg.pull_threshold_for_queue = 12345);
         c.do_rebalance().await.unwrap();
         assert_eq!(
-            c.config().pull_threshold_for_queue, 12345,
+            c.config().pull_threshold_for_queue,
+            12345,
             "an unchanged assignment must not re-run the division"
         );
 
@@ -8379,7 +8449,11 @@ mod tests {
             vec![(1, 1), (2, 1)],
             "the unacked tail must have reconsumeTimes bumped before redelivery"
         );
-        assert_eq!(h.offset(), 1, "the offset may only stop at the first unacked message");
+        assert_eq!(
+            h.offset(),
+            1,
+            "the offset may only stop at the first unacked message"
+        );
     }
 
     #[tokio::test]
@@ -8387,7 +8461,11 @@ mod tests {
         let h = AckHarness::new(false, Some(2), ConsumeConcurrentlyStatus::ReconsumeLater);
         assert!(!h.run(3).await);
         assert_eq!(h.pending(), vec![(0, 1), (1, 1), (2, 1)]);
-        assert_eq!(h.offset(), 0, "the whole batch went unacked, the offset stays put");
+        assert_eq!(
+            h.offset(),
+            0,
+            "the whole batch went unacked, the offset stays put"
+        );
     }
 
     #[tokio::test]
@@ -8613,7 +8691,10 @@ mod tests {
             &poison,
             orderly_max_reconsume_times(&cfg),
         );
-        assert_eq!(new_msg.topic, "%RETRY%G", "orderly send-back goes to %RETRY%<group>");
+        assert_eq!(
+            new_msg.topic, "%RETRY%G",
+            "orderly send-back goes to %RETRY%<group>"
+        );
         assert_eq!(new_msg.body, poison.body);
         assert_eq!(new_msg.get_property(PROPERTY_KEYS), Some("k7"));
         assert_eq!(new_msg.get_property(PROPERTY_RETRY_TOPIC), Some("T"));
@@ -8650,7 +8731,11 @@ mod tests {
             .expect("pending")
             .append(&mut tail);
         assert!(!h.run(orderly_batch(0, &[0, 1])).await);
-        assert_eq!(h.offset(), 0, "still retrying in place, the offset must not pass it");
+        assert_eq!(
+            h.offset(),
+            0,
+            "still retrying in place, the offset must not pass it"
+        );
         assert_eq!(
             h.pending(),
             vec![(0, 1), (1, 2), (2, 0)],
@@ -8730,7 +8815,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn manual_commit_advances_without_requeueing() {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Commit);
@@ -8744,7 +8828,11 @@ mod tests {
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Rollback);
         assert!(!h.run(orderly_batch(0, &[0])).await);
         assert_eq!(h.offset(), 0, "rollback must not commit the offset");
-        assert_eq!(h.pending(), vec![(0, 0)], "the message returns to the queue head for retry");
+        assert_eq!(
+            h.pending(),
+            vec![(0, 0)],
+            "the message returns to the queue head for retry"
+        );
     }
 
     #[tokio::test]
@@ -8764,7 +8852,11 @@ mod tests {
     async fn manual_suspend_never_commits_the_offset() {
         let h = OrderlyHarness::new_manual(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         assert!(!h.run(orderly_batch(7, &[2])).await);
-        assert_eq!(h.offset(), 0, "manual mode suspends without committing the offset");
+        assert_eq!(
+            h.offset(),
+            0,
+            "manual mode suspends without committing the offset"
+        );
     }
 
     #[tokio::test]
@@ -8818,7 +8910,10 @@ mod tests {
                 Some(expect),
                 "{status:?} mapping"
             );
-            assert!(r.order, "{status:?}: an orderly listener must report order=true");
+            assert!(
+                r.order,
+                "{status:?}: an orderly listener must report order=true"
+            );
             assert!(
                 !r.auto_commit,
                 "{status:?}: the listener-set autoCommit=false must go back to the broker as-is"
@@ -8838,7 +8933,10 @@ mod tests {
             .expect("direct consume must not error");
         assert_eq!(r.consume_result.as_deref(), Some(CMResult::CR_SUCCESS));
         assert!(!r.order, "a concurrent listener must report order=false");
-        assert!(r.auto_commit, "the concurrent side keeps the initial autoCommit=true");
+        assert!(
+            r.auto_commit,
+            "the concurrent side keeps the initial autoCommit=true"
+        );
     }
 
     // ---------------- POP ----------------
@@ -8868,12 +8966,20 @@ mod tests {
         // (1) FOUND + 2 messages: RT recorded once, TPS recorded once per message
         record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 2, began);
         assert_eq!(rt().times(), 1);
-        assert!(rt().value() >= 30, "RT should be this pop round's elapsed time: {}", rt().value());
+        assert!(
+            rt().value() >= 30,
+            "RT should be this pop round's elapsed time: {}",
+            rt().value()
+        );
         assert_eq!(tps().times(), 1);
         assert_eq!(tps().value(), 2);
 
         record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 0, began);
-        assert_eq!(rt().times(), 2, "an empty-handed FOUND round still records RT");
+        assert_eq!(
+            rt().times(),
+            2,
+            "an empty-handed FOUND round still records RT"
+        );
         assert_eq!(tps().times(), 1, "an empty list must not record TPS");
 
         // (3) POLLING_NOT_FOUND: neither cell records. Empty POP polls are the norm; counting the suspend
@@ -8886,7 +8992,11 @@ mod tests {
         //     number of rows the broker popped: three rows popped, one of them dropped before the
         //     listener, books two deliveries.
         record_pop_pull_stats(&stats, group, topic, PopStatus::Found, 1, began);
-        assert_eq!(rt().times(), 3, "a round that delivered something records RT");
+        assert_eq!(
+            rt().times(),
+            3,
+            "a round that delivered something records RT"
+        );
         assert_eq!(tps().times(), 2);
         assert_eq!(tps().value(), 3, "TPS counts only what was handed over");
     }
@@ -8941,7 +9051,11 @@ mod tests {
         // (3) FOUND but empty-handed: the round trip still belongs in the average, the nothing does
         //     not belong in throughput.
         record_pull_round_stats(&stats, group, topic, true, current_time_millis() - began, 0);
-        assert_eq!(rt().times(), 2, "an empty-handed FOUND round still records RT");
+        assert_eq!(
+            rt().times(),
+            2,
+            "an empty-handed FOUND round still records RT"
+        );
         assert_eq!(tps().times(), 1, "an empty list must not record TPS");
 
         // (4) The count the stats take is the one left after the pre-delivery pipeline: five rows
@@ -9283,14 +9397,8 @@ mod tests {
             pop_row("T", 101, 4),
             pop_row("T", 102, 5),
         ];
-        let kept = prepare_pop_batch_for_delivery(
-            &inner,
-            &read_cfg(&inner),
-            &mq,
-            &sub,
-            &popped,
-            &pq,
-        );
+        let kept =
+            prepare_pop_batch_for_delivery(&inner, &read_cfg(&inner), &mq, &sub, &popped, &pq);
         assert_eq!(kept.len(), 1, "only the row at the budget is deliverable");
         assert_eq!(kept[0].queue_offset, 100);
         assert_eq!(
@@ -9304,14 +9412,8 @@ mod tests {
         consumer.update_config(|c| c.max_reconsume_times = 9);
         let pq2 = PopProcessQueue::new();
         pq2.inc_found_msg(3);
-        let kept_all = prepare_pop_batch_for_delivery(
-            &inner,
-            &read_cfg(&inner),
-            &mq,
-            &sub,
-            &popped,
-            &pq2,
-        );
+        let kept_all =
+            prepare_pop_batch_for_delivery(&inner, &read_cfg(&inner), &mq, &sub, &popped, &pq2);
         assert_eq!(kept_all.len(), 3, "a budget every row clears drops nothing");
         assert_eq!(pq2.wait_ack_count(), 3);
     }
@@ -9325,8 +9427,14 @@ mod tests {
         assert!(is_pop_timeout(&[], now, 60_000));
         assert!(is_pop_timeout(&one(), 0, 60_000));
         assert!(is_pop_timeout(&one(), now - 1000, 0));
-        assert!(!is_pop_timeout(&one(), now, 60_000), "still inside the invisible window");
-        assert!(is_pop_timeout(&one(), now - 60_000, 60_000), "the window has passed");
+        assert!(
+            !is_pop_timeout(&one(), now, 60_000),
+            "still inside the invisible window"
+        );
+        assert!(
+            is_pop_timeout(&one(), now - 60_000, 60_000),
+            "the window has passed"
+        );
     }
 
     /// The two-pass traversal of POP consume-result handling: whatever the consume result is,
@@ -9422,7 +9530,6 @@ mod tests {
         assert!(pop_ck_target(inner, &bad_flag).is_none());
     }
 
-
     struct CountingOrderlyListener(Arc<AtomicUsize>);
 
     impl MessageListenerOrderly for CountingOrderlyListener {
@@ -9484,11 +9591,7 @@ mod tests {
             mq.clone(),
         )
         .await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "orderly POP stalled"
-        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "orderly POP stalled");
         assert_eq!(
             pq.wait_ack_count(),
             2,
@@ -9526,10 +9629,18 @@ mod tests {
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), false).await;
         assert_eq!(consumer.pop_orderly_request_count(), 1, "dedup by (pq, mq)");
         submit_pop_orderly_request(&inner, pq.clone(), q1.clone(), false).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 2, "a different mq counts as a new request");
+        assert_eq!(
+            consumer.pop_orderly_request_count(),
+            2,
+            "a different mq counts as a new request"
+        );
         let pq2 = PopProcessQueue::new();
         submit_pop_orderly_request(&inner, pq2.clone(), q0.clone(), false).await;
-        assert_eq!(consumer.pop_orderly_request_count(), 3, "a different pq counts as a new request");
+        assert_eq!(
+            consumer.pop_orderly_request_count(),
+            3,
+            "a different pq counts as a new request"
+        );
         submit_pop_orderly_request(&inner, pq.clone(), q0.clone(), true).await;
         assert_eq!(
             consumer.pop_orderly_request_count(),
@@ -9689,7 +9800,10 @@ mod tests {
             assert_eq!(msgs[0].topic, cut, "a POP row under {arrived}");
             // The delivery name the listener finally gets is the plain business topic.
             reset_retry_topic_and_namespace(&consumer.inner, &mut msgs);
-            assert_eq!(msgs[0].topic, "OrderTopic", "and the wrap comes off after the cut");
+            assert_eq!(
+                msgs[0].topic, "OrderTopic",
+                "and the wrap comes off after the cut"
+            );
         }
     }
 
@@ -9705,7 +9819,8 @@ mod tests {
         let popper = DefaultMQPushConsumer::new("MyGroup").unwrap();
         popper.update_config(|c| c.pop_mode = true);
         let pop_seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        popper.set_message_listener_concurrently(Arc::new(TopicRecordingListener(pop_seen.clone())));
+        popper
+            .set_message_listener_concurrently(Arc::new(TopicRecordingListener(pop_seen.clone())));
         let pq = PopProcessQueue::new();
         pq.inc_found_msg(1);
         submit_pop_consume_request(
@@ -9724,7 +9839,8 @@ mod tests {
         // Leg 2: the pulled batch entry, same name, same cut.
         let puller = DefaultMQPushConsumer::new("MyGroup").unwrap();
         let pull_seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        puller.set_message_listener_concurrently(Arc::new(TopicRecordingListener(pull_seen.clone())));
+        puller
+            .set_message_listener_concurrently(Arc::new(TopicRecordingListener(pull_seen.clone())));
         let mq = queue(retry_topic, "broker-a", 0);
         let key = mq_key(&mq);
         consume_batch(&puller.inner, &key, &mq, vec![ext(retry_topic, None)], None)
@@ -9744,9 +9860,15 @@ mod tests {
         )));
         let mq = queue(retry_topic, "broker-a", 0);
         let key = mq_key(&mq);
-        consume_batch(&orderly.inner, &key, &mq, vec![ext(retry_topic, None)], None)
-            .await
-            .expect("consume_batch must not error");
+        consume_batch(
+            &orderly.inner,
+            &key,
+            &mq,
+            vec![ext(retry_topic, None)],
+            None,
+        )
+        .await
+        .expect("consume_batch must not error");
         assert_eq!(
             orderly_seen.lock().unwrap().clone(),
             vec![retry_topic.to_string()],
@@ -9872,10 +9994,7 @@ mod tests {
         // The in-flight unacked count goes through waitAckCount, and the entry carries exactly
         // the three pop fields.
         let first = info.mq_pop_table[0].1.as_object().unwrap();
-        assert_eq!(
-            first.get("waitAckCount"),
-            Some(&serde_json::Value::from(3))
-        );
+        assert_eq!(first.get("waitAckCount"), Some(&serde_json::Value::from(3)));
         assert_eq!(first.get("droped"), Some(&serde_json::Value::from(false)));
         assert!(first.contains_key("lastPopTimestamp"));
         assert_eq!(first.len(), 3);
@@ -9901,7 +10020,6 @@ mod tests {
             vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]
         );
     }
-
 
     /// Stamps the clock directly, bypassing the real loop (this module has no `MQClientInstance`; the loop would exit immediately).
     fn stamp_at(consumer: &DefaultMQPushConsumer, key: &str, at: i64) {
@@ -10261,12 +10379,8 @@ mod tests {
         let other = queue("Other", "broker-a", 0);
         {
             let mut state = lock(&consumer.inner.state);
-            state
-                .mq_map
-                .insert(mq_key(&mine), mine.clone());
-            state
-                .mq_map
-                .insert(mq_key(&other), other.clone());
+            state.mq_map.insert(mq_key(&mine), mine.clone());
+            state.mq_map.insert(mq_key(&other), other.clone());
             state.consume_offsets.insert(mq_key(&mine), 42);
             state.consume_offsets.insert(mq_key(&other), 7);
         }
@@ -10279,7 +10393,10 @@ mod tests {
         };
         // Absent, empty and a name that matches nothing are three different asks;
         // the first two both mean "no filter".
-        assert_eq!(keys(None), vec![("Other".to_string(), 7), ("T".to_string(), 42)]);
+        assert_eq!(
+            keys(None),
+            vec![("Other".to_string(), 7), ("T".to_string(), 42)]
+        );
         assert_eq!(
             keys(Some("")),
             vec![("Other".to_string(), 7), ("T".to_string(), 42)],
@@ -10302,7 +10419,6 @@ mod tests {
         assert!(lock(&consumer.inner.state).last_pull_at.is_empty());
         assert!(lock(&consumer.inner.state).queue_owners.is_empty());
     }
-
 
     // Contract fixture: output of real fastjson2 2.0.59 + rocketmq-client 5.5.0 (pretty variant included)
     const CONTRACT_OFFSETS_COMPACT: &str = concat!(
@@ -10561,7 +10677,6 @@ mod tests {
         assert_eq!(recalc_pull_from_which_node(&state, &other), master);
     }
 
-
     const CTO_TOPIC: &str = "P6CorrectTagsOffsetTopic";
 
     fn cto_mq() -> MessageQueue {
@@ -10602,14 +10717,26 @@ mod tests {
         for status in [PullStatus::NoNewMsg, PullStatus::NoMatchedMsg] {
             let mut h = CtoHarness::new();
             h.correct(status, 42);
-            assert_eq!(h.offset(), Some(42), "{status:?} must lift the offset from 0 to the replied offset");
+            assert_eq!(
+                h.offset(),
+                Some(42),
+                "{status:?} must lift the offset from 0 to the replied offset"
+            );
             h.correct(status, 43);
-            assert_eq!(h.offset(), Some(43), "keeps advancing by the replied offset once a record exists");
+            assert_eq!(
+                h.offset(),
+                Some(43),
+                "keeps advancing by the replied offset once a record exists"
+            );
         }
         for status in [PullStatus::Found, PullStatus::OffsetIllegal] {
             let mut h = CtoHarness::new();
             h.correct(status, 42);
-            assert_eq!(h.offset(), None, "{status:?} is not an empty pull; the offset must not be touched");
+            assert_eq!(
+                h.offset(),
+                None,
+                "{status:?} is not an empty pull; the offset must not be touched"
+            );
         }
     }
 
@@ -10617,9 +10744,17 @@ mod tests {
     fn correct_tags_offset_creates_the_record_even_for_a_zero_offset() {
         let mut h = CtoHarness::new();
         h.correct(PullStatus::NoNewMsg, 0);
-        assert_eq!(h.offset(), Some(0), "even a 0 for an empty queue must create the record");
+        assert_eq!(
+            h.offset(),
+            Some(0),
+            "even a 0 for an empty queue must create the record"
+        );
         h.correct(PullStatus::NoNewMsg, 0);
-        assert_eq!(h.offset(), Some(0), "correcting again after creation: neither advances nor regresses");
+        assert_eq!(
+            h.offset(),
+            Some(0),
+            "correcting again after creation: neither advances nor regresses"
+        );
     }
 
     /// `increaseOnly=true`: advance only, never regress.
@@ -10628,7 +10763,11 @@ mod tests {
         let mut h = CtoHarness::new();
         h.state.consume_offsets.insert(h.key.clone(), 100);
         h.correct(PullStatus::NoNewMsg, 50);
-        assert_eq!(h.offset(), Some(100), "replied offset is smaller: stay in place");
+        assert_eq!(
+            h.offset(),
+            Some(100),
+            "replied offset is smaller: stay in place"
+        );
         h.correct(PullStatus::NoNewMsg, 100);
         assert_eq!(h.offset(), Some(100), "equal: no change");
         h.correct(PullStatus::NoNewMsg, 101);
@@ -10657,7 +10796,11 @@ mod tests {
         // an explicit 0 (briefly possible while wrapping up) does not block
         h.state.inflight.insert(h.key.clone(), 0);
         h.correct(PullStatus::NoNewMsg, 42);
-        assert_eq!(h.offset(), Some(42), "correction is allowed once inflight drops to zero");
+        assert_eq!(
+            h.offset(),
+            Some(42),
+            "correction is allowed once inflight drops to zero"
+        );
 
         // no pending entry at all (queue never pulled) counts as empty; a missing entry must not skip the correction
         let mut fresh = CtoHarness {
@@ -10741,7 +10884,10 @@ mod tests {
             .await
             .expect("listener was not called (5s)")
             .expect("entered channel closed unexpectedly");
-        assert_eq!(observed, None, "the offset must not move while the batch is in flight");
+        assert_eq!(
+            observed, None,
+            "the offset must not move while the batch is in flight"
+        );
         assert_eq!(
             lock(&c.inner.state).inflight.get(&key).copied(),
             Some(1),
@@ -10760,7 +10906,10 @@ mod tests {
             {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "batch not settled within 5s");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "batch not settled within 5s"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // successful consumption has already pushed the offset to max(queueOffset)+1; only now may the empty-pull correction take effect
@@ -10784,7 +10933,11 @@ mod tests {
 
     #[test]
     fn clean_expire_period_equals_consume_timeout_minutes() {
-        assert_eq!(clean_expire_period_millis(15), 900_000, "default 15 minutes");
+        assert_eq!(
+            clean_expire_period_millis(15),
+            900_000,
+            "default 15 minutes"
+        );
         assert_eq!(clean_expire_period_millis(1), 60_000);
         assert_eq!(
             clean_expire_period_millis(0),
@@ -10819,7 +10972,10 @@ mod tests {
             "exactly at the threshold: only strictly greater acts"
         );
         assert!(!is_consume_expired(Some(now), now, 1));
-        assert!(!is_consume_expired(None, now, 1), "a missing stamp is not treated as expired");
+        assert!(
+            !is_consume_expired(None, now, 1),
+            "a missing stamp is not treated as expired"
+        );
         // default 15 minutes: 14m59.999s does nothing, 15m plus 1ms acts
         assert!(!is_consume_expired(Some(now - 899_999), now, 15));
         assert!(is_consume_expired(Some(now - 900_001), now, 15));
@@ -10851,7 +11007,11 @@ mod tests {
             "head not expired: later entries cannot be either (stop at the first hit)"
         );
         let state = lock(&consumer.inner.state);
-        assert_eq!(state.pending.get(&key).unwrap().len(), 2, "not a single entry may be touched");
+        assert_eq!(
+            state.pending.get(&key).unwrap().len(),
+            2,
+            "not a single entry may be touched"
+        );
     }
 
     #[tokio::test]
@@ -10904,7 +11064,10 @@ mod tests {
             2,
             "a failed send-back never removes the entry (removing it would truly lose the message)"
         );
-        assert!(!state.consume_offsets.contains_key(&key), "the offset must not be touched");
+        assert!(
+            !state.consume_offsets.contains_key(&key),
+            "the offset must not be touched"
+        );
     }
 
     #[tokio::test]
@@ -10977,7 +11140,10 @@ mod tests {
             1,
             "removed from the registry side"
         );
-        assert!(state.pending.get(&key).unwrap().is_empty(), "removed from the buffer side too");
+        assert!(
+            state.pending.get(&key).unwrap().is_empty(),
+            "removed from the buffer side too"
+        );
 
         // a smaller offset appeared ahead: yield; must not race to remove it
         let mut state = State::default();
@@ -11029,7 +11195,10 @@ mod tests {
             remove_process_queue_entry_locked(&mut state, &key, 1);
             assert!(!process_queue_contains_locked(&state, &key, 1));
             assert!(process_queue_contains_locked(&state, &key, 2));
-            assert!(!state.inflight_msgs.contains_key(&key), "empty buckets must be dropped");
+            assert!(
+                !state.inflight_msgs.contains_key(&key),
+                "empty buckets must be dropped"
+            );
         }
     }
 
@@ -11059,8 +11228,14 @@ mod tests {
             vec![0],
             "o0 attempts a send-back but fails (not started); o1 was swept away and is skipped outright"
         );
-        assert_eq!(failed[0].1.reconsume_times, 1, "failure increments in place");
-        assert_eq!(batch[1].reconsume_times, 0, "skipped entries must not get their count bumped");
+        assert_eq!(
+            failed[0].1.reconsume_times, 1,
+            "failure increments in place"
+        );
+        assert_eq!(
+            batch[1].reconsume_times, 0,
+            "skipped entries must not get their count bumped"
+        );
     }
 
     #[test]
@@ -11127,7 +11302,11 @@ mod tests {
         {
             let state = lock(&c.inner.state);
             let entries = process_queue_entries_locked(&state, &key);
-            assert_eq!(entries.len(), 2, "the in-flight batch must appear in the sweep view");
+            assert_eq!(
+                entries.len(),
+                2,
+                "the in-flight batch must appear in the sweep view"
+            );
             assert!(
                 entries.iter().all(|m| consume_start_timestamp(m).is_some()),
                 "the copies registered into the view must already carry the CONSUME_START_TIME stamp"
@@ -11148,7 +11327,10 @@ mod tests {
             if !lock(&c.inner.state).inflight_msgs.contains_key(&key) {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "registration not unregistered within 5s");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "registration not unregistered within 5s"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // the sweep view thereby returns to the "only buffered messages" state
@@ -11358,10 +11540,17 @@ mod tests {
         // the consumed offset is handed to the caller to persist (in `handle_offset_illegal` this is `revoke_queues`)
         assert_eq!(revoked.len(), 1);
         assert_eq!(revoked[0].0, h.mq);
-        assert_eq!(revoked[0].1, Some(0), "what gets persisted is the corrected frozen offset");
+        assert_eq!(
+            revoked[0].1,
+            Some(0),
+            "what gets persisted is the corrected frozen offset"
+        );
 
         let state = lock(&h.c.inner.state);
-        assert!(!state.pending.contains_key(&h.key), "the buffered batch is invalidated wholesale");
+        assert!(
+            !state.pending.contains_key(&h.key),
+            "the buffered batch is invalidated wholesale"
+        );
         assert!(!state.offset_table.contains_key(&h.key));
         assert!(!state.consume_offsets.contains_key(&h.key));
         assert!(!state.mq_map.contains_key(&h.key));
@@ -11375,7 +11564,10 @@ mod tests {
             Some(1),
             "epoch +1 (setDropped)"
         );
-        assert!(state.frozen_offsets.contains(&h.key), "the freeze must survive until the queue is rebuilt");
+        assert!(
+            state.frozen_offsets.contains(&h.key),
+            "the freeze must survive until the queue is rebuilt"
+        );
     }
 
     #[test]
@@ -11458,7 +11650,11 @@ mod tests {
         );
         // after the rebuild acks work again: only batches with the **new epoch** count; old-epoch ones stay invalidated
         h.ack(&[0, 1], 0);
-        assert_eq!(h.offset(), None, "an old-epoch ack still must not move the offset");
+        assert_eq!(
+            h.offset(),
+            None,
+            "an old-epoch ack still must not move the offset"
+        );
         h.ack(&[0, 1], h.epoch());
         assert_eq!(h.offset(), Some(2));
     }
@@ -11508,7 +11704,11 @@ mod tests {
             .consume_offsets
             .insert(h.key.clone(), 0);
         h.ack(&[0, 1, 2], 0);
-        assert_eq!(h.offset(), Some(0), "an old-epoch ack must not move the offset");
+        assert_eq!(
+            h.offset(),
+            Some(0),
+            "an old-epoch ack must not move the offset"
+        );
         h.ack(&[0, 1, 2], 1);
         assert_eq!(h.offset(), Some(3));
     }
@@ -11612,17 +11812,28 @@ mod tests {
         let h = ResetHarness::new(MessageModel::CLUSTERING);
         h.reset(0).await;
         assert_eq!(h.epoch(), 1, "the queue was retired, epoch +1");
-        assert_eq!(h.offset(), None, "the offset is handed over for persistence");
+        assert_eq!(
+            h.offset(),
+            None,
+            "the offset is handed over for persistence"
+        );
         {
             let state = lock(&h.c.inner.state);
             assert!(!state.mq_map.contains_key(&h.key));
-            assert!(!state.pending.contains_key(&h.key), "the buffered batch is invalidated wholesale");
+            assert!(
+                !state.pending.contains_key(&h.key),
+                "the buffered batch is invalidated wholesale"
+            );
             assert!(!state.offset_table.contains_key(&h.key));
             assert!(!state.queue_owners.contains_key(&h.key));
         }
         // a batch fetched before the reset but returned after it (epoch 0): its ack must be dropped; the offset must not come back to life
         ack_batch(&h.c, &h.key, &[0, 1], 0);
-        assert_eq!(h.offset(), None, "the old batch's ack is blocked by the epoch");
+        assert_eq!(
+            h.offset(),
+            None,
+            "the old batch's ack is blocked by the epoch"
+        );
         // the rebuilt queue (epoch 1) acks as usual
         ack_batch(&h.c, &h.key, &[4, 5], 1);
         assert_eq!(h.offset(), Some(6));
@@ -11705,7 +11916,8 @@ mod tests {
 
     #[test]
     fn trace_host_reports_empty_client_id_before_start() {
-        let c = DefaultMQPushConsumer::new("GID_trace_host").expect("a legal group name must not fail to construct");
+        let c = DefaultMQPushConsumer::new("GID_trace_host")
+            .expect("a legal group name must not fail to construct");
         // returns an empty string when the host has no _mq_client
         assert_eq!(TraceHost::client_id(&c), "");
     }
@@ -11799,9 +12011,9 @@ mod tests {
                 MessageQueueAssignment::new(MessageQueueKey::new("T", *broker, *id), mode)
             })
             .collect();
-        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
-            Some(&list),
-        )
+        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(Some(
+            &list,
+        ))
     }
 
     /// The same body for one named topic (the per-topic script answers each 400 with this).
@@ -11813,9 +12025,9 @@ mod tests {
                 MessageQueueAssignment::new(MessageQueueKey::new(topic, broker, *id), "POP")
             })
             .collect();
-        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
-            Some(&list),
-        )
+        crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(Some(
+            &list,
+        ))
     }
 
     struct AssignState {
@@ -11845,9 +12057,13 @@ mod tests {
 
     impl AssignCluster {
         async fn start() -> AssignCluster {
-            let broker = TcpListener::bind("127.0.0.1:0").await.expect("bind mock broker");
+            let broker = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock broker");
             let broker_addr = broker.local_addr().expect("mock broker addr").to_string();
-            let namesrv = TcpListener::bind("127.0.0.1:0").await.expect("bind mock namesrv");
+            let namesrv = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock namesrv");
             let namesrv_addr = namesrv.local_addr().expect("mock namesrv addr").to_string();
             let state = Arc::new(AssignState {
                 fixture: Mutex::new(None),
@@ -11885,7 +12101,10 @@ mod tests {
         }
 
         /// All 400 request bodies the fake broker has received (decoded).
-        fn requests(&self) -> Vec<crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody> {
+        fn requests(
+            &self,
+        ) -> Vec<crate::remoting::protocol::query_assignment_body::QueryAssignmentRequestBody>
+        {
             let raw = lock(&self.state.bodies).clone();
             raw.iter()
                 .map(|b| {
@@ -11981,19 +12200,22 @@ mod tests {
     fn spawn_assign_namesrv(listener: TcpListener, broker_addr: String) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let addr = broker_addr.clone();
                 tokio::spawn(async move {
                     while let Some(frame) = read_assign_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
-                        let mut response =
-                            if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
-                                let mut r = assign_response_for(&request, response_code::SUCCESS);
-                                r.set_body(Some(assign_route_json(&addr)));
-                                r
-                            } else {
-                                assign_response_for(&request, response_code::SUCCESS)
-                            };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
+                        let mut response = if request.code == request_code::GET_ROUTEINFO_BY_TOPIC {
+                            let mut r = assign_response_for(&request, response_code::SUCCESS);
+                            r.set_body(Some(assign_route_json(&addr)));
+                            r
+                        } else {
+                            assign_response_for(&request, response_code::SUCCESS)
+                        };
                         write_assign_frame(&mut stream, &mut response).await;
                     }
                 });
@@ -12004,23 +12226,32 @@ mod tests {
     fn spawn_assign_broker(listener: TcpListener, state: Arc<AssignState>) -> JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     while let Some(frame) = read_assign_frame(&mut stream).await {
-                        let Ok(request) = RemotingCommand::decode(&frame) else { return };
+                        let Ok(request) = RemotingCommand::decode(&frame) else {
+                            return;
+                        };
                         if request.code == request_code::HEART_BEAT {
-                            state.heartbeats.lock().unwrap_or_else(|e| e.into_inner()).push(
-                                request.body().unwrap_or(&[]).to_vec(),
-                            );
-                            let mut response = assign_response_for(&request, response_code::SUCCESS);
+                            state
+                                .heartbeats
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(request.body().unwrap_or(&[]).to_vec());
+                            let mut response =
+                                assign_response_for(&request, response_code::SUCCESS);
                             write_assign_frame(&mut stream, &mut response).await;
                             continue;
                         }
                         if request.code == request_code::QUERY_ASSIGNMENT {
-                            state.bodies.lock().unwrap_or_else(|e| e.into_inner()).push(
-                                request.body().unwrap_or(&[]).to_vec(),
-                            );
+                            state
+                                .bodies
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(request.body().unwrap_or(&[]).to_vec());
                             let fixture = lock(&state.fixture).clone();
                             match fixture {
                                 Some(f) if f.silent_close => return, // no reply; tear down the connection directly
@@ -12033,7 +12264,8 @@ mod tests {
                                             )
                                             .map(|r| r.topic)
                                             .unwrap_or_default();
-                                            let queues = map.get(&topic).cloned().unwrap_or_default();
+                                            let queues =
+                                                map.get(&topic).cloned().unwrap_or_default();
                                             Some(topic_assignment_body(&topic, &queues))
                                         }
                                         _ => f.body.clone(),
@@ -12045,10 +12277,8 @@ mod tests {
                                 }
                                 None => {
                                     // default script: the two POP queues 0/1 on broker-a
-                                    let mut response = assign_response_for(
-                                        &request,
-                                        response_code::SUCCESS,
-                                    );
+                                    let mut response =
+                                        assign_response_for(&request, response_code::SUCCESS);
                                     response.set_body(Some(assignment_body(&[
                                         ("broker-a", 0, "POP"),
                                         ("broker-a", 1, "POP"),
@@ -12083,8 +12313,8 @@ mod tests {
                         if request.code == request_code::QUERY_CONSUMER_OFFSET {
                             // The store read this round: a scripted failure is what makes the
                             // rebalance skip the queue instead of starting it at a guess.
-                            let (code, offset) = lock(&state.offset_read)
-                                .unwrap_or((response_code::SUCCESS, 0));
+                            let (code, offset) =
+                                lock(&state.offset_read).unwrap_or((response_code::SUCCESS, 0));
                             let mut response = assign_response_for(&request, code);
                             if code == response_code::SUCCESS {
                                 response.add_ext_field("offset", &offset.to_string());
@@ -12098,7 +12328,10 @@ mod tests {
                                 .and_then(|v| v.parse::<i64>().ok())
                                 .unwrap_or(-1);
                             lock(&state.pulls).push((
-                                request.get_ext_field("topic").unwrap_or_default().to_string(),
+                                request
+                                    .get_ext_field("topic")
+                                    .unwrap_or_default()
+                                    .to_string(),
                                 request
                                     .get_ext_field("queueId")
                                     .and_then(|v| v.parse::<i32>().ok())
@@ -12164,7 +12397,10 @@ mod tests {
 
     /// Builds a classic (non-POP) consumer on the same fake cluster: registered in the instance and
     /// `started` so `require_client` works, with no background loops (the rebalance is driven by hand).
-    fn classic_consumer_on_cluster(instance: &str, cluster: &AssignCluster) -> DefaultMQPushConsumer {
+    fn classic_consumer_on_cluster(
+        instance: &str,
+        cluster: &AssignCluster,
+    ) -> DefaultMQPushConsumer {
         let group = "GID_classic_offset";
         let c = DefaultMQPushConsumer::new(group).expect("legal group name");
         c.subscribe("T", "*").expect("subscribe");
@@ -12196,7 +12432,11 @@ mod tests {
 
         {
             let state = lock(&c.inner.state);
-            assert_eq!(state.assigned.len(), 4, "the assignment itself survives the failed read");
+            assert_eq!(
+                state.assigned.len(),
+                4,
+                "the assignment itself survives the failed read"
+            );
             assert!(
                 state.queue_owners.is_empty(),
                 "a queue with no cursor must get no pull loop"
@@ -12225,7 +12465,9 @@ mod tests {
         let pulls = cluster.pulls();
         assert!(!pulls.is_empty(), "the recovered queues must start pulling");
         assert!(
-            pulls.iter().all(|(topic, _, offset)| topic == "T" && *offset == 7),
+            pulls
+                .iter()
+                .all(|(topic, _, offset)| topic == "T" && *offset == 7),
             "pulls resume at the committed offset, never at a guessed one: {pulls:?}"
         );
     }
@@ -12290,8 +12532,14 @@ mod tests {
         assert_eq!(reqs.len(), 1, "one 400 per topic");
         assert_eq!(reqs[0].topic, "T");
         assert_eq!(reqs[0].consumer_group, "GID_pop_assign");
-        assert_eq!(reqs[0].client_id, "cid-pop-qa-ok", "clientId comes from the instance");
-        assert_eq!(reqs[0].strategy_name, "AVG", "the strategy name rides in the body; the broker picks the strategy by it");
+        assert_eq!(
+            reqs[0].client_id, "cid-pop-qa-ok",
+            "clientId comes from the instance"
+        );
+        assert_eq!(
+            reqs[0].strategy_name, "AVG",
+            "the strategy name rides in the body; the broker picks the strategy by it"
+        );
         assert_eq!(reqs[0].message_model, "CLUSTERING");
         // POP mode no longer sends GET_CONSUMER_LIST_BY_GROUP: the queue set is decided entirely by the 400
     }
@@ -12303,7 +12551,11 @@ mod tests {
         let c = pop_consumer_on_cluster("pop-qa-empty", &cluster);
 
         c.do_rebalance().await.unwrap();
-        assert_eq!(sorted_keys(&c).len(), 2, "the default assignment arrives first");
+        assert_eq!(
+            sorted_keys(&c).len(),
+            2,
+            "the default assignment arrives first"
+        );
 
         cluster.set(Some(AssignFixture::with_assignments(&[])));
         c.do_rebalance().await.unwrap();
@@ -12340,7 +12592,10 @@ mod tests {
 
         c.do_rebalance().await.unwrap();
         let before = sorted_keys(&c);
-        assert_eq!(before, vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]);
+        assert_eq!(
+            before,
+            vec!["Tbroker-a0".to_string(), "Tbroker-a1".to_string()]
+        );
 
         // (1) broker error code
         cluster.set(Some(AssignFixture::with_code(response_code::SYSTEM_ERROR)));
@@ -12354,7 +12609,11 @@ mod tests {
         // (2) SUCCESS + null set
         cluster.set(Some(AssignFixture::null_set()));
         c.do_rebalance().await.unwrap();
-        assert_eq!(sorted_keys(&c), before, "null means invalid result, skip the update");
+        assert_eq!(
+            sorted_keys(&c),
+            before,
+            "null means invalid result, skip the update"
+        );
 
         // (3) transport-layer failure: the 400 closes the connection right after receiving the request (the error necessarily returns within the 3s RPC timeout budget)
         cluster.set(Some(AssignFixture::drop_connection()));
@@ -12438,13 +12697,22 @@ mod tests {
         assert_eq!(calls[1].0, "T2");
         assert_eq!(
             (calls[0].1, calls[0].2.as_slice()),
-            (4usize, &["T1broker-a0".to_string(), "T1broker-a1".to_string()][..]),
+            (
+                4usize,
+                &["T1broker-a0".to_string(), "T1broker-a1".to_string()][..]
+            ),
             "one call carries the FULL route set and this instance's share of it"
         );
-        let beat = cluster.heartbeat_versions().pop().expect("the beat was recorded");
+        let beat = cluster
+            .heartbeat_versions()
+            .pop()
+            .expect("the beat was recorded");
         let t1_v1 = beat["T1"];
         let t2_v1 = beat["T2"];
-        assert!(t1_v1 > 0 && t2_v1 > 0, "a restamp is a wall-clock stamp: {beat:?}");
+        assert!(
+            t1_v1 > 0 && t2_v1 > 0,
+            "a restamp is a wall-clock stamp: {beat:?}"
+        );
         assert_eq!(
             t1_v1, t2_v1,
             "one round shares a single stamp across the topics it moved"
@@ -12456,10 +12724,26 @@ mod tests {
         c.update_config(|cfg| cfg.pull_threshold_for_queue = 12_345);
         let beats_before = cluster.heartbeat_count();
         c.do_rebalance().await.unwrap();
-        assert_eq!(cluster.heartbeat_count(), beats_before, "an unchanged round sends no beat");
-        assert_eq!(lock(&spy.calls).len(), 2, "an unchanged round reports nothing to the app");
-        assert_eq!(c.config().pull_threshold_for_queue, 12_345, "not re-divided");
-        assert_eq!(subscription_version(&c, "T1"), t1_v1, "an unmoved subscription keeps its version");
+        assert_eq!(
+            cluster.heartbeat_count(),
+            beats_before,
+            "an unchanged round sends no beat"
+        );
+        assert_eq!(
+            lock(&spy.calls).len(),
+            2,
+            "an unchanged round reports nothing to the app"
+        );
+        assert_eq!(
+            c.config().pull_threshold_for_queue,
+            12_345,
+            "not re-divided"
+        );
+        assert_eq!(
+            subscription_version(&c, "T1"),
+            t1_v1,
+            "an unmoved subscription keeps its version"
+        );
         assert_eq!(subscription_version(&c, "T2"), t2_v1);
 
         // Round 3: T2's share shrinks to nothing while T1 keeps the identical two queues. Only T2
@@ -12482,14 +12766,21 @@ mod tests {
             "the shrunk round divides over the 2 queues it owns now, not the 3 it had"
         );
         let calls = lock(&spy.calls).clone();
-        assert_eq!(calls.len(), 3, "exactly one more callback for one moved topic");
+        assert_eq!(
+            calls.len(),
+            3,
+            "exactly one more callback for one moved topic"
+        );
         assert_eq!(
             (calls[2].0.as_str(), calls[2].1, calls[2].2.as_slice()),
             ("T2", 4, &[] as &[String]),
             "T2 is told with its full route set and an empty share; T1 is never re-reported"
         );
         let versions = subscription_versions(&c);
-        assert_eq!(versions["T1"], t1_v1, "the unmoved topic's version is left alone");
+        assert_eq!(
+            versions["T1"], t1_v1,
+            "the unmoved topic's version is left alone"
+        );
         assert!(
             versions["T2"] > t2_v1,
             "the moved topic carries a fresh stamp: {versions:?}"
@@ -12507,21 +12798,26 @@ mod tests {
     async fn pop_assignment_dedups_and_survives_mixed_modes() {
         let cluster = AssignCluster::start().await;
         let c = pop_consumer_on_cluster("pop-qa-dedup", &cluster);
-        let body = crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
-            Some(&{
-                let mut items = assignment_items(&[("broker-a", 0, "POP")]);
-                items.extend(assignment_items(&[("broker-a", 0, "POP")])); // duplicate entry
-                items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
-                    message_queue: None,
-                    mode: "POP".to_string(),
-                });
-                items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
-                    message_queue: Some(MessageQueueKey::new("T", "broker-a", 1)),
-                    mode: "PULL".to_string(), // mixed mode: observe only
-                });
-                items
-            }),
-        );
+        let body =
+            crate::remoting::protocol::query_assignment_body::QueryAssignmentResponseBody::encode(
+                Some(&{
+                    let mut items = assignment_items(&[("broker-a", 0, "POP")]);
+                    items.extend(assignment_items(&[("broker-a", 0, "POP")])); // duplicate entry
+                    items.push(
+                        crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
+                            message_queue: None,
+                            mode: "POP".to_string(),
+                        },
+                    );
+                    items.push(
+                        crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
+                            message_queue: Some(MessageQueueKey::new("T", "broker-a", 1)),
+                            mode: "PULL".to_string(), // mixed mode: observe only
+                        },
+                    );
+                    items
+                }),
+            );
         cluster.set(Some(AssignFixture {
             code: response_code::SUCCESS,
             body: Some(body),

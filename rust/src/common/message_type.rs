@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MessageType {
     #[default]
@@ -74,10 +73,7 @@ mod tests {
             assert_eq!(MessageType::get_by_short_name(t.short_name()), t);
             assert_eq!(MessageType::from_value(t.value()), Some(t));
         }
-        assert_eq!(
-            MessageType::NormalMsg.short_name(),
-            "Normal"
-        );
+        assert_eq!(MessageType::NormalMsg.short_name(), "Normal");
         assert_eq!(MessageType::TransMsgHalf.short_name(), "Trans");
         assert_eq!(MessageType::TransMsgCommit.short_name(), "TransCommit");
     }
@@ -85,7 +81,10 @@ mod tests {
     #[test]
     fn unknown_short_name_falls_back_to_normal() {
         assert_eq!(MessageType::get_by_short_name(""), MessageType::NormalMsg);
-        assert_eq!(MessageType::get_by_short_name("nonsense"), MessageType::NormalMsg);
+        assert_eq!(
+            MessageType::get_by_short_name("nonsense"),
+            MessageType::NormalMsg
+        );
         assert_eq!(MessageType::from_value(5), None);
         assert_eq!(MessageType::from_value(-1), None);
     }

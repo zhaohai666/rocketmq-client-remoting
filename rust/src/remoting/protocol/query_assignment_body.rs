@@ -113,8 +113,7 @@ impl MessageQueueAssignment {
         expect_object(value, "MessageQueueAssignment")?;
         Ok(MessageQueueAssignment {
             message_queue: MessageQueueKey::from_value(&jraw_map_null(value, "messageQueue")),
-            mode: jstring(value, "mode")
-                .unwrap_or_else(|| MESSAGE_REQUEST_MODE_PULL.to_string()),
+            mode: jstring(value, "mode").unwrap_or_else(|| MESSAGE_REQUEST_MODE_PULL.to_string()),
         })
     }
 }
@@ -183,13 +182,8 @@ mod tests {
 
     #[test]
     fn request_body_encodes_wire_property_names() {
-        let body = QueryAssignmentRequestBody::new(
-            "T1",
-            "GID_g",
-            "127.0.0.1@inst",
-            "AVG",
-            "CLUSTERING",
-        );
+        let body =
+            QueryAssignmentRequestBody::new("T1", "GID_g", "127.0.0.1@inst", "AVG", "CLUSTERING");
         let text = String::from_utf8(body.encode()).unwrap();
         for key in [
             "\"topic\":\"T1\"",
@@ -227,15 +221,11 @@ mod tests {
         assert_eq!(QueryAssignmentResponseBody::decode(b"null").unwrap(), None);
         assert_eq!(QueryAssignmentResponseBody::decode(b"{}").unwrap(), None);
         assert_eq!(
-            QueryAssignmentResponseBody::decode(
-                b"{\"messageQueueAssignments\":null}"
-            )
-            .unwrap(),
+            QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":null}").unwrap(),
             None
         );
         // Explicit empty array: Some(empty) -- "clear all previous assignments"
-        let got =
-            QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":[]}").unwrap();
+        let got = QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":[]}").unwrap();
         assert_eq!(got.map(|v| v.len()), Some(0));
     }
 
@@ -266,10 +256,10 @@ mod tests {
         assert!(
             QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":\"nope\"}").is_err()
         );
-        assert!(QueryAssignmentResponseBody::decode(
-            b"{\"messageQueueAssignments\":[\"nope\"]}"
-        )
-        .is_err());
+        assert!(
+            QueryAssignmentResponseBody::decode(b"{\"messageQueueAssignments\":[\"nope\"]}")
+                .is_err()
+        );
     }
 
     #[test]
@@ -278,11 +268,10 @@ mod tests {
             MessageQueueAssignment::new(mq("T", "broker-a", 0), MESSAGE_REQUEST_MODE_POP),
             MessageQueueAssignment::new(mq("T", "broker-a", 1), MESSAGE_REQUEST_MODE_PULL),
         ];
-        let got = QueryAssignmentResponseBody::decode(&QueryAssignmentResponseBody::encode(Some(
-            &items,
-        )))
-        .unwrap()
-        .expect("assignments present");
+        let got =
+            QueryAssignmentResponseBody::decode(&QueryAssignmentResponseBody::encode(Some(&items)))
+                .unwrap()
+                .expect("assignments present");
         assert_eq!(got, items);
 
         // None encodes without the key -> decodes back to None

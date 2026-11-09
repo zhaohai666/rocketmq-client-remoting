@@ -17,9 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rocketmq_client_remoting::client::admin::{AdminConfig, DefaultMQAdminExt};
-use rocketmq_client_remoting::client::producer::{
-    DefaultMQProducer, ProducerConfig, SendCallback,
-};
+use rocketmq_client_remoting::client::producer::{DefaultMQProducer, ProducerConfig, SendCallback};
 use rocketmq_client_remoting::client::result::{SendResult, SendStatus};
 use rocketmq_client_remoting::common::message::{Message, MessageQueue};
 use rocketmq_client_remoting::common::mix_all::MixAll;
@@ -178,16 +176,15 @@ impl Env {
                         .unwrap_or_default();
                     *lock(&self.broker_addr) = addr.clone();
                     *lock(&self.broker_name) = name.clone();
-                    ck.check(
-                        "cluster probe",
-                        true,
-                        &format!("broker={addr} name={name}"),
-                    );
+                    ck.check("cluster probe", true, &format!("broker={addr} name={name}"));
                     return true;
                 }
             }
             if Instant::now() >= deadline {
-                ck.abort("cluster probe", "nameServer returned no broker within the budget");
+                ck.abort(
+                    "cluster probe",
+                    "nameServer returned no broker within the budget",
+                );
                 return false;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -195,7 +192,12 @@ impl Env {
     }
 
     /// A producer with only the c/d knobs configured; `None` keeps the default.
-    fn producer(&self, kind: &str, c: Option<&str>, d: Option<i32>) -> Result<DefaultMQProducer, String> {
+    fn producer(
+        &self,
+        kind: &str,
+        c: Option<&str>,
+        d: Option<i32>,
+    ) -> Result<DefaultMQProducer, String> {
         DefaultMQProducer::with_config(ProducerConfig {
             producer_group: self.producer_group(),
             instance_name: format!("hdr-{kind}-{}", self.stamp),
@@ -209,7 +211,14 @@ impl Env {
     }
 
     /// Starts a standalone producer to send one message, then shuts it down (H1..H3 each need a different c/d combination).
-    async fn send_once(&self, kind: &str, c: Option<&str>, d: Option<i32>, topic: &str, body: &str) -> Result<SendResult, String> {
+    async fn send_once(
+        &self,
+        kind: &str,
+        c: Option<&str>,
+        d: Option<i32>,
+        topic: &str,
+        body: &str,
+    ) -> Result<SendResult, String> {
         let producer = self.producer(kind, c, d)?;
         producer.start().await.map_err(|e| e.to_string())?;
         let mut msg = Message::new(topic, Some(body.as_bytes()));
@@ -291,9 +300,7 @@ async fn check_queue_nums(ck: &mut Checker, env: &Env) {
             &format!(
                 "msgId={} broker={}",
                 r.msg_id.unwrap_or_default(),
-                r.message_queue
-                    .map(|mq| mq.broker_name)
-                    .unwrap_or_default()
+                r.message_queue.map(|mq| mq.broker_name).unwrap_or_default()
             ),
         ),
         Err(e) => ck.abort("H1 default-config send succeeded", &e),
@@ -474,10 +481,7 @@ async fn check_broker_name(ck: &mut Checker, env: &Env) {
     let t5 = env.topic("BrokerName");
     match env.send_once("h5", None, None, &t5, "h5").await {
         Ok(r) => {
-            let landed = r
-                .message_queue
-                .map(|mq| mq.broker_name)
-                .unwrap_or_default();
+            let landed = r.message_queue.map(|mq| mq.broker_name).unwrap_or_default();
             ck.check(
                 "H5 the landing broker name matches the route (n is exactly it)",
                 r.status == SendStatus::SendOk && landed == env.broker_name(),

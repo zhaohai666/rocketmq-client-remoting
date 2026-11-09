@@ -1902,8 +1902,15 @@ class DefaultMQProducer:
         from common.message_decoder import decode_messages
         return decode_messages(body)
 
-    def view_message(self, topic: str, msg_id: str):
-        raise MQClientException("viewMessage by msgId is not supported in Python edition")
+    def view_message(self, topic: str, msg_id: str) -> MessageExt:
+        """Java ``DefaultMQProducer#viewMessage`` (the MQAdmin facade, :1081).
+
+        Delegates to the client instance's SINGLE-leg lookup
+        (``MQAdminImpl#viewMessage``): offset msgId only, decoded and asked
+        VIEW_MESSAGE_BY_ID(33) on the broker that stamped it -- no uniq-key
+        fallback at this layer.
+        """
+        return self._require_client().view_message(topic, msg_id)
 
     # ---------------- Helpers ----------------
     def _check_message(self, msg: Message) -> None:

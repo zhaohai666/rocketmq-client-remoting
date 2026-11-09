@@ -5,9 +5,9 @@
 //! offset query/update, heartbeat, queue locking, admin APIs (create/delete topic, cluster
 //! info, etc.) and broker-initiated request (220/221/307/309/326) dispatch.
 
-use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -31,10 +31,11 @@ use crate::common::message_const::{
     KEY_SEPARATOR, PROPERTY_CORRELATION_ID, PROPERTY_FIRST_POP_TIME, PROPERTY_MAX_RECONSUME_TIMES,
     PROPERTY_MSG_REGION, PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME,
     PROPERTY_REPLY_MESSAGE_ARRIVE_TIME, PROPERTY_TRACE_SWITCH,
+    PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
 use crate::common::message_decoder::{
-    decode_message, decode_messages, decode_messages_with, message_properties_2_string,
-    string_2_message_properties, unwrap_inner_batch, DecodeOptions,
+    decode_message, decode_message_id, decode_messages, decode_messages_with,
+    message_properties_2_string, string_2_message_properties, unwrap_inner_batch, DecodeOptions,
 };
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::{MessageSysFlag, PullSysFlag};
@@ -371,6 +372,11 @@ impl<'a> PublishMessage<'a> {
 
 // ================================================================ config
 
+/// Java `MQAdminImpl`'s own RPC budget (MQAdminImpl.java:67, `timeoutMillis = 6000`):
+/// the producer / push / pull `view_message` facades run on it, not on the send
+/// timeout or the admin budget.
+pub const DEFAULT_VIEW_MESSAGE_TIMEOUT_MILLIS: i64 = 6000;
+
 /// `MQClientInstance` constructor parameters (fully explicit injection + module-internal constants).
 #[derive(Clone)]
 pub struct MQClientInstanceConfig {
@@ -543,7 +549,10 @@ impl std::fmt::Debug for MQClientInstanceConfig {
                 "mq_client_api_timeout_millis",
                 &self.mq_client_api_timeout_millis,
             )
-            .field("enable_concurrent_heartbeat", &self.enable_concurrent_heartbeat)
+            .field(
+                "enable_concurrent_heartbeat",
+                &self.enable_concurrent_heartbeat,
+            )
             .field(
                 "concurrent_heartbeat_thread_pool_size",
                 &self.concurrent_heartbeat_thread_pool_size,
@@ -735,7 +744,8 @@ impl MQClientInstance {
         let vip_channel_enabled = config.vip_channel_enabled;
         let use_heartbeat_v2 = config.use_heartbeat_v2;
         let decode_read_body = config.decode_read_body;
-        let enable_heartbeat_channel_event_listener = config.enable_heartbeat_channel_event_listener;
+        let enable_heartbeat_channel_event_listener =
+            config.enable_heartbeat_channel_event_listener;
         let mq_client_api_timeout_millis = config.mq_client_api_timeout_millis;
         let inner = Arc::new(Inner {
             client_id: client_id.to_string(),
@@ -1104,7 +1114,9 @@ impl MQClientInstance {
             // name the group that is not hosted here.
             return RemotingCommand::create_response(
                 response_code::SYSTEM_ERROR,
-                Some(format!("The Consumer Group <{group}> not exist in this consumer")),
+                Some(format!(
+                    "The Consumer Group <{group}> not exist in this consumer"
+                )),
             );
         };
         let info = consumer.consumer_running_info();
@@ -1124,7 +1136,9 @@ impl MQClientInstance {
             // Same as 307: the probe is reported per client, so name the group.
             return RemotingCommand::create_response(
                 response_code::SYSTEM_ERROR,
-                Some(format!("The Consumer Group <{group}> not exist in this consumer")),
+                Some(format!(
+                    "The Consumer Group <{group}> not exist in this consumer"
+                )),
             );
         };
         let Some(raw) = cmd.body().filter(|b| !b.is_empty()) else {
@@ -1287,7 +1301,8 @@ impl MQClientInstance {
         self.spawn_periodic(
             "heartbeat",
             |me| async move {
-                me.send_heartbeat_to_all_broker(me.mq_client_api_timeout_millis()).await;
+                me.send_heartbeat_to_all_broker(me.mq_client_api_timeout_millis())
+                    .await;
             },
             self.inner.config.heartbeat_initial_delay_millis,
             self.inner.config.heartbeat_interval_millis,
@@ -1416,7 +1431,11 @@ impl MQClientInstance {
                 .collect();
             for topic in topics {
                 if let Err(e) = self
-                    .update_topic_route_info_from_name_server(&topic, self.mq_client_api_timeout_millis(), false)
+                    .update_topic_route_info_from_name_server(
+                        &topic,
+                        self.mq_client_api_timeout_millis(),
+                        false,
+                    )
                     .await
                 {
                     rmq_debug!("route refresh failed for {topic}: {e}");
@@ -1600,7 +1619,9 @@ impl MQClientInstance {
                 topic, &route,
             ) {
                 Some(endpoints) => {
-                    tables.topic_end_points_table.insert(topic.to_string(), endpoints);
+                    tables
+                        .topic_end_points_table
+                        .insert(topic.to_string(), endpoints);
                 }
                 None => {
                     tables.topic_end_points_table.remove(topic);
@@ -1678,8 +1699,12 @@ impl MQClientInstance {
                 return Ok(info);
             }
         }
-        self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), is_default)
-            .await?;
+        self.update_topic_route_info_from_name_server(
+            topic,
+            self.mq_client_api_timeout_millis(),
+            is_default,
+        )
+        .await?;
         match self.publish_info_of(topic) {
             Some(info) if info.ok() => Ok(info),
             _ => bail!("Can not find Message Queue for topic: {topic}"),
@@ -1692,7 +1717,11 @@ impl MQClientInstance {
             return Some(route);
         }
         if let Err(e) = self
-            .update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
+            .update_topic_route_info_from_name_server(
+                topic,
+                self.mq_client_api_timeout_millis(),
+                false,
+            )
             .await
         {
             // A refresh failure swallows the exception and falls through to the cache read
@@ -1967,7 +1996,10 @@ impl MQClientInstance {
         );
         request.mark_oneway_rpc();
         let addr = self.vip_addr(addr);
-        self.inner.remoting_client.invoke_oneway(&addr, &mut request).await
+        self.inner
+            .remoting_client
+            .invoke_oneway(&addr, &mut request)
+            .await
     }
 
     /// `on_complete` fires exactly once (guaranteed by the remoting layer). `msg` is only read by
@@ -2857,8 +2889,12 @@ impl MQClientInstance {
     pub async fn publish_addr_for(&self, broker_name: &str, topic: &str) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
-                .await?;
+            self.update_topic_route_info_from_name_server(
+                topic,
+                self.mq_client_api_timeout_millis(),
+                false,
+            )
+            .await?;
             addr = self.find_broker_address_in_publish(broker_name);
         }
         addr.ok_or_else(|| Error::client(format!("The broker[{broker_name}] not exist")))
@@ -2876,11 +2912,18 @@ impl MQClientInstance {
     }
 
     /// Address resolution for POP ack / changeInvisibleTime.
-    pub async fn pop_ack_addr(&self, broker_name: &str, topic: &str, queue_id: i32) -> Result<String> {
+    pub async fn pop_ack_addr(
+        &self,
+        broker_name: &str,
+        topic: &str,
+        queue_id: i32,
+    ) -> Result<String> {
         let resolve_des = |inst: &Self| -> String {
             if crate::client::static_topic::is_logical_queue_mock_broker_name(broker_name) {
                 inst.get_broker_name_from_message_queue(&MessageQueue::new(
-                    topic, broker_name, queue_id,
+                    topic,
+                    broker_name,
+                    queue_id,
                 ))
             } else {
                 broker_name.to_string()
@@ -2889,8 +2932,12 @@ impl MQClientInstance {
         let mut des = resolve_des(self);
         let mut addr = self.find_broker_address_in_publish(&des);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
-                .await?;
+            self.update_topic_route_info_from_name_server(
+                topic,
+                self.mq_client_api_timeout_millis(),
+                false,
+            )
+            .await?;
             des = resolve_des(self);
             addr = self.find_broker_address_in_publish(&des);
         }
@@ -2919,8 +2966,12 @@ impl MQClientInstance {
     async fn publish_addr_in_admin(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(&mq.topic, self.mq_client_api_timeout_millis(), false)
-                .await?;
+            self.update_topic_route_info_from_name_server(
+                &mq.topic,
+                self.mq_client_api_timeout_millis(),
+                false,
+            )
+            .await?;
             addr = self.find_broker_address_in_publish(&mq.broker_name);
         }
         addr.ok_or_else(|| Error::client(format!("The broker[{}] not exist", mq.broker_name)))
@@ -2996,8 +3047,12 @@ impl MQClientInstance {
     async fn consumer_offset_addr(&self, mq: &MessageQueue) -> Result<String> {
         let mut addr = self.find_broker_address_in_publish(&mq.broker_name);
         if addr.is_none() {
-            self.update_topic_route_info_from_name_server(&mq.topic, self.mq_client_api_timeout_millis(), false)
-                .await?;
+            self.update_topic_route_info_from_name_server(
+                &mq.topic,
+                self.mq_client_api_timeout_millis(),
+                false,
+            )
+            .await?;
             addr = self.broker_addr_of(&mq.broker_name);
         }
         addr.ok_or_else(|| Error::client(format!("The broker[{}] not exist", mq.broker_name)))
@@ -3230,7 +3285,9 @@ impl MQClientInstance {
             request_code::CONSUMER_SEND_MSG_BACK,
             Some(Box::new(header)),
         );
-        let response = self.invoke_broker_sync(addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_broker_sync(addr, &mut request, timeout_millis)
+            .await?;
         Self::check_response(&response)?;
         Ok(())
     }
@@ -3325,7 +3382,18 @@ impl MQClientInstance {
             for mut msg in decode_messages(&body) {
                 msg.broker_name = Some(broker_data.broker_name.clone());
                 if uniq_key {
-                    if msg.msg_id.as_deref() == Some(key) {
+                    // Java decodes query results as MessageClientExt, whose
+                    // getMsgId() returns the UNIQ_KEY property (offset id only as
+                    // fallback) — the client-visible id the hit is verified
+                    // against. The rust decoder keeps msg_id = offset id even in
+                    // client mode, so resolve the client-visible id here (csharp
+                    // does the same swap inside its decoder).
+                    let visible = msg
+                        .get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| msg.msg_id.clone());
+                    if visible.as_deref() == Some(key) {
                         messages.push(msg);
                     }
                     continue;
@@ -3347,6 +3415,51 @@ impl MQClientInstance {
             messages.truncate(max_num as usize);
         }
         messages
+    }
+
+    /// Java `MQAdminImpl#viewMessage(topic, msgId)` parity (MQAdminImpl.java:267):
+    /// a single leg — decode the offset msgId and ask the broker that stamped it
+    /// `VIEW_MESSAGE_BY_ID(33)` straight away. A decode failure maps to the
+    /// NO_MESSAGE client error Java raises there; every other leg failure
+    /// surfaces as-is. The uniq-key fallback is NOT part of this layer — it
+    /// belongs to the admin facade only (`DefaultMQAdminExtImpl#viewMessage`),
+    /// while the producer / push / pull facades ride this single-leg path.
+    /// `timeout_millis` defaults to MQAdminImpl's own RPC budget
+    /// (MQAdminImpl.java:67, 6000) at the facade call sites.
+    pub async fn view_message(
+        &self,
+        topic: &str,
+        msg_id: &str,
+        timeout_millis: i64,
+    ) -> Result<MessageExt> {
+        let (ip, port, offset) = decode_message_id(msg_id).map_err(|e| {
+            Error::client_with_code(
+                response_code::NO_MESSAGE,
+                format!("query message by id finished, but no message. (cause: {e})"),
+            )
+        })?;
+        if port == 0 || port > 65_535 {
+            return Err(Error::client(format!("not a valid offset msgId: {msg_id}")));
+        }
+        // The address is the store host:port the broker stamped into the offset
+        // msgId — a broker address, so the VIP rewrite applies like to any
+        // other query request.
+        let addr = format!("{ip}:{port}");
+        let mut request =
+            RemotingCommand::create_request_command(request_code::VIEW_MESSAGE_BY_ID, None);
+        request.add_ext_field("topic", topic);
+        request.add_ext_field("offset", &offset.to_string());
+        let response = self
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
+            .await?;
+        Self::check_response(&response)?;
+        match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => decode_message(body),
+            None => Err(Error::Broker {
+                response_code: response_code::NO_MESSAGE,
+                message: format!("message not found: {msg_id}"),
+            }),
+        }
     }
 
     // ---------------- queue locking (orderly consumption) ----------------
@@ -3666,7 +3779,9 @@ impl MQClientInstance {
                         });
                         if pool.submit(job) {
                             #[cfg(test)]
-                            self.inner.heartbeat_pool_jobs.fetch_add(1, Ordering::SeqCst);
+                            self.inner
+                                .heartbeat_pool_jobs
+                                .fetch_add(1, Ordering::SeqCst);
                         } else {
                             // Rejected (pool closed): count the wait down as if it had run.
                             gate.add_permits(1);
@@ -3781,7 +3896,9 @@ impl MQClientInstance {
         {
             return 0;
         }
-        let ok = self.send_heartbeat_to_all_broker(self.mq_client_api_timeout_millis()).await;
+        let ok = self
+            .send_heartbeat_to_all_broker(self.mq_client_api_timeout_millis())
+            .await;
         if ok > 0 {
             *self
                 .inner
@@ -3839,9 +3956,13 @@ impl MQClientInstance {
         let addr = match self.find_broker_addr_by_topic(topic) {
             Some(addr) => addr,
             None => {
-                if let Err(e) =
-                    self.update_topic_route_info_from_name_server(topic, self.mq_client_api_timeout_millis(), false)
-                        .await
+                if let Err(e) = self
+                    .update_topic_route_info_from_name_server(
+                        topic,
+                        self.mq_client_api_timeout_millis(),
+                        false,
+                    )
+                    .await
                 {
                     rmq_debug!("queryAssignment: route refresh for {topic} failed: {e}");
                 }
@@ -3886,7 +4007,9 @@ impl MQClientInstance {
             )
             .encode(),
         ));
-        let response = self.invoke_broker_sync(addr, &mut request, timeout_millis).await?;
+        let response = self
+            .invoke_broker_sync(addr, &mut request, timeout_millis)
+            .await?;
         if response.code != response_code::SUCCESS {
             return Err(Error::Broker {
                 response_code: response.code,
@@ -4272,7 +4395,10 @@ impl MQClientInstance {
             request_code::GET_CONSUMER_LIST_BY_GROUP,
             Some(Box::new(header)),
         );
-        let response = match self.invoke_broker_sync(&addr, &mut request, timeout_millis).await {
+        let response = match self
+            .invoke_broker_sync(&addr, &mut request, timeout_millis)
+            .await
+        {
             Ok(response) => response,
             Err(e) => {
                 rmq_debug!("get_consumer_id_list_by_group failed, {addr} {consumer_group}: {e}");
@@ -5496,7 +5622,9 @@ mod tests {
         /// two listeners whose ports differ by exactly 2, and an ephemeral bind cannot promise
         /// that relationship.
         async fn try_start_at(port: u16) -> Option<Arc<MockBroker>> {
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.ok()?;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .ok()?;
             Some(Self::serve(listener).await)
         }
 
@@ -5948,7 +6076,11 @@ mod tests {
         assert_eq!(unregs(&slave).len(), 1, "slave also received one 35");
         for rec in unregs(&master).into_iter().chain(unregs(&slave)) {
             let keys: Vec<&str> = rec.ext_fields.iter().map(|(k, _)| k.as_str()).collect();
-            assert_eq!(keys, vec!["clientID", "producerGroup"], "blank slots stay off the wire");
+            assert_eq!(
+                keys,
+                vec!["clientID", "producerGroup"],
+                "blank slots stay off the wire"
+            );
         }
         instance.shutdown();
     }
@@ -6053,7 +6185,8 @@ mod tests {
             "a producer-only instance beats to master + slave"
         );
         let on_master = master.recorded(request_code::HEART_BEAT);
-        let hb = HeartbeatData::decode(&on_master[0].body).expect("heartbeat body is a HeartbeatData");
+        let hb =
+            HeartbeatData::decode(&on_master[0].body).expect("heartbeat body is a HeartbeatData");
         let groups: Vec<&str> = hb
             .producer_data_set
             .iter()
@@ -6069,9 +6202,18 @@ mod tests {
         instance.register_consumer(GROUP, StubConsumer::new());
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 2);
         let on_master = master.recorded(request_code::HEART_BEAT);
-        let hb = HeartbeatData::decode(&on_master[1].body).expect("heartbeat body is a HeartbeatData");
-        assert_eq!(hb.producer_data_set.len(), 1, "the producer stays registered");
-        assert_eq!(hb.consumer_data_set.len(), 1, "the consumer joins the same beat");
+        let hb =
+            HeartbeatData::decode(&on_master[1].body).expect("heartbeat body is a HeartbeatData");
+        assert_eq!(
+            hb.producer_data_set.len(),
+            1,
+            "the producer stays registered"
+        );
+        assert_eq!(
+            hb.consumer_data_set.len(),
+            1,
+            "the consumer joins the same beat"
+        );
 
         instance.unregister_producer(PG);
         assert_eq!(instance.prepare_heartbeat_data().producer_data_set.len(), 0);
@@ -6155,8 +6297,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            wait_until(|| beaten(&broker).len() >= 3
-                && stub.rebalance_wakeups.load(Ordering::SeqCst) >= 1)
+            wait_until(
+                || beaten(&broker).len() >= 3 && stub.rebalance_wakeups.load(Ordering::SeqCst) >= 1
+            )
             .await,
             "the new connection must produce a re-registration beat and wake rebalance"
         );
@@ -6220,7 +6363,10 @@ mod tests {
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let beats = beaten(&broker);
         assert_eq!(beats.len(), 1);
-        assert_eq!(beats[0].heartbeat_fingerprint, 0, "no fingerprint on the V1 body");
+        assert_eq!(
+            beats[0].heartbeat_fingerprint, 0,
+            "no fingerprint on the V1 body"
+        );
         assert!(!beats[0].without_sub);
         assert_eq!(beats[0].consumer_data_set[0].subscription_data_set.len(), 1);
         instance.shutdown();
@@ -6237,9 +6383,15 @@ mod tests {
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let beats = beaten(&broker);
         assert_eq!(beats.len(), 2);
-        assert_ne!(beats[0].heartbeat_fingerprint, 0, "the switch is on the wire");
+        assert_ne!(
+            beats[0].heartbeat_fingerprint, 0,
+            "the switch is on the wire"
+        );
         for hb in &beats {
-            assert!(!hb.without_sub, "a broker that never said V2 keeps the subscriptions");
+            assert!(
+                !hb.without_sub,
+                "a broker that never said V2 keeps the subscriptions"
+            );
             assert_eq!(hb.consumer_data_set[0].subscription_data_set.len(), 1);
         }
         assert_eq!(
@@ -6297,8 +6449,14 @@ mod tests {
             assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         }
         let beats = beaten(&broker);
-        assert!(!beats[0].without_sub, "full body learns the broker speaks V2");
-        assert!(beats[1].without_sub, "fingerprint matched, so the cheap body went out");
+        assert!(
+            !beats[0].without_sub,
+            "full body learns the broker speaks V2"
+        );
+        assert!(
+            beats[1].without_sub,
+            "fingerprint matched, so the cheap body went out"
+        );
         assert!(
             !beats[2].without_sub,
             "subChange evicted the fingerprint, so the subscriptions went back out"
@@ -6316,11 +6474,17 @@ mod tests {
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let before = beaten(&broker);
-        assert!(before[1].without_sub, "warm baseline: the cheap body is in use");
+        assert!(
+            before[1].without_sub,
+            "warm baseline: the cheap body is in use"
+        );
 
         instance.register_consumer(
             "GID_second_group",
-            StubConsumer::with_subs("GID_second_group", vec![tag_sub(TOPIC, "tagB", ExpressionType::TAG)]),
+            StubConsumer::with_subs(
+                "GID_second_group",
+                vec![tag_sub(TOPIC, "tagB", ExpressionType::TAG)],
+            ),
         );
         assert_eq!(instance.send_heartbeat_to_all_broker(3000).await, 1);
         let after = beaten(&broker);
@@ -6393,7 +6557,11 @@ mod tests {
             "the broker that just entered the route is registered at once"
         );
         let hb = HeartbeatData::decode(&beats[0].body).expect("heartbeat body is a HeartbeatData");
-        assert_eq!(hb.producer_data_set.len(), 1, "the beat carries the producer group");
+        assert_eq!(
+            hb.producer_data_set.len(),
+            1,
+            "the beat carries the producer group"
+        );
 
         // Same route again: every known broker is already registered, so nothing goes out.
         assert!(instance
@@ -6603,7 +6771,10 @@ mod tests {
             !PullSysFlag::has_commit_offset_flag(sent_flag),
             "a COMMIT_OFFSET on the slave would be meaningless"
         );
-        assert!(PullSysFlag::has_suspend_flag(sent_flag), "suspend bit stays set");
+        assert!(
+            PullSysFlag::has_suspend_flag(sent_flag),
+            "suspend bit stays set"
+        );
         assert!(
             ext_of(rec, "subscription").is_none(),
             "with the SUBSCRIPTION bit off the field never enters extFields (null → field dropped)"
@@ -6673,10 +6844,18 @@ mod tests {
         let (instance, master, _slave) = instance_with_master_slave().await;
         let members = vec![
             crate::common::message::Message::with_tags_and_keys(
-                "T", Some(b"m1"), Some("TagA"), None, 0,
+                "T",
+                Some(b"m1"),
+                Some("TagA"),
+                None,
+                0,
             ),
             crate::common::message::Message::with_tags_and_keys(
-                "T", Some(b"m2"), Some("TagB"), None, 0,
+                "T",
+                Some(b"m2"),
+                Some("TagB"),
+                None,
+                0,
             ),
         ];
         let mut envelope = sample_message();
@@ -6713,7 +6892,11 @@ mod tests {
             .await
             .expect("pull");
 
-        assert_eq!(result.msg_found_list.len(), 2, "one message per batch member");
+        assert_eq!(
+            result.msg_found_list.len(),
+            2,
+            "one message per batch member"
+        );
         assert_eq!(result.msg_found_list[0].queue_offset, 41);
         assert_eq!(result.msg_found_list[1].queue_offset, 42);
         assert_eq!(result.msg_found_list[0].get_body(), b"m1");
@@ -6721,7 +6904,6 @@ mod tests {
         assert_eq!(result.msg_found_list[0].queue_id, 2);
         instance.shutdown();
     }
-
 
     /// Fake name server: answers `GET_ROUTEINFO_BY_TOPIC` with the route body held in `holder`
     /// (`None` ⇒ TOPIC_NOT_EXIST), SUCCESS for everything else; records every request code it receives.
@@ -6933,12 +7115,17 @@ mod tests {
         let broker = MockBroker::start().await;
         let instance = new_instance();
         instance
-            .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0, BATCH_CK_A2], 3000, Some(&broker.addr))
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &[BATCH_CK_A0, BATCH_CK_A2],
+                3000,
+                Some(&broker.addr),
+            )
             .await
             .expect("two tickets of one group ack in one request");
         let merged = broker.recorded(request_code::BATCH_ACK_MESSAGE);
-        let body: serde_json::Value =
-            serde_json::from_slice(&merged[0].body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&merged[0].body).expect("json body");
         let acks = body["acks"].as_array().expect("acks array");
         assert_eq!(acks.len(), 1, "one merge key must collapse to one entry");
         assert_eq!(text_of(&acks[0]["b"]), "BQ==");
@@ -6956,10 +7143,13 @@ mod tests {
             .expect("two groups ack in one request");
         let split = broker.recorded(request_code::BATCH_ACK_MESSAGE);
         assert_eq!(split.len(), 2);
-        let body: serde_json::Value =
-            serde_json::from_slice(&split[1].body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&split[1].body).expect("json body");
         let acks = body["acks"].as_array().expect("acks array");
-        assert_eq!(acks.len(), 2, "a distinct merge key must stay its own entry");
+        assert_eq!(
+            acks.len(),
+            2,
+            "a distinct merge key must stay its own entry"
+        );
         assert_eq!(text_of(&acks[0]["b"]), "AQ==");
         assert_eq!(acks[1]["pt"], serde_json::Value::from(1999000000000_i64));
         // Its own group, its own start offset: the bit index is still 102 - 100.
@@ -6977,10 +7167,9 @@ mod tests {
             )
             .await
             .expect("the second ticket only marks a bit");
-        let last_body: serde_json::Value = serde_json::from_slice(
-            &broker.recorded(request_code::BATCH_ACK_MESSAGE)[2].body,
-        )
-        .expect("json body");
+        let last_body: serde_json::Value =
+            serde_json::from_slice(&broker.recorded(request_code::BATCH_ACK_MESSAGE)[2].body)
+                .expect("json body");
         let last = last_body["acks"].as_array().expect("acks array");
         assert_eq!(last.len(), 1);
         assert_eq!(last[0]["it"], serde_json::Value::from(60000_i64));
@@ -6998,10 +7187,9 @@ mod tests {
             )
             .await
             .expect("two queues ack in one request");
-        let by_queue: serde_json::Value = serde_json::from_slice(
-            &broker.recorded(request_code::BATCH_ACK_MESSAGE)[3].body,
-        )
-        .expect("json body");
+        let by_queue: serde_json::Value =
+            serde_json::from_slice(&broker.recorded(request_code::BATCH_ACK_MESSAGE)[3].body)
+                .expect("json body");
         let acks = by_queue["acks"].as_array().expect("acks array");
         assert_eq!(acks.len(), 2, "a different queue is a different group");
         assert_eq!(acks[0]["q"], serde_json::Value::from(3_i32));
@@ -7051,15 +7239,18 @@ mod tests {
             .batch_ack_message(GROUP, TOPIC, &[], 3000, Some(&broker.addr))
             .await
             .expect_err("an empty ticket list cannot be acked");
-        assert!(
-            err.to_string().contains("at least one extraInfo"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("at least one extraInfo"), "{err}");
         assert!(broker.recorded(request_code::BATCH_ACK_MESSAGE).is_empty());
 
         // A 7-segment ticket carries no message offset: it fails before the frame is built.
         let err = instance
-            .batch_ack_message(GROUP, TOPIC, &["100 1700000000000 60000 0 0 broker-a 3"], 3000, Some(&broker.addr))
+            .batch_ack_message(
+                GROUP,
+                TOPIC,
+                &["100 1700000000000 60000 0 0 broker-a 3"],
+                3000,
+                Some(&broker.addr),
+            )
             .await
             .expect_err("a ticket without the message offset is rejected");
         assert!(err.to_string().contains("getQueueOffset"), "{err}");
@@ -7069,7 +7260,10 @@ mod tests {
         );
 
         // A non-SUCCESS answer comes back as the code, exactly like the single ack path.
-        broker.script(vec![response_code::SYSTEM_ERROR], vec!["no such group".to_string()]);
+        broker.script(
+            vec![response_code::SYSTEM_ERROR],
+            vec!["no such group".to_string()],
+        );
         let code = instance
             .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0], 3000, Some(&broker.addr))
             .await
@@ -7142,7 +7336,11 @@ mod tests {
                 .expect("resolves after the route refresh"),
             "127.0.0.1:10911"
         );
-        assert_eq!(namesrv.route_requests(), 1, "refresh only on lookup miss, and only once");
+        assert_eq!(
+            namesrv.route_requests(),
+            1,
+            "refresh only on lookup miss, and only once"
+        );
         instance.shutdown();
     }
 
@@ -7250,7 +7448,6 @@ mod tests {
         assert!(slave.recorded(request_code::GET_MAX_OFFSET).is_empty());
         instance.shutdown();
     }
-
 
     /// When only a slave is left in the route, not a single LOCK/UNLOCK may go on the wire: a lock taken on the slave
     /// lives only in that slave's own lock manager, the master never learns of it, and orderly consumption's mutual exclusion silently breaks.
@@ -7521,14 +7718,7 @@ mod tests {
         let mqs = vec![mq.clone()];
         let sub = tag_sub(TOPIC, "*", ExpressionType::TAG);
         let extra = crate::remoting::protocol::extra_info::build_extra_info(
-            1,
-            2,
-            3,
-            0,
-            TOPIC,
-            BROKER,
-            0,
-            None,
+            1, 2, 3, 0, TOPIC, BROKER, 0, None,
         );
 
         let _ = instance
@@ -7569,7 +7759,9 @@ mod tests {
                 1,
             )
             .await;
-        let _ = instance.delete_topic_in_broker(route_addr, TOPIC, 3000).await;
+        let _ = instance
+            .delete_topic_in_broker(route_addr, TOPIC, 3000)
+            .await;
         let _ = instance
             .query_message(TOPIC, "key", 1, 0, 1, 3000, Some(route_addr), None, false)
             .await;
@@ -7613,7 +7805,16 @@ mod tests {
             )
             .await;
         let _ = instance
-            .ack_message(GROUP, TOPIC, 0, &extra, 1, Some(BROKER), 3000, Some(route_addr))
+            .ack_message(
+                GROUP,
+                TOPIC,
+                0,
+                &extra,
+                1,
+                Some(BROKER),
+                3000,
+                Some(route_addr),
+            )
             .await;
         let _ = instance
             .batch_ack_message(GROUP, TOPIC, &[BATCH_CK_A0], 3000, Some(route_addr))
@@ -7735,7 +7936,11 @@ mod tests {
                 "with the switch off request {code} must not reach port - 2"
             );
         }
-        assert_eq!(instance.vip_addr(&route.addr), route.addr, "off leaves the address untouched");
+        assert_eq!(
+            instance.vip_addr(&route.addr),
+            route.addr,
+            "off leaves the address untouched"
+        );
         instance.shutdown();
     }
 
@@ -7750,16 +7955,26 @@ mod tests {
 
         let (route, fast) = vip_pair().await;
         let admin = DefaultMQAdminExt::new();
-        admin.set_instance_name(&format!("ADMIN_vip_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        admin.set_instance_name(&format!(
+            "ADMIN_vip_{}",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         admin.set_name_server_addresses(std::slice::from_ref(&route.addr));
         admin.set_timeout_millis(3000);
         admin.set_vip_channel_enabled(true);
-        admin.start().await.expect("the fake broker answers the start handshake");
+        admin
+            .start()
+            .await
+            .expect("the fake broker answers the start handshake");
         let mq = MessageQueue::new(TOPIC, BROKER, 0);
 
         let _ = admin.fetch_broker_runtime_stats(&route.addr, None).await;
-        let _ = admin.update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 7).await;
-        let _ = admin.get_consumer_list_by_group(GROUP, Some(route.addr.as_str())).await;
+        let _ = admin
+            .update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 7)
+            .await;
+        let _ = admin
+            .get_consumer_list_by_group(GROUP, Some(route.addr.as_str()))
+            .await;
         let _ = admin.get_broker_config(&route.addr, None).await;
 
         assert_eq!(
@@ -7779,7 +7994,8 @@ mod tests {
             "the delegated offset write follows the switch"
         );
         assert_eq!(
-            fast.recorded(request_code::GET_CONSUMER_LIST_BY_GROUP).len(),
+            fast.recorded(request_code::GET_CONSUMER_LIST_BY_GROUP)
+                .len(),
             1,
             "the delegated consumer list follows the switch"
         );
@@ -7796,8 +8012,12 @@ mod tests {
         // Flipping the switch off after start(): the delegated family has to go back to the
         // listening port, which a setter that only touches the admin's own config would miss.
         admin.set_vip_channel_enabled(false);
-        let _ = admin.update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 8).await;
-        let _ = admin.get_consumer_list_by_group(GROUP, Some(route.addr.as_str())).await;
+        let _ = admin
+            .update_consumer_offset_to_broker(&route.addr, GROUP, &mq, 8)
+            .await;
+        let _ = admin
+            .get_consumer_list_by_group(GROUP, Some(route.addr.as_str()))
+            .await;
         let _ = admin.fetch_broker_runtime_stats(&route.addr, None).await;
         let _ = admin.get_broker_config(&route.addr, None).await;
 
@@ -7807,7 +8027,9 @@ mod tests {
             "the delegated offset write returns to the listening port"
         );
         assert_eq!(
-            route.recorded(request_code::GET_CONSUMER_LIST_BY_GROUP).len(),
+            route
+                .recorded(request_code::GET_CONSUMER_LIST_BY_GROUP)
+                .len(),
             1,
             "the delegated consumer list returns to the listening port"
         );
@@ -7843,7 +8065,10 @@ mod tests {
 
         let on = instance.decode_received_messages(&batch);
         assert_eq!(on.len(), 2);
-        assert_eq!(on[0].body.as_deref(), Some(b"directly-consume-me".as_slice()));
+        assert_eq!(
+            on[0].body.as_deref(),
+            Some(b"directly-consume-me".as_slice())
+        );
 
         instance.set_decode_read_body(false);
         assert!(!instance.is_decode_read_body());
@@ -7899,7 +8124,10 @@ mod tests {
         assert_eq!(MQ_CLIENT_API_TIMEOUT_MILLIS, 3000);
 
         let broker = MockBroker::start().await;
-        let id = format!("{GROUP}@api-timeout-{}", SEQ.fetch_add(1, Ordering::Relaxed));
+        let id = format!(
+            "{GROUP}@api-timeout-{}",
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let instance = MQClientInstance::with_config(
             &id,
             vec![NAMESRV.to_string()],

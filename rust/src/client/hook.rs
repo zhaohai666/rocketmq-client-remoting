@@ -1,4 +1,3 @@
-
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
@@ -295,7 +294,9 @@ pub struct HookList<H: ?Sized> {
 impl<H: ?Sized> HookList<H> {
     /// Empty list.
     pub fn new() -> Self {
-        HookList { inner: RwLock::new(Vec::new()) }
+        HookList {
+            inner: RwLock::new(Vec::new()),
+        }
     }
 
     /// Appends to the end; firing order = registration order; `Arc` guarantees a valid hook, so no null check is needed.
@@ -330,7 +331,9 @@ impl<H: ?Sized> Default for HookList<H> {
 
 impl<H: ?Sized> fmt::Debug for HookList<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HookList").field("len", &self.len()).finish()
+        f.debug_struct("HookList")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -398,7 +401,10 @@ pub fn execute_end_transaction_hook(
 }
 
 /// `DefaultMQPushConsumerImpl.executeConsumeHookBefore`: exceptions are swallowed and logged as warn.
-pub fn execute_consume_hook_before(hooks: &ConsumeMessageHookList, context: &mut ConsumeMessageContext) {
+pub fn execute_consume_hook_before(
+    hooks: &ConsumeMessageHookList,
+    context: &mut ConsumeMessageContext,
+) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.consume_message_before(context) {
             rmq_warn!("consumeMessageHook executeHookBefore exception: {}", e);
@@ -407,7 +413,10 @@ pub fn execute_consume_hook_before(hooks: &ConsumeMessageHookList, context: &mut
 }
 
 /// `DefaultMQPushConsumerImpl.executeConsumeHookAfter`: exceptions are swallowed and logged as warn.
-pub fn execute_consume_hook_after(hooks: &ConsumeMessageHookList, context: &mut ConsumeMessageContext) {
+pub fn execute_consume_hook_after(
+    hooks: &ConsumeMessageHookList,
+    context: &mut ConsumeMessageContext,
+) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.consume_message_after(context) {
             rmq_warn!("consumeMessageHook executeHookAfter exception: {}", e);
@@ -439,7 +448,8 @@ fn read_guard<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 }
 
 fn write_guard<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -489,7 +499,9 @@ mod tests {
         }
 
         fn send_message_after(&self, context: &mut SendMessageContext) -> Result<()> {
-            let seen = any_downcast::<&str>(&context.mq_trace_context).copied().unwrap_or("");
+            let seen = any_downcast::<&str>(&context.mq_trace_context)
+                .copied()
+                .unwrap_or("");
             self.recorder.record(&format!("after:{}", seen));
             Ok(())
         }
@@ -598,9 +610,15 @@ mod tests {
         assert_eq!(CommunicationMode::Async.to_string(), "ASYNC");
         assert_eq!(CommunicationMode::Oneway.to_string(), "ONEWAY");
         // Unknown names fall back to SYNC (same convention as from_code in result.rs)
-        assert_eq!(CommunicationMode::from_name("NOPE"), CommunicationMode::Sync);
+        assert_eq!(
+            CommunicationMode::from_name("NOPE"),
+            CommunicationMode::Sync
+        );
         assert_eq!(CommunicationMode::from_name(""), CommunicationMode::Sync);
-        assert_eq!(CommunicationMode::from_name("ONEWAY"), CommunicationMode::Oneway);
+        assert_eq!(
+            CommunicationMode::from_name("ONEWAY"),
+            CommunicationMode::Oneway
+        );
         assert_eq!(CommunicationMode::default(), CommunicationMode::Sync);
     }
 
@@ -666,7 +684,9 @@ mod tests {
         );
         assert_eq!(with_msgs.msg_list.len(), 1);
         // An empty list lands as an empty list, same as None
-        assert!(ConsumeMessageContext::new("G", Some(Vec::new()), None).msg_list.is_empty());
+        assert!(ConsumeMessageContext::new("G", Some(Vec::new()), None)
+            .msg_list
+            .is_empty());
     }
 
     #[test]
@@ -689,7 +709,10 @@ mod tests {
         assert!(!hooks.has_hooks());
         assert!(hooks.is_empty());
         let recorder = Arc::new(Recorder::default());
-        hooks.register(Arc::new(SendHook { recorder: recorder.clone(), boom: false }));
+        hooks.register(Arc::new(SendHook {
+            recorder: recorder.clone(),
+            boom: false,
+        }));
         assert!(hooks.has_hooks());
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks.hooks()[0].hook_name(), "send-hook");
@@ -700,8 +723,14 @@ mod tests {
         let hooks = SendMessageHookList::new();
         let boom = Arc::new(Recorder::default());
         let fine = Arc::new(Recorder::default());
-        hooks.register(Arc::new(SendHook { recorder: boom.clone(), boom: true }));
-        hooks.register(Arc::new(SendHook { recorder: fine.clone(), boom: false }));
+        hooks.register(Arc::new(SendHook {
+            recorder: boom.clone(),
+            boom: true,
+        }));
+        hooks.register(Arc::new(SendHook {
+            recorder: fine.clone(),
+            boom: false,
+        }));
 
         let mut context = SendMessageContext::default();
         execute_send_message_hook_before(&hooks, &mut context);
@@ -721,8 +750,14 @@ mod tests {
         let hooks = CheckForbiddenHookList::new();
         let first = Arc::new(Recorder::default());
         let second = Arc::new(Recorder::default());
-        hooks.register(Arc::new(ForbiddenHook { recorder: first.clone(), forbid: true }));
-        hooks.register(Arc::new(ForbiddenHook { recorder: second.clone(), forbid: false }));
+        hooks.register(Arc::new(ForbiddenHook {
+            recorder: first.clone(),
+            forbid: true,
+        }));
+        hooks.register(Arc::new(ForbiddenHook {
+            recorder: second.clone(),
+            forbid: false,
+        }));
 
         let mut context = CheckForbiddenContext::default();
         let err = execute_check_forbidden_hook(&hooks, &mut context)
@@ -736,7 +771,10 @@ mod tests {
     fn check_forbidden_passes_when_hook_allows() {
         let hooks = CheckForbiddenHookList::new();
         let recorder = Arc::new(Recorder::default());
-        hooks.register(Arc::new(ForbiddenHook { recorder: recorder.clone(), forbid: false }));
+        hooks.register(Arc::new(ForbiddenHook {
+            recorder: recorder.clone(),
+            forbid: false,
+        }));
         let mut context = CheckForbiddenContext {
             group: "GID_test".into(),
             name_srv_addr: "127.0.0.1:9876".into(),
@@ -757,8 +795,14 @@ mod tests {
         let hooks = ConsumeMessageHookList::new();
         let boom = Arc::new(Recorder::default());
         let fine = Arc::new(Recorder::default());
-        hooks.register(Arc::new(ConsumeHook { recorder: boom.clone(), boom: true }));
-        hooks.register(Arc::new(ConsumeHook { recorder: fine.clone(), boom: false }));
+        hooks.register(Arc::new(ConsumeHook {
+            recorder: boom.clone(),
+            boom: true,
+        }));
+        hooks.register(Arc::new(ConsumeHook {
+            recorder: fine.clone(),
+            boom: false,
+        }));
         let mut context = ConsumeMessageContext::new("G", Some(vec![msg_ext(b"a")]), None);
         context.success = false;
         execute_consume_hook_before(&hooks, &mut context);
@@ -776,7 +820,9 @@ mod tests {
         // An error thrown by the end-transaction hook likewise only logs warn and does not affect later hooks
         let end_hooks = EndTransactionHookList::new();
         let end_recorder = Arc::new(Recorder::default());
-        end_hooks.register(Arc::new(EndHook { recorder: end_recorder.clone() }));
+        end_hooks.register(Arc::new(EndHook {
+            recorder: end_recorder.clone(),
+        }));
         execute_end_transaction_hook(&end_hooks, &mut EndTransactionContext::default());
         assert_eq!(end_recorder.snapshot(), vec!["end".to_string()]);
     }

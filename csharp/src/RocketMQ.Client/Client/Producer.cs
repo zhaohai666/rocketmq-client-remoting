@@ -1189,6 +1189,17 @@ public class DefaultMQProducer
         return _mqClient;
     }
 
+    /// <summary>
+    /// Java DefaultMQProducerImpl#viewMessage parity
+    /// (DefaultMQProducerImpl.java:517): the MQAdminImpl single-leg path —
+    /// offset msgId only, decoded and asked VIEW_MESSAGE_BY_ID(33) on the
+    /// broker that stamped it. A msgId that does not decode as an offset id
+    /// surfaces the NO_MESSAGE client error (no uniq-key fallback at this
+    /// layer).
+    /// </summary>
+    public MessageExt ViewMessage(string topic, string msgId) =>
+        GetClient().ViewMessage(topic, msgId);
+
     // ---------------- Hook execution (executeSendMessageHookBefore/After, executeEndTransactionHook) ----------------
     // Exceptions thrown by hooks are always swallowed and logged as warn: trace failures
     // must never affect normal send/receive.
