@@ -93,17 +93,18 @@ func (i *Instance) PopMessage(brokerName, addr string, header *remoting.PopMessa
 
 // AckMessage sends ACK_MESSAGE(200051) synchronously. `offset` must be the
 // checkpoint's segment 7 (the message's own queue offset).
-func (i *Instance) AckMessage(addr string, header *remoting.AckMessageRequestHeader, timeoutMillis int64) error {
+//
+// Java parity (MQClientAPIImpl#ackMessageAsync:987-993): ANY non-SUCCESS broker
+// code means the broker could not find the checkpoint and is reported as
+// AckStatus.NO_EXIST -- a result, not an error. Only transport failures come
+// back as `err`. The returned int32 is the raw broker code; the push consumer
+// warns on non-SUCCESS and moves on (DefaultMQPushConsumerImpl:842).
+func (i *Instance) AckMessage(addr string, header *remoting.AckMessageRequestHeader, timeoutMillis int64) (int32, error) {
 	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqAckMessage, header), timeoutMillis)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if response.Code != remoting.RespSuccess {
-		// Any non-SUCCESS code means the broker could not find the checkpoint —
-		// a warning, not a hard error.
-		return common.BrokerError(response.Code, response.Remark)
-	}
-	return nil
+	return response.Code, nil
 }
 
 // BatchAckMessage sends BATCH_ACK_MESSAGE(200151) with a pre-built body.
@@ -128,22 +129,35 @@ func (i *Instance) BatchAckMessage(addr string, body *remoting.BatchAckMessageRe
 	return nil
 }
 
-// ChangeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053) and returns the
-// NEW popTime / invisibleTime the broker assigned.
+// ChangeInvisibleTimeOutcome carries the raw broker verdict of
+// CHANGE_MESSAGE_INVISIBLETIME(200053) plus the decoded response header.
 //
-// The returned values are not cosmetic: the checkpoint must be rebuilt from
-// them so a later ACK still matches the (now longer) invisibility window.
-func (i *Instance) ChangeInvisibleTime(addr string, header *remoting.ChangeInvisibleTimeRequestHeader, timeoutMillis int64) (*remoting.ChangeInvisibleTimeResponseHeader, error) {
+// Java parity (MQClientAPIImpl#changeInvisibleTimeAsync:1018-1036): SUCCESS
+// yields AckStatus.OK with the NEW popTime / invisibleTime (the caller rebuilds
+// the checkpoint from them so a later ACK still matches the longer window);
+// ANY non-SUCCESS code yields AckStatus.NO_EXIST -- a result, not an error.
+// Header is nil unless Code == RespSuccess.
+type ChangeInvisibleTimeOutcome struct {
+	Code   int32
+	Remark string
+	Header *remoting.ChangeInvisibleTimeResponseHeader
+}
+
+// ChangeInvisibleTime sends CHANGE_MESSAGE_INVISIBLETIME(200053). The returned
+// values are not cosmetic: the checkpoint must be rebuilt from Outcome.Header
+// so a later ACK still matches the (now longer) invisibility window.
+func (i *Instance) ChangeInvisibleTime(addr string, header *remoting.ChangeInvisibleTimeRequestHeader, timeoutMillis int64) (*ChangeInvisibleTimeOutcome, error) {
 	response, err := i.invokeSync(addr, remoting.CreateRequestCommand(remoting.ReqChangeMessageInvisibleTime, header), timeoutMillis)
 	if err != nil {
 		return nil, err
 	}
-	if response.Code != remoting.RespSuccess {
-		return nil, common.BrokerError(response.Code, response.Remark)
+	out := &ChangeInvisibleTimeOutcome{Code: response.Code, Remark: response.Remark}
+	if response.Code == remoting.RespSuccess {
+		respHeader := &remoting.ChangeInvisibleTimeResponseHeader{}
+		respHeader.FromExtFields(response.ExtFields())
+		out.Header = respHeader
 	}
-	respHeader := &remoting.ChangeInvisibleTimeResponseHeader{}
-	respHeader.FromExtFields(response.ExtFields())
-	return respHeader, nil
+	return out, nil
 }
 
 // SetMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401) — the broker-side

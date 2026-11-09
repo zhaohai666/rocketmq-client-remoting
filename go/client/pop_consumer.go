@@ -176,6 +176,28 @@ func (c *DefaultMQPushConsumer) popFlowControlHit(mq common.MessageQueue, pq *po
 	return true
 }
 
+// requireClient resolves the shared client instance once the consumer has
+// started (same gate the pull consumer uses).
+func (c *DefaultMQPushConsumer) requireClient() (*Instance, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.started || c.instance == nil {
+		return nil, common.ClientError("consumer not started, call Start() first")
+	}
+	return c.instance, nil
+}
+
+// ViewMessage is Java DefaultMQPushConsumerImpl#viewMessage
+// (DefaultMQPushConsumerImpl.java:1329) parity: the MQAdminImpl single-leg
+// path — offset msgId only, no uniq-key fallback at this layer.
+func (c *DefaultMQPushConsumer) ViewMessage(topic, msgID string) (*common.MessageExt, error) {
+	client, err := c.requireClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.ViewMessage(topic, msgID, defaultViewMessageTimeoutMillis)
+}
+
 // popOnce issues one POP_MESSAGE and returns the processed result.
 func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.SubscriptionData) (*PopResult, error) {
 	c.mu.Lock()
@@ -586,8 +608,13 @@ func (c *DefaultMQPushConsumer) ackMessagePop(msg *common.MessageExt) {
 		ExtraInfo:     remoting.StrPtr(extraInfo),
 		Offset:        remoting.I64Ptr(queueOffset),
 	}
-	if err := c.instance.AckMessage(addr, header, popAsyncTimeoutMillis); err != nil {
+	code, err := c.instance.AckMessage(addr, header, popAsyncTimeoutMillis)
+	if err != nil {
 		common.LogWarnf("Ack message fail. extraInfo: %s error: %v", extraInfo, err)
+	} else if code != remoting.RespSuccess {
+		// Java maps any non-SUCCESS to AckStatus.NO_EXIST and only warns
+		// (DefaultMQPushConsumerImpl:842) -- the checkpoint is already gone.
+		common.LogWarnf("Ack message fail. extraInfo: %s AckStatus.NO_EXIST code=%d", extraInfo, code)
 	}
 }
 
@@ -641,9 +668,15 @@ func (c *DefaultMQPushConsumer) changePopInvisibleTimeAtLevel(msg *common.Messag
 		InvisibleTime: remoting.I64Ptr(delaySecond * 1000),
 		Suspend:       remoting.BoolPtr(false),
 	}
-	if _, err := c.instance.ChangeInvisibleTime(addr, header, popAsyncTimeoutMillis); err != nil {
+	outcome, err := c.instance.ChangeInvisibleTime(addr, header, popAsyncTimeoutMillis)
+	if err != nil {
 		common.LogErrorf("changePopInvisibleTimeAsync fail, group:%s msg:%s error:%v",
 			c.consumerGroup, msg.MsgID, err)
+	} else if outcome.Code != remoting.RespSuccess {
+		// AckStatus.NO_EXIST (Java changeInvisibleTimeAsync:1030): the checkpoint
+		// was already revived/evicted -- report it, nothing to rebuild.
+		common.LogErrorf("changePopInvisibleTimeAsync fail, group:%s msg:%s AckStatus.NO_EXIST code=%d remark=%s",
+			c.consumerGroup, msg.MsgID, outcome.Code, outcome.Remark)
 	}
 }
 

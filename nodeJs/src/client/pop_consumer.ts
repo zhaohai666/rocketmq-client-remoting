@@ -554,7 +554,12 @@ export async function ackMessagePop(c: DefaultMQPushConsumer, msg: MessageExt): 
   header.extraInfo = extraInfo;
   header.offset = queueOffset;
   try {
-    await c.mqClient!.ackMessage(addr, header, POP_ASYNC_TIMEOUT_MILLIS);
+    const code = await c.mqClient!.ackMessage(addr, header, POP_ASYNC_TIMEOUT_MILLIS);
+    if (code !== ResponseCode.SUCCESS) {
+      // Java maps any non-SUCCESS to AckStatus.NO_EXIST and only warns
+      // (DefaultMQPushConsumerImpl:842) — the checkpoint is already gone.
+      logger.warning('Ack message fail. extraInfo: %s AckStatus.NO_EXIST code=%s', extraInfo, code);
+    }
   } catch (e) {
     logger.warning('Ack message fail. extraInfo: %s error: %s', extraInfo, (e as Error).message);
   }
@@ -611,7 +616,13 @@ function changePopInvisibleTimeAtLevel(c: DefaultMQPushConsumer, msg: MessageExt
     header.invisibleTime = delaySecond * 1000;
     header.suspend = false;
     try {
-      await c.mqClient!.changeInvisibleTime(addr, header, POP_ASYNC_TIMEOUT_MILLIS);
+      const outcome = await c.mqClient!.changeInvisibleTime(addr, header, POP_ASYNC_TIMEOUT_MILLIS);
+      if (outcome.code !== ResponseCode.SUCCESS) {
+        // AckStatus.NO_EXIST (Java changeInvisibleTimeAsync:1030): the
+        // checkpoint was already revived/evicted — report it, nothing to rebuild.
+        logger.error('changePopInvisibleTimeAsync fail, group:%s msg:%s AckStatus.NO_EXIST code=%s remark=%s',
+          c.consumerGroup, msg.getMsgId(), outcome.code, outcome.remark);
+      }
     } catch (e) {
       logger.error('changePopInvisibleTimeAsync fail, group:%s msg:%s error:%s',
         c.consumerGroup, msg.getMsgId(), (e as Error).message);

@@ -120,7 +120,13 @@ func (b *consumerBroker) answerAck(req *remoting.RemotingCommand) *remoting.Remo
 	header.FromExtFields(req.ExtFields())
 	b.mu.Lock()
 	b.acks = append(b.acks, header)
+	ackCode := b.ackCode
 	b.mu.Unlock()
+	if ackCode != 0 {
+		// The store-cannot-find-the-checkpoint path: any non-SUCCESS code is
+		// AckStatus.NO_EXIST on the wire (Java ackMessageAsync:991).
+		return remoting.CreateResponseCommand(ackCode, "no such checkpoint")
+	}
 	return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 }
 
@@ -141,7 +147,12 @@ func (b *consumerBroker) answerChangeInvisible(req *remoting.RemotingCommand) *r
 	b.mu.Lock()
 	b.changeInvisible = append(b.changeInvisible, header)
 	fixture := b.popFixture
+	ciCode := b.changeInvisibleCode
 	b.mu.Unlock()
+	if ciCode != 0 {
+		// AckStatus.NO_EXIST on the wire (Java changeInvisibleTimeAsync:1030).
+		return remoting.CreateResponseCommand(ciCode, "no such checkpoint")
+	}
 	popTime := int64(1)
 	invisible := i64Or(header.InvisibleTime, 0)
 	if fixture != nil {
@@ -967,4 +978,90 @@ func waitForBudget(t *testing.T, budget time.Duration, cond func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %s", budget)
+}
+
+// forceAckCode / forceChangeInvisibleCode stage the checkpoint-already-gone
+// answers for ACK_MESSAGE(200051) / CHANGE_MESSAGE_INVISIBLETIME(200053).
+func (b *consumerBroker) forceAckCode(code int32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ackCode = code
+}
+
+func (b *consumerBroker) forceChangeInvisibleCode(code int32) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.changeInvisibleCode = code
+}
+
+// ackHeaderForTest is a well-formed ACK header for mock broker "b1".
+func ackHeaderForTest() *remoting.AckMessageRequestHeader {
+	return &remoting.AckMessageRequestHeader{
+		Bname:         remoting.StrPtr("b1"),
+		ConsumerGroup: remoting.StrPtr("PopUnitGroup"),
+		Topic:         remoting.StrPtr("AckUnitTopic"),
+		QueueID:       remoting.I32Ptr(0),
+		ExtraInfo:     remoting.StrPtr("0 0 0 0 AckUnitTopic b1 0 1"),
+		Offset:        remoting.I64Ptr(1),
+	}
+}
+
+func changeInvisibleHeaderForTest() *remoting.ChangeInvisibleTimeRequestHeader {
+	return &remoting.ChangeInvisibleTimeRequestHeader{
+		Bname:         remoting.StrPtr("b1"),
+		ConsumerGroup: remoting.StrPtr("PopUnitGroup"),
+		Topic:         remoting.StrPtr("AckUnitTopic"),
+		QueueID:       remoting.I32Ptr(0),
+		ExtraInfo:     remoting.StrPtr("0 0 0 0 AckUnitTopic b1 0 1"),
+		Offset:        remoting.I64Ptr(1),
+		InvisibleTime: remoting.I64Ptr(30000),
+		Suspend:       remoting.BoolPtr(false),
+	}
+}
+
+// TestAckNoSuchCheckpointIsAResultNotAnError pins the Java soft-fail contract of
+// the two POP cleanup primitives: ANY non-SUCCESS broker code maps to
+// AckStatus.NO_EXIST (MQClientAPIImpl#ackMessageAsync:987-993 and
+// #changeInvisibleTimeAsync:1018-1036) and must come back as a RESULT, with only
+// transport failures surfacing as `err`. The push consumer warns on non-SUCCESS
+// and moves on (DefaultMQPushConsumerImpl:842).
+func TestAckNoSuchCheckpointIsAResultNotAnError(t *testing.T) {
+	h := newTestInstanceForPop(t)
+	inst, broker := h.Instance, h.broker
+	addr, _, ok := inst.FindBrokerAddressInSubscribe("b1", int64(common.MasterID), true)
+	if !ok {
+		t.Fatal("broker b1 not reachable")
+	}
+
+	// ---- SUCCESS stays success and still decodes the response header.
+	code, err := inst.AckMessage(addr, ackHeaderForTest(), 2000)
+	if err != nil || code != remoting.RespSuccess {
+		t.Fatalf("success ack: code=%d err=%v", code, err)
+	}
+	out, err := inst.ChangeInvisibleTime(addr, changeInvisibleHeaderForTest(), 2000)
+	if err != nil || out.Code != remoting.RespSuccess {
+		t.Fatalf("success changeInvisible: code=%d err=%v", out.Code, err)
+	}
+	if out.Header == nil || i64Or(out.Header.PopTime, -1) <= 0 || i32Or(out.Header.ReviveQid, -1) != 3 {
+		t.Fatalf("success changeInvisible must decode the response header, got %+v", out.Header)
+	}
+
+	// ---- The checkpoint is gone: NO_EXIST is a result, not an error.
+	broker.forceAckCode(remoting.RespSystemError)
+	code, err = inst.AckMessage(addr, ackHeaderForTest(), 2000)
+	if err != nil {
+		t.Fatalf("non-SUCCESS ack must not be an error, got %v", err)
+	}
+	if code != remoting.RespSystemError {
+		t.Fatalf("non-SUCCESS ack must surface the broker code, got %d", code)
+	}
+
+	broker.forceChangeInvisibleCode(remoting.RespSystemError)
+	out, err = inst.ChangeInvisibleTime(addr, changeInvisibleHeaderForTest(), 2000)
+	if err != nil {
+		t.Fatalf("non-SUCCESS changeInvisible must not be an error, got %v", err)
+	}
+	if out.Code != remoting.RespSystemError || out.Header != nil {
+		t.Fatalf("NO_EXIST outcome must carry the code and no header, got %+v", out)
+	}
 }

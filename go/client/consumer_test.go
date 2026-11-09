@@ -131,6 +131,12 @@ type consumerBroker struct {
 	changeInvisible []*remoting.ChangeInvisibleTimeRequestHeader
 	requestModes    []*remoting.SetMessageRequestModeRequestBody
 	popFixture      *popFixture
+	// ackCode / changeInvisibleCode, when non-zero, make ACK_MESSAGE(200051) /
+	// CHANGE_MESSAGE_INVISIBLETIME(200053) answer that code instead of success:
+	// the checkpoint-already-gone path the client must report as a result
+	// (AckStatus.NO_EXIST), not a transport error.
+	ackCode             int32
+	changeInvisibleCode int32
 
 	queryAssignments   []*remoting.QueryAssignmentRequestBody
 	assignmentsByTopic map[string]*assignmentFixture

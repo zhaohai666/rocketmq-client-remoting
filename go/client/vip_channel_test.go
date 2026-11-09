@@ -130,7 +130,7 @@ func TestVipChannelNeverMovesRegistrationOrPopTraffic(t *testing.T) {
 	if err := inst.UnregisterClient(stub.addr, "GID_vip_p", "GID_vip", 2000); err != nil {
 		t.Fatalf("unregister should reach the listening port: %v", err)
 	}
-	_ = inst.AckMessage(stub.addr, &remoting.AckMessageRequestHeader{
+	_, _ = inst.AckMessage(stub.addr, &remoting.AckMessageRequestHeader{
 		Bname: vipStr("b1"), ConsumerGroup: vipStr("GID_vip"), Topic: vipStr("VipTopic"),
 		QueueID: vipI32(0), ExtraInfo: vipStr("0 0 0 0 VipTopic b1 0 1"), Offset: vipI64(0),
 	}, 2000)
