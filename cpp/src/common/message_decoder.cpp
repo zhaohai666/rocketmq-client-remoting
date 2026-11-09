@@ -2,6 +2,7 @@
 // with two paths that must **never be mixed**:
 //   1) the 17-field storage format: encodeMessageExt / decodeMessage / decodeMessages (broker storage and pull replies);
 //   2) the 6-field light format: encodeMessage / encodeMessages / decodeBatchMessage / decodeBatchMessages (batch body).
+#include <utility>
 #include "rocketmq/common/message_decoder.h"
 
 #include "rocketmq/common/compression.h"

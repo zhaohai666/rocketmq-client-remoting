@@ -28,10 +28,12 @@
 // Every wait has an explicit bound, and every peer thread exits within 100 ms of the stop flag
 // (polling select rather than a bare blocking call), so a parked leg shows up as a FAIL line
 // naming the assertion instead of a silent 120 s ctest timeout.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>

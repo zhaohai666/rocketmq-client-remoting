@@ -105,11 +105,17 @@ async function main() {
     if (c) {
       const q = new (mod.MessageQueue)('SmokeDistTopic', 'broker-a', 0);
       const r = await withDeadline(c.fetchConsumeOffset(q, true), 20000);
-      check('dist pull consumer reads an unknown offset as -1', r.ok && r.v === -1,
+      // Java RemoteBrokerOffsetStore#readOffset READ_FROM_STORE: a broker that
+      // cannot be found makes fetchConsumeOffsetFromBroker throw
+      // MQClientException("The broker[...] not exist"), caught by
+      // catch (Exception) → -2. -1 is reserved for the broker answering
+      // QUERY_NOT_FOUND (OffsetNotFoundException). CI runs without a cluster,
+      // so -2 is the Java-parity answer here.
+      check('dist pull consumer reads an offset with no broker as -2', r.ok && r.v === -2,
         r.ok ? `got=${r.v}` : String(r.e && r.e.message));
     }
   } catch (e) {
-    check('dist pull consumer reads an unknown offset as -1', false, e.message);
+    check('dist pull consumer reads an offset with no broker as -2', false, e.message);
   }
 
   const rchild = timeoutCallbackChild(distDir);
