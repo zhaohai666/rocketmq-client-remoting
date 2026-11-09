@@ -26,9 +26,9 @@ use crate::client::hook::{
     AnyHolder, ConsumeMessageContext, ConsumeMessageHook, EndTransactionContext,
     EndTransactionHook, SendMessageContext, SendMessageHook,
 };
-use crate::client::result::SendStatus;
 #[cfg(test)]
 use crate::client::result::LocalTransactionState;
+use crate::client::result::SendStatus;
 use crate::client::trace::TraceConstants;
 #[cfg(test)]
 use crate::common::message::MessageExt;

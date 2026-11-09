@@ -1256,6 +1256,13 @@ public class ProducerAsyncTests : IDisposable
         using var cluster = MockCluster.Start(1);
         cluster.MakeSilent(0);
         DefaultMQProducer producer = Started(cluster, "GID_batch_async_bp");
+        // The async retry chain (retryTimesWhenSendAsyncFailed) must stay off here: on a loaded
+        // runner an early transport failure of the silent-broker send (e.g. the connection
+        // fail-fast path, needRetry=true with most of the budget still unspent) would legitimately
+        // retry and put a second SendBatchMessage on the wire, and the exact-count assertion below
+        // would report a scheduling artifact as a batching bug. Java allows configuring 0; with it
+        // "exactly one request" is deterministic regardless of load.
+        producer.RetryTimesWhenSendAsyncFailed = 0;
         producer.EnableBackpressureForAsyncMode = true;
         producer.BackPressureForAsyncSendNum = 10;
         producer.BackPressureForAsyncSendSize = 1024 * 1024;

@@ -1507,19 +1507,31 @@ impl SendMessageHook for ParkingSendHook {
         }
         let (free, cap) = gate.unwrap_or((-1, -1));
         lock(&self.entries).push((label, began.elapsed().as_millis(), free, cap));
-        // The WaitTimeoutResult must be read: discarding it means waiting without a timeout again, making the fallback useless.
-        let mut guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        while !*guard {
-            match self.opened.wait_timeout(guard, PARK_BACKSTOP) {
-                Ok((next, timed_out)) => {
-                    guard = next;
-                    if timed_out.timed_out() {
-                        break;
+        // ⚠ The wait must run under `block_in_place`. This hook parks sends by **blocking the
+        // thread that polls the send task**; nine parked sends then freeze nine worker threads,
+        // and on a loaded host (CI: several concurrent tests on 4 cores) the dispatcher handing
+        // the next send its pool slot can starve behind them for the whole fuse -- measured once:
+        // the 10th send was only dispatched after the 600s fuse released the parked sends, i.e.
+        // after two of them had already given their gate permits back, so it strolled through the
+        // gate without ever queueing and the case read "never reached the gate". `block_in_place`
+        // turns this worker into a blocking thread and lets the runtime spawn a replacement, so
+        // parked sends keep holding their permits (exactly the state the case verifies) without
+        // eating the scheduler the pool depends on.
+        let _ = tokio::task::block_in_place(|| {
+            // The WaitTimeoutResult must be read: discarding it means waiting without a timeout again, making the fallback useless.
+            let mut guard = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+            while !*guard {
+                match self.opened.wait_timeout(guard, PARK_BACKSTOP) {
+                    Ok((next, timed_out)) => {
+                        guard = next;
+                        if timed_out.timed_out() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
+        });
         Ok(())
     }
 }
