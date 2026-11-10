@@ -890,3 +890,276 @@ class BatchAckMessageRequestBody:
     @staticmethod
     def decode(data: bytes) -> "BatchAckMessageRequestBody":
         return BatchAckMessageRequestBody.from_dict(RemotingSerializable.decode_json(data))
+
+
+# ---------------- #47 admin ops RPC bodies (Java remoting.protocol.body.*) ----------------
+
+
+class QueryCorrectionOffsetBody:
+    """``QueryCorrectionOffsetBody`` (QUERY_CORRECTION_OFFSET = 308)."""
+
+    def __init__(self):
+        # JSON object keys are strings; Java holds Map<Integer, Long>.
+        self.correction_offsets: Dict[int, int] = {}
+
+    def to_dict(self) -> dict:
+        return {"correctionOffsets": {str(k): v for k, v in self.correction_offsets.items()}}
+
+    @staticmethod
+    def from_dict(d: dict) -> "QueryCorrectionOffsetBody":
+        b = QueryCorrectionOffsetBody()
+        for k, v in (d.get("correctionOffsets") or {}).items():
+            b.correction_offsets[int(k)] = int(v)
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "QueryCorrectionOffsetBody":
+        return QueryCorrectionOffsetBody.from_dict(RemotingSerializable.decode_json(data))
+
+
+class ProducerInfo:
+    """``ProducerInfo`` (one entry of ``ProducerTableInfo.data``, GET_ALL_PRODUCER_INFO = 328)."""
+
+    def __init__(self):
+        self.client_id: Optional[str] = None
+        self.remote_ip: Optional[str] = None
+        self.language: Optional[str] = None
+        self.version: int = 0
+        self.last_update_timestamp: int = 0
+
+    def to_dict(self) -> dict:
+        return {"clientId": self.client_id, "remoteIP": self.remote_ip,
+                "language": self.language, "version": self.version,
+                "lastUpdateTimestamp": self.last_update_timestamp}
+
+    @staticmethod
+    def from_dict(d: dict) -> "ProducerInfo":
+        p = ProducerInfo()
+        p.client_id = d.get("clientId")
+        p.remote_ip = d.get("remoteIP")
+        p.language = d.get("language")
+        p.version = int(d.get("version") or 0)
+        p.last_update_timestamp = int(d.get("lastUpdateTimestamp") or 0)
+        return p
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "ProducerInfo":
+        return ProducerInfo.from_dict(RemotingSerializable.decode_json(data))
+
+
+class ProducerTableInfo:
+    """``ProducerTableInfo``: group -> the producers that are still alive in it."""
+
+    def __init__(self):
+        self.data: Dict[str, List[ProducerInfo]] = {}
+
+    def to_dict(self) -> dict:
+        return {"data": {g: [p.to_dict() for p in ps] for g, ps in self.data.items()}}
+
+    @staticmethod
+    def from_dict(d: dict) -> "ProducerTableInfo":
+        b = ProducerTableInfo()
+        for g, ps in (d.get("data") or {}).items():
+            b.data[g] = [ProducerInfo.from_dict(p) for p in (ps or [])]
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "ProducerTableInfo":
+        return ProducerTableInfo.from_dict(RemotingSerializable.decode_json(data))
+
+
+class HAConnectionRuntimeInfo:
+    """``HARuntimeInfo.HAConnectionRuntimeInfo`` (one HA connection to a slave)."""
+
+    def __init__(self):
+        self.addr: Optional[str] = None
+        self.slave_ack_offset: int = 0
+        self.diff: int = 0
+        self.in_sync: bool = False
+        self.transferred_byte_in_second: int = 0
+        self.transfer_from_where: int = 0
+
+    def to_dict(self) -> dict:
+        return {"addr": self.addr, "slaveAckOffset": self.slave_ack_offset,
+                "diff": self.diff, "inSync": self.in_sync,
+                "transferredByteInSecond": self.transferred_byte_in_second,
+                "transferFromWhere": self.transfer_from_where}
+
+    @staticmethod
+    def from_dict(d: dict) -> "HAConnectionRuntimeInfo":
+        c = HAConnectionRuntimeInfo()
+        c.addr = d.get("addr")
+        c.slave_ack_offset = int(d.get("slaveAckOffset") or 0)
+        c.diff = int(d.get("diff") or 0)
+        c.in_sync = bool(d.get("inSync") or False)
+        c.transferred_byte_in_second = int(d.get("transferredByteInSecond") or 0)
+        c.transfer_from_where = int(d.get("transferFromWhere") or 0)
+        return c
+
+
+class HAClientRuntimeInfo:
+    """``HARuntimeInfo.HAClientRuntimeInfo`` (the HA client on a slave)."""
+
+    def __init__(self):
+        self.master_addr: Optional[str] = None
+        self.transferred_byte_in_second: int = 0
+        self.max_offset: int = 0
+        self.last_read_timestamp: int = 0
+        self.last_write_timestamp: int = 0
+        self.master_flush_offset: int = 0
+        self.is_activated: bool = False
+
+    def to_dict(self) -> dict:
+        return {"masterAddr": self.master_addr,
+                "transferredByteInSecond": self.transferred_byte_in_second,
+                "maxOffset": self.max_offset,
+                "lastReadTimestamp": self.last_read_timestamp,
+                "lastWriteTimestamp": self.last_write_timestamp,
+                "masterFlushOffset": self.master_flush_offset,
+                "activated": self.is_activated}
+
+    @staticmethod
+    def from_dict(d: dict) -> "HAClientRuntimeInfo":
+        c = HAClientRuntimeInfo()
+        c.master_addr = d.get("masterAddr")
+        c.transferred_byte_in_second = int(d.get("transferredByteInSecond") or 0)
+        c.max_offset = int(d.get("maxOffset") or 0)
+        c.last_read_timestamp = int(d.get("lastReadTimestamp") or 0)
+        c.last_write_timestamp = int(d.get("lastWriteTimestamp") or 0)
+        c.master_flush_offset = int(d.get("masterFlushOffset") or 0)
+        # Java's field is ``isActivated``: fastjson writes ``activated`` from the
+        # isXxx getter; accept both spellings when reading broker data back.
+        c.is_activated = bool(d.get("isActivated") or d.get("activated") or False)
+        return c
+
+
+class HARuntimeInfo:
+    """``HARuntimeInfo`` (GET_BROKER_HA_STATUS = 907)."""
+
+    def __init__(self):
+        self.master: bool = False
+        self.master_commit_log_max_offset: int = 0
+        self.in_sync_slave_nums: int = 0
+        self.ha_connection_info: List[HAConnectionRuntimeInfo] = []
+        self.ha_client_runtime_info: HAClientRuntimeInfo = HAClientRuntimeInfo()
+
+    def to_dict(self) -> dict:
+        return {"master": self.master,
+                "masterCommitLogMaxOffset": self.master_commit_log_max_offset,
+                "inSyncSlaveNums": self.in_sync_slave_nums,
+                "haConnectionInfo": [c.to_dict() for c in self.ha_connection_info],
+                "haClientRuntimeInfo": self.ha_client_runtime_info.to_dict()}
+
+    @staticmethod
+    def from_dict(d: dict) -> "HARuntimeInfo":
+        b = HARuntimeInfo()
+        b.master = bool(d.get("master") or False)
+        b.master_commit_log_max_offset = int(d.get("masterCommitLogMaxOffset") or 0)
+        b.in_sync_slave_nums = int(d.get("inSyncSlaveNums") or 0)
+        b.ha_connection_info = [HAConnectionRuntimeInfo.from_dict(c)
+                                for c in (d.get("haConnectionInfo") or [])]
+        if d.get("haClientRuntimeInfo"):
+            b.ha_client_runtime_info = HAClientRuntimeInfo.from_dict(d["haClientRuntimeInfo"])
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "HARuntimeInfo":
+        return HARuntimeInfo.from_dict(RemotingSerializable.decode_json(data))
+
+
+class EpochEntry:
+    """``EpochEntry`` (one epoch entry of the broker's commitlog epoch cache)."""
+
+    def __init__(self):
+        self.epoch: int = 0
+        self.start_offset: int = 0
+        # Java default: LAST_EPOCH_END_OFFSET = Long.MAX_VALUE.
+        self.end_offset: int = 9223372036854775807
+
+    def to_dict(self) -> dict:
+        return {"epoch": self.epoch, "startOffset": self.start_offset,
+                "endOffset": self.end_offset}
+
+    @staticmethod
+    def from_dict(d: dict) -> "EpochEntry":
+        e = EpochEntry()
+        e.epoch = int(d.get("epoch") or 0)
+        e.start_offset = int(d.get("startOffset") or 0)
+        e.end_offset = int(d.get("endOffset") or 9223372036854775807)
+        return e
+
+
+class EpochEntryCache:
+    """``EpochEntryCache`` (GET_BROKER_EPOCH_CACHE = 1007)."""
+
+    def __init__(self):
+        self.cluster_name: Optional[str] = None
+        self.broker_name: Optional[str] = None
+        self.broker_id: int = 0
+        self.epoch_list: List[EpochEntry] = []
+        self.max_offset: int = 0
+
+    def to_dict(self) -> dict:
+        return {"clusterName": self.cluster_name, "brokerName": self.broker_name,
+                "brokerId": self.broker_id,
+                "epochList": [e.to_dict() for e in self.epoch_list],
+                "maxOffset": self.max_offset}
+
+    @staticmethod
+    def from_dict(d: dict) -> "EpochEntryCache":
+        b = EpochEntryCache()
+        b.cluster_name = d.get("clusterName")
+        b.broker_name = d.get("brokerName")
+        b.broker_id = int(d.get("brokerId") or 0)
+        b.epoch_list = [EpochEntry.from_dict(e) for e in (d.get("epochList") or [])]
+        b.max_offset = int(d.get("maxOffset") or 0)
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "EpochEntryCache":
+        return EpochEntryCache.from_dict(RemotingSerializable.decode_json(data))
+
+
+class BrokerMemberGroup:
+    """``BrokerMemberGroup`` (the broker-set answer of CONTROLLER_ELECT_MASTER = 1002)."""
+
+    def __init__(self):
+        self.cluster: Optional[str] = None
+        self.broker_name: Optional[str] = None
+        # JSON object keys are strings; Java holds Map<Long, String>.
+        self.broker_addrs: Dict[int, str] = {}
+
+    def to_dict(self) -> dict:
+        return {"cluster": self.cluster, "brokerName": self.broker_name,
+                "brokerAddrs": {str(k): v for k, v in self.broker_addrs.items()}}
+
+    @staticmethod
+    def from_dict(d: dict) -> "BrokerMemberGroup":
+        b = BrokerMemberGroup()
+        b.cluster = d.get("cluster")
+        b.broker_name = d.get("brokerName")
+        for k, v in (d.get("brokerAddrs") or {}).items():
+            b.broker_addrs[int(k)] = v
+        return b
+
+    def encode(self) -> bytes:
+        return RemotingSerializable.encode(self.to_dict())
+
+    @staticmethod
+    def decode(data: bytes) -> "BrokerMemberGroup":
+        return BrokerMemberGroup.from_dict(RemotingSerializable.decode_json(data))

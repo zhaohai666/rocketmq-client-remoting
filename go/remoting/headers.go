@@ -1258,3 +1258,96 @@ func (h *GetRouteInfoRequestHeader) FromExtFields(ext *common.StringMap) {
 	h.Topic = getStr(ext, "topic")
 	h.AcceptStandardJSONOnly = getBool(ext, "acceptStandardJsonOnly")
 }
+
+// ---------------- mqadmin ops family (#47) ----------------
+
+// QueryCorrectionOffsetRequestHeader (QUERY_CORRECTION_OFFSET / 308).
+// filterGroups is the comma-joined group set; Java leaves the key out when the
+// caller passed no filter groups.
+type QueryCorrectionOffsetRequestHeader struct {
+	Topic        *string
+	CompareGroup *string
+	FilterGroups *string
+}
+
+func (h *QueryCorrectionOffsetRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "topic", h.Topic)
+	putStr(out, "compareGroup", h.CompareGroup)
+	putStr(out, "filterGroups", h.FilterGroups)
+}
+
+func (h *QueryCorrectionOffsetRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.Topic = getStr(ext, "topic")
+	h.CompareGroup = getStr(ext, "compareGroup")
+	h.FilterGroups = getStr(ext, "filterGroups")
+}
+
+// GetAllProducerInfoRequestHeader (GET_ALL_PRODUCER_INFO / 328). Java declares
+// the header type but it carries no fields, so the extFields stay empty.
+type GetAllProducerInfoRequestHeader struct{}
+
+func (h *GetAllProducerInfoRequestHeader) ToExtFields(out *common.StringMap)   {}
+func (h *GetAllProducerInfoRequestHeader) FromExtFields(ext *common.StringMap) {}
+
+// ResetMasterFlushOffsetRequestHeader (RESET_MASTER_FLUSH_OFFSET / 908).
+type ResetMasterFlushOffsetRequestHeader struct {
+	MasterFlushOffset *int64
+}
+
+func (h *ResetMasterFlushOffsetRequestHeader) ToExtFields(out *common.StringMap) {
+	putI64(out, "masterFlushOffset", h.MasterFlushOffset)
+}
+
+func (h *ResetMasterFlushOffsetRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.MasterFlushOffset = getI64(ext, "masterFlushOffset")
+}
+
+// ElectMasterRequestHeader (CONTROLLER_ELECT_MASTER / 1002). The admin-trigger
+// shape is designateElect=true with brokerId defaulting to -1 and invokeTime
+// set to the wall clock at send time.
+type ElectMasterRequestHeader struct {
+	ClusterName    *string
+	BrokerName     *string
+	BrokerID       *int64
+	DesignateElect *bool
+	InvokeTime     *int64
+}
+
+func (h *ElectMasterRequestHeader) ToExtFields(out *common.StringMap) {
+	putStr(out, "clusterName", h.ClusterName)
+	putStr(out, "brokerName", h.BrokerName)
+	putI64(out, "brokerId", h.BrokerID)
+	putBool(out, "designateElect", h.DesignateElect)
+	putI64(out, "invokeTime", h.InvokeTime)
+}
+
+func (h *ElectMasterRequestHeader) FromExtFields(ext *common.StringMap) {
+	h.ClusterName = getStr(ext, "clusterName")
+	h.BrokerName = getStr(ext, "brokerName")
+	h.BrokerID = getI64(ext, "brokerId")
+	h.DesignateElect = getBool(ext, "designateElect")
+	h.InvokeTime = getI64(ext, "invokeTime")
+}
+
+// ElectMasterResponseHeader rides the 1002 answer's extFields; the member
+// group itself comes in the body.
+type ElectMasterResponseHeader struct {
+	MasterBrokerID    *int64
+	MasterAddress     *string
+	MasterEpoch       *int32
+	SyncStateSetEpoch *int32
+}
+
+func (h *ElectMasterResponseHeader) ToExtFields(out *common.StringMap) {
+	putI64(out, "masterBrokerId", h.MasterBrokerID)
+	putStr(out, "masterAddress", h.MasterAddress)
+	putI32(out, "masterEpoch", h.MasterEpoch)
+	putI32(out, "syncStateSetEpoch", h.SyncStateSetEpoch)
+}
+
+func (h *ElectMasterResponseHeader) FromExtFields(ext *common.StringMap) {
+	h.MasterBrokerID = getI64(ext, "masterBrokerId")
+	h.MasterAddress = getStr(ext, "masterAddress")
+	h.MasterEpoch = getI32(ext, "masterEpoch")
+	h.SyncStateSetEpoch = getI32(ext, "syncStateSetEpoch")
+}

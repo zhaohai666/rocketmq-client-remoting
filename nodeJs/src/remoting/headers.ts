@@ -1298,6 +1298,90 @@ export class DeleteAccessConfigRequestHeader extends CommandCustomHeader {
   fromExtFields(ext: Record<string, any>): void { this.accessKey = ext['accessKey'] != null ? ext['accessKey'] : null; }
 }
 
+// ---------------- #47 mqadmin ops RPC headers (Java remoting.protocol.header.*) ----------------
+
+// QUERY_CORRECTION_OFFSET(308). filterGroups arrives on the wire pre-joined
+// with commas (Java joins the Set itself in MQClientAPIImpl:2780-2788), so the
+// port keeps a plain string.
+export class QueryCorrectionOffsetHeader extends CommandCustomHeader {
+  topic: string | null = null;
+  compareGroup: string | null = null;
+  filterGroups: string | null = null;
+
+  toExtFields(): Record<string, any> {
+    return _ext({
+      topic: this.topic, compareGroup: this.compareGroup, filterGroups: this.filterGroups,
+    });
+  }
+  fromExtFields(ext: Record<string, any>): void {
+    this.topic = ext['topic'] != null ? ext['topic'] : null;
+    this.compareGroup = ext['compareGroup'] != null ? ext['compareGroup'] : null;
+    this.filterGroups = ext['filterGroups'] != null ? ext['filterGroups'] : null;
+  }
+}
+
+// GET_ALL_PRODUCER_INFO(328): empty header — the class exists so the request
+// still carries a (zero-field) header, matching Java's request-object shape.
+export class GetAllProducerInfoRequestHeader extends CommandCustomHeader {}
+
+// RESET_MASTER_FLUSH_OFFSET(908). masterFlushOffset is a primitive long:
+// 0 is a real value that must be sent.
+export class ResetMasterFlushOffsetHeader extends CommandCustomHeader {
+  masterFlushOffset: number = 0;
+
+  toExtFields(): Record<string, any> {
+    return _ext({ masterFlushOffset: this.masterFlushOffset });
+  }
+  fromExtFields(ext: Record<string, any>): void {
+    const n = _num(ext['masterFlushOffset']);
+    this.masterFlushOffset = n != null ? n : 0;
+  }
+}
+
+// CONTROLLER_ELECT_MASTER(1002). The admin facade always uses Java's
+// ofAdminTrigger: designateElect is forced to true and brokerId doubles as the
+// assigned master id (-1 means "no preference") — both @CFNotNull, always sent.
+export class ElectMasterRequestHeader extends CommandCustomHeader {
+  clusterName: string | null = null;
+  brokerName: string | null = null;
+  brokerId: number = -1;
+  designateElect: boolean = false;
+  invokeTime: number = Date.now();
+
+  static ofAdminTrigger(clusterName: string, brokerName: string,
+    brokerId: number | null): ElectMasterRequestHeader {
+    const h = new ElectMasterRequestHeader();
+    h.clusterName = clusterName;
+    h.brokerName = brokerName;
+    h.brokerId = brokerId != null ? brokerId : -1;
+    h.designateElect = true;
+    return h;
+  }
+
+  toExtFields(): Record<string, any> {
+    return _ext({
+      clusterName: this.clusterName, brokerName: this.brokerName,
+      brokerId: this.brokerId, designateElect: this.designateElect,
+      invokeTime: this.invokeTime,
+    });
+  }
+}
+
+// The elect answer rides the response extFields, not a body.
+export class ElectMasterResponseHeader extends CommandCustomHeader {
+  masterBrokerId: number | null = null;
+  masterAddress: string | null = null;
+  masterEpoch: number | null = null;
+  syncStateSetEpoch: number | null = null;
+
+  fromExtFields(ext: Record<string, any>): void {
+    this.masterBrokerId = _num(ext['masterBrokerId']);
+    this.masterAddress = ext['masterAddress'] != null ? ext['masterAddress'] : null;
+    this.masterEpoch = _num(ext['masterEpoch']);
+    this.syncStateSetEpoch = _num(ext['syncStateSetEpoch']);
+  }
+}
+
 export default {
   CommandCustomHeader, BoundaryType,
   SendMessageRequestHeader, SendMessageRequestHeaderV2, ReplyMessageRequestHeader,
@@ -1337,4 +1421,6 @@ export default {
   PopMessageRequestHeader, PopMessageResponseHeader, AckMessageRequestHeader,
   ChangeInvisibleTimeRequestHeader, ChangeInvisibleTimeResponseHeader,
   CreateAccessConfigRequestHeader, UpdateAccessConfigRequestHeader, DeleteAccessConfigRequestHeader,
+  QueryCorrectionOffsetHeader, GetAllProducerInfoRequestHeader, ResetMasterFlushOffsetHeader,
+  ElectMasterRequestHeader, ElectMasterResponseHeader,
 };

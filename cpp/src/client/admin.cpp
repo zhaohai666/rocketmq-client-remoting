@@ -2666,4 +2666,196 @@ AdminToolResult<T> DefaultMQAdminExt::adminToolExecute(
     }
 }
 
+// ---------------------------------------------------------------- Ops RPC group (#47)
+namespace {
+
+// MessageConst.TIMER_ENGINE_TYPE: the single ext field of SWITCH_TIMER_ENGINE(5001)
+constexpr const char* TIMER_ENGINE_TYPE_FIELD = "E_T";
+
+}  // namespace
+
+std::map<int32_t, int64_t> DefaultMQAdminExt::queryCorrectionOffset(
+    const std::string& brokerAddr, const std::string& topic, const std::string& group,
+    const std::set<std::string>& filterGroups, int32_t timeoutMillis) {
+    PropertyMap ext;
+    ext["topic"] = topic;
+    ext["compareGroup"] = group;
+    if (!filterGroups.empty()) {
+        std::string joined;
+        for (const std::string& g : filterGroups) {
+            if (!joined.empty()) joined += ",";
+            joined += g;
+        }
+        ext["filterGroups"] = joined;
+    }
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::QUERY_CORRECTION_OFFSET, ext, Bytes(), false,
+        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    // An empty body decodes to an empty map (nothing to correct)
+    QueryCorrectionOffsetBody body;
+    if (!response.body.empty()) QueryCorrectionOffsetBody::decode(response.body, body);
+    return body.correctionOffsets;
+}
+
+TopicList DefaultMQAdminExt::unitTopicList(int32_t requestCode, bool containRetry,
+                                           int32_t timeoutMillis) {
+    MQClientInstance& client = requireClient();
+    int32_t wait = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
+    std::string lastError;
+    for (const std::string& ns : client.nameServerAddrs()) {
+        RemotingCommand response;
+        try {
+            response = client.invokeSyncRaw(ns, requestCode, PropertyMap(), Bytes(), false, wait);
+        } catch (const std::exception& e) {
+            lastError = e.what();
+            continue;
+        }
+        if (response.code != ResponseCode::SUCCESS) {
+            throw MQClientException(response.remark, response.code);
+        }
+        if (response.body.empty()) {
+            throw MQClientException("the name server answered without a body", response.code);
+        }
+        TopicList list;
+        if (!TopicList::decode(response.body, list)) {
+            throw MQClientException("malformed topic list body", response.code);
+        }
+        if (!containRetry) {
+            // Java strips the %RETRY% prefix client-side (MQClientAPIImpl:2817-2825);
+            // containRetry itself never goes on the wire.
+            std::vector<std::string> kept;
+            for (const std::string& t : list.topicList) {
+                if (!MixAll::isRetryTopic(t)) kept.push_back(t);
+            }
+            list.topicList = std::move(kept);
+        }
+        return list;
+    }
+    throw MQClientException("all name servers unreachable: " + lastError);
+}
+
+TopicList DefaultMQAdminExt::getUnitTopicList(bool containRetry, int32_t timeoutMillis) {
+    return unitTopicList(RequestCode::GET_UNIT_TOPIC_LIST, containRetry, timeoutMillis);
+}
+
+TopicList DefaultMQAdminExt::getHasUnitSubTopicList(bool containRetry, int32_t timeoutMillis) {
+    return unitTopicList(RequestCode::GET_HAS_UNIT_SUB_TOPIC_LIST, containRetry, timeoutMillis);
+}
+
+TopicList DefaultMQAdminExt::getHasUnitSubUnUnitTopicList(bool containRetry, int32_t timeoutMillis) {
+    return unitTopicList(RequestCode::GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST, containRetry,
+                         timeoutMillis);
+}
+
+ProducerTableInfo DefaultMQAdminExt::getAllProducerInfo(const std::string& brokerAddr,
+                                                        int32_t timeoutMillis) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        vipAddr(brokerAddr), RequestCode::GET_ALL_PRODUCER_INFO, PropertyMap(), Bytes(), false,
+        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    if (response.body.empty()) {
+        throw MQBrokerException(response.code, "empty producer table body");
+    }
+    ProducerTableInfo table;
+    if (!ProducerTableInfo::decode(response.body, table)) {
+        throw MQBrokerException(response.code, "malformed producer table body");
+    }
+    return table;
+}
+
+HARuntimeInfo DefaultMQAdminExt::getBrokerHAStatus(const std::string& brokerAddr,
+                                                   int32_t timeoutMillis) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::GET_BROKER_HA_STATUS, PropertyMap(), Bytes(), false,
+        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    if (response.body.empty()) {
+        throw MQBrokerException(response.code, "empty HA status body");
+    }
+    HARuntimeInfo info;
+    if (!HARuntimeInfo::decode(response.body, info)) {
+        throw MQBrokerException(response.code, "malformed HA status body");
+    }
+    return info;
+}
+
+void DefaultMQAdminExt::resetMasterFlushOffset(const std::string& brokerAddr,
+                                               int64_t masterFlushOffset) {
+    // masterFlushOffset is a primitive long: 0 is a real value and must be sent
+    PropertyMap ext;
+    ext["masterFlushOffset"] = i64str(masterFlushOffset);
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::RESET_MASTER_FLUSH_OFFSET, ext, Bytes(), false, 3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
+ElectMasterResult DefaultMQAdminExt::electMaster(const std::string& controllerAddr,
+                                                 const std::string& clusterName,
+                                                 const std::string& brokerName, int64_t brokerId) {
+    // Two-phase: metadata first, then the elect request to the controller leader with the
+    // Java ofAdminTrigger shape (designateElect=true, brokerId = the assigned master id).
+    ControllerMetaData meta = getControllerMetaData(controllerAddr);
+    if (meta.controllerLeaderAddress.empty()) {
+        throw MQClientException("controller leader address is not available");
+    }
+    PropertyMap ext;
+    ext["clusterName"] = clusterName;
+    ext["brokerName"] = brokerName;
+    ext["brokerId"] = i64str(brokerId);
+    ext["designateElect"] = "true";
+    ext["invokeTime"] = i64str(UtilAll::currentTimeMillis());
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        meta.controllerLeaderAddress, RequestCode::CONTROLLER_ELECT_MASTER, ext, Bytes(), false,
+        3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    ElectMasterResult result;
+    result.header.masterBrokerId = extInt(response, "masterBrokerId", -1);
+    result.header.masterAddress = extStr(response, "masterAddress");
+    result.header.masterEpoch = static_cast<int32_t>(extInt(response, "masterEpoch", 0));
+    result.header.syncStateSetEpoch =
+        static_cast<int32_t>(extInt(response, "syncStateSetEpoch", 0));
+    // A body-less answer leaves the member group untouched (all fields unset)
+    if (!response.body.empty()) BrokerMemberGroup::decode(response.body, result.memberGroup);
+    return result;
+}
+
+EpochEntryCache DefaultMQAdminExt::getBrokerEpochCache(const std::string& brokerAddr) {
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::GET_BROKER_EPOCH_CACHE, PropertyMap(), Bytes(), false, 3000);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+    if (response.body.empty()) {
+        throw MQBrokerException(response.code, "empty epoch cache body");
+    }
+    EpochEntryCache cache;
+    if (!EpochEntryCache::decode(response.body, cache)) {
+        throw MQBrokerException(response.code, "malformed epoch cache body");
+    }
+    return cache;
+}
+
+void DefaultMQAdminExt::switchTimerEngine(const std::string& brokerAddr,
+                                          const std::string& engineType, int32_t timeoutMillis) {
+    PropertyMap ext;
+    ext[TIMER_ENGINE_TYPE_FIELD] = engineType;
+    RemotingCommand response = requireClient().invokeSyncRaw(
+        brokerAddr, RequestCode::SWITCH_TIMER_ENGINE, ext, Bytes(), false,
+        timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
+    if (response.code != ResponseCode::SUCCESS) {
+        throw MQBrokerException(response.code, response.remark);
+    }
+}
+
 }  // namespace rocketmq

@@ -648,4 +648,285 @@ bool BrokerOperatorResult::decode(const Bytes& data, BrokerOperatorResult& out) 
     return true;
 }
 
+// ---------------------------------------------------------------- #47 ops RPC group
+
+namespace {
+
+int64_t keyToI64(const std::string& key) {
+    try {
+        return std::stoll(key);
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------- QueryCorrectionOffsetBody
+JsonValue QueryCorrectionOffsetBody::toJson() const {
+    JsonValue table = JsonValue::makeObject();
+    for (const auto& kv : correctionOffsets) {
+        table.set(std::to_string(kv.first), JsonValue::makeInt(kv.second));
+    }
+    JsonValue v = JsonValue::makeObject();
+    v.set("correctionOffsets", table);
+    return v;
+}
+
+QueryCorrectionOffsetBody QueryCorrectionOffsetBody::fromJson(const JsonValue& v) {
+    QueryCorrectionOffsetBody b;
+    const JsonValue* table = v.find("correctionOffsets");
+    if (table != nullptr && table->isObject()) {
+        for (const auto& kv : table->objectItems()) {
+            b.correctionOffsets[static_cast<int32_t>(keyToI64(kv.first))] = kv.second.intValue();
+        }
+    }
+    return b;
+}
+
+Bytes QueryCorrectionOffsetBody::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool QueryCorrectionOffsetBody::decode(const Bytes& data, QueryCorrectionOffsetBody& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- ProducerInfo / ProducerTableInfo
+JsonValue ProducerInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("clientId", JsonValue::makeString(clientId));
+    v.set("remoteIP", JsonValue::makeString(remoteIP));
+    v.set("language", JsonValue::makeString(language));
+    v.set("version", JsonValue::makeInt(version));
+    v.set("lastUpdateTimestamp", JsonValue::makeInt(lastUpdateTimestamp));
+    return v;
+}
+
+ProducerInfo ProducerInfo::fromJson(const JsonValue& v) {
+    ProducerInfo p;
+    p.clientId = getStr(v, "clientId", "");
+    p.remoteIP = getStr(v, "remoteIP", "");
+    p.language = getStr(v, "language", "");
+    p.version = getInt(v, "version", 0);
+    p.lastUpdateTimestamp = getInt(v, "lastUpdateTimestamp", 0);
+    return p;
+}
+
+JsonValue ProducerTableInfo::toJson() const {
+    JsonValue table = JsonValue::makeObject();
+    for (const auto& kv : data) {
+        JsonValue arr = JsonValue::makeArray();
+        for (const ProducerInfo& p : kv.second) arr.pushArray(p.toJson());
+        table.set(kv.first, arr);
+    }
+    JsonValue v = JsonValue::makeObject();
+    v.set("data", table);
+    return v;
+}
+
+ProducerTableInfo ProducerTableInfo::fromJson(const JsonValue& v) {
+    ProducerTableInfo t;
+    const JsonValue* data = v.find("data");
+    if (data != nullptr && data->isObject()) {
+        for (const auto& kv : data->objectItems()) {
+            std::vector<ProducerInfo> list;
+            if (kv.second.isArray()) {
+                for (size_t i = 0; i < kv.second.size(); ++i) {
+                    if (kv.second.at(i).isObject()) list.push_back(ProducerInfo::fromJson(kv.second.at(i)));
+                }
+            }
+            t.data[kv.first] = std::move(list);
+        }
+    }
+    return t;
+}
+
+Bytes ProducerTableInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool ProducerTableInfo::decode(const Bytes& data, ProducerTableInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- HA runtime info
+JsonValue HAConnectionRuntimeInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("addr", JsonValue::makeString(addr));
+    v.set("slaveAckOffset", JsonValue::makeInt(slaveAckOffset));
+    v.set("diff", JsonValue::makeInt(diff));
+    v.set("inSync", JsonValue::makeBool(inSync));
+    v.set("transferredByteInSecond", JsonValue::makeInt(transferredByteInSecond));
+    v.set("transferFromWhere", JsonValue::makeInt(transferFromWhere));
+    return v;
+}
+
+HAConnectionRuntimeInfo HAConnectionRuntimeInfo::fromJson(const JsonValue& v) {
+    HAConnectionRuntimeInfo c;
+    c.addr = getStr(v, "addr", "");
+    c.slaveAckOffset = getInt(v, "slaveAckOffset", 0);
+    c.diff = getInt(v, "diff", 0);
+    c.inSync = getBool(v, "inSync", false);
+    c.transferredByteInSecond = getInt(v, "transferredByteInSecond", 0);
+    c.transferFromWhere = getInt(v, "transferFromWhere", 0);
+    return c;
+}
+
+JsonValue HAClientRuntimeInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("masterAddr", JsonValue::makeString(masterAddr));
+    v.set("transferredByteInSecond", JsonValue::makeInt(transferredByteInSecond));
+    v.set("maxOffset", JsonValue::makeInt(maxOffset));
+    v.set("lastReadTimestamp", JsonValue::makeInt(lastReadTimestamp));
+    v.set("lastWriteTimestamp", JsonValue::makeInt(lastWriteTimestamp));
+    v.set("masterFlushOffset", JsonValue::makeInt(masterFlushOffset));
+    v.set("activated", JsonValue::makeBool(activated));
+    return v;
+}
+
+HAClientRuntimeInfo HAClientRuntimeInfo::fromJson(const JsonValue& v) {
+    HAClientRuntimeInfo c;
+    c.masterAddr = getStr(v, "masterAddr", "");
+    c.transferredByteInSecond = getInt(v, "transferredByteInSecond", 0);
+    c.maxOffset = getInt(v, "maxOffset", 0);
+    c.lastReadTimestamp = getInt(v, "lastReadTimestamp", 0);
+    c.lastWriteTimestamp = getInt(v, "lastWriteTimestamp", 0);
+    c.masterFlushOffset = getInt(v, "masterFlushOffset", 0);
+    c.activated = getBool(v, "activated", getBool(v, "isActivated", false));
+    return c;
+}
+
+JsonValue HARuntimeInfo::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("master", JsonValue::makeBool(master));
+    v.set("masterCommitLogMaxOffset", JsonValue::makeInt(masterCommitLogMaxOffset));
+    v.set("inSyncSlaveNums", JsonValue::makeInt(inSyncSlaveNums));
+    JsonValue arr = JsonValue::makeArray();
+    for (const HAConnectionRuntimeInfo& c : haConnectionInfo) arr.pushArray(c.toJson());
+    v.set("haConnectionInfo", arr);
+    v.set("haClientRuntimeInfo", haClientRuntimeInfo.toJson());
+    return v;
+}
+
+HARuntimeInfo HARuntimeInfo::fromJson(const JsonValue& v) {
+    HARuntimeInfo info;
+    info.master = getBool(v, "master", false);
+    info.masterCommitLogMaxOffset = getInt(v, "masterCommitLogMaxOffset", 0);
+    info.inSyncSlaveNums = static_cast<int32_t>(getInt(v, "inSyncSlaveNums", 0));
+    const JsonValue* arr = v.find("haConnectionInfo");
+    if (arr != nullptr && arr->isArray()) {
+        for (size_t i = 0; i < arr->size(); ++i) {
+            if (arr->at(i).isObject()) {
+                info.haConnectionInfo.push_back(HAConnectionRuntimeInfo::fromJson(arr->at(i)));
+            }
+        }
+    }
+    const JsonValue* client = v.find("haClientRuntimeInfo");
+    if (client != nullptr && client->isObject()) {
+        info.haClientRuntimeInfo = HAClientRuntimeInfo::fromJson(*client);
+    }
+    return info;
+}
+
+Bytes HARuntimeInfo::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool HARuntimeInfo::decode(const Bytes& data, HARuntimeInfo& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- EpochEntry / EpochEntryCache
+JsonValue EpochEntry::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("epoch", JsonValue::makeInt(epoch));
+    v.set("startOffset", JsonValue::makeInt(startOffset));
+    v.set("endOffset", JsonValue::makeInt(endOffset));
+    return v;
+}
+
+EpochEntry EpochEntry::fromJson(const JsonValue& v) {
+    EpochEntry e;
+    e.epoch = static_cast<int32_t>(getInt(v, "epoch", 0));
+    e.startOffset = getInt(v, "startOffset", 0);
+    // A missing endOffset means the epoch is still being written (Java Long.MAX_VALUE)
+    e.endOffset = getInt(v, "endOffset", std::numeric_limits<int64_t>::max());
+    return e;
+}
+
+JsonValue EpochEntryCache::toJson() const {
+    JsonValue v = JsonValue::makeObject();
+    v.set("clusterName", JsonValue::makeString(clusterName));
+    v.set("brokerName", JsonValue::makeString(brokerName));
+    v.set("brokerId", JsonValue::makeInt(brokerId));
+    JsonValue arr = JsonValue::makeArray();
+    for (const EpochEntry& e : epochList) arr.pushArray(e.toJson());
+    v.set("epochList", arr);
+    v.set("maxOffset", JsonValue::makeInt(maxOffset));
+    return v;
+}
+
+EpochEntryCache EpochEntryCache::fromJson(const JsonValue& v) {
+    EpochEntryCache c;
+    c.clusterName = getStr(v, "clusterName", "");
+    c.brokerName = getStr(v, "brokerName", "");
+    c.brokerId = getInt(v, "brokerId", 0);
+    const JsonValue* arr = v.find("epochList");
+    if (arr != nullptr && arr->isArray()) {
+        for (size_t i = 0; i < arr->size(); ++i) {
+            if (arr->at(i).isObject()) c.epochList.push_back(EpochEntry::fromJson(arr->at(i)));
+        }
+    }
+    c.maxOffset = getInt(v, "maxOffset", 0);
+    return c;
+}
+
+Bytes EpochEntryCache::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool EpochEntryCache::decode(const Bytes& data, EpochEntryCache& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
+// ---------------------------------------------------------------- BrokerMemberGroup
+JsonValue BrokerMemberGroup::toJson() const {
+    JsonValue addrs = JsonValue::makeObject();
+    for (const auto& kv : brokerAddrs) {
+        addrs.set(std::to_string(kv.first), JsonValue::makeString(kv.second));
+    }
+    JsonValue v = JsonValue::makeObject();
+    v.set("cluster", JsonValue::makeString(cluster));
+    v.set("brokerName", JsonValue::makeString(brokerName));
+    v.set("brokerAddrs", addrs);
+    return v;
+}
+
+BrokerMemberGroup BrokerMemberGroup::fromJson(const JsonValue& v) {
+    BrokerMemberGroup g;
+    g.cluster = getStr(v, "cluster", "");
+    g.brokerName = getStr(v, "brokerName", "");
+    const JsonValue* addrs = v.find("brokerAddrs");
+    if (addrs != nullptr && addrs->isObject()) {
+        for (const auto& kv : addrs->objectItems()) {
+            g.brokerAddrs[keyToI64(kv.first)] = kv.second.stringValue();
+        }
+    }
+    return g;
+}
+
+Bytes BrokerMemberGroup::encode() const { return RemotingSerializable::encode(toJson()); }
+
+bool BrokerMemberGroup::decode(const Bytes& data, BrokerMemberGroup& out) {
+    JsonValue v;
+    if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
+    out = fromJson(v);
+    return true;
+}
+
 }  // namespace rocketmq

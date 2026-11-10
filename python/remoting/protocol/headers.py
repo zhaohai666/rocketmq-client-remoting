@@ -1893,3 +1893,111 @@ class TriggerLiteDispatchRequestHeader(CommandCustomHeader):
             "group": self.group,
             "clientId": self.client_id,
         })
+
+
+# ---------------- #47 admin ops RPC headers (Java remoting.protocol.header.*) ----------------
+
+
+class QueryCorrectionOffsetHeader(CommandCustomHeader):
+    """``QueryCorrectionOffsetHeader`` (QUERY_CORRECTION_OFFSET = 308).
+
+    ``filter_groups`` arrives on the wire pre-joined with commas (Java joins the
+    Set itself in MQClientAPIImpl:2780-2788), so the port keeps a plain string.
+    """
+
+    def __init__(self, topic: Optional[str] = None, compare_group: Optional[str] = None,
+                 filter_groups: Optional[str] = None):
+        self.topic = topic
+        self.compare_group = compare_group
+        self.filter_groups = filter_groups
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "topic": self.topic,
+            "compareGroup": self.compare_group,
+            "filterGroups": self.filter_groups,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.topic = ext.get("topic")
+        self.compare_group = ext.get("compareGroup")
+        self.filter_groups = ext.get("filterGroups")
+
+
+class GetAllProducerInfoRequestHeader(CommandCustomHeader):
+    """``GetAllProducerInfoRequestHeader`` (GET_ALL_PRODUCER_INFO = 328): empty header."""
+
+    def to_ext_fields(self) -> dict:
+        return {}
+
+
+class ResetMasterFlushOffsetHeader(CommandCustomHeader):
+    """``ResetMasterFlushOffsetHeader`` (RESET_MASTER_FLUSH_OFFSET = 908).
+
+    ``master_flush_offset`` is a primitive long: 0 is a real value that must be sent.
+    """
+
+    def __init__(self, master_flush_offset: int = 0):
+        self.master_flush_offset = master_flush_offset
+
+    def to_ext_fields(self) -> dict:
+        return {"masterFlushOffset": self.master_flush_offset}
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.master_flush_offset = _l(ext.get("masterFlushOffset")) or 0
+
+
+class ElectMasterRequestHeader(CommandCustomHeader):
+    """``ElectMasterRequestHeader`` (CONTROLLER_ELECT_MASTER = 1002).
+
+    The admin facade always uses Java's ``ofAdminTrigger``: ``designate_elect``
+    is forced to true and ``broker_id`` doubles as the assigned master id
+    (-1 means "no preference" -- both are @CFNotNull, so they are always sent).
+    """
+
+    def __init__(self, cluster_name: str = "", broker_name: str = "",
+                 broker_id: Optional[int] = -1, designate_elect: bool = False):
+        self.cluster_name = cluster_name
+        self.broker_name = broker_name
+        self.broker_id = -1 if broker_id is None else broker_id
+        self.designate_elect = designate_elect
+        self.invoke_time: int = int(time.time() * 1000)
+
+    @staticmethod
+    def of_admin_trigger(cluster_name: str, broker_name: str,
+                         broker_id: Optional[int]) -> "ElectMasterRequestHeader":
+        return ElectMasterRequestHeader(cluster_name, broker_name, broker_id,
+                                        designate_elect=True)
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "clusterName": self.cluster_name,
+            "brokerName": self.broker_name,
+            "brokerId": self.broker_id,
+            "designateElect": self.designate_elect,
+            "invokeTime": self.invoke_time,
+        })
+
+
+class ElectMasterResponseHeader(CommandCustomHeader):
+    """``ElectMasterResponseHeader``: the answer fields live in the response ext_fields."""
+
+    def __init__(self):
+        self.master_broker_id: Optional[int] = None
+        self.master_address: Optional[str] = None
+        self.master_epoch: Optional[int] = None
+        self.sync_state_set_epoch: Optional[int] = None
+
+    def to_ext_fields(self) -> dict:
+        return _ext({
+            "masterBrokerId": self.master_broker_id,
+            "masterAddress": self.master_address,
+            "masterEpoch": self.master_epoch,
+            "syncStateSetEpoch": self.sync_state_set_epoch,
+        })
+
+    def from_ext_fields(self, ext: dict) -> None:
+        self.master_broker_id = _l(ext.get("masterBrokerId"))
+        self.master_address = ext.get("masterAddress")
+        self.master_epoch = _i(ext.get("masterEpoch"))
+        self.sync_state_set_epoch = _i(ext.get("syncStateSetEpoch"))

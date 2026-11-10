@@ -2316,3 +2316,141 @@ final class ChangeInvisibleTimeResponseHeader extends CommandCustomHeader
         $this->reviveQid = self::i($ext['reviveQid'] ?? null);
     }
 }
+
+// ---------------- #47 mqadmin ops RPC headers (Java remoting.protocol.header.*) ----------------
+
+/**
+ * QUERY_CORRECTION_OFFSET(308). filterGroups arrives on the wire pre-joined with
+ * commas (Java joins the Set itself in MQClientAPIImpl:2780-2788), so the port
+ * keeps a plain string.
+ */
+final class QueryCorrectionOffsetHeader extends CommandCustomHeader
+{
+    public function __construct(
+        public ?string $topic = null,
+        public ?string $compareGroup = null,
+        public ?string $filterGroups = null,
+    ) {
+    }
+
+    /** @return array<string, mixed> */
+    public function toExtFields(): array
+    {
+        return self::ext([
+            'topic' => $this->topic,
+            'compareGroup' => $this->compareGroup,
+            'filterGroups' => $this->filterGroups,
+        ]);
+    }
+
+    /** @param array<string, mixed> $ext */
+    public function fromExtFields(array $ext): void
+    {
+        $this->topic = isset($ext['topic']) ? (string)$ext['topic'] : null;
+        $this->compareGroup = isset($ext['compareGroup']) ? (string)$ext['compareGroup'] : null;
+        $this->filterGroups = isset($ext['filterGroups']) ? (string)$ext['filterGroups'] : null;
+    }
+}
+
+/** GET_ALL_PRODUCER_INFO(328): empty header — the class keeps the request-object shape. */
+final class GetAllProducerInfoRequestHeader extends CommandCustomHeader
+{
+    /** @return array<string, mixed> */
+    public function toExtFields(): array
+    {
+        return [];
+    }
+}
+
+/**
+ * RESET_MASTER_FLUSH_OFFSET(908). masterFlushOffset is a primitive long: 0 is a
+ * real value that must be sent.
+ */
+final class ResetMasterFlushOffsetHeader extends CommandCustomHeader
+{
+    public function __construct(public int $masterFlushOffset = 0)
+    {
+    }
+
+    /** @return array<string, mixed> */
+    public function toExtFields(): array
+    {
+        return self::ext(['masterFlushOffset' => $this->masterFlushOffset]);
+    }
+
+    /** @param array<string, mixed> $ext */
+    public function fromExtFields(array $ext): void
+    {
+        $this->masterFlushOffset = self::l($ext['masterFlushOffset'] ?? null) ?? 0;
+    }
+}
+
+/**
+ * CONTROLLER_ELECT_MASTER(1002). The admin facade always uses Java's ofAdminTrigger:
+ * designateElect is forced to true and brokerId doubles as the assigned master id
+ * (-1 means "no preference") — both @CFNotNull, always sent.
+ */
+final class ElectMasterRequestHeader extends CommandCustomHeader
+{
+    public function __construct(
+        public ?string $clusterName = null,
+        public ?string $brokerName = null,
+        public int $brokerId = -1,
+        public bool $designateElect = false,
+        public int $invokeTime = 0,
+    ) {
+        if ($this->invokeTime === 0) {
+            $this->invokeTime = (int)(microtime(true) * 1000);
+        }
+    }
+
+    /** Java's ElectMasterRequestHeader.ofAdminTrigger: designateElect forced true. */
+    public static function ofAdminTrigger(string $clusterName, string $brokerName, ?int $brokerId): self
+    {
+        return new self($clusterName, $brokerName, $brokerId ?? -1, true);
+    }
+
+    /** @return array<string, mixed> */
+    public function toExtFields(): array
+    {
+        return self::ext([
+            'clusterName' => $this->clusterName,
+            'brokerName' => $this->brokerName,
+            'brokerId' => $this->brokerId,
+            'designateElect' => $this->designateElect,
+            'invokeTime' => $this->invokeTime,
+        ]);
+    }
+}
+
+/** The elect answer rides the response extFields, not a body. */
+final class ElectMasterResponseHeader extends CommandCustomHeader
+{
+    public function __construct(
+        public ?int $masterBrokerId = null,
+        public ?string $masterAddress = null,
+        public ?int $masterEpoch = null,
+        public ?int $syncStateSetEpoch = null,
+    ) {
+    }
+
+    /** @return array<string, mixed> */
+    public function toExtFields(): array
+    {
+        return self::ext([
+            'masterBrokerId' => $this->masterBrokerId,
+            'masterAddress' => $this->masterAddress,
+            'masterEpoch' => $this->masterEpoch,
+            'syncStateSetEpoch' => $this->syncStateSetEpoch,
+        ]);
+    }
+
+    /** @param array<string, mixed> $ext */
+    public function fromExtFields(array $ext): void
+    {
+        $this->masterBrokerId = self::l($ext['masterBrokerId'] ?? null);
+        $this->masterAddress = isset($ext['masterAddress']) ? (string)$ext['masterAddress'] : null;
+        $this->masterEpoch = self::i($ext['masterEpoch'] ?? null);
+        $this->syncStateSetEpoch = self::i($ext['syncStateSetEpoch'] ?? null);
+    }
+}

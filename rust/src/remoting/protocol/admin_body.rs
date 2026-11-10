@@ -877,6 +877,278 @@ impl CheckRocksdbCqWriteResult {
     }
 }
 
+// ============================== mqadmin ops family (#47) ==============================
+
+/// A live (still-open) epoch omits `endOffset` on the wire; the decoder fills
+/// in Java's `Long.MAX_VALUE`.
+pub const LAST_EPOCH_END_OFFSET: i64 = i64::MAX;
+
+/// The 308 answer: per-queue correction offsets of `compareGroup`. The wire is
+/// a JSON object whose keys are the queue ids in string form, kept in wire
+/// order as `(queueId, offset)` pairs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QueryCorrectionOffsetBody {
+    pub correction_offsets: Vec<(i32, i64)>,
+}
+
+impl QueryCorrectionOffsetBody {
+    pub fn from_json_value(value: &Value) -> Result<QueryCorrectionOffsetBody> {
+        expect_object(value, "QueryCorrectionOffsetBody")?;
+        let mut correction_offsets = Vec::new();
+        for (key, raw) in jentries(value, "correctionOffsets")? {
+            let Ok(queue_id) = key.parse::<i32>() else {
+                continue;
+            };
+            let offset = match raw.as_i64() {
+                Some(v) => v,
+                None => continue,
+            };
+            correction_offsets.push((queue_id, offset));
+        }
+        Ok(QueryCorrectionOffsetBody { correction_offsets })
+    }
+
+    pub fn decode(data: &[u8]) -> Result<QueryCorrectionOffsetBody> {
+        QueryCorrectionOffsetBody::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+/// One live producer connection inside the 328 table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProducerInfo {
+    pub client_id: String,
+    pub remote_ip: String,
+    pub language: String,
+    pub version: i32,
+    pub last_update_timestamp: i64,
+}
+
+impl ProducerInfo {
+    pub fn from_json_value(value: &Value) -> Result<ProducerInfo> {
+        expect_object(value, "ProducerInfo")?;
+        Ok(ProducerInfo {
+            client_id: jstring_or(value, "clientId", ""),
+            remote_ip: jstring_or(value, "remoteIP", ""),
+            language: jstring_or(value, "language", ""),
+            version: jint(value, "version", 0),
+            last_update_timestamp: jlong(value, "lastUpdateTimestamp", 0),
+        })
+    }
+}
+
+/// The 328 answer: producer connections keyed by group, kept in wire order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProducerTableInfo {
+    pub data: Vec<(String, Vec<ProducerInfo>)>,
+}
+
+impl ProducerTableInfo {
+    pub fn get(&self, group: &str) -> Option<&Vec<ProducerInfo>> {
+        self.data
+            .iter()
+            .find(|(name, _)| name == group)
+            .map(|(_, list)| list)
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<ProducerTableInfo> {
+        expect_object(value, "ProducerTableInfo")?;
+        let mut data = Vec::new();
+        for (group, raw) in jentries(value, "data")? {
+            let mut list = Vec::new();
+            if let Some(items) = raw.as_array() {
+                for item in items {
+                    list.push(ProducerInfo::from_json_value(item)?);
+                }
+            }
+            data.push((group.clone(), list));
+        }
+        Ok(ProducerTableInfo { data })
+    }
+
+    pub fn decode(data: &[u8]) -> Result<ProducerTableInfo> {
+        ProducerTableInfo::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+/// One broker-side HA connection of the 907 answer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HAConnectionRuntimeInfo {
+    pub addr: String,
+    pub slave_ack_offset: i64,
+    pub diff: i64,
+    pub in_sync: bool,
+    pub transferred_byte_in_second: i64,
+    pub transfer_from_where: i64,
+}
+
+impl HAConnectionRuntimeInfo {
+    pub fn from_json_value(value: &Value) -> Result<HAConnectionRuntimeInfo> {
+        expect_object(value, "HAConnectionRuntimeInfo")?;
+        Ok(HAConnectionRuntimeInfo {
+            addr: jstring_or(value, "addr", ""),
+            slave_ack_offset: jlong(value, "slaveAckOffset", 0),
+            diff: jlong(value, "diff", 0),
+            in_sync: jboolean(value, "inSync", false),
+            transferred_byte_in_second: jlong(value, "transferredByteInSecond", 0),
+            transfer_from_where: jlong(value, "transferFromWhere", 0),
+        })
+    }
+}
+
+/// The HA client leg of the 907 answer. fastjson writes the Java `isActivated`
+/// property as `activated`; older writers spell the key out, so both decode.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HAClientRuntimeInfo {
+    pub master_addr: String,
+    pub transferred_byte_in_second: i64,
+    pub max_offset: i64,
+    pub last_read_timestamp: i64,
+    pub last_write_timestamp: i64,
+    pub master_flush_offset: i64,
+    pub activated: bool,
+}
+
+impl HAClientRuntimeInfo {
+    pub fn from_json_value(value: &Value) -> Result<HAClientRuntimeInfo> {
+        expect_object(value, "HAClientRuntimeInfo")?;
+        Ok(HAClientRuntimeInfo {
+            master_addr: jstring_or(value, "masterAddr", ""),
+            transferred_byte_in_second: jlong(value, "transferredByteInSecond", 0),
+            max_offset: jlong(value, "maxOffset", 0),
+            last_read_timestamp: jlong(value, "lastReadTimestamp", 0),
+            last_write_timestamp: jlong(value, "lastWriteTimestamp", 0),
+            master_flush_offset: jlong(value, "masterFlushOffset", 0),
+            activated: jboolean(value, "activated", jboolean(value, "isActivated", false)),
+        })
+    }
+}
+
+/// The 907 answer: the broker's HA replication view.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HARuntimeInfo {
+    pub master: bool,
+    pub master_commit_log_max_offset: i64,
+    pub in_sync_slave_nums: i32,
+    pub ha_connection_info: Vec<HAConnectionRuntimeInfo>,
+    pub ha_client_runtime_info: Option<HAClientRuntimeInfo>,
+}
+
+impl HARuntimeInfo {
+    pub fn from_json_value(value: &Value) -> Result<HARuntimeInfo> {
+        expect_object(value, "HARuntimeInfo")?;
+        let mut ha_connection_info = Vec::new();
+        for item in jarray(value, "haConnectionInfo")? {
+            ha_connection_info.push(HAConnectionRuntimeInfo::from_json_value(item)?);
+        }
+        let ha_client_runtime_info = match jfield(value, "haClientRuntimeInfo") {
+            Some(raw) if !raw.is_null() => Some(HAClientRuntimeInfo::from_json_value(raw)?),
+            _ => None,
+        };
+        Ok(HARuntimeInfo {
+            master: jboolean(value, "master", false),
+            master_commit_log_max_offset: jlong(value, "masterCommitLogMaxOffset", 0),
+            in_sync_slave_nums: jint(value, "inSyncSlaveNums", 0),
+            ha_connection_info,
+            ha_client_runtime_info,
+        })
+    }
+
+    pub fn decode(data: &[u8]) -> Result<HARuntimeInfo> {
+        HARuntimeInfo::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+/// One controller epoch of the 1007 answer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EpochEntry {
+    pub epoch: i32,
+    pub start_offset: i64,
+    pub end_offset: i64,
+}
+
+impl EpochEntry {
+    pub fn from_json_value(value: &Value) -> Result<EpochEntry> {
+        expect_object(value, "EpochEntry")?;
+        Ok(EpochEntry {
+            epoch: jint(value, "epoch", 0),
+            start_offset: jlong(value, "startOffset", 0),
+            end_offset: jlong(value, "endOffset", LAST_EPOCH_END_OFFSET),
+        })
+    }
+}
+
+/// The 1007 answer: the broker's epoch list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EpochEntryCache {
+    pub cluster_name: String,
+    pub broker_name: String,
+    pub broker_id: i64,
+    pub epoch_list: Vec<EpochEntry>,
+    pub max_offset: i64,
+}
+
+impl EpochEntryCache {
+    pub fn from_json_value(value: &Value) -> Result<EpochEntryCache> {
+        expect_object(value, "EpochEntryCache")?;
+        let mut epoch_list = Vec::new();
+        for item in jarray(value, "epochList")? {
+            epoch_list.push(EpochEntry::from_json_value(item)?);
+        }
+        Ok(EpochEntryCache {
+            cluster_name: jstring_or(value, "clusterName", ""),
+            broker_name: jstring_or(value, "brokerName", ""),
+            broker_id: jlong(value, "brokerId", 0),
+            epoch_list,
+            max_offset: jlong(value, "maxOffset", 0),
+        })
+    }
+
+    pub fn decode(data: &[u8]) -> Result<EpochEntryCache> {
+        EpochEntryCache::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
+/// The 1002 answer body: where the members of one broker group live. The wire
+/// keys the address map by brokerId in string form; entries are kept in wire
+/// order as `(brokerId, addr)` pairs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BrokerMemberGroup {
+    pub cluster: String,
+    pub broker_name: String,
+    pub broker_addrs: Vec<(i64, String)>,
+}
+
+impl BrokerMemberGroup {
+    pub fn get(&self, broker_id: i64) -> Option<&str> {
+        self.broker_addrs
+            .iter()
+            .find(|(id, _)| *id == broker_id)
+            .map(|(_, addr)| addr.as_str())
+    }
+
+    pub fn from_json_value(value: &Value) -> Result<BrokerMemberGroup> {
+        expect_object(value, "BrokerMemberGroup")?;
+        let mut broker_addrs = Vec::new();
+        for (key, raw) in jentries(value, "brokerAddrs")? {
+            let Ok(id) = key.parse::<i64>() else {
+                continue;
+            };
+            if let Some(addr) = raw.as_str() {
+                broker_addrs.push((id, addr.to_string()));
+            }
+        }
+        Ok(BrokerMemberGroup {
+            cluster: jstring_or(value, "cluster", ""),
+            broker_name: jstring_or(value, "brokerName", ""),
+            broker_addrs,
+        })
+    }
+
+    pub fn decode(data: &[u8]) -> Result<BrokerMemberGroup> {
+        BrokerMemberGroup::from_json_value(&RemotingSerializable::decode(data)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

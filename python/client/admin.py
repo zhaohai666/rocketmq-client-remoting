@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 from common.boundary_type import BoundaryType
 from common.message import MessageExt, MessageQueue
@@ -13,18 +13,24 @@ from common.sysflag import PermName
 from common.topic_config import TopicConfig
 from rocketmq_logging import get_logger
 from remoting.exception import RemotingException
-from remoting.protocol.body import (ClusterInfo, ConsumeMessageDirectlyResult,
+from remoting.protocol.body import (BrokerMemberGroup, ClusterInfo,
+                                      ConsumeMessageDirectlyResult,
                                       ConsumerConnection,
-                                      ConsumerRunningInfo, KVTable,
-                                      ProducerConnection, QueryConsumeTimeSpanBody,
+                                      ConsumerRunningInfo, EpochEntryCache,
+                                      HARuntimeInfo, KVTable,
+                                      ProducerConnection, ProducerTableInfo,
+                                      QueryConsumeTimeSpanBody,
+                                      QueryCorrectionOffsetBody,
                                       ResetOffsetBody, TopicList)
 from remoting.protocol.headers import (
     AddBrokerRequestHeader, CheckRocksdbCqWriteProgressRequestHeader,
     CleanControllerBrokerDataRequestHeader, ConsumeMessageDirectlyResultRequestHeader,
-    CreateTopicListRequestHeader, ExportRocksDBConfigToJsonRequestHeader,
+    CreateTopicListRequestHeader, ElectMasterRequestHeader,
+    ElectMasterResponseHeader, ExportRocksDBConfigToJsonRequestHeader,
     GetLiteClientInfoRequestHeader, GetLiteGroupInfoRequestHeader,
     GetLiteTopicInfoRequestHeader, GetMetaDataResponseHeader,
-    GetParentTopicInfoRequestHeader, RemoveBrokerRequestHeader,
+    GetParentTopicInfoRequestHeader, QueryCorrectionOffsetHeader,
+    RemoveBrokerRequestHeader, ResetMasterFlushOffsetHeader,
     TriggerLiteDispatchRequestHeader)
 from remoting.protocol.admin_body import (
     AclInfo, AdminToolResult, AdminToolsResultCodeEnum, BrokerOperatorResult,
@@ -62,6 +68,10 @@ CONTROLLER_RPC_TIMEOUT = 3000
 # The single ext field of the commitlog read-ahead request (no header class exists for
 # it, the key is the protocol constant).
 READ_AHEAD_MODE_KEY = "READ_AHEAD_MODE"
+
+# The single ext field of the timer-engine switch (no header class exists for it):
+# MessageConst.TIMER_ENGINE_TYPE on the Java side.
+TIMER_ENGINE_TYPE_KEY = "E_T"
 
 
 
@@ -2178,6 +2188,139 @@ class DefaultMQAdminExt:
                                   resourceFilter=resource_filter),
             timeout_millis=timeout_millis)
         return AclInfo.decode_list(response.body)
+
+    # ---------------- #47 ops RPC group (Java MQClientAPIImpl:2773-3816) ----------------
+    # The wire contract: 308/328 go through the config-gated VIP helper (no-op while
+    # vip_channel_enabled is false, exactly Java's brokerVIPChannel(flag, addr) split);
+    # 907/908/1007/5001 use the plain broker address; 311/312/313 go to a name server;
+    # 1002 first resolves the controller leader via 1005.
+
+    def query_correction_offset(self, broker_addr: str, topic: str, group: str,
+                                filter_groups: Optional[Set[str]] = None,
+                                timeout_millis: Optional[int] = None) -> Dict[int, int]:
+        """QUERY_CORRECTION_OFFSET = 308 (Java MQClientAPIImpl:2773)."""
+        header = QueryCorrectionOffsetHeader(
+            topic=topic, compare_group=group,
+            filter_groups=",".join(sorted(filter_groups)) if filter_groups else None)
+        response = self._invoke_broker(broker_addr, RequestCode.QUERY_CORRECTION_OFFSET,
+                                       ext_fields=header.to_ext_fields(),
+                                       timeout_millis=timeout_millis)
+        if not response.body:
+            return {}
+        return QueryCorrectionOffsetBody.decode(response.body).correction_offsets
+
+    def _unit_topic_list(self, code: int, contain_retry: bool,
+                         timeout_millis: Optional[int]) -> TopicList:
+        """GET_UNIT_TOPIC_LIST / GET_HAS_UNIT_SUB_TOPIC_LIST /
+        GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST share the shape: null header to a name
+        server, TopicList body, and the retry topics filtered client-side when
+        ``contain_retry`` is false (Java MQClientAPIImpl:2817-2825)."""
+        response = self._invoke_namesrv_one(code, timeout_millis=timeout_millis)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or "get unit topic list failed",
+                                    response.code)
+        if not response.body:
+            raise MQClientException("the name server answered without a body",
+                                    response.code)
+        topic_list = TopicList.decode(response.body)
+        if not contain_retry:
+            topic_list.topic_list = [t for t in topic_list.topic_list
+                                     if not MixAll.is_retry_topic(t)]
+        return topic_list
+
+    def get_unit_topic_list(self, contain_retry: bool = True,
+                            timeout_millis: Optional[int] = None) -> TopicList:
+        """GET_UNIT_TOPIC_LIST = 311 (Java MQClientAPIImpl:2807)."""
+        return self._unit_topic_list(RequestCode.GET_UNIT_TOPIC_LIST,
+                                     contain_retry, timeout_millis)
+
+    def get_has_unit_sub_topic_list(self, contain_retry: bool = True,
+                                    timeout_millis: Optional[int] = None) -> TopicList:
+        """GET_HAS_UNIT_SUB_TOPIC_LIST = 312 (Java MQClientAPIImpl:2837)."""
+        return self._unit_topic_list(RequestCode.GET_HAS_UNIT_SUB_TOPIC_LIST,
+                                     contain_retry, timeout_millis)
+
+    def get_has_unit_sub_un_unit_topic_list(self, contain_retry: bool = True,
+                                            timeout_millis: Optional[int] = None) -> TopicList:
+        """GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST = 313 (Java MQClientAPIImpl:2866)."""
+        return self._unit_topic_list(RequestCode.GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST,
+                                     contain_retry, timeout_millis)
+
+    def get_all_producer_info(self, broker_addr: str,
+                              timeout_millis: Optional[int] = None) -> ProducerTableInfo:
+        """GET_ALL_PRODUCER_INFO = 328 (Java MQClientAPIImpl:1843)."""
+        response = self._invoke_broker(broker_addr, RequestCode.GET_ALL_PRODUCER_INFO,
+                                       timeout_millis=timeout_millis)
+        if not response.body:
+            raise MQBrokerException(response.code, "empty producer table body", broker_addr)
+        return ProducerTableInfo.decode(response.body)
+
+    def get_broker_ha_status(self, broker_addr: str,
+                             timeout_millis: Optional[int] = None) -> HARuntimeInfo:
+        """GET_BROKER_HA_STATUS = 907 (Java MQClientAPIImpl:3422, plain address)."""
+        response = self._invoke_broker(broker_addr, RequestCode.GET_BROKER_HA_STATUS,
+                                       timeout_millis=timeout_millis, vip=False)
+        if not response.body:
+            raise MQBrokerException(response.code, "empty HA status body", broker_addr)
+        return HARuntimeInfo.decode(response.body)
+
+    def reset_master_flush_offset(self, broker_addr: str, master_flush_offset: int,
+                                  timeout_millis: Optional[int] = None) -> None:
+        """RESET_MASTER_FLUSH_OFFSET = 908 (Java MQClientAPIImpl:3403, 3s budget)."""
+        header = ResetMasterFlushOffsetHeader(master_flush_offset=master_flush_offset)
+        self._invoke_broker(broker_addr, RequestCode.RESET_MASTER_FLUSH_OFFSET,
+                            ext_fields=header.to_ext_fields(),
+                            timeout_millis=timeout_millis or CONTROLLER_RPC_TIMEOUT,
+                            vip=False)
+
+    def elect_master(self, controller_addr: str, cluster_name: str, broker_name: str,
+                     broker_id: Optional[int] = None,
+                     timeout_millis: Optional[int] = None
+                     ) -> "Tuple[ElectMasterResponseHeader, BrokerMemberGroup]":
+        """CONTROLLER_ELECT_MASTER = 1002 (Java MQClientAPIImpl:3544).
+
+        Two-step: resolve the controller leader through 1005, then send the elect
+        request to the leader with Java's ``ofAdminTrigger`` shape
+        (``designateElect=true``, ``brokerId`` = the assigned master id or -1).
+        """
+        client = self._require_client()
+        leader_address = self._controller_leader_address(controller_addr)
+        header = ElectMasterRequestHeader.of_admin_trigger(cluster_name, broker_name,
+                                                           broker_id)
+        request = RemotingCommand.create_request_command(
+            RequestCode.CONTROLLER_ELECT_MASTER, header)
+        for k, v in header.to_ext_fields().items():
+            request.ext_fields[k] = str(v)
+        response = client._invoke_sync(leader_address, request,
+                                       timeout_millis or CONTROLLER_RPC_TIMEOUT)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQBrokerException(response.code, response.remark or "")
+        response_header = ElectMasterResponseHeader()
+        response_header.from_ext_fields(response.ext_fields)
+        member_group = (BrokerMemberGroup.decode(response.body)
+                        if response.body else BrokerMemberGroup())
+        return response_header, member_group
+
+    def get_broker_epoch_cache(self, broker_addr: str,
+                               timeout_millis: Optional[int] = None) -> EpochEntryCache:
+        """GET_BROKER_EPOCH_CACHE = 1007 (Java MQClientAPIImpl:3474, 3s budget)."""
+        response = self._invoke_broker(broker_addr, RequestCode.GET_BROKER_EPOCH_CACHE,
+                                       timeout_millis=timeout_millis or CONTROLLER_RPC_TIMEOUT,
+                                       vip=False)
+        if not response.body:
+            raise MQBrokerException(response.code, "empty epoch cache body", broker_addr)
+        return EpochEntryCache.decode(response.body)
+
+    def switch_timer_engine(self, broker_addr: str, engine_type: str,
+                            timeout_millis: Optional[int] = None) -> None:
+        """SWITCH_TIMER_ENGINE = 5001 (Java MQClientAPIImpl:3806).
+
+        The engine type rides in the single ext field ``E_T``
+        (``MessageConst.TIMER_ENGINE_TYPE``) -- there is no header class for it.
+        """
+        self._invoke_broker(broker_addr, RequestCode.SWITCH_TIMER_ENGINE,
+                            ext_fields={TIMER_ENGINE_TYPE_KEY: engine_type},
+                            timeout_millis=timeout_millis, vip=False)
 
 
 # ---------------------------------------------------------------- Helpers

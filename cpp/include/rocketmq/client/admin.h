@@ -82,6 +82,22 @@ struct ControllerMetaData {
     std::string peers;
 };
 
+// Response header of CONTROLLER_ELECT_MASTER(1002): the four fields ride in the
+// response extFields; a missing masterBrokerId keeps the Java "no master" default.
+struct ElectMasterResponseHeader {
+    int64_t masterBrokerId = -1;
+    std::string masterAddress;
+    int32_t masterEpoch = 0;
+    int32_t syncStateSetEpoch = 0;
+};
+
+// Return value of electMaster(): the extFields header plus the BrokerMemberGroup body
+// (a body-less response leaves the member group with all fields unset).
+struct ElectMasterResult {
+    ElectMasterResponseHeader header;
+    BrokerMemberGroup memberGroup;
+};
+
 class DefaultMQAdminExt {
 public:
     // Matches DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
@@ -458,6 +474,47 @@ public:
                          const std::string& brokerControllerIdsToClean = std::string(),
                          bool isCleanLivingBroker = false);
 
+    // ---------------- Ops RPC group (#47, Java MQClientAPIImpl:2773-3816) ----------------
+    // Routing split: 308/328 go through the VIP helper (port-2 while vipChannelEnabled is on,
+    // a plain no-op when off, the same shape as Java brokerVIPChannel(flag, addr)); 907/908/1007/5001
+    // use the plain broker address; 311/312/313 go to a name server; 1002 first resolves the
+    // controller leader via 1005 and then sends the elect request to the leader (3000ms budget
+    // on every controller leg).
+    // QUERY_CORRECTION_OFFSET(308): the three header fields topic/compareGroup/filterGroups,
+    // filterGroups comma-joined and omitted when the set is empty. An empty body decodes to an
+    // empty map.
+    std::map<int32_t, int64_t> queryCorrectionOffset(const std::string& brokerAddr,
+                                                     const std::string& topic,
+                                                     const std::string& group,
+                                                     const std::set<std::string>& filterGroups = {},
+                                                     int32_t timeoutMillis = -1);
+    // The three unit-topic reads (311/312/313): null header to a name server, TopicList body,
+    // and the %RETRY% topics filtered client-side when containRetry is false (Java
+    // MQClientAPIImpl:2817-2825 filters locally; nothing about containRetry goes on the wire).
+    TopicList getUnitTopicList(bool containRetry = true, int32_t timeoutMillis = -1);
+    TopicList getHasUnitSubTopicList(bool containRetry = true, int32_t timeoutMillis = -1);
+    TopicList getHasUnitSubUnUnitTopicList(bool containRetry = true, int32_t timeoutMillis = -1);
+    // GET_ALL_PRODUCER_INFO(328): an empty GetAllProducerInfoRequestHeader; an empty response
+    // body is a failure (the broker always answers with the producer table).
+    ProducerTableInfo getAllProducerInfo(const std::string& brokerAddr, int32_t timeoutMillis = -1);
+    // GET_BROKER_HA_STATUS(907): plain broker address; an empty body is a failure.
+    HARuntimeInfo getBrokerHAStatus(const std::string& brokerAddr, int32_t timeoutMillis = -1);
+    // RESET_MASTER_FLUSH_OFFSET(908): the primitive long is always sent (0 is a real value);
+    // fixed 3000ms budget, only the SUCCESS code is checked.
+    void resetMasterFlushOffset(const std::string& brokerAddr, int64_t masterFlushOffset);
+    // CONTROLLER_ELECT_MASTER(1002), admin trigger form: designateElect is forced to true and
+    // brokerId doubles as the assigned master id (-1 = no preference, always sent).
+    // Returns the response extFields header plus the decoded BrokerMemberGroup body.
+    ElectMasterResult electMaster(const std::string& controllerAddr, const std::string& clusterName,
+                                  const std::string& brokerName, int64_t brokerId = -1);
+    // GET_BROKER_EPOCH_CACHE(1007): plain broker address, fixed 3000ms budget; a missing
+    // endOffset in an epoch entry decodes to Long.MAX_VALUE (Java LAST_EPOCH_END_OFFSET).
+    EpochEntryCache getBrokerEpochCache(const std::string& brokerAddr);
+    // SWITCH_TIMER_ENGINE(5001): the engine type is the single ext field E_T
+    // (MessageConst.TIMER_ENGINE_TYPE); no header, no body.
+    void switchTimerEngine(const std::string& brokerAddr, const std::string& engineType,
+                           int32_t timeoutMillis = -1);
+
     // ---------------- Cold-data flow control (2001/2002/2003) ----------------
     // 2001 carries the properties as body text (no request at all when the text is empty);
     // 2002 carries the consumer group as a plain string body (skipped when empty). Both VIP-rewritten.
@@ -552,6 +609,9 @@ private:
     // back, MQBrokerException otherwise.
     JsonValue invokeBrokerMethod(const std::string& addr, int32_t requestCode,
                                  const PropertyMap& extFields, int32_t timeoutMillis);
+    // One name-server round of the 311/312/313 family: first reachable name server wins; a
+    // non-SUCCESS code or an empty body throws immediately; containRetry filters client-side.
+    TopicList unitTopicList(int32_t requestCode, bool containRetry, int32_t timeoutMillis);
     // 29-family reset leaf for the concurrent form: SUCCESS without a body is a failure
     // (code 0 + remark), matching the fall-through of the raw switch.
     std::map<MessageQueue, int64_t> invokeBrokerToResetOffsetConcurrent(

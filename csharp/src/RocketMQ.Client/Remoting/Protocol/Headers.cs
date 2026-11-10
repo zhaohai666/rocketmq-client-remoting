@@ -1208,3 +1208,134 @@ public sealed class ChangeInvisibleTimeResponseHeader : ICommandCustomHeader
         ReviveQid = HeaderCodec.GetOptInt(ext, "reviveQid");
     }
 }
+
+// ---------------------------------------------------------------- #47 ops RPC group
+
+/// <summary>QueryCorrectionOffsetHeader (QUERY_CORRECTION_OFFSET = 308). The filterGroups
+/// set arrives on the wire pre-joined with commas (Java joins the Set itself in
+/// MQClientAPIImpl:2780-2788), so the port keeps a plain string.</summary>
+public sealed class QueryCorrectionOffsetRequestHeader : ICommandCustomHeader
+{
+    public string? Topic { get; set; }
+    public string? CompareGroup { get; set; }
+    public string? FilterGroups { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptStr(outMap, "topic", Topic);
+        HeaderCodec.PutOptStr(outMap, "compareGroup", CompareGroup);
+        HeaderCodec.PutOptStr(outMap, "filterGroups", FilterGroups);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        Topic = HeaderCodec.GetOptStr(ext, "topic");
+        CompareGroup = HeaderCodec.GetOptStr(ext, "compareGroup");
+        FilterGroups = HeaderCodec.GetOptStr(ext, "filterGroups");
+    }
+}
+
+/// <summary>GetAllProducerInfoRequestHeader (GET_ALL_PRODUCER_INFO = 328): an empty header,
+/// carried for shape parity with Java (no fields on the wire).</summary>
+public sealed class GetAllProducerInfoRequestHeader : ICommandCustomHeader
+{
+    public PropertyMap ToExtFields() => new();
+
+    public void FromExtFields(PropertyMap ext)
+    {
+    }
+}
+
+/// <summary>ResetMasterFlushOffsetHeader (RESET_MASTER_FLUSH_OFFSET = 908). The offset is a
+/// primitive long: 0 is a real value and must always be sent.</summary>
+public sealed class ResetMasterFlushOffsetHeader : ICommandCustomHeader
+{
+    public long MasterFlushOffset { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        outMap["masterFlushOffset"] = MasterFlushOffset.ToString(CultureInfo.InvariantCulture);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        MasterFlushOffset = HeaderCodec.GetOptLong(ext, "masterFlushOffset") ?? 0;
+    }
+}
+
+/// <summary>ElectMasterRequestHeader (CONTROLLER_ELECT_MASTER = 1002). The admin facade
+/// always uses Java's ofAdminTrigger: DesignateElect is forced to true and BrokerId doubles
+/// as the assigned master id (-1 means "no preference" — both are @CFNotNull, so they are
+/// always sent).</summary>
+public sealed class ElectMasterRequestHeader : ICommandCustomHeader
+{
+    public string ClusterName { get; set; } = string.Empty;
+    public string BrokerName { get; set; } = string.Empty;
+    public long BrokerId { get; set; } = -1;
+    public bool DesignateElect { get; set; }
+    public long InvokeTime { get; set; }
+
+    public static ElectMasterRequestHeader OfAdminTrigger(string clusterName, string brokerName,
+        long brokerId) =>
+        new()
+        {
+            ClusterName = clusterName,
+            BrokerName = brokerName,
+            BrokerId = brokerId,
+            DesignateElect = true,
+            InvokeTime = UtilAll.CurrentTimeMillis(),
+        };
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap
+        {
+            ["clusterName"] = ClusterName,
+            ["brokerName"] = BrokerName,
+            ["brokerId"] = BrokerId.ToString(CultureInfo.InvariantCulture),
+            ["designateElect"] = DesignateElect ? "true" : "false",
+            ["invokeTime"] = InvokeTime.ToString(CultureInfo.InvariantCulture),
+        };
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        ClusterName = HeaderCodec.GetOptStr(ext, "clusterName") ?? string.Empty;
+        BrokerName = HeaderCodec.GetOptStr(ext, "brokerName") ?? string.Empty;
+        BrokerId = HeaderCodec.GetOptLong(ext, "brokerId") ?? -1;
+        DesignateElect = HeaderCodec.GetOptBool(ext, "designateElect") ?? false;
+        InvokeTime = HeaderCodec.GetOptLong(ext, "invokeTime") ?? 0;
+    }
+}
+
+/// <summary>ElectMasterResponseHeader: the answer fields live in the response extFields.</summary>
+public sealed class ElectMasterResponseHeader : ICommandCustomHeader
+{
+    public long? MasterBrokerId { get; set; }
+    public string? MasterAddress { get; set; }
+    public int? MasterEpoch { get; set; }
+    public int? SyncStateSetEpoch { get; set; }
+
+    public PropertyMap ToExtFields()
+    {
+        var outMap = new PropertyMap();
+        HeaderCodec.PutOptLong(outMap, "masterBrokerId", MasterBrokerId);
+        HeaderCodec.PutOptStr(outMap, "masterAddress", MasterAddress);
+        HeaderCodec.PutOptInt(outMap, "masterEpoch", MasterEpoch);
+        HeaderCodec.PutOptInt(outMap, "syncStateSetEpoch", SyncStateSetEpoch);
+        return outMap;
+    }
+
+    public void FromExtFields(PropertyMap ext)
+    {
+        MasterBrokerId = HeaderCodec.GetOptLong(ext, "masterBrokerId");
+        MasterAddress = HeaderCodec.GetOptStr(ext, "masterAddress");
+        MasterEpoch = HeaderCodec.GetOptInt(ext, "masterEpoch");
+        SyncStateSetEpoch = HeaderCodec.GetOptInt(ext, "syncStateSetEpoch");
+    }
+}

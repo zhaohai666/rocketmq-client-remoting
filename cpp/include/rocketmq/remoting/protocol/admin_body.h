@@ -8,6 +8,7 @@
 #define ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -274,6 +275,129 @@ struct BrokerOperatorResult {
 
     Bytes encode() const;
     static bool decode(const Bytes& data, BrokerOperatorResult& out);
+};
+
+// ---------------------------------------------------------------- #47 ops RPC group
+// Response bodies of the ten mqadmin operations added in Java MQClientAPIImpl:2773-3816.
+// Field names are byte-exact Java properties: broker-side fastjson2 deserializes by name,
+// a misspelled key is silently dropped.
+
+// Body of QUERY_CORRECTION_OFFSET(308): {correctionOffsets: {"<queueId>": offset}}.
+// The JSON object keys are strings; Java holds Map<Integer, Long>.
+struct QueryCorrectionOffsetBody {
+    std::map<int32_t, int64_t> correctionOffsets;
+
+    JsonValue toJson() const;
+    static QueryCorrectionOffsetBody fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, QueryCorrectionOffsetBody& out);
+};
+
+// One entry of ProducerTableInfo.data (GET_ALL_PRODUCER_INFO = 328)
+struct ProducerInfo {
+    std::string clientId;
+    std::string remoteIP;
+    std::string language;
+    int64_t version = 0;
+    int64_t lastUpdateTimestamp = 0;
+
+    JsonValue toJson() const;
+    static ProducerInfo fromJson(const JsonValue& v);
+};
+
+// Body of GET_ALL_PRODUCER_INFO(328): {data: {group: [ProducerInfo...]}}
+struct ProducerTableInfo {
+    std::map<std::string, std::vector<ProducerInfo>> data;
+
+    JsonValue toJson() const;
+    static ProducerTableInfo fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, ProducerTableInfo& out);
+};
+
+// One HA connection to a slave, nested in HARuntimeInfo.haConnectionInfo
+struct HAConnectionRuntimeInfo {
+    std::string addr;
+    int64_t slaveAckOffset = 0;
+    int64_t diff = 0;
+    bool inSync = false;
+    int64_t transferredByteInSecond = 0;
+    int64_t transferFromWhere = 0;
+
+    JsonValue toJson() const;
+    static HAConnectionRuntimeInfo fromJson(const JsonValue& v);
+};
+
+// The HA client leg of HARuntimeInfo.haClientRuntimeInfo. fastjson2 writes the
+// activated flag under "activated" (older builds "isActivated"); decode accepts both.
+struct HAClientRuntimeInfo {
+    std::string masterAddr;
+    int64_t transferredByteInSecond = 0;
+    int64_t maxOffset = 0;
+    int64_t lastReadTimestamp = 0;
+    int64_t lastWriteTimestamp = 0;
+    int64_t masterFlushOffset = 0;
+    bool activated = false;
+
+    JsonValue toJson() const;
+    static HAClientRuntimeInfo fromJson(const JsonValue& v);
+};
+
+// Body of GET_BROKER_HA_STATUS(907)
+struct HARuntimeInfo {
+    bool master = false;
+    int64_t masterCommitLogMaxOffset = 0;
+    int32_t inSyncSlaveNums = 0;
+    std::vector<HAConnectionRuntimeInfo> haConnectionInfo;
+    HAClientRuntimeInfo haClientRuntimeInfo;
+
+    JsonValue toJson() const;
+    static HARuntimeInfo fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, HARuntimeInfo& out);
+};
+
+// One epoch entry of EpochEntryCache.epochList. A missing endOffset means "this epoch
+// is still being written": Java defaults it to Long.MAX_VALUE on the wire.
+struct EpochEntry {
+    int32_t epoch = 0;
+    int64_t startOffset = 0;
+    int64_t endOffset = std::numeric_limits<int64_t>::max();
+
+    JsonValue toJson() const;
+    static EpochEntry fromJson(const JsonValue& v);
+};
+
+// Body of GET_BROKER_EPOCH_CACHE(1007)
+struct EpochEntryCache {
+    std::string clusterName;
+    std::string brokerName;
+    int64_t brokerId = 0;
+    std::vector<EpochEntry> epochList;
+    int64_t maxOffset = 0;
+
+    JsonValue toJson() const;
+    static EpochEntryCache fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, EpochEntryCache& out);
+};
+
+// Body of CONTROLLER_ELECT_MASTER(1002): {cluster, brokerName, brokerAddrs: {"<id>": addr}}.
+// The JSON object keys are strings; Java holds Map<Long, String>.
+struct BrokerMemberGroup {
+    std::string cluster;
+    std::string brokerName;
+    std::map<int64_t, std::string> brokerAddrs;
+
+    JsonValue toJson() const;
+    static BrokerMemberGroup fromJson(const JsonValue& v);
+
+    Bytes encode() const;
+    static bool decode(const Bytes& data, BrokerMemberGroup& out);
 };
 
 }  // namespace rocketmq

@@ -23,8 +23,10 @@ use crate::common::topic_config::TopicConfig;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::admin_body::{
-    BrokerReplicasInfo, CheckRocksdbCqWriteResult, ConsumeStats, MessageQueueKey, OffsetWrapper,
-    QueryConsumeQueueResponseBody, TopicConfigSerializeWrapper, TopicStatsTable,
+    BrokerMemberGroup, BrokerReplicasInfo, CheckRocksdbCqWriteResult, ConsumeStats,
+    EpochEntryCache, HARuntimeInfo, MessageQueueKey, OffsetWrapper, ProducerTableInfo,
+    QueryConsumeQueueResponseBody, QueryCorrectionOffsetBody, TopicConfigSerializeWrapper,
+    TopicStatsTable,
 };
 use crate::remoting::protocol::auth_body::{
     acl_from_body, acls_from_body, user_from_body, users_from_body, Acl, AuthUser,
@@ -35,7 +37,11 @@ use crate::remoting::protocol::body::{
     ResetOffsetBody, TopicList,
 };
 use crate::remoting::protocol::codes::{language_code, request_code, response_code};
-use crate::remoting::protocol::ext_fields::{ExtFields, StringMap};
+use crate::remoting::protocol::ext_fields::{CustomHeader, ExtFields, StringMap};
+use crate::remoting::protocol::headers::{
+    ElectMasterRequestHeader, ElectMasterResponseHeader, GetAllProducerInfoRequestHeader,
+    QueryCorrectionOffsetRequestHeader, ResetMasterFlushOffsetRequestHeader,
+};
 use crate::remoting::protocol::remoting_command::RemotingCommand;
 use crate::remoting::protocol::route::{QueueData, TopicRouteData};
 use crate::remoting::protocol::serialize::RemotingSerializable;
@@ -3470,6 +3476,283 @@ impl DefaultMQAdminExt {
             .invoke_sync(&leader_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
             .await?;
         MQClientInstance::check_response(&response)?;
+        Ok(())
+    }
+
+    // ---------------- mqadmin ops family (#47) ----------------
+
+    /// `QUERY_CORRECTION_OFFSET(308)`: the per-queue correction offsets of
+    /// `compare_group` against one broker. Fast-channel RPC — the VIP switch
+    /// moves the port. `filter_groups` is comma-joined; an empty slice leaves
+    /// the key off the wire entirely (Java's `filterGroup == null` case).
+    pub async fn query_correction_offset(
+        &self,
+        broker_addr: &str,
+        topic: &str,
+        compare_group: &str,
+        filter_groups: &[String],
+        timeout_millis: Option<i64>,
+    ) -> Result<Vec<(i32, i64)>> {
+        let header = QueryCorrectionOffsetRequestHeader {
+            topic: Some(topic.to_string()),
+            compare_group: Some(compare_group.to_string()),
+            filter_groups: if filter_groups.is_empty() {
+                None
+            } else {
+                Some(filter_groups.join(","))
+            },
+        };
+        let response = self
+            .invoke_broker(
+                broker_addr,
+                request_code::QUERY_CORRECTION_OFFSET,
+                &ExtFields::from_header(&header),
+                None,
+                timeout_millis,
+            )
+            .await?;
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::client_with_code(response.code, response.remark.unwrap_or_default())
+            })?;
+        Ok(QueryCorrectionOffsetBody::decode(body)?.correction_offsets)
+    }
+
+    /// The three unit-topic reads (311/312/313) share one shape: a bare
+    /// request to a NAME SERVER with a null header, and a local `%RETRY%`
+    /// strip after decoding when `contain_retry` is false. `contain_retry` is
+    /// never sent on the wire.
+    async fn get_unit_topic_family(
+        &self,
+        code: i32,
+        contain_retry: bool,
+        timeout_millis: Option<i64>,
+    ) -> Result<TopicList> {
+        let response = self
+            .invoke_namesrv_one(code, &ExtFields::new(), timeout_millis)
+            .await?;
+        if response.code != response_code::SUCCESS {
+            return Err(Error::client_with_code(
+                response.code,
+                response.remark.unwrap_or_default(),
+            ));
+        }
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::client_with_code(response.code, response.remark.unwrap_or_default())
+            })?;
+        let mut topics = TopicList::decode(body)?;
+        if !contain_retry {
+            topics
+                .topic_list
+                .retain(|topic| !topic.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX));
+        }
+        Ok(topics)
+    }
+
+    /// `GET_UNIT_TOPIC_LIST(311)`.
+    pub async fn get_unit_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: Option<i64>,
+    ) -> Result<TopicList> {
+        self.get_unit_topic_family(
+            request_code::GET_UNIT_TOPIC_LIST,
+            contain_retry,
+            timeout_millis,
+        )
+        .await
+    }
+
+    /// `GET_HAS_UNIT_SUB_TOPIC_LIST(312)`.
+    pub async fn get_has_unit_sub_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: Option<i64>,
+    ) -> Result<TopicList> {
+        self.get_unit_topic_family(
+            request_code::GET_HAS_UNIT_SUB_TOPIC_LIST,
+            contain_retry,
+            timeout_millis,
+        )
+        .await
+    }
+
+    /// `GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST(313)`.
+    pub async fn get_has_unit_sub_un_unit_topic_list(
+        &self,
+        contain_retry: bool,
+        timeout_millis: Option<i64>,
+    ) -> Result<TopicList> {
+        self.get_unit_topic_family(
+            request_code::GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST,
+            contain_retry,
+            timeout_millis,
+        )
+        .await
+    }
+
+    /// `GET_ALL_PRODUCER_INFO(328)`: the live producer connections of one
+    /// broker keyed by group. Fast-channel RPC — the VIP switch moves the
+    /// port; the header type exists but carries no fields.
+    pub async fn get_all_producer_info(
+        &self,
+        broker_addr: &str,
+        timeout_millis: Option<i64>,
+    ) -> Result<ProducerTableInfo> {
+        let header = GetAllProducerInfoRequestHeader {};
+        let response = self
+            .invoke_broker(
+                broker_addr,
+                request_code::GET_ALL_PRODUCER_INFO,
+                &ExtFields::from_header(&header),
+                None,
+                timeout_millis,
+            )
+            .await?;
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::client_with_code(response.code, response.remark.unwrap_or_default())
+            })?;
+        ProducerTableInfo::decode(body)
+    }
+
+    /// `GET_BROKER_HA_STATUS(907)`: the broker's HA replication view, served
+    /// on the plain listening port.
+    pub async fn get_broker_ha_status(
+        &self,
+        broker_addr: &str,
+        timeout_millis: Option<i64>,
+    ) -> Result<HARuntimeInfo> {
+        let response = self
+            .invoke_broker_plain(
+                broker_addr,
+                request_code::GET_BROKER_HA_STATUS,
+                &ExtFields::new(),
+                None,
+                timeout_millis,
+            )
+            .await?;
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::client_with_code(response.code, response.remark.unwrap_or_default())
+            })?;
+        HARuntimeInfo::decode(body)
+    }
+
+    /// `RESET_MASTER_FLUSH_OFFSET(908)`: one primitive long in the header, on
+    /// the fixed controller budget, plain port.
+    pub async fn reset_master_flush_offset(
+        &self,
+        broker_addr: &str,
+        master_flush_offset: i64,
+    ) -> Result<()> {
+        let header = ResetMasterFlushOffsetRequestHeader {
+            master_flush_offset: Some(master_flush_offset),
+        };
+        self.invoke_broker_plain(
+            broker_addr,
+            request_code::RESET_MASTER_FLUSH_OFFSET,
+            &ExtFields::from_header(&header),
+            None,
+            Some(CONTROLLER_RPC_TIMEOUT_MILLIS),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `CONTROLLER_ELECT_MASTER(1002)`: the two-phase admin trigger. Phase one
+    /// resolves the leader with the 1005 metadata read, phase two sends the
+    /// ofAdminTrigger header — `designateElect=true`, `brokerId` defaulting to
+    /// -1, `invokeTime` = now — to the leader. The answer header rides the
+    /// response extFields, the member group is the body (Java's Pair).
+    pub async fn elect_master(
+        &self,
+        controller_addr: &str,
+        cluster_name: &str,
+        broker_name: &str,
+        broker_id: i64,
+    ) -> Result<(ElectMasterResponseHeader, BrokerMemberGroup)> {
+        let leader_addr = self.controller_leader_address(controller_addr).await?;
+        let header = ElectMasterRequestHeader {
+            cluster_name: Some(cluster_name.to_string()),
+            broker_name: Some(broker_name.to_string()),
+            broker_id: Some(broker_id),
+            designate_elect: Some(true),
+            invoke_time: Some(current_time_millis()),
+        };
+        let client = self.require_client()?;
+        let mut request = build_request(
+            request_code::CONTROLLER_ELECT_MASTER,
+            &ExtFields::from_header(&header),
+            None,
+        );
+        let response = client
+            .invoke_sync(&leader_addr, &mut request, CONTROLLER_RPC_TIMEOUT_MILLIS)
+            .await?;
+        MQClientInstance::check_response(&response)?;
+        let mut response_header = ElectMasterResponseHeader::default();
+        response_header.from_ext_fields(response.ext_fields());
+        let group = match response.body.as_deref().filter(|b| !b.is_empty()) {
+            Some(body) => BrokerMemberGroup::decode(body)?,
+            None => BrokerMemberGroup::default(),
+        };
+        Ok((response_header, group))
+    }
+
+    /// `GET_BROKER_EPOCH_CACHE(1007)`: the broker's epoch list, on the fixed
+    /// controller budget, plain port. A live epoch omits `endOffset`; the
+    /// decoder fills in `i64::MAX` (Java's `Long.MAX_VALUE`).
+    pub async fn get_broker_epoch_cache(&self, broker_addr: &str) -> Result<EpochEntryCache> {
+        let response = self
+            .invoke_broker_plain(
+                broker_addr,
+                request_code::GET_BROKER_EPOCH_CACHE,
+                &ExtFields::new(),
+                None,
+                Some(CONTROLLER_RPC_TIMEOUT_MILLIS),
+            )
+            .await?;
+        let body = response
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .ok_or_else(|| {
+                Error::client_with_code(response.code, response.remark.unwrap_or_default())
+            })?;
+        EpochEntryCache::decode(body)
+    }
+
+    /// `SWITCH_TIMER_ENGINE(5001)`: no header of its own — the engine type
+    /// rides the reserved `E_T` extField key.
+    pub async fn switch_timer_engine(
+        &self,
+        broker_addr: &str,
+        engine_type: &str,
+        timeout_millis: Option<i64>,
+    ) -> Result<()> {
+        let mut ext = ExtFields::new();
+        ext.insert("E_T", engine_type);
+        self.invoke_broker_plain(
+            broker_addr,
+            request_code::SWITCH_TIMER_ENGINE,
+            &ext,
+            None,
+            timeout_millis,
+        )
+        .await?;
         Ok(())
     }
 
@@ -7058,6 +7341,570 @@ mod tests {
             "an empty mode stays empty instead of becoming an invented default"
         );
         assert_eq!(body_json(&requests[1].1)["mode"], "NOT_POP");
+        admin.shutdown();
+    }
+
+    // ---------------- #47 ops RPC family (308/311/312/313/328/907/908/1002/1007/5001) ----------------
+
+    fn script_ok(body: &str) -> AdminScript {
+        vec![(
+            request_code::QUERY_CORRECTION_OFFSET,
+            response_code::SUCCESS,
+            Some(body.as_bytes().to_vec()),
+            Vec::new(),
+        )]
+    }
+
+    fn ext_snapshot(ext: &ExtFields) -> Vec<(String, String)> {
+        ext.iter().cloned().collect()
+    }
+
+    fn get_ext<'a>(ext: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// 308: the three header fields exactly, no request body, and the decoded
+    /// per-queue map. Java joins the filter-group set itself, comma-joined.
+    #[tokio::test]
+    async fn ops_query_correction_offset_sends_three_fields_and_decodes() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            script_ok(r#"{"correctionOffsets":{"0":110,"3":407}}"#),
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let offsets = admin
+            .query_correction_offset(
+                &addr,
+                "OpsTopic",
+                "GID_Ops",
+                &["GID_other".to_string(), "GID_x".to_string()],
+                None,
+            )
+            .await
+            .expect("308 end-to-end");
+        assert_eq!(offsets, vec![(0, 110), (3, 407)]);
+
+        let (ext, body) = logged_request(&log, request_code::QUERY_CORRECTION_OFFSET);
+        assert!(body.is_none(), "308 must not carry a request body");
+        let snapshot = ext_snapshot(&ext);
+        assert_eq!(snapshot.len(), 3, "exactly topic/compareGroup/filterGroups");
+        assert_eq!(get_ext(&snapshot, "topic"), Some("OpsTopic"));
+        assert_eq!(get_ext(&snapshot, "compareGroup"), Some("GID_Ops"));
+        let joined = get_ext(&snapshot, "filterGroups").expect("filterGroups present");
+        let mut parts: Vec<&str> = joined.split(',').collect();
+        parts.sort_unstable();
+        assert_eq!(parts, vec!["GID_other", "GID_x"]);
+        admin.shutdown();
+    }
+
+    /// An empty filter-group slice is Java's `filterGroup == null`: the key is
+    /// omitted, not written empty.
+    #[tokio::test]
+    async fn ops_query_correction_offset_omits_empty_filter_groups() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, script_ok(r#"{"correctionOffsets":{}}"#)).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .query_correction_offset(&addr, "OpsTopic", "GID_Ops", &[], None)
+            .await
+            .expect("308 without filter groups");
+
+        let (ext, _) = logged_request(&log, request_code::QUERY_CORRECTION_OFFSET);
+        let snapshot = ext_snapshot(&ext);
+        assert_eq!(
+            get_ext(&snapshot, "filterGroups"),
+            None,
+            "no filter groups must mean no key at all"
+        );
+        assert_eq!(snapshot.len(), 2);
+        admin.shutdown();
+    }
+
+    /// VIP both states: with the switch on, handing the address two ports
+    /// above the listener proves the request was rewritten down by 2 (Java
+    /// `brokerVIPChannel`); with the switch off the published port answers.
+    #[tokio::test]
+    async fn ops_query_correction_offset_vip_rewrites_the_port() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, script_ok(r#"{"correctionOffsets":{}}"#)).await;
+        let admin = started_direct_admin(&addr).await;
+        admin.set_vip_channel_enabled(true);
+
+        let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+        let shifted = format!("127.0.0.1:{}", port + 2);
+        admin
+            .query_correction_offset(&shifted, "T", "G", &[], None)
+            .await
+            .expect("vip on must land on port-2, i.e. the mock");
+        assert_eq!(
+            lock(&log)
+                .iter()
+                .filter(|(code, ..)| *code == request_code::QUERY_CORRECTION_OFFSET)
+                .count(),
+            1
+        );
+        admin.shutdown();
+    }
+
+    /// 311/312/313: one name server, a null header (no extFields at all), no
+    /// request body, and the decoded topic list. `containRetry=false` strips
+    /// the %RETRY% topics client-side after decoding — the raw request stays a
+    /// null header.
+    #[tokio::test]
+    async fn ops_unit_topic_family_hits_one_name_server_with_null_header() {
+        let body = r#"{"topicList":["TopicA","%RETRY%G"]}"#;
+        let cases = [
+            (
+                request_code::GET_UNIT_TOPIC_LIST,
+                "get_unit_topic_list",
+                0usize,
+            ),
+            (
+                request_code::GET_HAS_UNIT_SUB_TOPIC_LIST,
+                "get_has_unit_sub",
+                1,
+            ),
+            (
+                request_code::GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST,
+                "get_has_unit_sub_un_unit",
+                2,
+            ),
+        ];
+        for (code, _name, idx) in cases {
+            let (listener, addr) = bind_admin_mock().await;
+            let log = spawn_admin_broker(
+                listener,
+                vec![(
+                    code,
+                    response_code::SUCCESS,
+                    Some(body.as_bytes().to_vec()),
+                    Vec::new(),
+                )],
+            )
+            .await;
+            let admin = started_direct_admin(&addr).await;
+            assert_eq!(
+                admin.get_name_server_address_list(),
+                vec![addr.clone()],
+                "the unit family must be aimed at the name server list"
+            );
+
+            let topics = match idx {
+                0 => admin.get_unit_topic_list(true, None).await,
+                1 => admin.get_has_unit_sub_topic_list(true, None).await,
+                _ => admin.get_has_unit_sub_un_unit_topic_list(true, None).await,
+            }
+            .unwrap_or_else(|e| panic!("code {code} end-to-end failed: {e}"));
+            assert_eq!(
+                topics.topic_list,
+                vec!["TopicA".to_string(), "%RETRY%G".to_string()]
+            );
+
+            let (ext, req_body) = logged_request(&log, code);
+            assert!(ext.is_empty(), "code {code} must carry a null header");
+            assert!(req_body.is_none(), "code {code} must not carry a body");
+            admin.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn ops_unit_topic_list_filters_retry_topics_locally() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_UNIT_TOPIC_LIST,
+                response_code::SUCCESS,
+                Some(br#"{"topicList":["TopicA","%RETRY%G","%RETRY%G_lite"]}"#.to_vec()),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let topics = admin
+            .get_unit_topic_list(false, None)
+            .await
+            .expect("311 with local filter");
+        assert_eq!(topics.topic_list, vec!["TopicA".to_string()]);
+        // the raw answer is untouched on the wire: the filter happens after decoding
+        let (ext, _) = logged_request(&log, request_code::GET_UNIT_TOPIC_LIST);
+        assert!(ext.is_empty());
+        admin.shutdown();
+    }
+
+    /// 328: an empty header, no request body, and the nested producer table.
+    #[tokio::test]
+    async fn ops_get_all_producer_info_decodes_the_table() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_ALL_PRODUCER_INFO,
+                response_code::SUCCESS,
+                Some(
+                    br#"{"data":{"G":[{"clientId":"cid-1","remoteIP":"10.0.0.1","language":"JAVA","version":500,"lastUpdateTimestamp":1700000000000}]}}"#.to_vec(),
+                ),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let table = admin
+            .get_all_producer_info(&addr, None)
+            .await
+            .expect("328 end-to-end");
+        let list = table.get("G").expect("the group row");
+        assert_eq!(list.len(), 1);
+        let info = &list[0];
+        assert_eq!(info.client_id, "cid-1");
+        assert_eq!(info.remote_ip, "10.0.0.1");
+        assert_eq!(info.language, "JAVA");
+        assert_eq!(info.version, 500);
+        assert_eq!(info.last_update_timestamp, 1_700_000_000_000);
+
+        let (ext, body) = logged_request(&log, request_code::GET_ALL_PRODUCER_INFO);
+        assert!(ext.is_empty(), "GetAllProducerInfoRequestHeader is empty");
+        assert!(body.is_none());
+        admin.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ops_get_all_producer_info_vip_rewrites_the_port() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_ALL_PRODUCER_INFO,
+                response_code::SUCCESS,
+                Some(br#"{"data":{}}"#.to_vec()),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+        admin.set_vip_channel_enabled(true);
+
+        let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+        admin
+            .get_all_producer_info(&format!("127.0.0.1:{}", port + 2), None)
+            .await
+            .expect("vip on must land on port-2, i.e. the mock");
+        assert_eq!(
+            lock(&log)
+                .iter()
+                .filter(|(code, ..)| *code == request_code::GET_ALL_PRODUCER_INFO)
+                .count(),
+            1
+        );
+        admin.shutdown();
+    }
+
+    /// 907: the plain port (no -2 rewrite is applied to the given address),
+    /// no header fields, and the nested runtime decode including the
+    /// `activated` spelling of `isActivated`.
+    #[tokio::test]
+    async fn ops_get_broker_ha_status_decodes_nested_runtime_info() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_BROKER_HA_STATUS,
+                response_code::SUCCESS,
+                Some(
+                    br#"{"master":true,"masterCommitLogMaxOffset":9001,"inSyncSlaveNums":2,"haConnectionInfo":[{"addr":"10.0.0.2:10912","slaveAckOffset":8900,"diff":101,"inSync":true,"transferredByteInSecond":2048,"transferFromWhere":8700}],"haClientRuntimeInfo":{"masterAddr":"10.0.0.1:10912","transferredByteInSecond":12,"maxOffset":9001,"lastReadTimestamp":111,"lastWriteTimestamp":222,"masterFlushOffset":8800,"activated":true}}"#.to_vec(),
+                ),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let info = admin
+            .get_broker_ha_status(&addr, None)
+            .await
+            .expect("907 end-to-end");
+        assert!(info.master);
+        assert_eq!(info.master_commit_log_max_offset, 9001);
+        assert_eq!(info.in_sync_slave_nums, 2);
+        assert_eq!(info.ha_connection_info.len(), 1);
+        let conn = &info.ha_connection_info[0];
+        assert_eq!(
+            (
+                conn.addr.as_str(),
+                conn.slave_ack_offset,
+                conn.diff,
+                conn.in_sync
+            ),
+            ("10.0.0.2:10912", 8900, 101, true)
+        );
+        assert_eq!(conn.transferred_byte_in_second, 2048);
+        assert_eq!(conn.transfer_from_where, 8700);
+        let hc = info.ha_client_runtime_info.expect("ha client leg");
+        assert_eq!(hc.master_addr, "10.0.0.1:10912");
+        assert_eq!(hc.max_offset, 9001);
+        assert_eq!(hc.master_flush_offset, 8800);
+        assert!(hc.activated);
+
+        let (ext, body) = logged_request(&log, request_code::GET_BROKER_HA_STATUS);
+        assert!(ext.is_empty(), "null header");
+        assert!(body.is_none());
+        admin.shutdown();
+    }
+
+    /// 908: one primitive long in the header and nothing else, pinned to the
+    /// 3000ms budget.
+    #[tokio::test]
+    async fn ops_reset_master_flush_offset_sends_the_primitive_long() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .reset_master_flush_offset(&addr, 12345)
+            .await
+            .expect("908 end-to-end");
+
+        let (ext, body) = logged_request(&log, request_code::RESET_MASTER_FLUSH_OFFSET);
+        assert_eq!(
+            ext_snapshot(&ext),
+            vec![("masterFlushOffset".to_string(), "12345".to_string())]
+        );
+        assert!(body.is_none());
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::RESET_MASTER_FLUSH_OFFSET),
+            vec![CONTROLLER_RPC_TIMEOUT_MILLIS],
+            "908 is pinned to the fixed 3000ms budget"
+        );
+        admin.shutdown();
+    }
+
+    /// 1002: step 1 the 1005 metadata read names the leader, step 2 the
+    /// admin-trigger header goes to the leader with `designateElect=true`;
+    /// the answer header decodes from the extFields and the member group from
+    /// the body.
+    #[tokio::test]
+    async fn ops_elect_master_resolves_the_leader_then_sends_the_trigger() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![
+                (
+                    request_code::CONTROLLER_GET_METADATA_INFO,
+                    response_code::SUCCESS,
+                    None,
+                    vec![("controllerLeaderAddress".to_string(), addr.clone())],
+                ),
+                (
+                    request_code::CONTROLLER_ELECT_MASTER,
+                    response_code::SUCCESS,
+                    Some(
+                        br#"{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"10.0.0.1:10911","1":"10.0.0.2:10911"}}"#.to_vec(),
+                    ),
+                    vec![
+                        ("masterBrokerId".to_string(), "1".to_string()),
+                        ("masterAddress".to_string(), "10.0.0.2:10911".to_string()),
+                        ("masterEpoch".to_string(), "3".to_string()),
+                        ("syncStateSetEpoch".to_string(), "7".to_string()),
+                    ],
+                ),
+            ],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let (header, group) = admin
+            .elect_master(&addr, "DefaultCluster", "broker-a", 1)
+            .await
+            .expect("elect master end-to-end");
+
+        let codes = log_codes(&log);
+        let meta_pos = codes
+            .iter()
+            .position(|c| *c == request_code::CONTROLLER_GET_METADATA_INFO)
+            .expect("the 1005 metadata leg");
+        let elect_pos = codes
+            .iter()
+            .position(|c| *c == request_code::CONTROLLER_ELECT_MASTER)
+            .expect("the 1002 elect leg");
+        assert!(meta_pos < elect_pos, "metadata must precede the elect leg");
+
+        let (ext, body) = logged_request(&log, request_code::CONTROLLER_ELECT_MASTER);
+        assert!(body.is_none(), "1002 must not carry a request body");
+        let snapshot = ext_snapshot(&ext);
+        assert_eq!(get_ext(&snapshot, "clusterName"), Some("DefaultCluster"));
+        assert_eq!(get_ext(&snapshot, "brokerName"), Some("broker-a"));
+        assert_eq!(get_ext(&snapshot, "brokerId"), Some("1"));
+        assert_eq!(
+            get_ext(&snapshot, "designateElect"),
+            Some("true"),
+            "the admin path always triggers the election"
+        );
+        let invoke_time: i64 = get_ext(&snapshot, "invokeTime")
+            .expect("invokeTime present")
+            .parse()
+            .expect("invokeTime is the current millis");
+        assert!(invoke_time > 0);
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::CONTROLLER_ELECT_MASTER),
+            vec![CONTROLLER_RPC_TIMEOUT_MILLIS],
+            "the elect leg is pinned to the fixed 3000ms budget"
+        );
+
+        assert_eq!(header.master_broker_id, Some(1));
+        assert_eq!(header.master_address.as_deref(), Some("10.0.0.2:10911"));
+        assert_eq!(header.master_epoch, Some(3));
+        assert_eq!(header.sync_state_set_epoch, Some(7));
+        assert_eq!(group.cluster, "DefaultCluster");
+        assert_eq!(group.broker_name, "broker-a");
+        assert_eq!(
+            group.broker_addrs,
+            vec![
+                (0, "10.0.0.1:10911".to_string()),
+                (1, "10.0.0.2:10911".to_string())
+            ]
+        );
+        admin.shutdown();
+    }
+
+    /// Without a designated id the header carries Java's -1 default.
+    #[tokio::test]
+    async fn ops_elect_master_without_a_designated_id_sends_minus_one() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::CONTROLLER_GET_METADATA_INFO,
+                response_code::SUCCESS,
+                None,
+                vec![("controllerLeaderAddress".to_string(), addr.clone())],
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .elect_master(&addr, "DefaultCluster", "broker-a", -1)
+            .await
+            .expect("elect master with the default id");
+
+        let (ext, _) = logged_request(&log, request_code::CONTROLLER_ELECT_MASTER);
+        assert_eq!(get_ext(&ext_snapshot(&ext), "brokerId"), Some("-1"));
+        admin.shutdown();
+    }
+
+    /// 1007: the epoch list decodes, and a live epoch's missing `endOffset`
+    /// fills in Java's Long.MAX_VALUE. Pinned to the 3000ms budget.
+    #[tokio::test]
+    async fn ops_get_broker_epoch_cache_fills_the_default_end_offset() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_BROKER_EPOCH_CACHE,
+                response_code::SUCCESS,
+                Some(
+                    br#"{"clusterName":"DefaultCluster","brokerName":"broker-a","brokerId":1,"epochList":[{"epoch":1,"startOffset":0,"endOffset":500},{"epoch":2,"startOffset":500}],"maxOffset":900}"#.to_vec(),
+                ),
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let cache = admin
+            .get_broker_epoch_cache(&addr)
+            .await
+            .expect("1007 end-to-end");
+        assert_eq!(cache.cluster_name, "DefaultCluster");
+        assert_eq!(cache.broker_name, "broker-a");
+        assert_eq!(cache.broker_id, 1);
+        assert_eq!(cache.max_offset, 900);
+        assert_eq!(cache.epoch_list.len(), 2);
+        assert_eq!(
+            (
+                cache.epoch_list[0].epoch,
+                cache.epoch_list[0].start_offset,
+                cache.epoch_list[0].end_offset
+            ),
+            (1, 0, 500)
+        );
+        assert_eq!(
+            (cache.epoch_list[1].epoch, cache.epoch_list[1].start_offset),
+            (2, 500)
+        );
+        assert_eq!(
+            cache.epoch_list[1].end_offset,
+            i64::MAX,
+            "a live epoch's endOffset defaults to 9223372036854775807"
+        );
+
+        let (ext, body) = logged_request(&log, request_code::GET_BROKER_EPOCH_CACHE);
+        assert!(ext.is_empty(), "null header");
+        assert!(body.is_none());
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::GET_BROKER_EPOCH_CACHE),
+            vec![CONTROLLER_RPC_TIMEOUT_MILLIS]
+        );
+        admin.shutdown();
+    }
+
+    /// 5001: exactly one extField `E_T` = the engine type, and the caller's
+    /// timeout passes through.
+    #[tokio::test]
+    async fn ops_switch_timer_engine_sends_the_single_e_t_field() {
+        let (listener, addr) = bind_admin_mock().await;
+        let log = spawn_admin_broker(listener, Vec::new()).await;
+        let admin = started_direct_admin(&addr).await;
+
+        admin
+            .switch_timer_engine(&addr, "rocksdb", Some(4500))
+            .await
+            .expect("5001 end-to-end");
+
+        let (ext, body) = logged_request(&log, request_code::SWITCH_TIMER_ENGINE);
+        assert_eq!(
+            ext_snapshot(&ext),
+            vec![("E_T".to_string(), "rocksdb".to_string())]
+        );
+        assert!(body.is_none());
+        let client = admin_client(&admin);
+        assert_eq!(
+            timeouts_of(&client, request_code::SWITCH_TIMER_ENGINE),
+            vec![4500]
+        );
+        admin.shutdown();
+    }
+
+    /// A rejected ops call surfaces the broker's code as-is.
+    #[tokio::test]
+    async fn ops_broker_family_failure_carries_the_code() {
+        let (listener, addr) = bind_admin_mock().await;
+        spawn_admin_broker(
+            listener,
+            vec![(
+                request_code::GET_BROKER_HA_STATUS,
+                response_code::SYSTEM_ERROR,
+                None,
+                Vec::new(),
+            )],
+        )
+        .await;
+        let admin = started_direct_admin(&addr).await;
+
+        let err = admin
+            .get_broker_ha_status(&addr, None)
+            .await
+            .expect_err("the broker error must surface");
+        assert_eq!(err.response_code(), Some(response_code::SYSTEM_ERROR));
         admin.shutdown();
     }
 }

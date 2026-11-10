@@ -902,6 +902,212 @@ export class QueryResult {
   }
 }
 
+// ---------------------------------------------------------------------------
+// #47 mqadmin ops RPC bodies (Java remoting.protocol.body.*)
+// ---------------------------------------------------------------------------
+
+// QUERY_CORRECTION_OFFSET(308). JSON object keys are strings; Java holds
+// Map<Integer, Long>, so the keys are parsed back to numbers.
+export class QueryCorrectionOffsetBody {
+  correctionOffsets: Record<number, number> = {};
+  static fromDict(d: Record<string, any>): QueryCorrectionOffsetBody {
+    const b = new QueryCorrectionOffsetBody();
+    const raw = d['correctionOffsets'] || {};
+    for (const k of Object.keys(raw)) b.correctionOffsets[parseInt(k, 10)] = parseInt(raw[k], 10);
+    return b;
+  }
+  static decode(data: Buffer): QueryCorrectionOffsetBody {
+    return QueryCorrectionOffsetBody.fromDict(RemotingSerializable.decode(data) as Record<string, any>);
+  }
+}
+
+// One entry of ProducerTableInfo.data (GET_ALL_PRODUCER_INFO = 328).
+export class ProducerInfo {
+  clientId: string | null;
+  remoteIP: string | null;
+  language: string | null;
+  version: number;
+  lastUpdateTimestamp: number;
+  constructor() {
+    this.clientId = null; this.remoteIP = null; this.language = null;
+    this.version = 0; this.lastUpdateTimestamp = 0;
+  }
+  static fromDict(d: Record<string, any>): ProducerInfo {
+    const p = new ProducerInfo();
+    p.clientId = d['clientId'] != null ? d['clientId'] : null;
+    p.remoteIP = d['remoteIP'] != null ? d['remoteIP'] : null;
+    p.language = d['language'] != null ? d['language'] : null;
+    p.version = parseInt(d['version'] != null ? d['version'] : 0, 10) || 0;
+    p.lastUpdateTimestamp = parseInt(d['lastUpdateTimestamp'] != null ? d['lastUpdateTimestamp'] : 0, 10) || 0;
+    return p;
+  }
+}
+
+// GET_ALL_PRODUCER_INFO(328): group -> the producers that are still alive in it.
+export class ProducerTableInfo {
+  data: Record<string, ProducerInfo[]> = {};
+  static fromDict(d: Record<string, any>): ProducerTableInfo {
+    const b = new ProducerTableInfo();
+    const raw = d['data'] || {};
+    for (const g of Object.keys(raw)) {
+      b.data[g] = (raw[g] || []).map((p: Record<string, any>) => ProducerInfo.fromDict(p));
+    }
+    return b;
+  }
+  static decode(data: Buffer): ProducerTableInfo {
+    return ProducerTableInfo.fromDict(RemotingSerializable.decode(data) as Record<string, any>);
+  }
+}
+
+// HARuntimeInfo.HAConnectionRuntimeInfo (one HA connection to a slave).
+export class HAConnectionRuntimeInfo {
+  addr: string | null;
+  slaveAckOffset: number;
+  diff: number;
+  inSync: boolean;
+  transferredByteInSecond: number;
+  transferFromWhere: number;
+  constructor() {
+    this.addr = null; this.slaveAckOffset = 0; this.diff = 0;
+    this.inSync = false; this.transferredByteInSecond = 0; this.transferFromWhere = 0;
+  }
+  static fromDict(d: Record<string, any>): HAConnectionRuntimeInfo {
+    const c = new HAConnectionRuntimeInfo();
+    c.addr = d['addr'] != null ? d['addr'] : null;
+    c.slaveAckOffset = parseInt(d['slaveAckOffset'] != null ? d['slaveAckOffset'] : 0, 10) || 0;
+    c.diff = parseInt(d['diff'] != null ? d['diff'] : 0, 10) || 0;
+    c.inSync = d['inSync'] === true;
+    c.transferredByteInSecond = parseInt(d['transferredByteInSecond'] != null ? d['transferredByteInSecond'] : 0, 10) || 0;
+    c.transferFromWhere = parseInt(d['transferFromWhere'] != null ? d['transferFromWhere'] : 0, 10) || 0;
+    return c;
+  }
+}
+
+// HARuntimeInfo.HAClientRuntimeInfo (the HA client on a slave). Java's field is
+// isActivated: fastjson writes `activated` from the isXxx getter; accept both
+// spellings when reading broker data back.
+export class HAClientRuntimeInfo {
+  masterAddr: string | null;
+  transferredByteInSecond: number;
+  maxOffset: number;
+  lastReadTimestamp: number;
+  lastWriteTimestamp: number;
+  masterFlushOffset: number;
+  isActivated: boolean;
+  constructor() {
+    this.masterAddr = null; this.transferredByteInSecond = 0; this.maxOffset = 0;
+    this.lastReadTimestamp = 0; this.lastWriteTimestamp = 0;
+    this.masterFlushOffset = 0; this.isActivated = false;
+  }
+  static fromDict(d: Record<string, any>): HAClientRuntimeInfo {
+    const c = new HAClientRuntimeInfo();
+    c.masterAddr = d['masterAddr'] != null ? d['masterAddr'] : null;
+    c.transferredByteInSecond = parseInt(d['transferredByteInSecond'] != null ? d['transferredByteInSecond'] : 0, 10) || 0;
+    c.maxOffset = parseInt(d['maxOffset'] != null ? d['maxOffset'] : 0, 10) || 0;
+    c.lastReadTimestamp = parseInt(d['lastReadTimestamp'] != null ? d['lastReadTimestamp'] : 0, 10) || 0;
+    c.lastWriteTimestamp = parseInt(d['lastWriteTimestamp'] != null ? d['lastWriteTimestamp'] : 0, 10) || 0;
+    c.masterFlushOffset = parseInt(d['masterFlushOffset'] != null ? d['masterFlushOffset'] : 0, 10) || 0;
+    c.isActivated = d['isActivated'] === true || d['activated'] === true;
+    return c;
+  }
+}
+
+// GET_BROKER_HA_STATUS(907).
+export class HARuntimeInfo {
+  master: boolean;
+  masterCommitLogMaxOffset: number;
+  inSyncSlaveNums: number;
+  haConnectionInfo: HAConnectionRuntimeInfo[];
+  haClientRuntimeInfo: HAClientRuntimeInfo;
+  constructor() {
+    this.master = false; this.masterCommitLogMaxOffset = 0; this.inSyncSlaveNums = 0;
+    this.haConnectionInfo = []; this.haClientRuntimeInfo = new HAClientRuntimeInfo();
+  }
+  static fromDict(d: Record<string, any>): HARuntimeInfo {
+    const b = new HARuntimeInfo();
+    b.master = d['master'] === true;
+    b.masterCommitLogMaxOffset = parseInt(d['masterCommitLogMaxOffset'] != null ? d['masterCommitLogMaxOffset'] : 0, 10) || 0;
+    b.inSyncSlaveNums = parseInt(d['inSyncSlaveNums'] != null ? d['inSyncSlaveNums'] : 0, 10) || 0;
+    b.haConnectionInfo = (d['haConnectionInfo'] || []).map((c: Record<string, any>) => HAConnectionRuntimeInfo.fromDict(c));
+    if (d['haClientRuntimeInfo']) {
+      b.haClientRuntimeInfo = HAClientRuntimeInfo.fromDict(d['haClientRuntimeInfo']);
+    }
+    return b;
+  }
+  static decode(data: Buffer): HARuntimeInfo {
+    return HARuntimeInfo.fromDict(RemotingSerializable.decode(data) as Record<string, any>);
+  }
+}
+
+// One epoch entry of the broker's commitlog epoch cache. Java default:
+// LAST_EPOCH_END_OFFSET = Long.MAX_VALUE.
+export const LAST_EPOCH_END_OFFSET = 9223372036854775807;
+
+export class EpochEntry {
+  epoch: number;
+  startOffset: number;
+  endOffset: number;
+  constructor() {
+    this.epoch = 0; this.startOffset = 0; this.endOffset = LAST_EPOCH_END_OFFSET;
+  }
+  static fromDict(d: Record<string, any>): EpochEntry {
+    const e = new EpochEntry();
+    e.epoch = parseInt(d['epoch'] != null ? d['epoch'] : 0, 10) || 0;
+    e.startOffset = parseInt(d['startOffset'] != null ? d['startOffset'] : 0, 10) || 0;
+    e.endOffset = d['endOffset'] != null
+      ? parseInt(d['endOffset'], 10) : LAST_EPOCH_END_OFFSET;
+    if (e.endOffset == null || Number.isNaN(e.endOffset)) e.endOffset = LAST_EPOCH_END_OFFSET;
+    return e;
+  }
+}
+
+// GET_BROKER_EPOCH_CACHE(1007).
+export class EpochEntryCache {
+  clusterName: string | null;
+  brokerName: string | null;
+  brokerId: number;
+  epochList: EpochEntry[];
+  maxOffset: number;
+  constructor() {
+    this.clusterName = null; this.brokerName = null; this.brokerId = 0;
+    this.epochList = []; this.maxOffset = 0;
+  }
+  static fromDict(d: Record<string, any>): EpochEntryCache {
+    const b = new EpochEntryCache();
+    b.clusterName = d['clusterName'] != null ? d['clusterName'] : null;
+    b.brokerName = d['brokerName'] != null ? d['brokerName'] : null;
+    b.brokerId = parseInt(d['brokerId'] != null ? d['brokerId'] : 0, 10) || 0;
+    b.epochList = (d['epochList'] || []).map((e: Record<string, any>) => EpochEntry.fromDict(e));
+    b.maxOffset = parseInt(d['maxOffset'] != null ? d['maxOffset'] : 0, 10) || 0;
+    return b;
+  }
+  static decode(data: Buffer): EpochEntryCache {
+    return EpochEntryCache.fromDict(RemotingSerializable.decode(data) as Record<string, any>);
+  }
+}
+
+// CONTROLLER_ELECT_MASTER(1002) broker-set answer. JSON object keys are
+// strings; Java holds Map<Long, String>, so the keys are parsed back to numbers.
+export class BrokerMemberGroup {
+  cluster: string | null;
+  brokerName: string | null;
+  brokerAddrs: Record<number, string> = {};
+  constructor() {
+    this.cluster = null; this.brokerName = null;
+  }
+  static fromDict(d: Record<string, any>): BrokerMemberGroup {
+    const b = new BrokerMemberGroup();
+    b.cluster = d['cluster'] != null ? d['cluster'] : null;
+    b.brokerName = d['brokerName'] != null ? d['brokerName'] : null;
+    const raw = d['brokerAddrs'] || {};
+    for (const k of Object.keys(raw)) b.brokerAddrs[parseInt(k, 10)] = raw[k];
+    return b;
+  }
+  static decode(data: Buffer): BrokerMemberGroup {
+    return BrokerMemberGroup.fromDict(RemotingSerializable.decode(data) as Record<string, any>);
+  }
+}
+
 export default {
   KVTable, TopicList, GroupList, LockBatchRequestBody, LockBatchResponseBody, UnlockBatchRequestBody,
   GetConsumerListByGroupResponseBody, CheckClientRequestBody, ClusterInfo, Connection, ConsumerConnection,
@@ -910,4 +1116,7 @@ export default {
   ConsumeMessageDirectlyResult, ConsumerRunningInfo, TopicConfig, TopicConfigSerializeWrapper,
   OffsetWrapper, ConsumeStats, BrokerStatsData, StatsItem, MessageRequestMode, QueryMsgResponseBody, QueryResult,
   messageQueueKey, parseMessageQueueKey, decodeMessageQueueMap,
+  QueryCorrectionOffsetBody, ProducerInfo, ProducerTableInfo,
+  HAConnectionRuntimeInfo, HAClientRuntimeInfo, HARuntimeInfo,
+  EpochEntry, EpochEntryCache, BrokerMemberGroup,
 };

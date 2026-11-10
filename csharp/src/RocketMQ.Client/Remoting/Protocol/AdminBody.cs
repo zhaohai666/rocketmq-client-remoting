@@ -1265,3 +1265,437 @@ public sealed class AdminToolResult<T>
         Data = data,
     };
 }
+
+// ---------------------------------------------------------------- #47 ops RPC group
+// Response bodies of the ten mqadmin operations added in Java MQClientAPIImpl:2773-3816.
+// Field names are byte-exact Java properties: broker-side fastjson2 deserializes by name,
+// a misspelled key is silently dropped.
+
+/// <summary>Body of QUERY_CORRECTION_OFFSET(308): {correctionOffsets: {"&lt;queueId&gt;": offset}}.
+/// The JSON object keys are strings; Java holds Map&lt;Integer, Long&gt;.</summary>
+public sealed class QueryCorrectionOffsetBody
+{
+    public Dictionary<int, long> CorrectionOffsets { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var table = JsonValue.MakeObject();
+        foreach (var kv in CorrectionOffsets)
+        {
+            table.Set(kv.Key.ToString(CultureInfo.InvariantCulture), JsonValue.MakeInt(kv.Value));
+        }
+
+        var v = JsonValue.MakeObject();
+        v.Set("correctionOffsets", table);
+        return v;
+    }
+
+    public static QueryCorrectionOffsetBody FromJson(JsonValue v)
+    {
+        var b = new QueryCorrectionOffsetBody();
+        JsonValue? table = v.Find("correctionOffsets");
+        if (table is { IsObject: true })
+        {
+            foreach (var kv in table.ObjectItems())
+            {
+                if (long.TryParse(kv.Key, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                        out long key))
+                {
+                    b.CorrectionOffsets[(int)key] = kv.Value.IntValue(0);
+                }
+            }
+        }
+
+        return b;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out QueryCorrectionOffsetBody @out)
+    {
+        @out = new QueryCorrectionOffsetBody();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject)
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>One entry of ProducerTableInfo.Data (GET_ALL_PRODUCER_INFO = 328).</summary>
+public sealed class ProducerInfo
+{
+    public string ClientId { get; set; } = string.Empty;
+    public string RemoteIP { get; set; } = string.Empty;
+    public string Language { get; set; } = string.Empty;
+    public long Version { get; set; }
+    public long LastUpdateTimestamp { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("clientId", JsonValue.MakeString(ClientId));
+        v.Set("remoteIP", JsonValue.MakeString(RemoteIP));
+        v.Set("language", JsonValue.MakeString(Language));
+        v.Set("version", JsonValue.MakeInt(Version));
+        v.Set("lastUpdateTimestamp", JsonValue.MakeInt(LastUpdateTimestamp));
+        return v;
+    }
+
+    public static ProducerInfo FromJson(JsonValue v) => new()
+    {
+        ClientId = v.Get("clientId").StringValue(),
+        RemoteIP = v.Get("remoteIP").StringValue(),
+        Language = v.Get("language").StringValue(),
+        Version = v.Get("version").IntValue(0),
+        LastUpdateTimestamp = v.Get("lastUpdateTimestamp").IntValue(0),
+    };
+}
+
+/// <summary>Body of GET_ALL_PRODUCER_INFO(328): {data: {group: [ProducerInfo...]}}.</summary>
+public sealed class ProducerTableInfo
+{
+    public Dictionary<string, List<ProducerInfo>> Data { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var table = JsonValue.MakeObject();
+        foreach (var kv in Data)
+        {
+            var arr = JsonValue.MakeArray();
+            foreach (ProducerInfo p in kv.Value) arr.PushArray(p.ToJson());
+            table.Set(kv.Key, arr);
+        }
+
+        var v = JsonValue.MakeObject();
+        v.Set("data", table);
+        return v;
+    }
+
+    public static ProducerTableInfo FromJson(JsonValue v)
+    {
+        var t = new ProducerTableInfo();
+        JsonValue? table = v.Find("data");
+        if (table is { IsObject: true })
+        {
+            foreach (var kv in table.ObjectItems())
+            {
+                var list = new List<ProducerInfo>();
+                if (kv.Value.IsArray)
+                {
+                    for (int i = 0; i < kv.Value.Size(); ++i)
+                    {
+                        if (kv.Value.At(i).IsObject) list.Add(ProducerInfo.FromJson(kv.Value.At(i)));
+                    }
+                }
+
+                t.Data[kv.Key] = list;
+            }
+        }
+
+        return t;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out ProducerTableInfo @out)
+    {
+        @out = new ProducerTableInfo();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject)
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>One HA connection to a slave, nested in HARuntimeInfo.HaConnectionInfo.</summary>
+public sealed class HAConnectionRuntimeInfo
+{
+    public string Addr { get; set; } = string.Empty;
+    public long SlaveAckOffset { get; set; }
+    public long Diff { get; set; }
+    public bool InSync { get; set; }
+    public long TransferredByteInSecond { get; set; }
+    public long TransferFromWhere { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("addr", JsonValue.MakeString(Addr));
+        v.Set("slaveAckOffset", JsonValue.MakeInt(SlaveAckOffset));
+        v.Set("diff", JsonValue.MakeInt(Diff));
+        v.Set("inSync", JsonValue.MakeBool(InSync));
+        v.Set("transferredByteInSecond", JsonValue.MakeInt(TransferredByteInSecond));
+        v.Set("transferFromWhere", JsonValue.MakeInt(TransferFromWhere));
+        return v;
+    }
+
+    public static HAConnectionRuntimeInfo FromJson(JsonValue v) => new()
+    {
+        Addr = v.Get("addr").StringValue(),
+        SlaveAckOffset = v.Get("slaveAckOffset").IntValue(0),
+        Diff = v.Get("diff").IntValue(0),
+        InSync = v.Find("inSync") is { IsBool: true } s && s.BoolValue(),
+        TransferredByteInSecond = v.Get("transferredByteInSecond").IntValue(0),
+        TransferFromWhere = v.Get("transferFromWhere").IntValue(0),
+    };
+}
+
+/// <summary>The HA client leg of HARuntimeInfo.HaClientRuntimeInfo. fastjson2 writes the
+/// activated flag under "activated" (older builds "isActivated"); decode accepts both.</summary>
+public sealed class HAClientRuntimeInfo
+{
+    public string MasterAddr { get; set; } = string.Empty;
+    public long TransferredByteInSecond { get; set; }
+    public long MaxOffset { get; set; }
+    public long LastReadTimestamp { get; set; }
+    public long LastWriteTimestamp { get; set; }
+    public long MasterFlushOffset { get; set; }
+    public bool Activated { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("masterAddr", JsonValue.MakeString(MasterAddr));
+        v.Set("transferredByteInSecond", JsonValue.MakeInt(TransferredByteInSecond));
+        v.Set("maxOffset", JsonValue.MakeInt(MaxOffset));
+        v.Set("lastReadTimestamp", JsonValue.MakeInt(LastReadTimestamp));
+        v.Set("lastWriteTimestamp", JsonValue.MakeInt(LastWriteTimestamp));
+        v.Set("masterFlushOffset", JsonValue.MakeInt(MasterFlushOffset));
+        v.Set("activated", JsonValue.MakeBool(Activated));
+        return v;
+    }
+
+    public static HAClientRuntimeInfo FromJson(JsonValue v)
+    {
+        bool activated = v.Find("activated") is { IsBool: true } a && a.BoolValue();
+        if (!activated && v.Find("isActivated") is { IsBool: true } legacy)
+        {
+            activated = legacy.BoolValue();
+        }
+
+        return new HAClientRuntimeInfo
+        {
+            MasterAddr = v.Get("masterAddr").StringValue(),
+            TransferredByteInSecond = v.Get("transferredByteInSecond").IntValue(0),
+            MaxOffset = v.Get("maxOffset").IntValue(0),
+            LastReadTimestamp = v.Get("lastReadTimestamp").IntValue(0),
+            LastWriteTimestamp = v.Get("lastWriteTimestamp").IntValue(0),
+            MasterFlushOffset = v.Get("masterFlushOffset").IntValue(0),
+            Activated = activated,
+        };
+    }
+}
+
+/// <summary>Body of GET_BROKER_HA_STATUS(907).</summary>
+public sealed class HARuntimeInfo
+{
+    public bool Master { get; set; }
+    public long MasterCommitLogMaxOffset { get; set; }
+    public int InSyncSlaveNums { get; set; }
+    public List<HAConnectionRuntimeInfo> HaConnectionInfo { get; } = new();
+    public HAClientRuntimeInfo HaClientRuntimeInfo { get; set; } = new();
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("master", JsonValue.MakeBool(Master));
+        v.Set("masterCommitLogMaxOffset", JsonValue.MakeInt(MasterCommitLogMaxOffset));
+        v.Set("inSyncSlaveNums", JsonValue.MakeInt(InSyncSlaveNums));
+        var arr = JsonValue.MakeArray();
+        foreach (HAConnectionRuntimeInfo c in HaConnectionInfo) arr.PushArray(c.ToJson());
+        v.Set("haConnectionInfo", arr);
+        v.Set("haClientRuntimeInfo", HaClientRuntimeInfo.ToJson());
+        return v;
+    }
+
+    public static HARuntimeInfo FromJson(JsonValue v)
+    {
+        var info = new HARuntimeInfo
+        {
+            Master = v.Find("master") is { IsBool: true } m && m.BoolValue(),
+            MasterCommitLogMaxOffset = v.Get("masterCommitLogMaxOffset").IntValue(0),
+            InSyncSlaveNums = LegacyNumber.ToInt32(v.Get("inSyncSlaveNums").IntValue(0)),
+        };
+        JsonValue? arr = v.Find("haConnectionInfo");
+        if (arr is { IsArray: true })
+        {
+            for (int i = 0; i < arr.Size(); ++i)
+            {
+                if (arr.At(i).IsObject) info.HaConnectionInfo.Add(HAConnectionRuntimeInfo.FromJson(arr.At(i)));
+            }
+        }
+
+        if (v.Find("haClientRuntimeInfo") is { IsObject: true } client)
+        {
+            info.HaClientRuntimeInfo = HAClientRuntimeInfo.FromJson(client);
+        }
+
+        return info;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out HARuntimeInfo @out)
+    {
+        @out = new HARuntimeInfo();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject)
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>One epoch entry of EpochEntryCache.EpochList. A missing endOffset means "this
+/// epoch is still being written": Java defaults it to Long.MAX_VALUE on the wire.</summary>
+public sealed class EpochEntry
+{
+    public int Epoch { get; set; }
+    public long StartOffset { get; set; }
+    public long EndOffset { get; set; } = long.MaxValue;
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("epoch", JsonValue.MakeInt(Epoch));
+        v.Set("startOffset", JsonValue.MakeInt(StartOffset));
+        v.Set("endOffset", JsonValue.MakeInt(EndOffset));
+        return v;
+    }
+
+    public static EpochEntry FromJson(JsonValue v) => new()
+    {
+        Epoch = LegacyNumber.ToInt32(v.Get("epoch").IntValue(0)),
+        StartOffset = v.Get("startOffset").IntValue(0),
+        // A missing endOffset means the epoch is still being written (Java Long.MAX_VALUE)
+        EndOffset = v.Get("endOffset").IntValue(long.MaxValue),
+    };
+}
+
+/// <summary>Body of GET_BROKER_EPOCH_CACHE(1007).</summary>
+public sealed class EpochEntryCache
+{
+    public string ClusterName { get; set; } = string.Empty;
+    public string BrokerName { get; set; } = string.Empty;
+    public long BrokerId { get; set; }
+    public List<EpochEntry> EpochList { get; } = new();
+    public long MaxOffset { get; set; }
+
+    public JsonValue ToJson()
+    {
+        var v = JsonValue.MakeObject();
+        v.Set("clusterName", JsonValue.MakeString(ClusterName));
+        v.Set("brokerName", JsonValue.MakeString(BrokerName));
+        v.Set("brokerId", JsonValue.MakeInt(BrokerId));
+        var arr = JsonValue.MakeArray();
+        foreach (EpochEntry e in EpochList) arr.PushArray(e.ToJson());
+        v.Set("epochList", arr);
+        v.Set("maxOffset", JsonValue.MakeInt(MaxOffset));
+        return v;
+    }
+
+    public static EpochEntryCache FromJson(JsonValue v)
+    {
+        var c = new EpochEntryCache
+        {
+            ClusterName = v.Get("clusterName").StringValue(),
+            BrokerName = v.Get("brokerName").StringValue(),
+            BrokerId = v.Get("brokerId").IntValue(0),
+            MaxOffset = v.Get("maxOffset").IntValue(0),
+        };
+        JsonValue? arr = v.Find("epochList");
+        if (arr is { IsArray: true })
+        {
+            for (int i = 0; i < arr.Size(); ++i)
+            {
+                if (arr.At(i).IsObject) c.EpochList.Add(EpochEntry.FromJson(arr.At(i)));
+            }
+        }
+
+        return c;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out EpochEntryCache @out)
+    {
+        @out = new EpochEntryCache();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject)
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}
+
+/// <summary>Body of CONTROLLER_ELECT_MASTER(1002): {cluster, brokerName,
+/// brokerAddrs: {"&lt;id&gt;": addr}}. The JSON object keys are strings; Java holds
+/// Map&lt;Long, String&gt;.</summary>
+public sealed class BrokerMemberGroup
+{
+    public string Cluster { get; set; } = string.Empty;
+    public string BrokerName { get; set; } = string.Empty;
+    public Dictionary<long, string> BrokerAddrs { get; } = new();
+
+    public JsonValue ToJson()
+    {
+        var addrs = JsonValue.MakeObject();
+        foreach (var kv in BrokerAddrs)
+        {
+            addrs.Set(kv.Key.ToString(CultureInfo.InvariantCulture), JsonValue.MakeString(kv.Value));
+        }
+
+        var v = JsonValue.MakeObject();
+        v.Set("cluster", JsonValue.MakeString(Cluster));
+        v.Set("brokerName", JsonValue.MakeString(BrokerName));
+        v.Set("brokerAddrs", addrs);
+        return v;
+    }
+
+    public static BrokerMemberGroup FromJson(JsonValue v)
+    {
+        var g = new BrokerMemberGroup
+        {
+            Cluster = v.Get("cluster").StringValue(),
+            BrokerName = v.Get("brokerName").StringValue(),
+        };
+        JsonValue? addrs = v.Find("brokerAddrs");
+        if (addrs is { IsObject: true })
+        {
+            foreach (var kv in addrs.ObjectItems())
+            {
+                if (long.TryParse(kv.Key, NumberStyles.Integer, CultureInfo.InvariantCulture,
+                        out long id))
+                {
+                    g.BrokerAddrs[id] = kv.Value.StringValue();
+                }
+            }
+        }
+
+        return g;
+    }
+
+    public byte[] Encode() => RemotingSerializable.Encode(ToJson());
+
+    public static bool Decode(byte[] data, out BrokerMemberGroup @out)
+    {
+        @out = new BrokerMemberGroup();
+        if (data.Length == 0 || !RemotingSerializable.Decode(data, out JsonValue v) || !v.IsObject)
+        {
+            return false;
+        }
+
+        @out = FromJson(v);
+        return true;
+    }
+}

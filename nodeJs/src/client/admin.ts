@@ -42,7 +42,13 @@ import {
   ResetOffsetBody, TopicConfig, TopicConfigSerializeWrapper, TopicList,
   TopicFilterType, DEFAULT_PERM,
   ConsumeMessageDirectlyResult, QueryConsumeTimeSpanBody,
+  QueryCorrectionOffsetBody, ProducerTableInfo, HARuntimeInfo,
+  EpochEntryCache, BrokerMemberGroup,
 } from '../remoting/bodies.ts';
+import {
+  QueryCorrectionOffsetHeader, ResetMasterFlushOffsetHeader,
+  ElectMasterRequestHeader, ElectMasterResponseHeader,
+} from '../remoting/headers.ts';
 import {
   TopicStatsTable, UserInfo, AclInfo, QueryConsumeQueueResponseBody, GroupForbidden,
   BrokerReplicasInfo, GetMetaDataResponseHeader, CheckRocksdbCqWriteResult,
@@ -82,6 +88,9 @@ const POP_RETRY_SEPARATOR_V1 = '_';
 // Header key of SET_COMMITLOG_READ_MODE(2004) — the request has no header
 // class, this one field is written by hand.
 const FILE_READAHEAD_MODE_KEY = 'READ_AHEAD_MODE';
+// Header key of SWITCH_TIMER_ENGINE(5001) — MessageConst.TIMER_ENGINE_TYPE on
+// the Java side; there is no header class for it either.
+const TIMER_ENGINE_TYPE_KEY = 'E_T';
 // Fixed budget of the leader-routed controller RPCs (metadata / sync state /
 // clean): the controller answers locally, a longer wait only hides a dead
 // controller.
@@ -2152,6 +2161,149 @@ export class DefaultMQAdminExt {
       if (response.code !== ResponseCode.SUCCESS) errResponse = response;
     }
     if (errResponse != null) throw this._clientError(errResponse.code, errResponse.remark);
+  }
+
+  // ---------------- #47 mqadmin ops RPC group ----------------
+
+  // QUERY_CORRECTION_OFFSET(308): the broker's suggested consumer-offset
+  // corrections for `group` on `topic`. filterGroups travels comma-joined in
+  // the header; Java wraps this one RPC in brokerVIPChannel(flag, addr).
+  async queryCorrectionOffset(brokerAddr: string, topic: string, group: string,
+    filterGroups: Set<string> | null = null, timeoutMillis?: number):
+    Promise<Record<number, number>> {
+    const header = new QueryCorrectionOffsetHeader();
+    header.topic = topic;
+    header.compareGroup = group;
+    header.filterGroups = (filterGroups != null && filterGroups.size > 0)
+      ? Array.from(filterGroups).sort().join(',') : null;
+    const response = await this._invokeBroker(brokerAddr, RequestCode.QUERY_CORRECTION_OFFSET,
+      adminExt(header.toExtFields()), null, timeoutMillis);
+    const body = response.body as Buffer | null;
+    if (body == null || body.length === 0) return {};
+    return QueryCorrectionOffsetBody.decode(body).correctionOffsets;
+  }
+
+  // GET_UNIT_TOPIC_LIST(311) / GET_HAS_UNIT_SUB_TOPIC_LIST(312) /
+  // GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST(313) share the shape: null header to a
+  // name server, TopicList body, and the %RETRY% topics filtered client-side
+  // when containRetry is false (Java MQClientAPIImpl:2817-2825) — the raw
+  // answer is untouched on the wire.
+  private async _unitTopicList(code: number, containRetry: boolean,
+    timeoutMillis?: number): Promise<TopicList> {
+    const response = await this._invokeNameServerOne(code, null, timeoutMillis);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw this._clientError(response.code, response.remark || 'get unit topic list failed');
+    }
+    const body = response.body as Buffer | null;
+    if (body == null || body.length === 0) {
+      throw this._clientError(response.code, 'the name server answered without a body');
+    }
+    const topicList = TopicList.decode(body);
+    if (!containRetry && topicList.topicList != null) {
+      topicList.topicList = topicList.topicList.filter((t) => !MixAll.isRetryTopic(t));
+    }
+    return topicList;
+  }
+
+  async getUnitTopicList(containRetry = true, timeoutMillis?: number): Promise<TopicList> {
+    return this._unitTopicList(RequestCode.GET_UNIT_TOPIC_LIST, containRetry, timeoutMillis);
+  }
+
+  async getHasUnitSubTopicList(containRetry = true, timeoutMillis?: number): Promise<TopicList> {
+    return this._unitTopicList(RequestCode.GET_HAS_UNIT_SUB_TOPIC_LIST, containRetry, timeoutMillis);
+  }
+
+  async getHasUnitSubUnUnitTopicList(containRetry = true, timeoutMillis?: number): Promise<TopicList> {
+    return this._unitTopicList(RequestCode.GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST, containRetry, timeoutMillis);
+  }
+
+  // GET_ALL_PRODUCER_INFO(328): group -> producer table, empty (zero-field)
+  // header. Java wraps this one in brokerVIPChannel(flag, addr).
+  async getAllProducerInfo(brokerAddr: string, timeoutMillis?: number): Promise<ProducerTableInfo> {
+    const response = await this._invokeBroker(brokerAddr, RequestCode.GET_ALL_PRODUCER_INFO,
+      {}, null, timeoutMillis);
+    const body = response.body as Buffer | null;
+    if (body == null || body.length === 0) {
+      throw new MQBrokerException(response.code, 'empty producer table body', brokerAddr);
+    }
+    return ProducerTableInfo.decode(body);
+  }
+
+  // GET_BROKER_HA_STATUS(907) — dialled at the plain broker address, never
+  // translated to the VIP port.
+  async getBrokerHAStatus(brokerAddr: string, timeoutMillis?: number): Promise<HARuntimeInfo> {
+    const response = await this._invokeChecked(brokerAddr, RequestCode.GET_BROKER_HA_STATUS,
+      null, null, timeoutMillis);
+    const body = response.body as Buffer | null;
+    if (body == null || body.length === 0) {
+      throw new MQBrokerException(response.code, 'empty HA status body', brokerAddr);
+    }
+    return HARuntimeInfo.decode(body);
+  }
+
+  // RESET_MASTER_FLUSH_OFFSET(908): one primitive long in the header, code-only
+  // answer. Java pins this family to a 3000 ms budget.
+  async resetMasterFlushOffset(brokerAddr: string, masterFlushOffset: number,
+    timeoutMillis?: number): Promise<void> {
+    const header = new ResetMasterFlushOffsetHeader();
+    header.masterFlushOffset = masterFlushOffset;
+    const budget = (timeoutMillis != null && timeoutMillis > 0)
+      ? timeoutMillis : ControllerInvokeTimeoutMillis;
+    await this._invokeChecked(brokerAddr, RequestCode.RESET_MASTER_FLUSH_OFFSET,
+      adminExt(header.toExtFields()), null, budget);
+  }
+
+  // CONTROLLER_ELECT_MASTER(1002), two-phase: resolve the leader through 1005,
+  // then send the elect request to the LEADER with Java's ofAdminTrigger shape
+  // (designateElect=true, brokerId = the assigned master id or -1). The answer
+  // carries the header in the response extFields and the broker set in the body;
+  // the elect leg is pinned to the 3000 ms controller budget.
+  async electMaster(controllerAddr: string, clusterName: string, brokerName: string,
+    brokerId: number | null = null, timeoutMillis?: number):
+    Promise<[ElectMasterResponseHeader, BrokerMemberGroup]> {
+    const meta = await this.getControllerMetaData(controllerAddr);
+    const leaderAddress = meta.controllerLeaderAddress;
+    if (leaderAddress == null) {
+      throw new MQBrokerException(ResponseCode.SYSTEM_ERROR, 'controller leader address not found',
+        controllerAddr);
+    }
+    const header = ElectMasterRequestHeader.ofAdminTrigger(clusterName, brokerName, brokerId);
+    const budget = (timeoutMillis != null && timeoutMillis > 0)
+      ? timeoutMillis : ControllerInvokeTimeoutMillis;
+    const response = await this._invokeRaw(leaderAddress, RequestCode.CONTROLLER_ELECT_MASTER,
+      adminExt(header.toExtFields()), null, budget);
+    if (response.code !== ResponseCode.SUCCESS) {
+      throw new MQBrokerException(response.code, response.remark || `CODE: ${response.code}`,
+        leaderAddress);
+    }
+    const responseHeader = new ElectMasterResponseHeader();
+    responseHeader.fromExtFields(response.extFields || {});
+    const body = response.body as Buffer | null;
+    const memberGroup = (body != null && body.length > 0)
+      ? BrokerMemberGroup.decode(body) : new BrokerMemberGroup();
+    return [responseHeader, memberGroup];
+  }
+
+  // GET_BROKER_EPOCH_CACHE(1007): the commitlog epoch list, plain broker
+  // address, 3000 ms budget.
+  async getBrokerEpochCache(brokerAddr: string, timeoutMillis?: number): Promise<EpochEntryCache> {
+    const budget = (timeoutMillis != null && timeoutMillis > 0)
+      ? timeoutMillis : ControllerInvokeTimeoutMillis;
+    const response = await this._invokeChecked(brokerAddr, RequestCode.GET_BROKER_EPOCH_CACHE,
+      null, null, budget);
+    const body = response.body as Buffer | null;
+    if (body == null || body.length === 0) {
+      throw new MQBrokerException(response.code, 'empty epoch cache body', brokerAddr);
+    }
+    return EpochEntryCache.decode(body);
+  }
+
+  // SWITCH_TIMER_ENGINE(5001): the engine type rides in the single ext field
+  // E_T (MessageConst.TIMER_ENGINE_TYPE) — no header class for it.
+  async switchTimerEngine(brokerAddr: string, engineType: string,
+    timeoutMillis?: number): Promise<void> {
+    await this._invokeChecked(brokerAddr, RequestCode.SWITCH_TIMER_ENGINE,
+      { [TIMER_ENGINE_TYPE_KEY]: engineType }, null, timeoutMillis);
   }
 
   // ---------------- Cold-data flow control ----------------

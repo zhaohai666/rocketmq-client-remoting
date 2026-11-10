@@ -904,6 +904,55 @@ header_struct! {
     }
 }
 
+// ============================== mqadmin ops family (#47) ==============================
+
+header_struct! {
+/// `QUERY_CORRECTION_OFFSET(308)`: `filterGroups` is the comma-joined group
+/// set; Java leaves the key out entirely when the caller passed no groups.
+    QueryCorrectionOffsetRequestHeader {
+        topic: s => "topic",
+        compare_group: s => "compareGroup",
+        filter_groups: s => "filterGroups",
+    }
+}
+
+header_struct! {
+/// `GET_ALL_PRODUCER_INFO(328)`: Java declares the header type but it carries
+/// no fields, so the extFields stay empty.
+    GetAllProducerInfoRequestHeader {}
+}
+
+header_struct! {
+/// `RESET_MASTER_FLUSH_OFFSET(908)`.
+    ResetMasterFlushOffsetRequestHeader {
+        master_flush_offset: l => "masterFlushOffset",
+    }
+}
+
+header_struct! {
+/// `CONTROLLER_ELECT_MASTER(1002)` request: the admin-trigger shape is
+/// `designateElect=true` with `brokerId` defaulting to -1 and `invokeTime`
+/// set to the wall clock at send time.
+    ElectMasterRequestHeader {
+        cluster_name: s => "clusterName",
+        broker_name: s => "brokerName",
+        broker_id: l => "brokerId",
+        designate_elect: b => "designateElect",
+        invoke_time: l => "invokeTime",
+    }
+}
+
+header_struct! {
+/// The 1002 answer header rides the response extFields; the member group
+/// itself comes in the body.
+    ElectMasterResponseHeader {
+        master_broker_id: l => "masterBrokerId",
+        master_address: s => "masterAddress",
+        master_epoch: i => "masterEpoch",
+        sync_state_set_epoch: i => "syncStateSetEpoch",
+    }
+}
+
 #[cfg(test)]
 const PROTOCOL_HEADER_FIELDS: &[(&str, &[&str])] = &[
     (

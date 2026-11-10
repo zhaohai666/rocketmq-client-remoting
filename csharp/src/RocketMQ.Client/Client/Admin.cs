@@ -2343,6 +2343,249 @@ public sealed class DefaultMQAdminExt
         }
     }
 
+    // ---------------------------------------------------------------- Ops RPC group (#47)
+    // Routing split: 308/328 go through AddrForRpc (port-2 while VipChannelEnabled is on, a
+    // plain no-op when off, the same shape as Java brokerVIPChannel(flag, addr)); 907/908/1007/5001
+    // use the plain broker address; 311/312/313 go to a name server; 1002 first resolves the
+    // controller leader via 1005 and then sends the elect request to the leader (3000ms budget
+    // on every controller leg).
+
+    /// <summary>QUERY_CORRECTION_OFFSET(308): the three header fields topic/compareGroup/
+    /// filterGroups, filterGroups comma-joined and omitted when the set is empty. An empty
+    /// body decodes to an empty map.</summary>
+    public Dictionary<int, long> QueryCorrectionOffset(string brokerAddr, string topic, string group,
+        IEnumerable<string>? filterGroups = null, int timeoutMillis = -1)
+    {
+        var header = new QueryCorrectionOffsetRequestHeader
+        {
+            Topic = topic,
+            CompareGroup = group,
+        };
+        if (filterGroups != null)
+        {
+            List<string> groups = filterGroups.ToList();
+            if (groups.Count > 0)
+            {
+                header.FilterGroups = string.Join(",", groups);
+            }
+        }
+
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        RemotingCommand response = RequireClient().InvokeSyncRaw(AddrForRpc(brokerAddr),
+            RequestCode.QueryCorrectionOffset, header.ToExtFields(), null, false, to);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        // An empty body decodes to an empty map (nothing to correct)
+        var body = new QueryCorrectionOffsetBody();
+        if (response.Body is { Length: > 0 } && !QueryCorrectionOffsetBody.Decode(response.Body, out body!))
+        {
+            throw new MQBrokerException(response.Code, "malformed correction offset body");
+        }
+
+        return body.CorrectionOffsets;
+    }
+
+    /// <summary>One name-server round of the 311/312/313 family: first reachable name server
+    /// wins; a non-SUCCESS code or an empty body throws immediately; the %RETRY% topics are
+    /// filtered client-side when containRetry is false (Java MQClientAPIImpl:2817-2825 filters
+    /// locally; nothing about containRetry goes on the wire).</summary>
+    private TopicList UnitTopicList(int requestCode, bool containRetry, int timeoutMillis)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        MQClientInstance client = RequireClient();
+        string? lastError = null;
+        foreach (string ns in client.NameServerAddrs)
+        {
+            RemotingCommand response;
+            try
+            {
+                response = client.InvokeSyncRaw(ns, requestCode, null, null, false, to);
+            }
+            catch (Exception e)
+            {
+                lastError = e.Message;
+                continue;
+            }
+
+            if (response.Code != ResponseCode.Success)
+            {
+                throw new MQClientException(response.Remark, response.Code);
+            }
+
+            if (response.Body is not { Length: > 0 })
+            {
+                throw new MQClientException("the name server answered without a body",
+                    response.Code);
+            }
+
+            if (!TopicList.Decode(response.Body, out TopicList list))
+            {
+                throw new MQClientException("malformed topic list body", response.Code);
+            }
+
+            if (!containRetry)
+            {
+                // Java strips the %RETRY% prefix client-side (MQClientAPIImpl:2817-2825)
+                var kept = new List<string>();
+                foreach (string t in list.Topics)
+                {
+                    if (!MixAll.IsRetryTopic(t)) kept.Add(t);
+                }
+
+                list.Topics.Clear();
+                list.Topics.AddRange(kept);
+            }
+
+            return list;
+        }
+
+        throw new MQClientException("all name servers unreachable: " + (lastError ?? ""));
+    }
+
+    /// <summary>GET_UNIT_TOPIC_LIST(311): null header to a name server, TopicList body.</summary>
+    public TopicList GetUnitTopicList(bool containRetry = true, int timeoutMillis = -1) =>
+        UnitTopicList(RequestCode.GetUnitTopicList, containRetry, timeoutMillis);
+
+    /// <summary>GET_HAS_UNIT_SUB_TOPIC_LIST(312): null header to a name server.</summary>
+    public TopicList GetHasUnitSubTopicList(bool containRetry = true, int timeoutMillis = -1) =>
+        UnitTopicList(RequestCode.GetHasUnitSubTopicList, containRetry, timeoutMillis);
+
+    /// <summary>GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST(313): null header to a name server.</summary>
+    public TopicList GetHasUnitSubUnUnitTopicList(bool containRetry = true, int timeoutMillis = -1) =>
+        UnitTopicList(RequestCode.GetHasUnitSubUnunitTopicList, containRetry, timeoutMillis);
+
+    /// <summary>GET_ALL_PRODUCER_INFO(328): an empty GetAllProducerInfoRequestHeader; an
+    /// empty response body is a failure (the broker always answers with the producer table).</summary>
+    public ProducerTableInfo GetAllProducerInfo(string brokerAddr, int timeoutMillis = -1)
+    {
+        var header = new GetAllProducerInfoRequestHeader();
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        RemotingCommand response = RequireClient().InvokeSyncRaw(AddrForRpc(brokerAddr),
+            RequestCode.GetAllProducerInfo, header.ToExtFields(), null, false, to);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        if (response.Body is not { Length: > 0 })
+        {
+            throw new MQBrokerException(response.Code, "empty producer table body");
+        }
+
+        if (!ProducerTableInfo.Decode(response.Body, out ProducerTableInfo table))
+        {
+            throw new MQBrokerException(response.Code, "malformed producer table body");
+        }
+
+        return table;
+    }
+
+    /// <summary>GET_BROKER_HA_STATUS(907): plain broker address; an empty body is a failure.</summary>
+    public HARuntimeInfo GetBrokerHaStatus(string brokerAddr, int timeoutMillis = -1)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr,
+            RequestCode.GetBrokerHaStatus, null, null, false, to);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        if (response.Body is not { Length: > 0 })
+        {
+            throw new MQBrokerException(response.Code, "empty HA status body");
+        }
+
+        if (!HARuntimeInfo.Decode(response.Body, out HARuntimeInfo info))
+        {
+            throw new MQBrokerException(response.Code, "malformed HA status body");
+        }
+
+        return info;
+    }
+
+    /// <summary>RESET_MASTER_FLUSH_OFFSET(908): the primitive long is always sent (0 is a
+    /// real value); fixed 3000ms budget, only the SUCCESS code is checked.</summary>
+    public void ResetMasterFlushOffset(string brokerAddr, long masterFlushOffset)
+    {
+        var header = new ResetMasterFlushOffsetHeader { MasterFlushOffset = masterFlushOffset };
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr,
+            RequestCode.ResetMasterFlushOffset, header.ToExtFields(), null, false, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
+    /// <summary>CONTROLLER_ELECT_MASTER(1002), admin trigger form: DesignateElect is forced
+    /// to true and BrokerId doubles as the assigned master id (-1 = no preference, always
+    /// sent). Returns the response extFields header plus the decoded BrokerMemberGroup body
+    /// (a body-less answer leaves the member group untouched).</summary>
+    public (ElectMasterResponseHeader Header, BrokerMemberGroup MemberGroup) ElectMaster(
+        string controllerAddr, string clusterName, string brokerName, long brokerId = -1)
+    {
+        GetMetaDataResponseHeader meta = GetControllerMetaData(controllerAddr);
+        ElectMasterRequestHeader header =
+            ElectMasterRequestHeader.OfAdminTrigger(clusterName, brokerName, brokerId);
+        RemotingCommand response = RequireClient().InvokeSyncRaw(meta.ControllerLeaderAddress,
+            RequestCode.ControllerElectMaster, header.ToExtFields(), null, false, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        var resultHeader = new ElectMasterResponseHeader();
+        resultHeader.FromExtFields(response.ExtFields);
+        var memberGroup = new BrokerMemberGroup();
+        if (response.Body is { Length: > 0 })
+        {
+            BrokerMemberGroup.Decode(response.Body, out memberGroup!);
+        }
+
+        return (resultHeader, memberGroup);
+    }
+
+    /// <summary>GET_BROKER_EPOCH_CACHE(1007): plain broker address, fixed 3000ms budget; a
+    /// missing endOffset in an epoch entry decodes to long.MaxValue (Java LAST_EPOCH_END_OFFSET).</summary>
+    public EpochEntryCache GetBrokerEpochCache(string brokerAddr)
+    {
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr,
+            RequestCode.GetBrokerEpochCache, null, null, false, 3000);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+
+        if (response.Body is not { Length: > 0 })
+        {
+            throw new MQBrokerException(response.Code, "empty epoch cache body");
+        }
+
+        if (!EpochEntryCache.Decode(response.Body, out EpochEntryCache cache))
+        {
+            throw new MQBrokerException(response.Code, "malformed epoch cache body");
+        }
+
+        return cache;
+    }
+
+    /// <summary>SWITCH_TIMER_ENGINE(5001): the engine type is the single ext field E_T
+    /// (MessageConst.TIMER_ENGINE_TYPE); no header, no body.</summary>
+    public void SwitchTimerEngine(string brokerAddr, string engineType, int timeoutMillis = -1)
+    {
+        int to = timeoutMillis < 0 ? _timeoutMillis : timeoutMillis;
+        var ext = new PropertyMap { ["E_T"] = engineType };
+        RemotingCommand response = RequireClient().InvokeSyncRaw(brokerAddr,
+            RequestCode.SwitchTimerEngine, ext, null, false, to);
+        if (response.Code != ResponseCode.Success)
+        {
+            throw new MQBrokerException(response.Code, response.Remark);
+        }
+    }
+
     // ---------------------------------------------------------------- Lite admin
 
     /// <summary>

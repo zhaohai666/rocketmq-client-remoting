@@ -996,3 +996,253 @@ final class ConsumeMessageDirectlyResult
         return self::fromDict(is_array($obj) ? $obj : []);
     }
 }
+
+// ---------------- #47 mqadmin ops RPC bodies (Java remoting.protocol.body.*) ----------------
+
+/**
+ * QUERY_CORRECTION_OFFSET(308). JSON object keys are strings; Java holds
+ * Map<Integer, Long>, so the keys are parsed back to ints.
+ */
+final class QueryCorrectionOffsetBody
+{
+    /** @var array<int, int> */
+    public array $correctionOffsets = [];
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $b = new self();
+        foreach ((array)($d['correctionOffsets'] ?? []) as $k => $v) {
+            $b->correctionOffsets[(int)$k] = (int)$v;
+        }
+        return $b;
+    }
+
+    public static function decode(string $data): self
+    {
+        $obj = RemotingSerializable::fastjsonLoads($data);
+        return self::fromDict(is_array($obj) ? $obj : []);
+    }
+}
+
+/** One entry of ProducerTableInfo.data (GET_ALL_PRODUCER_INFO = 328). */
+final class ProducerInfo
+{
+    public ?string $clientId = null;
+    public ?string $remoteIP = null;
+    public ?string $language = null;
+    public int $version = 0;
+    public int $lastUpdateTimestamp = 0;
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $p = new self();
+        $p->clientId = isset($d['clientId']) ? (string)$d['clientId'] : null;
+        $p->remoteIP = isset($d['remoteIP']) ? (string)$d['remoteIP'] : null;
+        $p->language = isset($d['language']) ? (string)$d['language'] : null;
+        $p->version = (int)($d['version'] ?? 0);
+        $p->lastUpdateTimestamp = (int)($d['lastUpdateTimestamp'] ?? 0);
+        return $p;
+    }
+}
+
+/** GET_ALL_PRODUCER_INFO(328): group -> the producers that are still alive in it. */
+final class ProducerTableInfo
+{
+    /** @var array<string, list<ProducerInfo>> */
+    public array $data = [];
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $b = new self();
+        foreach ((array)($d['data'] ?? []) as $group => $producers) {
+            $b->data[(string)$group] = [];
+            foreach ((array)$producers as $p) {
+                $b->data[(string)$group][] = ProducerInfo::fromDict(is_array($p) ? $p : []);
+            }
+        }
+        return $b;
+    }
+
+    public static function decode(string $data): self
+    {
+        $obj = RemotingSerializable::fastjsonLoads($data);
+        return self::fromDict(is_array($obj) ? $obj : []);
+    }
+}
+
+/** HARuntimeInfo.HAConnectionRuntimeInfo (one HA connection to a slave). */
+final class HAConnectionRuntimeInfo
+{
+    public ?string $addr = null;
+    public int $slaveAckOffset = 0;
+    public int $diff = 0;
+    public bool $inSync = false;
+    public int $transferredByteInSecond = 0;
+    public int $transferFromWhere = 0;
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $c = new self();
+        $c->addr = isset($d['addr']) ? (string)$d['addr'] : null;
+        $c->slaveAckOffset = (int)($d['slaveAckOffset'] ?? 0);
+        $c->diff = (int)($d['diff'] ?? 0);
+        $c->inSync = (bool)($d['inSync'] ?? false);
+        $c->transferredByteInSecond = (int)($d['transferredByteInSecond'] ?? 0);
+        $c->transferFromWhere = (int)($d['transferFromWhere'] ?? 0);
+        return $c;
+    }
+}
+
+/**
+ * HARuntimeInfo.HAClientRuntimeInfo (the HA client on a slave). Java's field is
+ * isActivated: fastjson writes ``activated`` from the isXxx getter; accept both
+ * spellings when reading broker data back.
+ */
+final class HAClientRuntimeInfo
+{
+    public ?string $masterAddr = null;
+    public int $transferredByteInSecond = 0;
+    public int $maxOffset = 0;
+    public int $lastReadTimestamp = 0;
+    public int $lastWriteTimestamp = 0;
+    public int $masterFlushOffset = 0;
+    public bool $isActivated = false;
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $c = new self();
+        $c->masterAddr = isset($d['masterAddr']) ? (string)$d['masterAddr'] : null;
+        $c->transferredByteInSecond = (int)($d['transferredByteInSecond'] ?? 0);
+        $c->maxOffset = (int)($d['maxOffset'] ?? 0);
+        $c->lastReadTimestamp = (int)($d['lastReadTimestamp'] ?? 0);
+        $c->lastWriteTimestamp = (int)($d['lastWriteTimestamp'] ?? 0);
+        $c->masterFlushOffset = (int)($d['masterFlushOffset'] ?? 0);
+        $c->isActivated = (bool)($d['isActivated'] ?? ($d['activated'] ?? false));
+        return $c;
+    }
+}
+
+/** GET_BROKER_HA_STATUS(907). */
+final class HARuntimeInfo
+{
+    public bool $master = false;
+    public int $masterCommitLogMaxOffset = 0;
+    public int $inSyncSlaveNums = 0;
+    /** @var list<HAConnectionRuntimeInfo> */
+    public array $haConnectionInfo = [];
+    public HAClientRuntimeInfo $haClientRuntimeInfo;
+
+    public function __construct()
+    {
+        $this->haClientRuntimeInfo = new HAClientRuntimeInfo();
+    }
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $b = new self();
+        $b->master = (bool)($d['master'] ?? false);
+        $b->masterCommitLogMaxOffset = (int)($d['masterCommitLogMaxOffset'] ?? 0);
+        $b->inSyncSlaveNums = (int)($d['inSyncSlaveNums'] ?? 0);
+        foreach ((array)($d['haConnectionInfo'] ?? []) as $c) {
+            $b->haConnectionInfo[] = HAConnectionRuntimeInfo::fromDict(is_array($c) ? $c : []);
+        }
+        if (isset($d['haClientRuntimeInfo']) && is_array($d['haClientRuntimeInfo'])) {
+            $b->haClientRuntimeInfo = HAClientRuntimeInfo::fromDict($d['haClientRuntimeInfo']);
+        }
+        return $b;
+    }
+
+    public static function decode(string $data): self
+    {
+        $obj = RemotingSerializable::fastjsonLoads($data);
+        return self::fromDict(is_array($obj) ? $obj : []);
+    }
+}
+
+/** One epoch entry of the broker's commitlog epoch cache. Java default: LAST_EPOCH_END_OFFSET. */
+final class EpochEntry
+{
+    /** Java LAST_EPOCH_END_OFFSET = Long.MAX_VALUE. */
+    public const LAST_EPOCH_END_OFFSET = 9223372036854775807;
+
+    public int $epoch = 0;
+    public int $startOffset = 0;
+    public int $endOffset = self::LAST_EPOCH_END_OFFSET;
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $e = new self();
+        $e->epoch = (int)($d['epoch'] ?? 0);
+        $e->startOffset = (int)($d['startOffset'] ?? 0);
+        $e->endOffset = isset($d['endOffset']) ? (int)$d['endOffset'] : self::LAST_EPOCH_END_OFFSET;
+        return $e;
+    }
+}
+
+/** GET_BROKER_EPOCH_CACHE(1007). */
+final class EpochEntryCache
+{
+    public ?string $clusterName = null;
+    public ?string $brokerName = null;
+    public int $brokerId = 0;
+    /** @var list<EpochEntry> */
+    public array $epochList = [];
+    public int $maxOffset = 0;
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $b = new self();
+        $b->clusterName = isset($d['clusterName']) ? (string)$d['clusterName'] : null;
+        $b->brokerName = isset($d['brokerName']) ? (string)$d['brokerName'] : null;
+        $b->brokerId = (int)($d['brokerId'] ?? 0);
+        foreach ((array)($d['epochList'] ?? []) as $e) {
+            $b->epochList[] = EpochEntry::fromDict(is_array($e) ? $e : []);
+        }
+        $b->maxOffset = (int)($d['maxOffset'] ?? 0);
+        return $b;
+    }
+
+    public static function decode(string $data): self
+    {
+        $obj = RemotingSerializable::fastjsonLoads($data);
+        return self::fromDict(is_array($obj) ? $obj : []);
+    }
+}
+
+/**
+ * CONTROLLER_ELECT_MASTER(1002) broker-set answer. JSON object keys are strings;
+ * Java holds Map<Long, String>, so the keys are parsed back to ints.
+ */
+final class BrokerMemberGroup
+{
+    public ?string $cluster = null;
+    public ?string $brokerName = null;
+    /** @var array<int, string> */
+    public array $brokerAddrs = [];
+
+    /** @param array<string, mixed> $d */
+    public static function fromDict(array $d): self
+    {
+        $b = new self();
+        $b->cluster = isset($d['cluster']) ? (string)$d['cluster'] : null;
+        $b->brokerName = isset($d['brokerName']) ? (string)$d['brokerName'] : null;
+        foreach ((array)($d['brokerAddrs'] ?? []) as $k => $v) {
+            $b->brokerAddrs[(int)$k] = (string)$v;
+        }
+        return $b;
+    }
+
+    public static function decode(string $data): self
+    {
+        $obj = RemotingSerializable::fastjsonLoads($data);
+        return self::fromDict(is_array($obj) ? $obj : []);
+    }
+}

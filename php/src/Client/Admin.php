@@ -20,6 +20,7 @@ use RocketMQ\Remoting\Protocol\AdminToolsResultCodeEnum;
 use RocketMQ\Remoting\Protocol\AuthAclInfo;
 use RocketMQ\Remoting\Protocol\AuthUserInfo;
 use RocketMQ\Remoting\Protocol\BrokerData;
+use RocketMQ\Remoting\Protocol\BrokerMemberGroup;
 use RocketMQ\Remoting\Protocol\BrokerOperatorResult;
 use RocketMQ\Remoting\Protocol\BrokerReplicasInfo;
 use RocketMQ\Remoting\Protocol\CheckRocksdbCqWriteResult;
@@ -29,23 +30,32 @@ use RocketMQ\Remoting\Protocol\ConsumeStats;
 use RocketMQ\Remoting\Protocol\ConsumeStatsList;
 use RocketMQ\Remoting\Protocol\ConsumerConnection;
 use RocketMQ\Remoting\Protocol\ConsumerRunningInfo;
+use RocketMQ\Remoting\Protocol\ElectMasterRequestHeader;
+use RocketMQ\Remoting\Protocol\ElectMasterResponseHeader;
+use RocketMQ\Remoting\Protocol\EpochEntryCache;
 use RocketMQ\Remoting\Protocol\ExtraInfoUtil;
+use RocketMQ\Remoting\Protocol\GetAllProducerInfoRequestHeader;
 use RocketMQ\Remoting\Protocol\GetBrokerLiteInfoResponseBody;
 use RocketMQ\Remoting\Protocol\GetConsumerListByGroupResponseBody;
 use RocketMQ\Remoting\Protocol\GetLiteClientInfoResponseBody;
 use RocketMQ\Remoting\Protocol\GetLiteGroupInfoResponseBody;
 use RocketMQ\Remoting\Protocol\GetLiteTopicInfoResponseBody;
 use RocketMQ\Remoting\Protocol\GetParentTopicInfoResponseBody;
+use RocketMQ\Remoting\Protocol\HARuntimeInfo;
 use RocketMQ\Remoting\Protocol\KVTable;
 use RocketMQ\Remoting\Protocol\LanguageCode;
 use RocketMQ\Remoting\Protocol\OffsetWrapper;
 use RocketMQ\Remoting\Protocol\ProducerConnection;
+use RocketMQ\Remoting\Protocol\ProducerTableInfo;
+use RocketMQ\Remoting\Protocol\QueryCorrectionOffsetBody;
+use RocketMQ\Remoting\Protocol\QueryCorrectionOffsetHeader;
 use RocketMQ\Remoting\Protocol\QueueData;
 use RocketMQ\Remoting\Protocol\QueryConsumeQueueResponseBody;
 use RocketMQ\Remoting\Protocol\QueryConsumeTimeSpanBody;
 use RocketMQ\Remoting\Protocol\RemotingCommand;
 use RocketMQ\Remoting\Protocol\RequestCode;
 use RocketMQ\Remoting\Protocol\ResponseCode;
+use RocketMQ\Remoting\Protocol\ResetMasterFlushOffsetHeader;
 use RocketMQ\Remoting\Protocol\ResetOffsetBody;
 use RocketMQ\Remoting\Protocol\SubscriptionGroupConfig;
 use RocketMQ\Remoting\Protocol\SubscriptionGroupWrapper;
@@ -1234,6 +1244,166 @@ class DefaultMQAdminExt
             $ext['brokerControllerIdsToClean'] = $brokerControllerIdsToClean;
         }
         $this->invokeBroker($leaderAddress, RequestCode::CLEAN_BROKER_DATA, $ext, timeoutMillis: self::CONTROLLER_TIMEOUT, vip: false);
+    }
+
+    // ---------------- #47 mqadmin ops RPC group ----------------
+
+    /** Header field of SWITCH_TIMER_ENGINE(5001): MessageConst.TIMER_ENGINE_TYPE on the Java side. */
+    public const TIMER_ENGINE_TYPE = 'E_T';
+
+    /**
+     * QUERY_CORRECTION_OFFSET(308): the broker's suggested consumer-offset corrections for
+     * ``$group`` on ``$topic``. filterGroups travels comma-joined in the header; Java wraps
+     * this one RPC in brokerVIPChannel(flag, addr).
+     *
+     * @param array<string, string>|null $filterGroups kept as a plain string set (comma-joined)
+     * @return array<int, int>
+     */
+    public function queryCorrectionOffset(string $brokerAddr, string $topic, string $group, ?array $filterGroups = null, ?int $timeoutMillis = null): array
+    {
+        $header = new QueryCorrectionOffsetHeader(
+            topic: $topic,
+            compareGroup: $group,
+            filterGroups: ($filterGroups !== null && $filterGroups !== [])
+                ? implode(',', array_values($filterGroups)) : null,
+        );
+        $response = $this->invokeBroker($brokerAddr, RequestCode::QUERY_CORRECTION_OFFSET,
+            $header->toExtFields(), timeoutMillis: $timeoutMillis);
+        if ($response->body === null || $response->body === '') {
+            return [];
+        }
+        return QueryCorrectionOffsetBody::decode($response->body)->correctionOffsets;
+    }
+
+    /**
+     * GET_UNIT_TOPIC_LIST(311) / GET_HAS_UNIT_SUB_TOPIC_LIST(312) /
+     * GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST(313) share the shape: null header to ONE name
+     * server, TopicList body, and the %RETRY% topics filtered client-side when
+     * ``$containRetry`` is false (Java MQClientAPIImpl:2817-2825) — the raw answer is
+     * untouched on the wire.
+     */
+    private function unitTopicList(int $code, bool $containRetry, ?int $timeoutMillis): TopicList
+    {
+        $response = $this->invokeNamesrvOne($code, timeoutMillis: $timeoutMillis);
+        if ($response->code !== ResponseCode::SUCCESS) {
+            throw new MQClientException(
+                $response->remark !== null && $response->remark !== ''
+                    ? $response->remark : 'get unit topic list failed',
+                $response->code,
+            );
+        }
+        if ($response->body === null || $response->body === '') {
+            throw new MQClientException('the name server answered without a body', $response->code);
+        }
+        $topicList = TopicList::decode($response->body);
+        if (!$containRetry) {
+            $topicList->topicList = array_values(array_filter(
+                $topicList->topicList,
+                static fn(string $t): bool => !MixAll::isRetryTopic($t),
+            ));
+        }
+        return $topicList;
+    }
+
+    /** GET_UNIT_TOPIC_LIST(311) (Java MQClientAPIImpl:2807). */
+    public function getUnitTopicList(bool $containRetry = true, ?int $timeoutMillis = null): TopicList
+    {
+        return $this->unitTopicList(RequestCode::GET_UNIT_TOPIC_LIST, $containRetry, $timeoutMillis);
+    }
+
+    /** GET_HAS_UNIT_SUB_TOPIC_LIST(312) (Java MQClientAPIImpl:2837). */
+    public function getHasUnitSubTopicList(bool $containRetry = true, ?int $timeoutMillis = null): TopicList
+    {
+        return $this->unitTopicList(RequestCode::GET_HAS_UNIT_SUB_TOPIC_LIST, $containRetry, $timeoutMillis);
+    }
+
+    /** GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST(313) (Java MQClientAPIImpl:2866). */
+    public function getHasUnitSubUnUnitTopicList(bool $containRetry = true, ?int $timeoutMillis = null): TopicList
+    {
+        return $this->unitTopicList(RequestCode::GET_HAS_UNIT_SUB_UNUNIT_TOPIC_LIST, $containRetry, $timeoutMillis);
+    }
+
+    /**
+     * GET_ALL_PRODUCER_INFO(328): group -> producer table, empty (zero-field) header.
+     * Java wraps this one in brokerVIPChannel(flag, addr).
+     */
+    public function getAllProducerInfo(string $brokerAddr, ?int $timeoutMillis = null): ProducerTableInfo
+    {
+        $header = new GetAllProducerInfoRequestHeader();
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_ALL_PRODUCER_INFO,
+            $header->toExtFields(), timeoutMillis: $timeoutMillis);
+        if ($response->body === null || $response->body === '') {
+            throw new MQBrokerException($response->code, 'empty producer table body');
+        }
+        return ProducerTableInfo::decode($response->body);
+    }
+
+    /** GET_BROKER_HA_STATUS(907) — dialled at the plain broker address, never VIP-translated. */
+    public function getBrokerHAStatus(string $brokerAddr, ?int $timeoutMillis = null): HARuntimeInfo
+    {
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_BROKER_HA_STATUS,
+            timeoutMillis: $timeoutMillis, vip: false);
+        if ($response->body === null || $response->body === '') {
+            throw new MQBrokerException($response->code, 'empty HA status body');
+        }
+        return HARuntimeInfo::decode($response->body);
+    }
+
+    /**
+     * RESET_MASTER_FLUSH_OFFSET(908): one primitive long in the header, code-only answer.
+     * Java pins this family to the 3000 ms controller budget.
+     */
+    public function resetMasterFlushOffset(string $brokerAddr, int $masterFlushOffset, ?int $timeoutMillis = null): void
+    {
+        $header = new ResetMasterFlushOffsetHeader($masterFlushOffset);
+        $this->invokeBroker($brokerAddr, RequestCode::RESET_MASTER_FLUSH_OFFSET,
+            $header->toExtFields(), timeoutMillis: $timeoutMillis ?? self::CONTROLLER_TIMEOUT, vip: false);
+    }
+
+    /**
+     * CONTROLLER_ELECT_MASTER(1002), two-phase: resolve the leader through 1005, then send
+     * the elect request to the LEADER with Java's ofAdminTrigger shape (designateElect=true,
+     * brokerId = the assigned master id or -1). The answer carries the header in the response
+     * extFields and the broker set in the body; the elect leg is pinned to the 3000 ms budget.
+     *
+     * @return array{0: ElectMasterResponseHeader, 1: BrokerMemberGroup}
+     */
+    public function electMaster(string $controllerAddr, string $clusterName, string $brokerName, ?int $brokerId = null, ?int $timeoutMillis = null): array
+    {
+        $meta = $this->getControllerMetaData($controllerAddr);
+        $leaderAddress = self::controllerLeaderAddress($meta);
+        $header = ElectMasterRequestHeader::ofAdminTrigger($clusterName, $brokerName, $brokerId);
+        $response = $this->invokeBroker($leaderAddress, RequestCode::CONTROLLER_ELECT_MASTER,
+            $header->toExtFields(), timeoutMillis: $timeoutMillis ?? self::CONTROLLER_TIMEOUT, vip: false);
+        if ($response->code !== ResponseCode::SUCCESS) {
+            throw new MQBrokerException($response->code, $response->remark ?? '');
+        }
+        $responseHeader = new ElectMasterResponseHeader();
+        $responseHeader->fromExtFields($response->extFields);
+        $memberGroup = ($response->body !== null && $response->body !== '')
+            ? BrokerMemberGroup::decode($response->body) : new BrokerMemberGroup();
+        return [$responseHeader, $memberGroup];
+    }
+
+    /** GET_BROKER_EPOCH_CACHE(1007): the commitlog epoch list, plain broker address, 3000 ms budget. */
+    public function getBrokerEpochCache(string $brokerAddr, ?int $timeoutMillis = null): EpochEntryCache
+    {
+        $response = $this->invokeBroker($brokerAddr, RequestCode::GET_BROKER_EPOCH_CACHE,
+            timeoutMillis: $timeoutMillis ?? self::CONTROLLER_TIMEOUT, vip: false);
+        if ($response->body === null || $response->body === '') {
+            throw new MQBrokerException($response->code, 'empty epoch cache body');
+        }
+        return EpochEntryCache::decode($response->body);
+    }
+
+    /**
+     * SWITCH_TIMER_ENGINE(5001): the engine type rides in the single ext field ``E_T``
+     * (MessageConst.TIMER_ENGINE_TYPE) — no header class for it.
+     */
+    public function switchTimerEngine(string $brokerAddr, string $engineType, ?int $timeoutMillis = null): void
+    {
+        $this->invokeBroker($brokerAddr, RequestCode::SWITCH_TIMER_ENGINE,
+            [self::TIMER_ENGINE_TYPE => $engineType], timeoutMillis: $timeoutMillis, vip: false);
     }
 
     // ---------------- Subscription group management ----------------
