@@ -49,13 +49,13 @@ ports; see the table below and each language README for the details.
 
 | Language | Directory | Runtime model | Compression | Unit tests |
 | --- | --- | --- | --- | --- |
-| Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1787 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 74 cases green (8,640 assertions) |
-| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1182 passed |
-| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1193 passed; `cargo clippy --all-targets` warning-free |
-| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 875 test funcs (client 542 / common 135 / remoting 198); `go vet` / `gofmt` clean |
-| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 66 modules loaded + 54 smoke suites green (49 of them report 1,836 individually counted checks; the other 5 report check groups) |
-| PHP | [`php/`](php/README.en.md) | PHP 8.1+, single-threaded `tick()`-driven, zero composer deps | zlib via `gzcompress`; LZ4 as a pure-PHP frame; ZSTD prefers the `zstd` CLI and falls back to pure-PHP raw/RLE | `php tests/run_all.php`: 36 suites, 5,264 assertions + duplicate class-name guard |
+| Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1834 passed + 4 skipped |
+| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 77 cases green (77/77) |
+| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1220 passed |
+| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1224 passed; `cargo clippy --all-targets` warning-free |
+| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 914 test funcs (client 581 / common 135 / remoting 198), 84 `*_test.go` files; `go vet` / `gofmt` clean |
+| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 67 modules loaded + 59 smoke suites green (per-suite counts in the table below) |
+| PHP | [`php/`](php/README.en.md) | PHP 8.1+, single-threaded `tick()`-driven, zero composer deps | zlib via `gzcompress`; LZ4 as a pure-PHP frame; ZSTD prefers the `zstd` CLI and falls back to pure-PHP raw/RLE | `php tests/run_all.php`: 37 suites, 5,381 assertions + duplicate class-name guard |
 
 > Go's ZSTD encoder emits **valid frames without entropy coding** (store-only raw/RLE blocks): the
 > other ports decode them fine, but the ratio is ~1:1 — `storeSize ≈ body size` in the live matrix
@@ -68,8 +68,8 @@ compression), directory layout and live-verification tools.
 
 - A working cluster: NameServer `9876` + Broker `10911`. With `autoCreateTopicEnable=true` the
   first send creates the topic for you.
-- The runtime for your language: CPython 3.9+, a C++17 compiler + CMake, the .NET 10 SDK, stable
-  Rust + tokio, Go 1.21+, Node.js 20+ (23.8+ if you want ZSTD through `node:zlib`), PHP 8.1+.
+- The runtime for your language: CPython 3.8+, a C++17 compiler + CMake, the .NET 10 SDK, stable
+  Rust + tokio, Go 1.24, Node.js 22+ (23.8+ if you want ZSTD through `node:zlib`), PHP 8.1+.
 - Some cases need extra broker configuration (stated in the header comment of each live tool):
   master/slave cluster, `traceTopicEnable=true`, `enablePropertyFilter=true`,
   `recallMessageEnable`, POP-dedicated configuration, TLS certificates, ACL enabled.
