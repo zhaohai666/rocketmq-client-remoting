@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "rocketmq/client/consumer.h"
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/pull_consumer.h"
 #include "rocketmq/common/byte_buffer.h"
@@ -617,6 +618,96 @@ void testUnstartedConsumerRefuses() {
               "the unstarted wording stays stable");
 }
 
+// ---------------------------------------------------------------- Java MessageClientExt#getMsgId() parity
+// A consumed message carrying a UNIQ_KEY property must report that id (not the broker
+// offset id) on the CONSUMER_SEND_MSG_BACK header and on the retry copy's ORIGIN_MESSAGE_ID.
+const char* kUniqId = "AC1E0A0B2C3D4E5F60718293A4B5C6D7";
+
+MessageExt uniqSource(const std::string& topic, int32_t reconsumeTimes) {
+    MessageExt msg = sourceMessage(topic, reconsumeTimes);
+    msg.putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, kUniqId);
+    return msg;
+}
+
+// A push consumer needs a listener to start(); it never receives a message from this mock.
+class NoopListener : public MessageListenerConcurrently {
+public:
+    ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>&,
+                                            ConsumeConcurrentlyContext&) override {
+        return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
+    }
+};
+
+void testUniqKeyOnPullBounceAndRetryCopy(MockEndpoint& mock) {
+    const std::string topic = "SendBackUniqKeyPull";
+    mock.addRoute(topic);
+    mock.addRoute(retryTopic());
+    mock.scriptBounce({{ResponseCode::SYSTEM_ERROR, "bounce rejected"}});
+    mock.scriptSend({{ResponseCode::SUCCESS, ""}});
+    mock.clearRequests();
+
+    DefaultMQPullConsumer c(kGroup);
+    c.setNamesrvAddr(mock.address());
+    c.setInstanceName("send-back-uniq-pull");
+    c.start();
+    c.fetchSubscribeMessageQueues(topic);
+    c.sendMessageBack(uniqSource(topic, 0), 2);
+
+    const auto bounces = mock.requestsWithCode(RequestCode::CONSUMER_SEND_MSG_BACK);
+    const auto sends = mock.requestsWithCode(RequestCode::SEND_MESSAGE_V2);
+    expect(bounces.size() == 1, "uniq pull: one bounce reached the broker",
+           "bounces=" + std::to_string(bounces.size()));
+    expect(sends.size() == 1, "uniq pull: refused bounce degrades to one retry copy",
+           "sends=" + std::to_string(sends.size()));
+    if (!bounces.empty()) {
+        expectStr(extOr(bounces[0], "originMsgId"), kUniqId,
+                  "uniq pull: CONSUMER_SEND_MSG_BACK.originMsgId is the UNIQ_KEY");
+        expect(extOr(bounces[0], "originMsgId") != "MSG-ORIGIN-ID",
+               "uniq pull: the offset id is not used when UNIQ_KEY is present");
+    }
+    if (!sends.empty()) {
+        expect(propertiesContain(sends[0],
+                                 prop(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, kUniqId)),
+               "uniq pull: retry copy ORIGIN_MESSAGE_ID is the UNIQ_KEY");
+        expect(!propertiesContain(sends[0],
+                                  prop(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, "MSG-ORIGIN-ID")),
+               "uniq pull: retry copy does not carry the offset id");
+    }
+    c.shutdown();
+}
+
+void testUniqKeyOnPushBounceHeader(MockEndpoint& mock) {
+    const std::string topic = "SendBackUniqKeyPush";
+    mock.addRoute(topic);
+    mock.addRoute(retryTopic());
+    mock.scriptBounce({{ResponseCode::SUCCESS, "ok"}});
+    mock.scriptSend({{ResponseCode::SUCCESS, ""}});
+    mock.clearRequests();
+
+    DefaultMQPushConsumer c(kGroup);
+    c.setNamesrvAddr(mock.address());
+    c.setInstanceName("send-back-uniq-push");
+    c.subscribe(topic, "*");
+    c.setMessageListener(std::make_shared<NoopListener>());
+    c.start();
+    // findBrokerAddressInPublish does not refresh routes on a miss: pull this topic's
+    // route in so the broker-a master address is in the table before the bounce.
+    c.client().updateTopicRouteInfoFromNameServer(topic, -1, false);
+    mock.clearRequests();  // drop the start()/route frames; keep only the bounce
+    c.sendMessageBack(uniqSource(topic, 0), 2);
+
+    const auto bounces = mock.requestsWithCode(RequestCode::CONSUMER_SEND_MSG_BACK);
+    expect(bounces.size() == 1, "uniq push: one bounce reached the broker",
+           "bounces=" + std::to_string(bounces.size()));
+    if (!bounces.empty()) {
+        expectStr(extOr(bounces[0], "originMsgId"), kUniqId,
+                  "uniq push: CONSUMER_SEND_MSG_BACK.originMsgId is the UNIQ_KEY");
+        expect(extOr(bounces[0], "originMsgId") != "MSG-ORIGIN-ID",
+               "uniq push: the offset id is not used when UNIQ_KEY is present");
+    }
+    c.shutdown();
+}
+
 }  // namespace
 
 namespace {
@@ -653,6 +744,8 @@ int main() {
     runCase("retryCeilingKnobRidesOnBothLegs", mock, testRetryCeilingKnobRidesOnBothLegs);
     runCase("unlimitedSentinelReadsAsSixteen", mock, testUnlimitedSentinelReadsAsSixteen);
     runCase("missingMasterStillFallsBack", mock, testMissingMasterStillFallsBack);
+    runCase("uniqKeyOnPullBounceAndRetryCopy", mock, testUniqKeyOnPullBounceAndRetryCopy);
+    runCase("uniqKeyOnPushBounceHeader", mock, testUniqKeyOnPushBounceHeader);
     testUnstartedConsumerRefuses();
 
     std::printf("%s: %d checks, %d failures\n", fails == 0 ? "PASS" : "FAIL", checks, fails);

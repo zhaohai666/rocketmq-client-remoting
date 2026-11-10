@@ -7,12 +7,13 @@
 import { Message, MessageExt } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
+import { clientMsgId } from '../common/messageClientIdSetter.ts';
 
 export function buildRetryMessage(consumerGroup: string, msg: MessageExt, maxReconsumeTimes: number): Message {
   const newMsg = new Message(MixAll.getRetryTopic(consumerGroup), Buffer.from(msg.getBody() || Buffer.alloc(0)));
   newMsg.setProperties({ ...(msg.getProperties() || {}) });
   newMsg.setFlag(msg.getFlag());
-  let originMsgID = msg.getMsgId();
+  let originMsgID = clientMsgId(msg);
   const orig = msg.getProperty(MessageConst.PROPERTY_ORIGIN_MESSAGE_ID);
   if (orig) originMsgID = orig;
   if (originMsgID) newMsg.putProperty(MessageConst.PROPERTY_ORIGIN_MESSAGE_ID, originMsgID);

@@ -6129,7 +6129,9 @@ mod tests {
         assert_eq!(field(ext, "group"), Some("PG_PullBackOk"));
         assert_eq!(field(ext, "offset"), Some("4242"));
         assert_eq!(field(ext, "delayLevel"), Some("4"));
-        assert_eq!(field(ext, "originMsgId"), Some("MSG-ORIGIN-ID"));
+        // The consumed message carries a UNIQ_KEY; Java's
+        // MessageClientExt#getMsgId() returns it rather than the offset id.
+        assert_eq!(field(ext, "originMsgId"), Some("UNIQ-1"));
         assert_eq!(field(ext, "originTopic"), Some("T"));
         assert_eq!(field(ext, "unitMode"), Some("false"));
         assert_eq!(
@@ -6141,6 +6143,25 @@ mod tests {
             cluster.master.sends().is_empty(),
             "an accepted bounce needs no ordinary send"
         );
+        c.shutdown();
+    }
+
+    /// Without a UNIQ_KEY the CONSUMER_SEND_MSG_BACK header falls back to the
+    /// broker offset id kept in msg_id (Java MessageClientExt#getMsgId parity).
+    #[tokio::test]
+    async fn pull_send_back_origin_msg_id_falls_back_to_offset_id_without_uniq_key() {
+        let cluster = FakePullCluster::start().await;
+        let c = started_pull("pull_back_no_uniq", "PG_PullBackNoUniq", &cluster, "T").await;
+        let mut m = delivered_message("T", 1);
+        m.properties
+            .remove(crate::common::message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+        c.send_message_back(&m, 4)
+            .await
+            .expect("the broker accepts the bounce");
+
+        let bounces = cluster.master.bounces();
+        assert_eq!(bounces.len(), 1);
+        assert_eq!(field(&bounces[0], "originMsgId"), Some("MSG-ORIGIN-ID"));
         c.shutdown();
     }
 
@@ -6172,7 +6193,8 @@ mod tests {
         );
         assert_eq!(
             wire_property(ext, "ORIGIN_MESSAGE_ID").as_deref(),
-            Some("MSG-ORIGIN-ID")
+            Some("UNIQ-1"),
+            "the retry copy's origin id is the client UNIQ_KEY, not the offset id"
         );
         assert_eq!(wire_property(ext, "DELAY").as_deref(), Some("4"));
         assert_eq!(

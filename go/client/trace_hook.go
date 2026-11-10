@@ -117,7 +117,7 @@ func (h *ConsumeMessageTraceHook) ConsumeMessageBefore(ctx *ConsumeMessageContex
 		}
 		bean := newTraceBean()
 		bean.Topic = common.WithoutNamespace(msg.Topic, ctx.Namespace)
-		bean.MsgID = msg.MsgID
+		bean.MsgID = common.ClientMsgID(msg)
 		bean.Tags, _ = msg.GetTags()
 		bean.Keys, _ = msg.GetKeys()
 		bean.StoreTime = msg.StoreTimestamp

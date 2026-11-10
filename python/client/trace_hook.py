@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 
+from common.message_client_id_setter import client_msg_id
 from common.message_const import MessageConst
 from common.message_type import MessageType
 from common.mix_all import MixAll
@@ -98,7 +99,10 @@ class ConsumeMessageTraceHook(ConsumeMessageHook):
                 continue
             bean = TraceBean()
             bean.topic = NamespaceUtil.without_namespace(msg.topic)
-            bean.msg_id = msg.msg_id or ""
+            # Java ConsumeMessageTraceHookImpl:70 calls msg.getMsgId() on a
+            # MessageClientExt -> the UNIQ_KEY property, falling back to the
+            # offset id.  Reading msg.msg_id here would report the broker id.
+            bean.msg_id = client_msg_id(msg)
             bean.tags = msg.get_tags() or ""
             bean.keys = msg.get_keys() or ""
             bean.store_time = msg.store_timestamp

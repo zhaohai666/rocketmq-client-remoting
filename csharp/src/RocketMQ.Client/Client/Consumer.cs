@@ -7478,7 +7478,7 @@ public sealed class DefaultMQPushConsumer
                 Offset = msg.CommitLogOffset,
                 Group = ConsumerGroup,
                 DelayLevel = delayLevel,
-                OriginMsgId = msg.MsgId,
+                OriginMsgId = msg.ClientMsgId,
                 OriginTopic = msg.Topic,
                 // ⚠ Deliberately beyond protocol requirements:
                 // consumerSendMessageBack protocol-wise only fills

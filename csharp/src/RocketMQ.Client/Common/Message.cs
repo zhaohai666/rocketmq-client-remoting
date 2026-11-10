@@ -232,6 +232,24 @@ public class MessageExt : Message
     public string StoreHost { get; set; } = string.Empty;
     public int StoreHostPort { get; set; }
     public string MsgId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Java MessageClientExt#getMsgId() parity: the UNIQ_KEY property when present,
+    /// otherwise the broker offset id. One helper shared by every consume-side call site
+    /// (SubBefore bean, CONSUMER_SEND_MSG_BACK, retry ORIGIN_MESSAGE_ID).
+    /// </summary>
+    public string ClientMsgId
+    {
+        get
+        {
+            string uniq = MessageClientIDSetter.GetUniqId(this);
+            if (!string.IsNullOrEmpty(uniq)) return uniq;
+            // The decoder keeps the offset id in OffsetMsgId (and, absent UNIQ_KEY, in
+            // MsgId as well); hand-built messages may populate only MsgId.
+            return !string.IsNullOrEmpty(OffsetMsgId) ? OffsetMsgId : MsgId;
+        }
+    }
+
     public long CommitLogOffset { get; set; }
     public uint BodyCrc { get; set; }
     public int ReconsumeTimes { get; set; }

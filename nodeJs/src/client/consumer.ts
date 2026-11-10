@@ -65,6 +65,7 @@ import { GetConsumerStatusBody } from '../remoting/bodies.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
 import { MessageExt, MessageQueue } from '../common/message.ts';
 import { MessageConst } from '../common/messageConst.ts';
+import { clientMsgId } from '../common/messageClientIdSetter.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { defaultConsumeTimestamp, parseConsumeTimestamp, currentTimeMillis } from '../common/utilAll.ts';
 import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
@@ -2034,7 +2035,7 @@ export class DefaultMQPushConsumer {
       h.offset = msg.getCommitLogOffset();
       h.group = this.consumerGroup;
       h.delayLevel = delayLevel;
-      h.originMsgId = msg.getMsgId();
+      h.originMsgId = clientMsgId(msg);
       // Delivery hands the listener the bare topic; the broker-side record —
       // the one this bounce references — lives under the prefixed name.
       h.originTopic = MixAll.wrapNamespace(this.namespace, msg.getTopic());

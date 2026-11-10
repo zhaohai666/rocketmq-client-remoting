@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::client::result::SendStatus;
+use crate::common::message_client_id_setter::client_msg_id;
 use crate::common::message_const::{PROPERTY_MSG_REGION, PROPERTY_TRACE_SWITCH};
 use crate::common::message_type::MessageType;
 use crate::common::mix_all::MixAll;
@@ -186,7 +187,7 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
             }
             let mut bean = TraceBean::new();
             bean.topic = strip_namespace(&msg.topic);
-            bean.msg_id = msg.msg_id.clone().unwrap_or_default();
+            bean.msg_id = client_msg_id(msg);
             bean.tags = msg.get_tags().unwrap_or("").to_string();
             bean.keys = msg.get_keys().unwrap_or("").to_string();
             bean.store_time = msg.store_timestamp;
@@ -1195,6 +1196,38 @@ mod tests {
             assert_eq!(emitted.group_name, "GID_test");
         }
         assert_eq!(sink.count(), 5);
+    }
+
+    #[test]
+    fn consume_before_bean_msg_id_is_the_client_uniq_key() {
+        let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
+        let hook = ConsumeMessageTraceHook::new(sink.clone());
+
+        // A client-side decode keeps the broker offset id in msg_id, but Java's
+        // MessageClientExt#getMsgId() returns the UNIQ_KEY property.
+        let mut with_uniq = ext("T", "OFFSET-ID", None, None, None, None, 1, 1, 0);
+        with_uniq.put_property(
+            crate::common::message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+            "UNIQ-KEY-ID",
+        );
+        let mut context = ConsumeMessageContext::new("G", Some(vec![with_uniq]), None);
+        hook.consume_message_before(&mut context).unwrap();
+        assert_eq!(
+            sink.last().expect("test-only").trace_beans[0].msg_id,
+            "UNIQ-KEY-ID"
+        );
+
+        // With no UNIQ_KEY the bean falls back to the offset id.
+        let mut context = ConsumeMessageContext::new(
+            "G",
+            Some(vec![ext("T", "OFFSET-ID", None, None, None, None, 1, 1, 0)]),
+            None,
+        );
+        hook.consume_message_before(&mut context).unwrap();
+        assert_eq!(
+            sink.last().expect("test-only").trace_beans[0].msg_id,
+            "OFFSET-ID"
+        );
     }
 
     // ------------------------------------------------ end-transaction hooks

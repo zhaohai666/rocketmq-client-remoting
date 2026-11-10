@@ -1,4 +1,5 @@
 import { getHostIp, getPid, bytes2string } from './utilAll.ts';
+import { MessageConst } from './messageConst.ts';
 
 function ipToBytes(ip) {
   const parts = ip.split('.').map(Number);
@@ -37,4 +38,17 @@ export function createUniqID() {
   return bytes2string(Buffer.concat([IP, PID, CLASS_HASH, elapsed, counter]));
 }
 
-export default { createUniqID };
+// Java MessageClientExt.getMsgId() parity on a consumed message.
+//
+// Client-side decoding (decodesBatch(..., isClient=true)) keeps the broker offset
+// id in msg.msgId / msg.offsetMsgId and exposes UNIQ_KEY as a normal property.
+// Java's getMsgId() returns UNIQ_KEY and only falls back to the offset id when
+// that property is absent, so every place that in Java calls msg.getMsgId() on
+// a *consumed* message must go through this helper instead of reading the
+// offset id directly.
+export function clientMsgId(msg: any): string | null {
+  if (msg == null) return null;
+  return msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) || msg.getMsgId();
+}
+
+export default { createUniqID, clientMsgId };

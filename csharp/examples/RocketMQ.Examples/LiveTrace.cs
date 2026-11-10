@@ -256,20 +256,22 @@ public static class LiveTrace
         List<MessageExt> msgs = msgCollector.Snapshot().FindAll(IsPrimary);
     Check("S6 the business consumer received the 1 message from this send (the warm-up message is filtered out by body)", got && msgs.Count == 1,
             "count=" + msgs.Count.ToString(CultureInfo.InvariantCulture));
-        string recvMsgId = msgs.Count == 0 ? string.Empty : msgs[0].MsgId;
+        // The client-side decoder replaces MsgId with UNIQ_KEY, so the offset id lives in
+        // OffsetMsgId; compare the right fields so the assertion keeps its value.
+        string recvOffsetMsgId = msgs.Count == 0 ? string.Empty : msgs[0].OffsetMsgId;
         string recvUniq = msgs.Count == 0
             ? string.Empty
             : msgs[0].GetProperty(MessageConst.PropertyUniqClientMessageIdKeyidx);
-  Check("S7 the consume side msg_id == SendResult.offset_msg_id and the UNIQ_KEY travelled there via the properties",
-            msgs.Count > 0 && recvMsgId == result.OffsetMsgId && recvUniq == result.MsgId,
-            "recv=" + recvMsgId + " offset=" + result.OffsetMsgId + " uniq=" + recvUniq);
+  Check("S7 consume-side OffsetMsgId == SendResult.offset_msg_id (MsgId is UNIQ_KEY after client decode), and UNIQ_KEY reached the consumer via properties",
+            msgs.Count > 0 && recvOffsetMsgId == result.OffsetMsgId && recvUniq == result.MsgId,
+            "recvOffset=" + recvOffsetMsgId + " offset=" + result.OffsetMsgId + " uniq=" + recvUniq);
 
         // ---------------- a message with no keys (S17 uses real machine data to lock decoder robustness)----------------
         SendResult keyless = producer.Send(new Message(topic, Encoding.UTF8.GetBytes("no-keys-here")),
             5000);
         static bool IsKeyless(MessageExt m) => BodyText(m) == "no-keys-here";
         bool keylessOk = WaitUntil(() => msgCollector.Snapshot().Exists(IsKeyless), 25000);
-        string keylessId = keyless.OffsetMsgId;
+        string keylessId = keyless.MsgId; // UNIQ_KEY: S17 matches the SubBefore bean.msgId
 
         // close the consumer -> triggers the consume-side trace dispatcher to flush, ensuring SubBefore/SubAfter land
         consumer.Shutdown();
@@ -332,7 +334,7 @@ public static class LiveTrace
         TraceContext? subAfter = null;
         foreach (TraceContext r in records)
         {
-            if (r.TraceBeans.Count == 0 || r.TraceBeans[0].MsgId != recvMsgId) continue;
+            if (r.TraceBeans.Count == 0 || r.TraceBeans[0].MsgId != recvUniq) continue;
             if (r.TraceType == TraceType.SubBefore)
             {
                 subBeforeCount++;

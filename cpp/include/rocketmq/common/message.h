@@ -181,6 +181,8 @@ struct MessageExt : public Message {
 
     const std::string& getMsgId() const { return msgId; }
     void setMsgId(const std::string& id) { msgId = id; }
+    // Java MessageClientExt#getMsgId() parity: UNIQ_KEY property, else the offset id (msgId).
+    std::string clientMsgId() const;
 
     int64_t getCommitLogOffset() const { return commitLogOffset; }
     void setCommitLogOffset(int64_t o) { commitLogOffset = o; }

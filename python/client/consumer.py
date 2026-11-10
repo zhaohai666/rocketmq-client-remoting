@@ -15,6 +15,7 @@ from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from common.message import Message, MessageExt, MessageQueue
 from common.message_accessor import MessageAccessor
+from common.message_client_id_setter import client_msg_id
 from common.message_const import MessageConst
 from common.mix_all import MixAll
 from common.subscription_data import ExpressionType, FilterAPI, SubscriptionData
@@ -883,7 +884,7 @@ def _build_retry_message(msg: MessageExt, consumer_group: str,
     new_msg = Message(MixAll.get_retry_topic(consumer_group), msg.body)
     new_msg.properties = dict(msg.properties)
     new_msg.flag = msg.flag
-    origin_msg_id = MessageAccessor.get_origin_message_id(msg) or msg.msg_id
+    origin_msg_id = MessageAccessor.get_origin_message_id(msg) or client_msg_id(msg)
     if origin_msg_id:
         MessageAccessor.set_origin_message_id(new_msg, origin_msg_id)
     MessageAccessor.put_property(new_msg, MessageConst.PROPERTY_RETRY_TOPIC, msg.topic)
@@ -4279,7 +4280,7 @@ class DefaultMQPushConsumer:
             header.offset = msg.commit_log_offset
             header.group = self.consumer_group
             header.delay_level = delay_level
-            header.origin_msg_id = msg.msg_id
+            header.origin_msg_id = client_msg_id(msg)
             header.origin_topic = msg.topic
             header.unit_mode = self.unit_mode
             header.max_reconsume_times = max_reconsume
@@ -4992,7 +4993,7 @@ class DefaultMQPullConsumer:
             header.offset = msg.commit_log_offset
             header.group = self.consumer_group
             header.delay_level = delay_level
-            header.origin_msg_id = msg.msg_id
+            header.origin_msg_id = client_msg_id(msg)
             header.origin_topic = msg.topic
             header.unit_mode = self.unit_mode
             header.max_reconsume_times = max_reconsume

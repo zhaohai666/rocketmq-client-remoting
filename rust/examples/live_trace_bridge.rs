@@ -108,6 +108,23 @@ impl MessageListenerConcurrently for TraceReaderListener {
     }
 }
 
+/// Count the decoded Pub entries whose bean msgId is one of `ids`.
+fn decoded_pub_hits(texts: &[String], ids: &[String]) -> usize {
+    let mut hits = 0usize;
+    for text in texts {
+        for ctx in TraceDataEncoder::decoder_from_trace_data_string(Some(text)) {
+            if ctx.trace_type == Some(TraceType::Pub) {
+                if let Some(bean) = ctx.trace_beans.first() {
+                    if ids.iter().any(|id| id == &bean.msg_id) {
+                        hits += 1;
+                    }
+                }
+            }
+        }
+    }
+    hits
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let namesrv = match env::args().nth(1) {
@@ -264,14 +281,13 @@ async fn main() -> ExitCode {
     }));
     reader.start().await.unwrap();
 
-    // Wait for the reader to pull traces containing all 3 msgIds (flush period 5s + the reader's first rebalance round)
+    // Wait for the reader to pull traces whose *decoded Pub entries* cover all 3
+    // msgIds. SubBefore beans carry the client UNIQ_KEY too (Java
+    // MessageClientExt.getMsgId() parity), so a plain corpus.contains() wait
+    // would complete on consumer-side records before the producer's 5s flush.
     let deadline = Instant::now() + Duration::from_secs(120);
-    let got_all = reader_inbox.wait_for(deadline, |texts| {
-        let corpus = texts.join("");
-        traced_ids
-            .iter()
-            .all(|id| !id.is_empty() && corpus.contains(id))
-    });
+    let got_all =
+        reader_inbox.wait_for(deadline, |texts| decoded_pub_hits(texts, &traced_ids) >= 3);
     check!(
         "B2 the trace text contains all 3 business msgIds (producer-side traces really leave the process and land on the broker)",
         got_all
@@ -279,7 +295,6 @@ async fn main() -> ExitCode {
 
     // Decode and verify Pub / SubBefore / SubAfter
     let texts = reader_inbox.items.lock().unwrap().clone();
-    let corpus = texts.join("");
     let mut pub_hits = 0usize;
     let mut pub_ok = 0usize;
     let mut sub_before = 0usize;
@@ -326,11 +341,13 @@ async fn main() -> ExitCode {
         "before={sub_before} after={sub_after} paired={paired}"
     );
 
+    // B4 control: no *Pub* record carries an untraced msgId. The SubBefore
+    // records of these messages legitimately carry their UNIQ_KEY (the biz
+    // consumer has trace enabled and Java parity puts the client-visible id in
+    // every consume-side bean), so the raw corpus may mention them.
     check!(
         "B4 control: the enable_trace=false messages have no Pub records",
-        untraced_ids
-            .iter()
-            .all(|id| id.is_empty() || !corpus.contains(id))
+        decoded_pub_hits(&texts, &untraced_ids) == 0
     );
 
     // ---------- Cleanup ----------

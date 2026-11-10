@@ -20,7 +20,7 @@ internal static class RetryMessageFactory
         string originMsgId = msg.GetProperty(MessageConst.PropertyOriginMessageId);
         if (string.IsNullOrEmpty(originMsgId))
         {
-            originMsgId = msg.MsgId;
+            originMsgId = msg.ClientMsgId;
         }
 
         if (!string.IsNullOrEmpty(originMsgId))

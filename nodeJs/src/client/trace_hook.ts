@@ -4,8 +4,9 @@
 //  - The BEFORE and AFTER halves of one event **must share the same TraceContext
 //    object** (its internal requestId is what the console uses to stitch the two
 //    halves together) — the hook stores it in the context's hookState.
-//  - On the consume side msg_id uses the OFFSET form of the id (same convention as
-//    SendResult.offsetMsgId); the producer-side Pub trace uses UNIQ_KEY.
+//  - On the consume side msgId uses UNIQ_KEY (Java MessageClientExt.getMsgId()
+//    parity), falling back to the broker OFFSET-form id when UNIQ_KEY is absent;
+//    the producer-side Pub trace likewise uses UNIQ_KEY.
 //  - Exceptions inside a hook must never bring delivery down: swallow them all.
 import {
   ConsumeMessageHook, SendMessageHook, SendMessageContext, ConsumeMessageContext,
@@ -114,7 +115,7 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
       // The request id joins SubBefore and SubAfter of one consume.
       context.requestId = createUniqID();
       context.traceBeans = msgs.map((m: any) => {
-        const bean = traceBeanFromMessageExt(m, true);
+        const bean = traceBeanFromMessageExt(m, false);
         bean.clientHost = bean.clientHost || '';
         return bean;
       });
@@ -145,7 +146,7 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
         after.accessChannel = AccessChannelLocal;
         after.timeStamp = before.timeStamp;
         after.groupName = before.groupName;
-        const bean = traceBeanFromMessageExt(msgs[i], true);
+        const bean = traceBeanFromMessageExt(msgs[i], false);
         bean.retryTimes = msgs[i].getReconsumeTimes ? msgs[i].getReconsumeTimes() : 0;
         after.traceBeans = [bean];
         this.dispatcher.append(after);

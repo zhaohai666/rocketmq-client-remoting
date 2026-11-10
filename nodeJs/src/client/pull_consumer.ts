@@ -16,6 +16,7 @@ import type { OffsetStore } from './offset_store.ts';
 import { PullStatus, PullResult, MessageSelector } from './consumer_result.ts';
 import { MessageModel, ConsumeType } from '../remoting/heartbeat.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
+import { clientMsgId } from '../common/messageClientIdSetter.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { FilterAPI, SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
 import { PullSysFlag } from '../common/sysflag.ts';
@@ -558,7 +559,7 @@ export class DefaultMQPullConsumer {
       h.offset = msg.getCommitLogOffset();
       h.group = this.consumerGroup;
       h.delayLevel = delayLevel;
-      h.originMsgId = msg.getMsgId();
+      h.originMsgId = clientMsgId(msg);
       h.originTopic = this._withNamespace(msg.getTopic());
       h.unitMode = this.unitMode;
       h.maxReconsumeTimes = maxReconsume;

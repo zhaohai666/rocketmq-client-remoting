@@ -14,6 +14,7 @@
 //    would add an extra empty segment and shift every field. Always go through
 //    splitTrimmingTrailingEmpty below.
 import { MessageConst } from '../common/messageConst.ts';
+import { clientMsgId } from '../common/messageClientIdSetter.ts';
 
 // Trace-related constants; the last two accessChannel values are wire literals too.
 export const TraceGroupNamePrefix = '_INNER_TRACE_PRODUCER';
@@ -330,15 +331,18 @@ function decodeTraceContext(record: string): TraceContext | null {
   }
 }
 
-// Build a TraceBean from a MessageExt (consumer side): msgId takes the
-// OFFSET-form id, the same as SendResult.offsetMsgId; the producer-side Pub
-// trace uses UNIQ_KEY.
+// Build a TraceBean from a MessageExt (consumer side). The two modes:
+//   - offsetBasedId=true  -> the broker OFFSET-form id (SendResult.offsetMsgId);
+//   - offsetBasedId=false -> Java MessageClientExt.getMsgId() parity: the UNIQ_KEY
+//     property, falling back to the offset id (see clientMsgId()).
+// The consumer hooks use the UNIQ_KEY mode; the producer-side Pub trace is a
+// separate path and always uses UNIQ_KEY.
 export function traceBeanFromMessageExt(msg: any, offsetBasedId: boolean): TraceBean {
   const bean = new TraceBean();
   bean.topic = msg.getTopic();
   bean.msgId = offsetBasedId
     ? (msg.getOffsetMsgId() || msg.getMsgId())
-    : (msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) || msg.getMsgId());
+    : clientMsgId(msg);
   bean.tags = msg.getProperty(MessageConst.PROPERTY_TAGS) || '';
   bean.keys = msg.getProperty(MessageConst.PROPERTY_KEYS) || '';
   bean.storeHost = msg.getStoreHostString();

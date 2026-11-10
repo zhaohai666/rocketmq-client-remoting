@@ -911,9 +911,14 @@ func TestConsumerTraceE2EWritesSubBeforeAndSubAfter(t *testing.T) {
 	// The trace topic needs a route on the nameserver, or the dispatcher's
 	// internal producer has nowhere to send the records.
 	f := newClusterFixture(t, map[string]int{topic: 1, common.TraceTopic: 1})
-	for _, m := range f.broker.add(topic, 0, "traced-consume") {
+	msgs := f.broker.add(topic, 0, "traced-consume")
+	for _, m := range msgs {
 		m.PutProperty(common.PropertyMsgRegion, common.DefaultTraceRegionID)
 	}
+	// The fixture stamps a UNIQ_KEY on every pulled message, exactly like a
+	// real client-side decode. Java's MessageClientExt#getMsgId() returns it,
+	// so the consumer-side trace bean must carry it rather than the offset id.
+	uniq, _ := msgs[0].GetProperty(common.PropertyUniqKey)
 
 	listener := newRecordingListener()
 	c := f.newConsumer(t, group, listener, withConsumeFromWhere(ConsumeFromWhereFirstOffset))
@@ -953,9 +958,9 @@ func TestConsumerTraceE2EWritesSubBeforeAndSubAfter(t *testing.T) {
 		t.Errorf("bean msgIds = %q/%q, must be the same non-empty message id",
 			before.TraceBeans[0].MsgID, after.TraceBeans[0].MsgID)
 	}
-	if _, _, offset, err := common.DecodeMessageID(before.TraceBeans[0].MsgID); err != nil || offset != 1000 {
-		t.Errorf("bean msgId %q does not decode to commitLogOffset 1000 (err=%v)",
-			before.TraceBeans[0].MsgID, err)
+	if before.TraceBeans[0].MsgID != uniq {
+		t.Errorf("bean msgId = %q, want the UNIQ_KEY %q (Java MessageClientExt#getMsgId)",
+			before.TraceBeans[0].MsgID, uniq)
 	}
 	// The pair is joined on the requestId; a fresh one per record would leave
 	// the console with two unrelated half-traces.

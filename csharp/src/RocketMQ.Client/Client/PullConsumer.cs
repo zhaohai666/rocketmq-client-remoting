@@ -1078,7 +1078,7 @@ public sealed class DefaultMQPullConsumer
                 Offset = msg.CommitLogOffset,
                 Group = _consumerGroup,
                 DelayLevel = delayLevel,
-                OriginMsgId = msg.MsgId,
+                OriginMsgId = msg.ClientMsgId,
                 OriginTopic = msg.Topic,
                 UnitMode = _unitMode,
                 MaxReconsumeTimes = maxReconsume,

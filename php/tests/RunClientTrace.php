@@ -184,6 +184,7 @@ namespace {
     const MSG_ID_1 = 'AC1400A1F0A018B4AAC2A1B2C3D4E5F6';
     const MSG_ID_2 = 'AC1400A1F0A018B4AAC2A1B2C3D4E5F7';
     const OFFSET_MSG_ID = 'AC1400A1000027100000000000000001';
+    const UNIQ_ID = 'AC1E0A0B2C3D4E5F60718293A4B5C6D7';
     const BODY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; // 42 bytes
 
     // ---- Fixed vectors of the trace-log encoding (do not hand-edit; changing them breaks
@@ -1067,6 +1068,32 @@ namespace {
             $this->checkSame([], $d->appended, 'after does not enqueue when before was not run');
         }
 
+        /**
+         * Java MessageClientExt.getMsgId() parity: on a consumed message the
+         * trace bean's msgId is UNIQ_KEY, not the broker offset id. Java's
+         * ConsumeMessageTraceHookImpl reads msg.getMsgId() on a client-decoded
+         * MessageClientExt -> the UNIQ_KEY property.
+         */
+        private function testConsumeHookBeanMsgIdPrefersUniqKey(): void
+        {
+            $d = new CapturingDispatcher();
+            $hook = new ConsumeMessageTraceHook($d);
+
+            $msg = new MessageExt('TopicTest', BODY, 'TagA', 'KeyA');
+            $msg->msgId = OFFSET_MSG_ID;
+            $msg->putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, UNIQ_ID);
+            $ctx = new ConsumeMessageContext('CID_test', [$msg], new MessageQueue('TopicTest', 'broker-a', 0));
+            $ctx->props = ['ConsumeContextType' => 'SUCCESS'];
+            $ctx->success = true;
+            $hook->consumeMessageBefore($ctx);
+            $hook->consumeMessageAfter($ctx);
+
+            $this->checkSame(2, count($d->appended), 'uniq: before+after appended 2 records');
+            $this->checkSame(UNIQ_ID, $d->appended[0]->traceBeans[0]->msgId, 'uniq: SubBefore bean.msgId = UNIQ_KEY');
+            $this->checkSame(UNIQ_ID, $d->appended[1]->traceBeans[0]->msgId, 'uniq: SubAfter bean.msgId = UNIQ_KEY');
+            $this->check($d->appended[0]->traceBeans[0]->msgId !== OFFSET_MSG_ID, 'uniq: SubBefore bean.msgId != offset id');
+        }
+
         // ============================================================ End-transaction hook
 
         private function testEndTransactionHook(): void
@@ -1156,6 +1183,7 @@ namespace {
             $this->testConsumeHookContextCodeFromProps();
             $this->testConsumeHookSkipsTraceOff();
             $this->testConsumeHookAfterWithoutBefore();
+            $this->testConsumeHookBeanMsgIdPrefersUniqKey();
             $this->testEndTransactionHook();
 
             if ($this->failures === []) {

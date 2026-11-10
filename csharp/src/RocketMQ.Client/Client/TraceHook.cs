@@ -128,7 +128,7 @@ public sealed class ConsumeMessageTraceHook : IConsumeMessageHook
             var bean = new TraceBean
             {
                 Topic = NamespaceUtil.WithoutNamespace(msg.Topic),
-                MsgId = msg.MsgId ?? string.Empty,
+                MsgId = msg.ClientMsgId,
                 Tags = msg.Tags ?? string.Empty,
                 Keys = msg.Keys ?? string.Empty,
                 StoreTime = msg.StoreTimestamp,

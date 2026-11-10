@@ -24,3 +24,19 @@ func GetUniqID(msg *Message) (string, bool) {
 	}
 	return msg.GetProperty(PropertyUniqKey)
 }
+
+// ClientMsgID mirrors Java MessageClientExt#getMsgId() on a consumed message:
+// the id is the UNIQ_KEY property, and only falls back to the broker offset id
+// when that property is absent or empty. Client-side decoding keeps the offset
+// id in MsgID (and copies it into OffsetMsgID), so every consumer-side call site
+// that in Java reads msg.getMsgId() must go through this helper instead of
+// reading MsgID directly.
+func ClientMsgID(msg *MessageExt) string {
+	if msg == nil {
+		return ""
+	}
+	if v, ok := msg.GetProperty(PropertyUniqKey); ok && v != "" {
+		return v
+	}
+	return msg.MsgID
+}

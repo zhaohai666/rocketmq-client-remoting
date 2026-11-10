@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client;
 
+use RocketMQ\Common\MessageClientIdSetter;
 use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MessageType;
 use RocketMQ\Common\MixAll;
@@ -118,7 +119,7 @@ final class ConsumeMessageTraceHook implements ConsumeMessageHook
             }
             $bean = new TraceBean();
             $bean->topic = NamespaceUtil::withoutNamespace($msg->topic ?? '');
-            $bean->msgId = $msg->msgId ?? '';
+            $bean->msgId = MessageClientIdSetter::clientMsgId($msg);
             $bean->tags = $msg->getTags() ?? '';
             $bean->keys = $msg->getKeys() ?? '';
             $bean->storeTime = $msg->storeTimestamp;

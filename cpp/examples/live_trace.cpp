@@ -240,6 +240,9 @@ int main(int argc, char** argv) {
         msgs.empty()
             ? std::string()
             : msgs[0].getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    // S11 filters SubBefore/SubAfter by the consume-side client id (UNIQ_KEY, falling
+    // back to the offset id), which is exactly what the hook writes into bean.msgId.
+    std::string recvClientId = msgs.empty() ? std::string() : msgs[0].clientMsgId();
     check("S7 consumer-side msg_id == SendResult.offset_msg_id, and UNIQ_KEY reaches the consumer side via property",
           !msgs.empty() && recvMsgId == result.offsetMsgId && recvUniq == result.msgId,
           "recv=" + recvMsgId + " offset=" + result.offsetMsgId + " uniq=" + recvUniq);
@@ -252,7 +255,7 @@ int main(int argc, char** argv) {
         }
         return false;
     }, 25000);
-    std::string keylessId = keyless.offsetMsgId;
+    std::string keylessId = keyless.msgId;  // UNIQ_KEY: S17 matches the SubBefore bean.msgId
 
     // Shut the consumer down → triggers the consumer-side trace dispatcher flush, ensuring SubBefore/SubAfter land
     consumer.shutdown();
@@ -304,7 +307,7 @@ int main(int argc, char** argv) {
     const TraceContext* subBefore = nullptr;
     const TraceContext* subAfter = nullptr;
     for (const TraceContext& r : records) {
-        if (r.traceBeans.empty() || r.traceBeans[0].msgId != recvMsgId) continue;
+        if (r.traceBeans.empty() || r.traceBeans[0].msgId != recvClientId) continue;
         if (r.traceType == TraceType::SUB_BEFORE) {
             ++subBeforeCount;
             if (subBefore == nullptr) subBefore = &r;

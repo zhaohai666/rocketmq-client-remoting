@@ -1424,7 +1424,7 @@ func buildRetryMessage(msg *common.MessageExt, group string, maxReconsume int32)
 		newMsg.SetProperties(msg.Properties.Clone())
 	}
 	newMsg.Flag = msg.Flag
-	originMsgID := msg.MsgID
+	originMsgID := common.ClientMsgID(msg)
 	if v, ok := msg.GetProperty(common.PropertyOriginMessageID); ok && v != "" {
 		originMsgID = v
 	}

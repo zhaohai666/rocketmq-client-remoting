@@ -1416,21 +1416,41 @@ async fn r3_trace_hook(
             sub_before.request_id, sub_after.request_id
         ),
     );
+    // Java's MessageClientExt#getMsgId() returns the UNIQ_KEY property on a
+    // consumed message, so the SubBefore bean carries UNIQ_KEY, not the broker
+    // offset id kept in m.msg_id.
     let pulled_ids: Vec<String> = consumed
         .iter()
-        .map(|m| m.msg_id.clone().unwrap_or_default())
+        .map(|m| {
+            m.get_property(message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
+                .unwrap_or_default()
+                .to_string()
+        })
         .collect();
     let pulled_keys: Vec<String> = consumed
         .iter()
         .map(|m| m.get_keys().unwrap_or_default().to_string())
         .collect();
     ck.check(
-        "R3 SubBefore beans come from the real pulled messages (broker msgId, storeSize, retryTimes)",
+        "R3 SubBefore beans come from the real pulled messages (UNIQ_KEY, storeSize, retryTimes)",
         sub_before.trace_beans.len() == 3
             && sub_before.group_name == consumer_group
-            && sub_before.trace_beans.iter().map(|b| b.msg_id.clone()).collect::<Vec<_>>() == pulled_ids
-            && sub_before.trace_beans.iter().all(|b| b.retry_times == 0 && b.body_length > 0)
-            && sub_before.trace_beans.iter().map(|b| b.keys.clone()).collect::<Vec<_>>() == pulled_keys,
+            && sub_before
+                .trace_beans
+                .iter()
+                .map(|b| b.msg_id.clone())
+                .collect::<Vec<_>>()
+                == pulled_ids
+            && sub_before
+                .trace_beans
+                .iter()
+                .all(|b| b.retry_times == 0 && b.body_length > 0)
+            && sub_before
+                .trace_beans
+                .iter()
+                .map(|b| b.keys.clone())
+                .collect::<Vec<_>>()
+                == pulled_keys,
         &format!("beans={:?} ids={pulled_ids:?}", sub_before.trace_beans),
     );
     ck.check(

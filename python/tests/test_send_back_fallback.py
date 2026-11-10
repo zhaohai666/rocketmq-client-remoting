@@ -204,3 +204,31 @@ def test_pull_missing_master_falls_back_to_normal_send():
     assert client.send_back_requests == []
     assert len(client.inner_sends) == 1
     assert_retry_send(client.inner_sends[0])
+
+
+# ------------------------------------------------------- Java MessageClientExt.getMsgId() parity
+# Java MQClientAPIImpl:1691 consumerSendMessageBack and
+# DefaultMQPushConsumerImpl:792 sendMessageBackAsNormalMessage both call
+# msg.getMsgId() on a client-decoded MessageClientExt -> the UNIQ_KEY property,
+# not the broker offset id. The port keeps the offset id in msg.msg_id.
+UNIQ_ID = "AC1E0A0B2C3D4E5F60718293A4B5C6D7"
+
+
+def uniq_message() -> MessageExt:
+    m = message()
+    m.put_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, UNIQ_ID)
+    return m
+
+
+def test_send_back_header_and_retry_copy_carry_the_uniq_key():
+    for factory in (push_consumer, pull_consumer):
+        client = FakeClient(answer_code=ResponseCode.SYSTEM_ERROR)
+        c = factory(client)
+
+        c.send_message_back(uniq_message(), 0)
+
+        header = client.send_back_requests[0][1].custom_header
+        assert header.origin_msg_id == UNIQ_ID
+        assert header.origin_msg_id != MSG_ID
+        props = client.inner_sends[0][1].properties
+        assert props[MessageConst.PROPERTY_ORIGIN_MESSAGE_ID] == UNIQ_ID

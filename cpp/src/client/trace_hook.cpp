@@ -1,6 +1,6 @@
 // The three hard rules are in the trace_hook.h header comment: trace messages are never traced, whether a record is written is decided by the broker / message
-// property, and the consume-side msgId uses the offset-side ID (matching SendResult.offsetMsgId rather than SendResult.msgId /
-// UNIQ_KEY).
+// property, and the consume-side msgId uses the client id (MessageClientExt#getMsgId(): UNIQ_KEY, falling back to the offset id), while the send-side Pub msgId
+// stays SendResult.msgId (UNIQ_KEY) with offsetMsgId carrying the broker's offset id.
 #include "rocketmq/client/trace_hook.h"
 
 #include "rocketmq/common/logging.h"
@@ -94,7 +94,7 @@ void ConsumeMessageTraceHook::consumeMessageBefore(ConsumeMessageContext& contex
         if (traceOn == "false") continue;  // tracing disabled per message
         TraceBean bean;
         bean.topic = NamespaceUtil::withoutNamespace(msg.topic);
-        bean.msgId = msg.msgId;            // consume side uses the offset-side ID (matching SendResult.offsetMsgId)
+        bean.msgId = msg.clientMsgId();     // consume side uses UNIQ_KEY (falls back to the offset id)
         bean.tags = msg.getTags();
         bean.keys = msg.getKeys();
         bean.storeTime = msg.storeTimestamp;
@@ -129,7 +129,7 @@ void ConsumeMessageTraceHook::consumeMessageAfter(ConsumeMessageContext& context
     int32_t costTime = static_cast<int32_t>((now - subBefore.timeStamp)
                                             / static_cast<int64_t>(context.msgList.size()));
     subAfter->costTime = costTime;
-    subAfter->traceBeans = subBefore.traceBeans;      // the same batch of messages, msgIds stay the offset-side ones
+    subAfter->traceBeans = subBefore.traceBeans;      // the same batch of messages, msgIds stay the client ids (UNIQ_KEY)
 
     // props carries the ConsumeReturnType **name** (the consumer looks the ordinal up by name); unknown values fall back to SUCCESS.
     subAfter->contextCode = consumeReturnTypeOrdinal(context.props);

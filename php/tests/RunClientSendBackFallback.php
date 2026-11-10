@@ -307,6 +307,7 @@ $ckSame = static function (mixed $expected, mixed $actual, string $label) use (&
 };
 
 const SBF_MSG_ID = '0A0B0C0D0000000000000000000EA7';
+const SBF_UNIQ_ID = 'AC1E0A0B2C3D4E5F60718293A4B5C6D7';
 
 /** Builds the consumed message every leg starts from, including a half-message marker. */
 function sbfMessage(string $topic, int $reconsumeTimes = 0): MessageExt
@@ -320,6 +321,14 @@ function sbfMessage(string $topic, int $reconsumeTimes = 0): MessageExt
     $m->setFlag(7);
     $m->setReconsumeTimes($reconsumeTimes);
     $m->putProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED, 'true');
+    return $m;
+}
+
+/** Same consumed message, but with a UNIQ_KEY (as client-side decoding exposes it). */
+function sbfUniqMessage(string $topic): MessageExt
+{
+    $m = sbfMessage($topic);
+    $m->putProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX, SBF_UNIQ_ID);
     return $m;
 }
 
@@ -550,6 +559,39 @@ try {
         $c->sendMessageBack(sbfMessage('NoMasterTopic'), 0);
         $ckSame(0, count(sbfBounces()), 'pull.missingMaster.noBounceAttempted');
         $ckSame(1, count($inst->retrySends), 'pull.missingMaster.fallbackSendCount');
+    }
+
+    // ------------------------------------------- 11. Java MessageClientExt.getMsgId() parity
+    // CONSUMER_SEND_MSG_BACK.originMsgId and the retry copy's ORIGIN_MESSAGE_ID
+    // both read msg.getMsgId() on a client-decoded MessageClientExt -> UNIQ_KEY,
+    // not the broker offset id kept in MessageExt::$msgId.
+    {
+        $factories = [
+            'push' => static function (string $g, SendBackInstance $i): DefaultMQPushConsumer {
+                return sbfPush($g, $i);
+            },
+            'pull' => static function (string $g, SendBackInstance $i): DefaultMQPullConsumer {
+                return sbfPull($g, $i);
+            },
+        ];
+        foreach ($factories as $kind => $factory) {
+            $group = 'GID_SBF_Uniq' . ucfirst($kind);
+            $inst = $record($group, $broker->addr);
+            $c = $factory($group, $inst);
+            $c->sendMessageBack(sbfUniqMessage('RejectTopic'), 0);
+            $bounces = sbfBounces();
+            $ckSame(1, count($bounces), "uniq.{$kind}.bounceCount");
+            $ckSame(SBF_UNIQ_ID, $bounces[0]['originMsgId'] ?? null, "uniq.{$kind}.header.originMsgId");
+            $ck(SBF_MSG_ID !== ($bounces[0]['originMsgId'] ?? null), "uniq.{$kind}.header.notOffsetId");
+            $ckSame(1, count($inst->retrySends), "uniq.{$kind}.fallbackSendCount");
+            if (count($inst->retrySends) === 1) {
+                $ckSame(
+                    SBF_UNIQ_ID,
+                    (string) $inst->retrySends[0]->getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID),
+                    "uniq.{$kind}.retry.originMsgId"
+                );
+            }
+        }
     }
 } finally {
     $broker->stop();

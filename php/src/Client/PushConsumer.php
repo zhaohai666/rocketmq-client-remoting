@@ -7,6 +7,7 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\FilterAPI;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageAccessor;
+use RocketMQ\Common\MessageClientIdSetter;
 use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MessageExt;
 use RocketMQ\Common\MessageQueue;
@@ -2914,7 +2915,7 @@ final class DefaultMQPushConsumer
             $header->offset = $msg->commitLogOffset;
             $header->group = $this->consumerGroup;
             $header->delayLevel = $delayLevel;
-            $header->originMsgId = (string) $msg->msgId;
+            $header->originMsgId = MessageClientIdSetter::clientMsgId($msg);
             $header->originTopic = $msg->topic;
             $header->unitMode = $this->unitMode;
             $header->maxReconsumeTimes = $maxReconsume;
@@ -2960,7 +2961,10 @@ final class DefaultMQPushConsumer
         // touches the source message.
         $newMsg->properties = $msg->properties;
         $newMsg->flag = $msg->flag;
-        $originMsgId = MessageAccessor::getOriginMessageId($msg) ?? $msg->msgId;
+        // Java falls back on a blank ORIGIN_MESSAGE_ID too (not just null), and
+        // the fallback is msg.getMsgId() -> UNIQ_KEY on a consumed message.
+        $originMsgId = MessageAccessor::getOriginMessageId($msg)
+            ?: MessageClientIdSetter::clientMsgId($msg);
         if ($originMsgId !== null && $originMsgId !== '') {
             MessageAccessor::setOriginMessageId($newMsg, $originMsgId);
         }

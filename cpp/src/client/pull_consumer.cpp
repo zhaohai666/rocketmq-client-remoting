@@ -595,7 +595,7 @@ Message buildRetryCopy(const std::string& consumerGroup, const MessageExt& msg,
     newMsg.properties = msg.properties;
     newMsg.flag = msg.flag;
     std::string originMsgId = msg.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID);
-    if (originMsgId.empty()) originMsgId = msg.msgId;
+    if (originMsgId.empty()) originMsgId = msg.clientMsgId();
     if (!originMsgId.empty()) {
         newMsg.putProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, originMsgId);
     }
@@ -632,7 +632,7 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         header->offset = msg.commitLogOffset;
         header->group = consumerGroup_;
         header->delayLevel = delayLevel;
-        header->originMsgId = msg.msgId;
+        header->originMsgId = msg.clientMsgId();
         header->originTopic = msg.topic;
         header->unitMode = unitMode_;
         header->maxReconsumeTimes = maxReconsume;

@@ -74,6 +74,7 @@ use crate::client::trace_dispatcher::{TraceDispatcherType, TraceHost};
 use crate::client::trace_hook::{ConsumeMessageTraceHook, TraceReportSink};
 use crate::client::validators;
 use crate::common::message::{Message, MessageExt, MessageQueue};
+use crate::common::message_client_id_setter::client_msg_id;
 use crate::common::message_const::{
     PROPERTY_CONSUME_START_TIMESTAMP, PROPERTY_MAX_OFFSET, PROPERTY_MAX_RECONSUME_TIMES,
     PROPERTY_ORIGIN_MESSAGE_ID, PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME, PROPERTY_RETRY_TOPIC,
@@ -5620,8 +5621,7 @@ fn build_retry_message(consumer_group: &str, msg: &MessageExt, max_times: i32) -
         .get_property(PROPERTY_ORIGIN_MESSAGE_ID)
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-        .or_else(|| msg.msg_id.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| client_msg_id(msg));
     if !origin_msg_id.is_empty() {
         new_msg.put_property(PROPERTY_ORIGIN_MESSAGE_ID, &origin_msg_id);
     }
@@ -8675,6 +8675,31 @@ mod tests {
         let inner = h.c.inner.clone();
         let mut empty: Vec<MessageExt> = Vec::new();
         assert!(!check_orderly_reconsume_times(&inner, &mut empty).await);
+    }
+
+    #[test]
+    fn build_retry_message_origin_id_is_the_client_uniq_key() {
+        let mut with_uniq = ext("T", None);
+        with_uniq.msg_id = Some("OFFSET-ID".to_string());
+        with_uniq.put_property(
+            crate::common::message_const::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
+            "UNIQ-KEY-ID",
+        );
+        let copy = build_retry_message("G", &with_uniq, 16);
+        assert_eq!(
+            copy.get_property(PROPERTY_ORIGIN_MESSAGE_ID),
+            Some("UNIQ-KEY-ID"),
+            "the retry copy links back by the UNIQ_KEY, not the offset id"
+        );
+
+        // No UNIQ_KEY -> fall back to the broker offset id (Java parity).
+        let mut no_uniq = ext("T", None);
+        no_uniq.msg_id = Some("OFFSET-ID".to_string());
+        let copy = build_retry_message("G", &no_uniq, 16);
+        assert_eq!(
+            copy.get_property(PROPERTY_ORIGIN_MESSAGE_ID),
+            Some("OFFSET-ID")
+        );
     }
 
     #[test]

@@ -72,6 +72,16 @@ add_executable(rmq_test_admin_consume_directly test_admin_consume_directly.cpp)
 target_link_libraries(rmq_test_admin_consume_directly PRIVATE rocketmq::remoting)
 add_test(NAME admin_consume_directly COMMAND rmq_test_admin_consume_directly)
 
+# #47 ops RPC group (308/311/312/313/328/907/908/1002/1007/5001): a loopback listener pair pins
+# the request codes, the exact extFields key sets (308 three fields, 908 primitive long, 1002
+# ofAdminTrigger shape with E_T for 5001), name-server addressing for the unit-topic family, the
+# VIP port-2 rewrite for 308/328 (and the plain address of 907 even with the switch on), the
+# two-phase 1005 -> 1002 elect flow, and every response-body decode (numeric-keyed maps, nested
+# HA info, the Long.MAX_VALUE default of a missing endOffset).
+add_executable(rmq_test_admin_ops_rpc test_admin_ops_rpc.cpp)
+target_link_libraries(rmq_test_admin_ops_rpc PRIVATE rocketmq::remoting)
+add_test(NAME admin_ops_rpc COMMAND rmq_test_admin_ops_rpc)
+
 # Client logging: line format (ms/pid/thread name/file:line) + size-based rotation + maxIndex cap + level filtering
 add_executable(rmq_test_logging test_logging.cpp)
 target_link_libraries(rmq_test_logging PRIVATE rocketmq::remoting)
@@ -492,3 +502,9 @@ add_test(NAME client_config_switches COMMAND rmq_test_client_config_switches)
 add_executable(rmq_test_send_back_fallback test_send_back_fallback.cpp)
 target_link_libraries(rmq_test_send_back_fallback PRIVATE rocketmq::remoting)
 add_test(NAME send_back_fallback COMMAND rmq_test_send_back_fallback)
+
+# Java MessageClientExt#getMsgId() parity on consumed messages: UNIQ_KEY wins, offset id
+# is the fallback; SubBefore bean / CONSUMER_SEND_MSG_BACK / retry ORIGIN_MESSAGE_ID.
+add_executable(rmq_test_client_msg_id_parity test_client_msg_id_parity.cpp)
+target_link_libraries(rmq_test_client_msg_id_parity PRIVATE rocketmq::remoting)
+add_test(NAME client_msg_id_parity COMMAND rmq_test_client_msg_id_parity)

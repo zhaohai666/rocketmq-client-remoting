@@ -183,6 +183,10 @@ def main() -> int:
           got and len(msgs) == 1, "count=%d" % len(msgs))
     recv = msgs[0] if msgs else None
     recv_msg_id = recv.msg_id if recv else None
+    # Java MessageClientExt.getMsgId() returns the UNIQ_KEY property; the
+    # consume-side SubBefore/SubAfter beans use that client-visible id, not the
+    # decoded offset id kept in msg.msg_id.
+    recv_client_id = (get_uniq_id(recv) or recv_msg_id) if recv else None
     check("S7 the consumer-side msg_id == SendResult.offset_msg_id and the UNIQ_KEY arrives on the consumer side through the properties",
           recv is not None and recv_msg_id == result.offset_msg_id
           and get_uniq_id(recv) == result.msg_id,
@@ -193,7 +197,7 @@ def main() -> int:
     keyless = producer.send(Message(TOPIC, b"no-keys-here"), 5000)
     keyless_ok = _wait_until(
         lambda: any(bytes(m.body) == b"no-keys-here" for m in msg_collector.snapshot()), 25)
-    keyless_id = keyless.offset_msg_id
+    keyless_client_id = keyless.msg_id  # UNIQ_KEY, the id the SubBefore bean reports
 
     # Shut the consumer down -> this triggers the trace dispatcher to flush, guaranteeing that SubBefore/SubAfter land on disk
     consumer.shutdown()
@@ -236,12 +240,12 @@ def main() -> int:
           "raw_keys=%s" % [k for k, _t, _b in raw][:3])
 
     subs_before = [r for r in records if r.trace_type == TraceType.SUB_BEFORE and r.trace_beans
-                   and r.trace_beans[0].msg_id == recv_msg_id]
+                   and r.trace_beans[0].msg_id == recv_client_id]
     check("S11 a SubBefore shows up in the traces and its msgId matches the consumer side", len(subs_before) >= 1,
           "count=%d" % len(subs_before))
 
     subs_after = [r for r in records if r.trace_type == TraceType.SUB_AFTER and r.trace_beans
-                  and r.trace_beans[0].msg_id == recv_msg_id]
+                  and r.trace_beans[0].msg_id == recv_client_id]
     if subs_before and subs_after:
         before, after = subs_before[0], subs_after[0]
         check("S12 SubBefore/SubAfter are paired with the same requestId, success=true, contextCode=0",
@@ -284,7 +288,7 @@ def main() -> int:
 
     # ---------- S17 the trace of a message without keys (the last segment of SubBefore is empty) must decode too ----------
     kl_before = [r for r in records if r.trace_type == TraceType.SUB_BEFORE and r.trace_beans
-                 and r.trace_beans[0].msg_id == keyless_id]
+                 and r.trace_beans[0].msg_id == keyless_client_id]
     check("S17 a message without keys still yields a decodable SubBefore trace (an empty keys segment does not crash it)",
           keyless_ok and len(kl_before) >= 1 and kl_before[0].trace_beans[0].keys == "",
           "consumed=%s before=%d keys=%r" % (

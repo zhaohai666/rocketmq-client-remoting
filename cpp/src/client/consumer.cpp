@@ -4232,7 +4232,7 @@ Message DefaultMQPushConsumer::buildRetryMessage(const MessageExt& msg,
     newMsg.properties = msg.properties;
     newMsg.flag = msg.flag;
     std::string originMsgId = msg.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID);
-    if (originMsgId.empty()) originMsgId = msg.msgId;
+    if (originMsgId.empty()) originMsgId = msg.clientMsgId();
     if (!originMsgId.empty()) {
         newMsg.putProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID, originMsgId);
     }
@@ -4348,7 +4348,7 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         header->offset = msg.commitLogOffset;
         header->group = consumerGroup_;
         header->delayLevel = delayLevel;
-        header->originMsgId = msg.msgId;
+        header->originMsgId = msg.clientMsgId();
         header->originTopic = msg.topic;
         // NOTE: unitMode is reported faithfully here. A common shortcut fills only
         // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName and

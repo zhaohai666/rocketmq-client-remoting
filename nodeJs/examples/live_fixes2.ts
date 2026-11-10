@@ -232,8 +232,12 @@ async function main(): Promise<void> {
     for (const raw of traceRaw) {
       for (const ctx of DecodeTraceDataString(raw)) {
         if (ctx.traceType === 'Pub' && ctx.traceBeans.some((b: any) => b.msgId === uniq)) pubHit = true;
-        if (ctx.traceType === 'SubBefore' && ctx.groupName === `GID_Fix2_TraceC_${STAMP}`) subBefore = true;
-        if (ctx.traceType === 'SubAfter' && ctx.groupName === `GID_Fix2_TraceC_${STAMP}`) subAfter = true;
+        // Consumer-side trace beans carry UNIQ_KEY (Java MessageClientExt.getMsgId()),
+        // not the broker offset id — pin that instead of mere presence.
+        if (ctx.traceType === 'SubBefore' && ctx.groupName === `GID_Fix2_TraceC_${STAMP}`
+            && ctx.traceBeans.some((b: any) => b.msgId === uniq)) subBefore = true;
+        if (ctx.traceType === 'SubAfter' && ctx.groupName === `GID_Fix2_TraceC_${STAMP}`
+            && ctx.traceBeans.some((b: any) => b.msgId === uniq)) subAfter = true;
       }
     }
     check('fix4: Pub record with UNIQ_KEY msgId', pubHit, `rawRecords=${traceRaw.length}`);

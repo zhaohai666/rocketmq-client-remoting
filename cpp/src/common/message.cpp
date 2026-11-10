@@ -97,6 +97,14 @@ std::string Message::toString() const {
 
 // ---------------------------------------------------------------- MessageExt
 
+// Java MessageClientExt#getMsgId(): a client-decoded message reports the UNIQ_KEY
+// property and only falls back to the broker offset id (kept in msgId) when absent.
+std::string MessageExt::clientMsgId() const {
+    std::string uniq = getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+    if (!uniq.empty()) return uniq;
+    return msgId;
+}
+
 std::string MessageExt::getBornHostString() const {
     if (!bornHost.empty() && bornHostPort != 0) {
         return bornHost + ":" + std::to_string(bornHostPort);

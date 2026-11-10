@@ -234,7 +234,7 @@ func (i *Instance) sendMessageBack(group string, msg *common.MessageExt, delayLe
 		Offset:            remoting.I64Ptr(msg.CommitLogOffset),
 		Group:             remoting.StrPtr(group),
 		DelayLevel:        remoting.I32Ptr(delayLevel),
-		OriginMsgID:       remoting.StrPtr(msg.MsgID),
+		OriginMsgID:       remoting.StrPtr(common.ClientMsgID(msg)),
 		OriginTopic:       remoting.StrPtr(msg.Topic),
 		UnitMode:          remoting.BoolPtr(unitMode),
 		MaxReconsumeTimes: remoting.I32Ptr(maxReconsumeTimes),

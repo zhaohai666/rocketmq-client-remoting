@@ -48,4 +48,23 @@ final class MessageClientIdSetter
         }
         return $msg->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
     }
+
+    /**
+     * Java ``MessageClientExt#getMsgId()`` parity on a consumed message.
+     *
+     * Client-side decoding keeps the broker offset id in ``MessageExt::$msgId``
+     * and exposes UNIQ_KEY as a normal property. Java's getMsgId() returns the
+     * UNIQ_KEY property and only falls back to the offset id when that property
+     * is absent, so every place that in Java calls msg.getMsgId() on a
+     * *consumed* message must go through this helper instead of reading the
+     * offset id directly.
+     */
+    public static function clientMsgId(?Message $msg): string
+    {
+        $uniq = self::getUniqId($msg);
+        if ($uniq !== null && $uniq !== '') {
+            return $uniq;
+        }
+        return $msg instanceof MessageExt ? ($msg->msgId ?? '') : '';
+    }
 }

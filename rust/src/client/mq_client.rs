@@ -26,7 +26,7 @@ use crate::client::top_addressing::DefaultTopAddressing;
 use crate::common::boundary_type::BoundaryType;
 use crate::common::compression::decompress_body;
 use crate::common::message::{Message, MessageBatch, MessageExt, MessageQueue};
-use crate::common::message_client_id_setter::{get_uniq_id, set_uniq_id};
+use crate::common::message_client_id_setter::{client_msg_id, get_uniq_id, set_uniq_id};
 use crate::common::message_const::{
     KEY_SEPARATOR, PROPERTY_CORRELATION_ID, PROPERTY_FIRST_POP_TIME, PROPERTY_MAX_RECONSUME_TIMES,
     PROPERTY_MSG_REGION, PROPERTY_POP_CK, PROPERTY_RECONSUME_TIME,
@@ -3276,7 +3276,7 @@ impl MQClientInstance {
             offset: Some(msg.commit_log_offset),
             group: Some(consumer_group.to_string()),
             delay_level: Some(delay_level),
-            origin_msg_id: msg.msg_id.clone(),
+            origin_msg_id: Some(client_msg_id(msg)),
             origin_topic: Some(msg.topic.clone()),
             unit_mode: Some(unit_mode),
             max_reconsume_times,
