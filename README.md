@@ -374,6 +374,20 @@ CI，日志落在 `$HOME` 下既难清理也容易污染；随项目走更容易
 全部工具自带断言、失败以非 0 退出码收口；各端逐项清单与覆盖缺口写在对应 README 的
 「真实集群联调」一节。`scripts/with_cluster.sh` 会先检查 NameServer / Broker 是否就绪再执行命令。
 
+**同一能力跨七端一起验**用 `scripts/run_capability_closeout_live.sh`：它起一套集群 → 等 TBW102
+路由可见 → 逐端跑同一条能力探针 → 按端口回收自己起的进程。
+
+```bash
+bash scripts/run_capability_closeout_live.sh all                  # 七端串行，共用一套集群
+bash scripts/run_capability_closeout_live.sh python               # 只跑一端
+ROCKETMQ_NS_PORT=9941 ROCKETMQ_BROKER_PORT=10981 \
+  RMQ_CAP_WORK=/tmp/rmq_cap_a bash scripts/run_capability_closeout_live.sh all   # 换端口并行跑
+```
+
+当前覆盖 `ConsumeFromWhere` 六值折叠、LitePull `connectBrokerByUser`/`defaultBrokerId`、
+`adminExtGroup`（以及 node 的停机预算）；实测矩阵与两条容易被误判成 bug 的结论见
+`docs/classic-remoting-capability-checklist.md` 第 12 节。
+
 ### 开启 ACL 鉴权的集群：全部消息类型逐端收发
 
 集群打开 `authenticationEnabled=true` 后，每一端都要求**成对断言**：先无凭据发一次，必须拿到

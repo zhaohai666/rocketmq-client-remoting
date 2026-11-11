@@ -129,6 +129,9 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 | 7 个推送请求码（40/39/220/221/307/309/326） | `ClientRemotingProcessor` | ✅ 七端全齐（既有） | 复核确认，非缺口 |
 | Admin 门面规模 | `tools/.../DefaultMQAdminExt.java`（125 个 public 方法） | ✅ 七端已覆盖（147–194 个，含内部辅助） | 未移植者仅 trivial 访问器 |
 
+上表标记「七端补齐」的三项，除离线回归外**已对真实 5.5.1 集群跑通**（七端一次串行
+`RESULT: all green`，119 断言 0 失败），矩阵与两条"别当 bug 再查一遍"的实测结论见第 12.2 节。
+
 ## 11. 已知未移植（P3 边缘，按需再补）
 
 | Java 侧类 | 说明 | 各端现状 |
@@ -149,4 +152,52 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 3. 按上表逐能力跑各端 live 入口（topic/组名带本次时间戳，断言按 body 过滤）；
 4. 输出七端 × 能力矩阵（✅/❌/N/A），kill 集群。
 
-每次真机运行的矩阵结果只做本地归档，不随代码入库。
+### 12.1 第 10 节三项能力的真机入口
+
+```bash
+# 单端（自起集群、自等 TBW102 路由、自收尾）
+bash scripts/run_capability_closeout_live.sh python
+# 七端串行（共用一套集群，约 10 分钟）
+bash scripts/run_capability_closeout_live.sh all
+# 换端口并行跑（每端独立端口 + 独立 store，互不干扰）
+ROCKETMQ_NS_PORT=9941 ROCKETMQ_BROKER_PORT=10981 RMQ_CAP_WORK=/tmp/rmq_cap_a \
+  bash scripts/run_capability_closeout_live.sh all
+```
+
+探针文件：`python/verify_capability_closeout_live.py`、`go/examples/live_capability_closeout/`、
+`nodeJs/examples/live_capability_closeout.ts`、`php/examples/live_capability_closeout.php`、
+`rust/examples/live_capability_closeout.rs`、`cpp/examples/live_capability_closeout.cpp`、
+`csharp/examples/RocketMQ.Examples/LiveCapabilityCloseout.cs`（`capability-closeout` 子命令）。
+脚本按**端口**回收自己起的进程（`lsof -ti :PORT`），并发的多次运行不会互相误杀。
+
+### 12.2 2026-11-11 实测矩阵（七端一次串行，`RESULT: all green`）
+
+| 端 | L1 三个废弃值折叠 | L2 LitePull pin | L3 adminExtGroup | node L4 停机预算 | 断言数 |
+|---|---|---|---|---|---|
+| python | ✅ | ✅ | ✅ | — | 15 / 0 |
+| go | ✅ | ✅ | ✅ | — | 15 / 0 |
+| node | ✅ | ✅ | ✅ | ✅ | 18 / 0 |
+| php | ✅ | ✅ | ✅ | — | 19 / 0 |
+| rust | ✅ | ✅ | ✅ | — | 15 / 0 |
+| cpp | ✅ | ✅ | ✅ | — | 17 / 0 |
+| csharp | ✅ | ✅ | ✅ | — | 20 / 0 |
+
+（"断言数" = PASS / FAIL。）
+
+两条**必须记住的实测结论**，否则下轮会把 parity 当 bug 再查一遍：
+
+1. **`CONSUME_FROM_LAST_OFFSET` 家族的投递条数不是折叠判据。** 同端基线为 0 或 8，
+   由"该端是否显式发 `setZeroIfNotFound=false`"决定：py/node/php/rust 显式发 → broker 回
+   `QUERY_NOT_FOUND` → 客户端从 maxOffset 起 → 收 **0**；java/cpp/cs/go 不带该字段 → 可能命中
+   broker `ConsumerManageProcessor#queryConsumerOffset` 的 V3_0_6 兼容分支（`minOffset<=0`
+   且 `checkInMemByConsumeOffset(topic,q,0,1)` 命中）→ 回 `SUCCESS offset=0` → 收 **8**。
+   该分支依赖 offset 0 的页是否还在内存，**同端不同腿会翻转**：用 Java 参考客户端做 oracle，
+   同一进程五腿实测为 `FIRST=8, LAST=0, MIN=8, MAX=8, BOOT=0`。所以探针只断言
+   **"四个 LAST 家族值 == 同端 LAST_OFFSET 基线"**（折叠语义）+ 条数落在 `0..N`
+   （不崩、不空转），绝对值只打 INFO 供记录。
+2. **pin 到不存在的 slave 仍然投递**，不是洞：Java 用
+   `findBrokerAddressInSubscribe(..., onlyThisBroker=false)`，目标 brokerId 不在表里就回退到
+   表首 broker。断言必须落在**请求里真实携带的 brokerId**（`None`/`0`/`1`），不能落在"收不到"。
+
+单 broker 集群没有 slave，所以 L2 只能证明"id 真的进了请求"，"从 slave 读到数据"这条腿
+需要多 broker 拓扑，属已知未覆盖项。
