@@ -112,7 +112,9 @@
 
 ## 10. 2026-11-11 与 Java 参考实现的能力对齐（本轮结论）
 
-逐条比对 Java 5.x `client`/`common`/`tools` 三个模块后，**真缺口 3 项**、**证伪 2 项**。
+逐条比对 Java 5.x `client`/`common`/`tools` 三个模块后，**真缺口 3 项**、**证伪 3 项**
+（第 3 条「有序 POP」是 2026-11-11 二次复核时纠正的：首轮按行数误判成 P2 缺口，读方法体后确认
+Java 自身即骨架，见下方判定纪律）。
 每项的七端离线回归入口统一为 `capability_closeout`（py `tests/test_capability_closeout.py`、
 cpp `tests/test_capability_closeout.cpp`、cs `tests/.../CapabilityCloseoutTests.cs`、
 go `client/capability_closeout_test.go`、rust `pull_consumer.rs`/`admin.rs` 的 `#[cfg(test)]`、
@@ -126,8 +128,13 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 | Pull `setEnableRebalance` | `DefaultMQPullConsumer.java:503-509` → `DefaultMQPullConsumerImpl#doRebalance/tryRebalance:388-404` | ❌ **证伪，不是缺口** | 该开关只 gate `doRebalance()` / `tryRebalance()`，而七端 `DefaultMQPullConsumer` **根本没有 pull 侧重平衡机制**（文件头即写明"no rebalance"；分配结果需主动 `fetchSubscribeMessageQueues` + `fetchMessageQueuesInBalance` 取）。`enableRebalance=false` 描述的正是七端的既有不变行为，单加一个常量没有可 gate 的代码。真要补，应补"pull 侧重平衡 + MessageQueueListener 周期回调"整块，属新特性而非开关 |
 | Admin `setAdminExtGroup` / `getAdminExtGroup` | `DefaultMQAdminExt.java:85,105-111,706-712` | ✅ 七端补齐（七端均为新增，node 原只有构造参数） | 默认 `"admin_ext_group"`。Java 只用它做 admin 在 client 实例里的注册键 + 日志；七端 admin 不发合成 consumer 心跳，故**没有 wire 影响**，纯身份位。已按此写入各端注释，避免后来者误以为能改心跳组 |
 | `MessageConst` 六个属性（`CORRECTION_FLAG`/`MQ2_FLAG`/`SHARDING_KEY`/`DLQ_ORIGIN_MESSAGE_ID`/`DLQ_ORIGIN_TOPIC`/`TRANSACTION_ID`） | `common/.../message/MessageConst.java` | ❌ **证伪，不是缺口** | 在 Java client 内**无调用者**（仅常量定义或 broker/proxy 侧使用）；reply 消息的 `PROPERTY_MESSAGE_TTL`（wire `"TTL"`）七端概念上已有 TTL 支持 |
+| 有序 POP 消费（`MessageListenerOrderly` + POP） | `client/.../consumer/ConsumeMessagePopOrderlyService.java:315-324` | ❌ **证伪，不是缺口**（2026-11-11 复核，**此前误判为 P2 缺口，已更正**） | Java 5.5.1 这个类**自己就是未完成的骨架**：`ConsumeRequest#run()` 取到锁对象后**方法即结束**——没有 `synchronized (objLock)`、不调 `messageListener.consumeMessage`、不 ack；本类的 `processConsumeResult` 是 `return true` 且**无任何调用者**；4 参 `submitConsumeRequest` 直接抛 `UnsupportedOperationException`。对照同目录的真实现即可分辨：`ConsumeMessageOrderlyService:397/462/517`（`synchronized` + `consumeMessage` + `processConsumeResult(msgs,…)`）、`ConsumeMessagePopConcurrentlyService:97`（`consumeMessage`）。故七端「有序监听 + POP 收不到消息、积压不下降」是与 Java 完全一致的 parity；python/cpp 的空转骨架（`python/tests/test_pop_orderly.py` 用断言锁死"不消费不 ack"）与 go 的「不请求有序 POP」（`client/pop_consumer.go:238`）是同一行为的两种表达 |
 | 7 个推送请求码（40/39/220/221/307/309/326） | `ClientRemotingProcessor` | ✅ 七端全齐（既有） | 复核确认，非缺口 |
 | Admin 门面规模 | `tools/.../DefaultMQAdminExt.java`（125 个 public 方法） | ✅ 七端已覆盖（147–194 个，含内部辅助） | 未移植者仅 trivial 访问器 |
+
+> **判定纪律**：判「Java 有、我们缺」时，**行数不是证据，必须读方法体**。上一条就是反例——
+> `ConsumeMessagePopOrderlyService` 有 368 行，其中大半是 `equals`/`hashCode`/accessor/
+> `consumeMessageDirectly` 样板，核心 `run()` 只有「取锁 + 返回」两行，一眼看行数会得出相反结论。
 
 上表标记「七端补齐」的三项，除离线回归外**已对真实 5.5.1 集群跑通**（七端一次串行
 `RESULT: all green`，119 断言 0 失败），矩阵与两条"别当 bug 再查一遍"的实测结论见第 12.2 节。
@@ -136,7 +143,6 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 
 | Java 侧类 | 说明 | 各端现状 |
 |---|---|---|
-| `ConsumeMessagePopOrderlyService`（**有序 POP 消费**，368 行） | 不是边缘项：POP 模式下 `MessageListenerOrderly` 的完整消费链——队列锁、`COMMIT`/`ROLLBACK`、`checkReconsumeTimes`、`sendMessageBack`、`submitConsumeRequestLater`、revive 重投 | **七端均未实现**（P2）。python/cpp 有空转骨架（请求入队后 `run()` 拿到队列锁即返回，**既不消费也不 ack**，broker 到 `invisibleTime` 后 revive 重投；`python/tests/test_pop_orderly.py` 用断言把该行为锁死）；go 干脆不请求有序 POP（`client/pop_consumer.go:238` "this port does not do orderly POP"）；cs/rs/node/php 无相关代码。宏观症状：**有序监听 + POP 收不到消息且积压不下降**。补齐需七端同步做，且要先定 queue lock 与 COMMIT/ROLLBACK 的跨端契约 |
 | `MQClientAPIFactory` + `common.NameserverAccessConfig` | proxy/sdk 场景的多实例 `MQClientAPIImpl` 工厂（instanceName 自动编号）+ NS 域名配置持有器；经典 remoting 直连用不到 | 七端均无，按需补 |
 | `trace.TraceView` | 轨迹查看工具类，非运行时能力 | 七端均无，可忽略 |
 
