@@ -778,9 +778,10 @@ func TestPullConsumerShutdownUnregistersTheGroup(t *testing.T) {
 	c.Shutdown()
 }
 
-// TestPullConsumerRebalanceNotifiesTheQueueListener: this port has no pull-side
-// assignment, so the listener is told mqAll == mqDivided — claiming a subset was
-// "yours" would be a lie the caller might act on.
+// TestPullConsumerRebalanceNotifiesTheQueueListener: the NOTIFY_CONSUMER_IDS_
+// CHANGED kick runs the same background doRebalance a periodic round uses, and
+// with this consumer the only member of the group its allocation is the whole
+// topic — mqAll == mqDivided, delivered through the queue listener.
 func TestPullConsumerRebalanceNotifiesTheQueueListener(t *testing.T) {
 	const topic = "PullListenerTopic"
 	f := newClusterFixture(t, map[string]int{topic: 2})
@@ -790,6 +791,10 @@ func TestPullConsumerRebalanceNotifiesTheQueueListener(t *testing.T) {
 	requireNoError(t, "subscribe", c.Subscribe(topic, "*"))
 	startPullConsumer(t, c)
 
+	// The fixture pre-seeds the broker with a clientId built WITHOUT the pull
+	// consumer's @STREAM suffix; report the real one, or allocation cannot find
+	// this instance in the group.
+	f.broker.setClientIDs(c.ClientID())
 	c.RebalanceImmediately()
 	waitFor(t, "the queue listener to fire", func() bool { return listener.calls() > 0 })
 

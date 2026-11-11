@@ -140,10 +140,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new(namesrv: &str, prefix: &str) -> Result<Fixture, String> {
-        let setup = MQClientInstance::new(
-            &format!("{prefix}-setup"),
-            vec![namesrv.to_string()],
-        );
+        let setup = MQClientInstance::new(&format!("{prefix}-setup"), vec![namesrv.to_string()]);
         setup
             .start()
             .await
@@ -218,7 +215,9 @@ impl Fixture {
                 }
             }
             if Instant::now() >= deadline {
-                return Err(format!("route of {topic} not visible on the name server in 60s"));
+                return Err(format!(
+                    "route of {topic} not visible on the name server in 60s"
+                ));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -453,13 +452,12 @@ async fn run(namesrv: &str) -> Checker {
         }
     };
     println!("== capability closeout live (rust): ns={namesrv} prefix={prefix} ==");
-    println!(
-        "  INFO broker={} addr={}",
-        fx.broker_name, fx.broker_addr
-    );
+    println!("  INFO broker={} addr={}", fx.broker_name, fx.broker_addr);
 
     // ---------------------------------------------------------------- L1
-    println!("\nL1 ConsumeFromWhere: LAST-family values are accepted live (folding is pinned offline)");
+    println!(
+        "\nL1 ConsumeFromWhere: LAST-family values are accepted live (folding is pinned offline)"
+    );
     let t1 = fx.topic("FromWhere");
     if let Err(e) = fx.create_topic(&t1, 1).await {
         ck.abort("L1 create topic", &e);
@@ -538,7 +536,9 @@ async fn run(namesrv: &str) -> Checker {
 
     for (label, n) in &last_family {
         ck.check(
-            &format!("L1-{label} is accepted: consumer started, got a queue, consumed a sane count"),
+            &format!(
+                "L1-{label} is accepted: consumer started, got a queue, consumed a sane count"
+            ),
             !n.assigned.is_empty() && n.got <= N_MSG,
             &format!(
                 "received={} (sane range 0..={N_MSG}) assigned={:?}",
@@ -574,22 +574,15 @@ async fn run(namesrv: &str) -> Checker {
             println!(
                 "  INFO broker {} ids present in the cluster: {:?}",
                 fx.broker_name,
-                bd.broker_addrs.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+                bd.broker_addrs
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>()
             );
         }
     }
 
-    let off = lite_leg(
-        &mut ck,
-        &fx,
-        &t2,
-        &fx.group("pinOff"),
-        false,
-        0,
-        N_MSG,
-        20,
-    )
-    .await;
+    let off = lite_leg(&mut ck, &fx, &t2, &fx.group("pinOff"), false, 0, N_MSG, 20).await;
     ck.check(
         "L2-pin off: the request carries no broker id (route resolution as before)",
         !off.pin,
@@ -626,17 +619,7 @@ async fn run(namesrv: &str) -> Checker {
         &format!("got={} expect={N_MSG}", master.got),
     );
 
-    let slave = lite_leg(
-        &mut ck,
-        &fx,
-        &t2,
-        &fx.group("pinSlave"),
-        true,
-        1,
-        N_MSG,
-        12,
-    )
-    .await;
+    let slave = lite_leg(&mut ck, &fx, &t2, &fx.group("pinSlave"), true, 1, N_MSG, 12).await;
     ck.check(
         "L2-pin to a non-existent slave (1): the request carries brokerId=1",
         slave.pin && slave.default_broker_id == 1,
@@ -680,7 +663,10 @@ async fn run(namesrv: &str) -> Checker {
     let list = match admin.fetch_all_topic_list().await {
         Ok(list) => Some(list),
         Err(e) => {
-            ck.abort("L3 fetch_all_topic_list with a custom group", &e.to_string());
+            ck.abort(
+                "L3 fetch_all_topic_list with a custom group",
+                &e.to_string(),
+            );
             None
         }
     };

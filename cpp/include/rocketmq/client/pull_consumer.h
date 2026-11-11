@@ -3,8 +3,11 @@
 //   fetchSubscribeMessageQueues / fetchMessageQueuesInBalance / pull / pullBlockIfNotFound /
 //   fetchConsumeOffset / updateConsumeOffset / searchOffset / maxOffset / minOffset /
 //   earliestMsgStoreTime / sendMessageBack / createTopic.
-// fetchMessageQueuesInBalance recomputes the topic's share, so it is also the point where a registered
-// queue listener learns that the share moved.
+//
+// Like Java's DefaultMQPullConsumer (enableRebalance, default true), a resident thread divides every
+// registered topic across the group's instances every `rebalanceWaitMillis` (20s) and reports a moved
+// share through the queue listener; fetchMessageQueuesInBalance hands out that product. `setEnableRebalance(false)`
+// turns the thread's work off and makes fetchMessageQueuesInBalance compute the share on the spot instead.
 #ifndef ROCKETMQ_CLIENT_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_PULL_CONSUMER_H
 
@@ -89,9 +92,30 @@ public:
     // the point at which the broker moves the message to %DLQ%.
     void setMaxReconsumeTimes(int32_t times) { maxReconsumeTimes_ = times; }
     int32_t maxReconsumeTimes() const { return maxReconsumeTimes_; }
-    // Queue listeners are told only when fetchMessageQueuesInBalance hands out a view whose queue set
-    // moved for that topic: a re-ordering is not a change, a same-count swap to another broker is.
-    // The topic-keyed listener wins for its own topic; the single listener is the sink for the rest.
+
+    // ---------------- pull-side background rebalance ----------------
+    // Java DefaultMQPullConsumer.java:97 `enableRebalance = true`; DefaultMQPullConsumerImpl#doRebalance
+    // (:388-395) / #tryRebalance (:398-406) both gate on it. On by default: the resident thread divides
+    // every registered topic (BROADCASTING takes all queues) and notifies the queue listener when a
+    // share moved. Off: doRebalance does nothing and fetchMessageQueuesInBalance computes on the spot.
+    void setEnableRebalance(bool enable) { enableRebalance_.store(enable); }
+    bool isEnableRebalance() const { return enableRebalance_.load(); }
+    // Round period: Java system property rocketmq.client.rebalance.waitInterval (20000ms).
+    void setRebalanceWaitMillis(int32_t millis);
+    int32_t rebalanceWaitMillis() const { return rebalanceWaitMillis_.load(); }
+    // Lower bound between two rounds: Java rocketmq.client.rebalance.minInterval (1000ms).
+    void setRebalanceMinIntervalMillis(int32_t millis);
+    int32_t rebalanceMinIntervalMillis() const { return rebalanceMinIntervalMillis_.load(); }
+    // Snapshot of the product: topic -> the queues the background rebalance allocated to this instance.
+    // A topic that vanished from the route is present with an empty list (once it had been assigned).
+    std::map<std::string, std::vector<MessageQueue>> getRebalanceTable() const;
+
+    // Queue listeners are told when the share of a topic moves -- by the background rebalance
+    // only. `fetchMessageQueuesInBalance` is a pure query in Java (it reads the rebalance's
+    // process-queue table): it never fires `messageQueueChanged`, whether it answers from the
+    // table or computes on the spot. A re-ordering of the same queues is not a change, a
+    // same-count swap to another broker is. The topic-keyed listener wins for its own topic;
+    // the single listener is the sink for the rest.
     void setMessageQueueListener(std::shared_ptr<MessageQueueListener> listener) {
         std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
         messageQueueListener_ = std::move(listener);
@@ -119,6 +143,12 @@ public:
                                         const std::vector<MessageQueue>& after) {
         return assignmentChanged(before, after);
     }
+    // Test-only: run one rebalance round exactly the way the resident thread does (Java tryRebalance:
+    // true means balanced/no quick retry). Safe offline once start() has run.
+    bool doRebalanceForTest() { return doRebalance(); }
+    // Test-only: seed the product of the background rebalance without a round (what the fetch path reads).
+    void setRebalanceTableForTest(const std::string& topic,
+                                  const std::vector<MessageQueue>& queues);
 
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
@@ -139,6 +169,8 @@ public:
     // ---------------- lifecycle ----------------
     void start();
     void shutdown();
+    // The instance that owns this facade's RPCs (throws before start()). Same accessor as the push consumer.
+    MQClientInstance& client();
 
     int32_t sendHeartbeatToAllBroker();
     // Re-register with one broker when a connection to it has just been established (public for tests).
@@ -218,6 +250,23 @@ private:
     void startHeartbeatLoop();
     void heartbeatLoop();
 
+    // ---------------- pull-side background rebalance ----------------
+    // A resident thread per facade. Deviation from Java: Java shares one RebalanceService per client
+    // instance; here each facade drives its own loop. The observable behaviour -- which queues this
+    // instance owns and when the listener fires -- is identical.
+    void startRebalanceLoop();
+    void stopRebalanceLoop();
+    void rebalanceLoop();
+    // Java DefaultMQPullConsumerImpl#tryRebalance: gated on enableRebalance (off returns true, "no quick
+    // retry"), then one round over every registered topic. Returns whether the round is balanced.
+    bool doRebalance();
+    // Java RebalanceImpl#rebalanceByTopic on the pull path, plus RebalancePullImpl#messageQueueChanged.
+    bool rebalanceByTopic(const std::string& topic);
+    // Notify the registered listeners of a moved share; a throwing listener is logged and swallowed
+    // (RebalancePullImpl:49-51), so one bad callback cannot kill the loop.
+    void notifyQueueChanged(const std::string& topic, const std::vector<MessageQueue>& all,
+                            const std::vector<MessageQueue>& divided);
+
     // Tell the registered listeners about a topic's balanced view, but only when its own queue set
     // moved since the view last handed out. Returns whether they were told.
     bool notifyAssignmentChanged(const std::string& topic, const std::vector<MessageQueue>& all,
@@ -288,6 +337,19 @@ private:
     std::thread heartbeatThread_;
     std::mutex heartbeatLock_;
     std::condition_variable heartbeatCv_;
+
+    // ---- pull-side rebalance state (cross-thread: config read by the loop, table shared with the fetch path) ----
+    std::atomic<bool> enableRebalance_{true};
+    std::atomic<int32_t> rebalanceWaitMillis_{20000};
+    std::atomic<int32_t> rebalanceMinIntervalMillis_{1000};
+    mutable std::mutex rebalanceTableMutex_;
+    std::map<std::string, std::vector<MessageQueue>> rebalanceTable_;
+    std::atomic<bool> rebalanceStop_{false};
+    std::thread rebalanceThread_;
+    // Exit handshake so shutdown() can cap how long it waits before join (the loop wakes in <=100ms slices).
+    std::mutex rebalanceExitMutex_;
+    std::condition_variable rebalanceExitCv_;
+    bool rebalanceThreadExited_ = false;
 };
 
 }  // namespace rocketmq

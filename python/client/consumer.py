@@ -142,6 +142,16 @@ def _mq_sort_key(mq: MessageQueue):
     return (mq.topic, mq.broker_name, mq.queue_id)
 
 
+def _same_mq_set(left: List[MessageQueue], right: List[MessageQueue]) -> bool:
+    """Whether two allocations hold the same queues.
+
+    Compares the ``(topic, brokerName, queueId)`` identities as a set: order carries no
+    meaning, and "lost one, gained another" must count as a change even though the count
+    is unchanged (the same rule the push-side rebalance uses, see ``_queues_by_topic``).
+    """
+    return {_mq_sort_key(mq) for mq in left} == {_mq_sort_key(mq) for mq in right}
+
+
 def _queues_by_topic(queues: List[MessageQueue]) -> Dict[str, Set[str]]:
     """Group a queue list as topic -> the set of ``<brokerName>-<queueId>`` identities owned there.
 
@@ -4351,8 +4361,9 @@ class DefaultMQPullConsumer:
         self.message_queue_lists: List[MessageQueue] = []
         self.message_queue_listener: Optional[MessageQueueListener] = None
         # Queue allocation strategy (default AllocateMessageQueueAveragely).
-        # Pull mode manages queues itself and has no background rebalance,
-        # so it exists only as config and is validated by start().
+        # It is consumed by the background rebalance loop below (see `enable_rebalance`)
+        # and, when that loop has not filled the table yet, by
+        # `fetch_message_queues_in_balance`'s on-the-spot computation. start() rejects None.
         self.allocate_message_queue_strategy: Optional[AllocateMessageQueueStrategy] = \
             AllocateMessageQueueAveragely()
         # Pre-delivery filter hooks: attached to the pull result unpacking path at start()
@@ -4388,6 +4399,26 @@ class DefaultMQPullConsumer:
         self._pull_callback_executor: Optional[ConsumeExecutor] = None
         self._async_pull_lock = threading.Lock()
         self._pull_executors_closed = False
+        # ---- Pull-side rebalance (Java DefaultMQPullConsumer.java:97 / impl :388-406) ----
+        # Java's pull consumer DOES rebalance: the shared RebalanceService thread calls
+        # `mqClientFactory.doRebalance()` every `waitInterval` (20s, system property
+        # `rocketmq.client.rebalance.waitInterval`), which walks every registered consumer
+        # and calls its `tryRebalance()`; that gates on `enableRebalance` (default true) and
+        # then runs `rebalanceImpl.doRebalance(false)` -> allocate -> `messageQueueChanged`.
+        # This port therefore keeps the same switch and drives the same allocation formula
+        # from its own thread. Deviation: Java shares one RebalanceService per client
+        # instance, this port gives each facade its own loop (same shape as the heartbeat
+        # loop above); the observable behaviour -- which queues this instance owns and when
+        # the listener fires -- is the same.
+        self.enable_rebalance = True
+        self.rebalance_wait_millis = 20000
+        self.rebalance_min_interval_millis = 1000
+        # The product of the background rebalance: topic -> the queues allocated to this
+        # instance. Java reads the keys of the rebalance's process-queue table; here it is
+        # a plain table, and `fetch_message_queues_in_balance` prefers it when it is warm.
+        self._rebalance_table: Dict[str, List[MessageQueue]] = {}
+        self._rebalance_thread: Optional[threading.Thread] = None
+        self._rebalance_stop = threading.Event()
 
     def set_max_reconsume_times(self, max_reconsume_times: int) -> None:
         """Set the retry ceiling reported with message redelivery (default 16, -1 means unlimited)."""
@@ -4528,6 +4559,22 @@ class DefaultMQPullConsumer:
     def set_message_queue_listener(self, listener: MessageQueueListener) -> None:
         self.message_queue_listener = listener
 
+    def register_message_queue_listener(self, topic: str,
+                                        listener: Optional[MessageQueueListener]) -> None:
+        """Java ``DefaultMQPullConsumer#registerMessageQueueListener`` (:328-335).
+
+        Registers the topic **and** installs the listener in one call. The topic matters:
+        the background rebalance iterates ``register_topics``, so a listener without a
+        registered topic would never fire. ``listener=None`` keeps the current one (Java
+        overwrites only when non-null). Namespace is not rewritten here -- this port's pull
+        mode never rewrites resource names (see the ``namespace`` field comment).
+        """
+        if topic is None or not str(topic).strip():
+            return
+        self.register_topics.add(str(topic))
+        if listener is not None:
+            self.message_queue_listener = listener
+
     def set_allocate_message_queue_strategy(
             self, strategy: Optional[AllocateMessageQueueStrategy]) -> None:
         """Set the queue allocation strategy: the setter does not validate; setting None is rejected by start()."""
@@ -4535,6 +4582,160 @@ class DefaultMQPullConsumer:
 
     def get_register_topics(self) -> Set[str]:
         return self.register_topics
+
+    # ---------------- Pull-side rebalance (Java DefaultMQPullConsumerImpl :388-406) ----------------
+    def set_enable_rebalance(self, enable_rebalance: bool) -> None:
+        """Java ``DefaultMQPullConsumer#setEnableRebalance`` (:507).
+
+        Off means ``doRebalance``/``tryRebalance`` return without allocating anything, so
+        the caller's own ``fetch_message_queues_in_balance`` keeps computing on the spot.
+        """
+        self.enable_rebalance = bool(enable_rebalance)
+
+    def is_enable_rebalance(self) -> bool:
+        return self.enable_rebalance
+
+    def set_rebalance_wait_millis(self, millis: int) -> None:
+        """Round period: Java system property ``rocketmq.client.rebalance.waitInterval`` (20000)."""
+        self.rebalance_wait_millis = max(1, int(millis))
+
+    def set_rebalance_min_interval_millis(self, millis: int) -> None:
+        """Lower bound between two rounds: Java ``rocketmq.client.rebalance.minInterval`` (1000)."""
+        self.rebalance_min_interval_millis = max(1, int(millis))
+
+    def get_rebalance_table(self) -> Dict[str, List[MessageQueue]]:
+        """Snapshot of the background rebalance's product.
+
+        Java reads the keys of the rebalance's process-queue table; this port keeps an
+        equivalent per-topic table so the answer to "which queues are mine" does not have
+        to be recomputed on every call.
+        """
+        return {topic: list(mqs) for topic, mqs in self._rebalance_table.items()}
+
+    def _start_rebalance_loop(self) -> None:
+        t = threading.Thread(target=self._rebalance_loop, daemon=True,
+                             name="rmq-rebalance-%s" % self.consumer_group)
+        t.start()
+        self._rebalance_thread = t
+
+    def _rebalance_loop(self) -> None:
+        """Java ``RebalanceService#run``: wait, rebalance, then pick the next delay.
+
+        ``balanced`` -> wait the full ``waitInterval``; otherwise retry after
+        ``minInterval`` so a freshly appeared queue is claimed quickly.
+        """
+        wait = self.rebalance_wait_millis / 1000.0
+        last = time.time()
+        while not self._rebalance_stop.is_set():
+            if self._rebalance_stop.wait(wait):
+                break
+            if not self._started:
+                continue
+            try:
+                elapsed_ms = (time.time() - last) * 1000.0
+                if elapsed_ms < self.rebalance_min_interval_millis:
+                    wait = (self.rebalance_min_interval_millis - elapsed_ms) / 1000.0
+                    continue
+                balanced = self._do_rebalance()
+                wait = (self.rebalance_wait_millis if balanced
+                        else self.rebalance_min_interval_millis) / 1000.0
+                last = time.time()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("rebalance loop error: %s", e)
+                wait = self.rebalance_min_interval_millis / 1000.0
+
+    def _do_rebalance(self) -> bool:
+        """Java ``DefaultMQPullConsumerImpl#tryRebalance`` (:398-406).
+
+        With ``enableRebalance == false`` Java returns **true** (its "nothing left to
+        retry" answer). Returning false instead would pin the loop at ``minInterval`` and
+        burn a round-trip every second for nothing.
+        """
+        if not self.enable_rebalance:
+            return True
+        balanced = True
+        for topic in sorted(self.register_topics):
+            try:
+                if not self._rebalance_by_topic(topic):
+                    balanced = False
+            except Exception as e:  # noqa: BLE001
+                logger.debug("rebalance topic %s failed: %s", topic, e)
+                balanced = False
+        return balanced
+
+    def _rebalance_by_topic(self, topic: str) -> bool:
+        """Java ``RebalanceImpl#rebalanceByTopic`` (pull path) + ``messageQueueChanged``.
+
+        Returns whether this topic is already balanced. The listener fires **only when the
+        allocation changed**, with ``(topic, mqAll, mqDivided)`` -- exactly the three
+        arguments ``RebalancePullImpl#messageQueueChanged`` (:44-53) passes, and wrapped in
+        try/except there too so a throwing listener cannot kill the loop.
+
+        Deviation (documented): Java compares ``allocateResultSet`` against the freshly
+        updated process-queue table, so a "changed then already in place" round can report
+        balanced immediately. Here ``balanced`` means "identical to the previous round",
+        which costs at most one extra 1s confirmation round and never hammers.
+        """
+        client = self._require_client()
+        mq_all = sorted(client.get_topic_subscribe_info(topic), key=_mq_sort_key)
+        if not mq_all:
+            # Java notifies with two empty sets and warns "topic not exist"
+            # (BROADCASTING :276-284, CLUSTERING :286-294), then `break`s -- which leaves
+            # `balanced` at **true**. Returning False here would retry at minInterval
+            # forever while the topic is merely absent.
+            if self._rebalance_table.get(topic):
+                self._rebalance_table[topic] = []
+                self._notify_queue_changed(topic, [], [])
+            return True
+
+        if self.message_model == MessageModel.BROADCASTING:
+            divided: List[MessageQueue] = list(mq_all)
+        else:
+            cid_all = client.get_consumer_id_list_by_group(topic, self.consumer_group)
+            if not cid_all:
+                # Java warns "get consumer id list failed" and NOTIFIES NOTHING, leaving
+                # balanced at true so the next round waits the full interval.
+                logger.debug("doRebalance, %s %s, get consumer id list failed",
+                             self.consumer_group, topic)
+                return True
+            try:
+                allocated = self.allocate_message_queue_strategy.allocate(
+                    self.consumer_group, self.client_id or "", list(mq_all), sorted(cid_all))
+            except Exception as e:  # noqa: BLE001
+                logger.error("allocate message queue exception. strategy name: %s, ex: %s",
+                             getattr(self.allocate_message_queue_strategy, "name", "?"), e)
+                return False
+            divided = sorted([mq for mq in (allocated or []) if mq.topic == topic],
+                             key=_mq_sort_key)
+
+        previous = self._rebalance_table.get(topic)
+        if previous is None:
+            # First sight of this topic: Java's ``updateProcessQueueTableInRebalance`` counts
+            # only table additions/removals as a change, so an empty opening share
+            # ("nothing -> nothing") reports no change and stays silent. A first non-empty
+            # share IS a change (the table grew from nothing).
+            changed = bool(divided)
+        else:
+            changed = not _same_mq_set(previous, divided)
+        balanced = not changed
+        self._rebalance_table[topic] = list(divided)
+        if changed:
+            logger.info("client rebalanced result changed. Group: %s, topic: %s, "
+                        "mqAllSize: %d, rebalanceResultSize: %d",
+                        self.consumer_group, topic, len(mq_all), len(divided))
+            self._notify_queue_changed(topic, mq_all, divided)
+        return balanced
+
+    def _notify_queue_changed(self, topic: str, mq_all: List[MessageQueue],
+                              mq_divided: List[MessageQueue]) -> None:
+        listener = self.message_queue_listener
+        if listener is None:
+            return
+        try:
+            listener.message_queue_changed(topic, set(mq_all), set(mq_divided))
+        except Exception as e:  # noqa: BLE001
+            # Java logs and swallows (:49-51): the loop must survive a throwing listener.
+            logger.error("messageQueueChanged exception: %s", e)
 
     # ---------------- Heartbeat (register the consume group with the broker) ----------------
     def _refresh_route_for_heartbeat(self) -> None:
@@ -4712,6 +4913,10 @@ class DefaultMQPullConsumer:
         except Exception as e:  # noqa: BLE001
             logger.debug("initial heartbeat failed: %s", e)
         self._start_heartbeat_loop()
+        # Java registers the pull consumer's rebalance with the shared RebalanceService in
+        # start(); here the facade drives its own loop (see the field comment).
+        self._rebalance_stop.clear()
+        self._start_rebalance_loop()
 
     def shutdown(self) -> None:
         if not self._started:
@@ -4720,6 +4925,11 @@ class DefaultMQPullConsumer:
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=2.0)
+        # Stop pulling new allocations before the client instance goes away: the loop calls
+        # back into it (subscribe info / consumer id list).
+        self._rebalance_stop.set()
+        if self._rebalance_thread is not None and self._rebalance_thread.is_alive():
+            self._rebalance_thread.join(timeout=2.0)
         # Async pull dual pool: stop accepting new tasks and let in-flight tasks finish (the queue draining means threads exit naturally,
         # consistent with this repo's producer.shutdown approach of closing async pools).
         with self._async_pull_lock:
@@ -4767,9 +4977,13 @@ class DefaultMQPullConsumer:
         """The queues this instance should be responsible for "after balancing": the caller's pull loop relies on it to decide which queues to pull.
 
         A common implementation reads the keys of the rebalance's process-queue table directly -- that table is the **product** of the background rebalance.
-        This port's pull mode does not install a background rebalance (queues are managed by the caller, see the class comment),
-        so it computes on the spot using the **same allocation formula** as the push consumer's topic rebalance:
-        BROADCASTING gives all; CLUSTERING takes the subscription info (read perm policy, same source as
+        This port now does exactly that when ``enable_rebalance`` is on (the default, as
+        in Java ``DefaultMQPullConsumer.java:97``): the loop in ``_rebalance_loop`` keeps
+        ``_rebalance_table[topic]`` up to date and this method returns it. Only when the
+        switch is off -- or the table has not been filled for this topic yet -- is the
+        allocation computed on the spot, using the **same allocation formula** as the push
+        consumer's topic rebalance: BROADCASTING gives all; CLUSTERING takes the
+        subscription info (read perm policy, same source as
         `fetch_subscribe_message_queues`) as mq_all, queries `GET_CONSUMER_LIST_BY_GROUP`
         as cid_all, then hands them to this instance's configured allocation strategy. The formula shares the same
         policy as the push consumer's `_rebalance`, and if the two diverge the same queue would be claimed by two instances.
@@ -4784,6 +4998,10 @@ class DefaultMQPullConsumer:
         if topic is None:
             # The wording is the keyword callers match on the exception message; changing it breaks compatibility.
             raise ValueError("topic is null")
+        if self.enable_rebalance:
+            cached = self._rebalance_table.get(topic)
+            if cached is not None:
+                return sorted(list(cached), key=_mq_sort_key)
         pulled = [mq for mq in self._pull_from_which_node if mq.topic == topic]
         if self.message_model == MessageModel.BROADCASTING:
             allocated = client.get_topic_subscribe_info(topic) or pulled

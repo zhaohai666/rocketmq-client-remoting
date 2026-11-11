@@ -142,7 +142,7 @@ export function isFlowControlWarnTrip(times: number): boolean {
 // waits before asking again:
 //   * the broker's own flow-control answer (215): the short pause — nothing landed
 //     in the local buffer and the queue is readable again as soon as the broker's
-//     pressure drops, so no rebalance and no threshold rescan;
+//     pressure drops, so this round triggers no rebalance and no threshold rescan;
 //   * anything else (a system error, a busy answer, a dead connection, or no code
 //     at all because the failure never reached the wire): the generic pause this
 //     client was configured with.

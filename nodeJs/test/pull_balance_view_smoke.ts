@@ -5,10 +5,11 @@
 //     the namespace prefix then stripped; the official pull usage consumes only
 //     one's own set of queues, so "returning all queues" is a
 //     duplicate-consumption bug.
-//   * This implementation runs no pull-side rebalance thread; the view is
-//     computed on demand with the rebalanceByTopic formula, so what the test
-//     pins is the formula, the fallback when it cannot be computed, and the
-//     isRunning() guard.
+//   * This implementation DOES run a pull-side rebalance (enableRebalance, on by
+//     default) which fills a per-topic table; the view prefers that table and
+//     computes on demand only when the switch is off or the table is still cold.
+//     What the test pins is therefore the formula, the fallback when it cannot be
+//     computed, and the isRunning() guard.
 //   ⚠ The fallback is deliberately not "all queues": the grouping of N
 //     instances must never have them all read the same batch of messages just
 //     because one query went unanswered.

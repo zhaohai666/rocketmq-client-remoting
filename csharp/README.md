@@ -319,6 +319,10 @@ pull.Shutdown();
 队列变更通知：`pull.SetMessageQueueListener(listener)` 或
 `pull.RegisterMessageQueueListener(topic, listener)`（`IMessageQueueListener.MessageQueueChanged(mqAll, mqDivided)`）。
 拉模式消费者默认会发消费者心跳：`HeartbeatEnabled`、`HeartbeatBrokerIntervalMillis`。
+拉模式**也有后台重平衡**（Java `enableRebalance` 默认 true）：`EnableRebalance` 开时每个
+`RebalanceWaitMillis`（默认 20000，即 `rocketmq.client.rebalance.waitInterval`）跑一轮，
+分配有变动才回调监听器；一轮不平衡则隔 `RebalanceMinIntervalMillis`（默认 1000）重试。
+`FetchMessageQueuesInBalance` 优先返回重平衡的产物，开关关闭或该 topic 还没跑过一轮时才现算。
 
 ### LitePullConsumer（自己拉、自己提交，含队列集合变更监听）
 

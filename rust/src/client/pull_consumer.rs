@@ -3,8 +3,17 @@
 //!
 //! Both are "the caller holds the offset" consumers; the only difference is who pulls:
 //!
-//! * [`DefaultMQPullConsumer`]: pure RPC facade. The caller pulls queue by queue with
-//!   `pull(mq, offset)` and commits offsets itself with `update_consume_offset`; no local buffer, no background thread, no rebalance.
+//! * [`DefaultMQPullConsumer`]: RPC facade. The caller pulls queue by queue with
+//!   `pull(mq, offset)` and commits offsets itself with `update_consume_offset`; no local
+//!   buffer and no pull loop. It **does** rebalance in the background, exactly like Java
+//!   `DefaultMQPullConsumer` (`enableRebalance` defaults to **true**,
+//!   DefaultMQPullConsumer.java:97): a task wakes every
+//!   `rebalance_wait_millis` (20000, `rocketmq.client.rebalance.waitInterval`), allocates the
+//!   registered topics per [`AllocateMessageQueueStrategy`], and fires the
+//!   [`MessageQueueListener`] only when an allocation actually changed. A round that is not
+//!   balanced retries after `rebalance_min_interval_millis` (1000).
+//!   [`fetch_message_queues_in_balance`](DefaultMQPullConsumer::fetch_message_queues_in_balance)
+//!   reads that product when it is warm.
 //! * [`DefaultLitePullConsumer`]: `subscribe(..)`/`assign(..)` + a background pull thread feeding
 //!   the local buffer + `poll(..)` to take batches; offsets auto-commit by default.
 //!
@@ -54,7 +63,7 @@ use crate::remoting::protocol::heartbeat::{
 use crate::remoting::protocol::namespace_util::NamespaceUtil;
 use crate::remoting::rpchook::RPCHook;
 use crate::remoting::socks::SocksProxyConfig;
-use crate::{bail, rmq_debug, rmq_error, rmq_warn};
+use crate::{bail, rmq_debug, rmq_error, rmq_info, rmq_warn};
 
 use crate::client::consumer::ExpressionType;
 use crate::client::validators;
@@ -65,6 +74,12 @@ pub const DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS: i64 = 20_000;
 pub const DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: i64 = 30_000;
 /// `consumer_pull_timeout_millis` = 10000 for `DefaultMQPullConsumer`.
 pub const DEFAULT_CONSUMER_PULL_TIMEOUT_MILLIS: i64 = 10_000;
+/// Pull-side rebalance period between two balanced rounds: Java
+/// `rocketmq.client.rebalance.waitInterval`, 20000ms.
+pub const DEFAULT_REBALANCE_WAIT_MILLIS: u64 = 20_000;
+/// Pull-side rebalance floor between two rounds that are not balanced yet: Java
+/// `rocketmq.client.rebalance.minInterval`, 1000ms. A shorter value would spin the loop.
+pub const DEFAULT_REBALANCE_MIN_INTERVAL_MILLIS: u64 = 1_000;
 /// The hard-coded `suspendTimeoutMillis` in `pull()` (unused by short polling, but still sent in the request header).
 const PULL_SUSPEND_TIMEOUT_MILLIS: i64 = 15_000;
 /// The hard-coded request timeout for lite per-queue pulls.
@@ -298,6 +313,16 @@ pub struct PullConsumerConfig {
     /// Retry ceiling carried by a send-back and written onto the retry copy; default 16.
     /// `-1` reads as 16, the point at which the broker moves the message to `%DLQ%`.
     pub max_reconsume_times: i32,
+    /// Pull-side rebalance switch; **true** by default, matching Java
+    /// `DefaultMQPullConsumer.java:97`. Off, the background round allocates nothing and
+    /// `fetch_message_queues_in_balance` always computes on the spot.
+    pub enable_rebalance: bool,
+    /// Period between two balanced rounds (default 20000ms,
+    /// `rocketmq.client.rebalance.waitInterval`); also the wait before the very first round.
+    pub rebalance_wait_millis: u64,
+    /// Lower bound between two rounds while the allocation is still changing (default 1000ms,
+    /// `rocketmq.client.rebalance.minInterval`).
+    pub rebalance_min_interval_millis: u64,
 }
 
 impl Default for PullConsumerConfig {
@@ -327,6 +352,9 @@ impl Default for PullConsumerConfig {
             enable_concurrent_heartbeat: false,
             concurrent_heartbeat_thread_pool_size: default_concurrent_heartbeat_pool_size(),
             max_reconsume_times: 16,
+            enable_rebalance: true,
+            rebalance_wait_millis: DEFAULT_REBALANCE_WAIT_MILLIS,
+            rebalance_min_interval_millis: DEFAULT_REBALANCE_MIN_INTERVAL_MILLIS,
         }
     }
 }
@@ -349,6 +377,10 @@ struct PullInner {
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
     pull_from_which_node: Mutex<HashMap<MessageQueue, i64>>,
+    /// Product of the background rebalance: topic -> the queues allocated to this instance.
+    /// Java reads the keys of the rebalance's process-queue table; this is the equivalent
+    /// per-topic table, and `fetch_message_queues_in_balance` prefers it when it is warm.
+    rebalance_table: Mutex<BTreeMap<String, Vec<MessageQueue>>>,
 }
 
 impl Default for PullInner {
@@ -368,6 +400,7 @@ impl Default for PullInner {
             strategy: RwLock::new(Arc::new(AllocateMessageQueueAveragely)),
             rpc_hook: RwLock::new(None),
             pull_from_which_node: Mutex::new(HashMap::new()),
+            rebalance_table: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -602,6 +635,213 @@ impl DefaultMQPullConsumer {
         lock(&self.inner.register_topics).insert(topic);
     }
 
+    // ---------------- Pull-side rebalance (Java DefaultMQPullConsumerImpl) ----------------
+    //
+    // Java's pull consumer is **not** the "no rebalance" shape this port used to document: the
+    // shared `RebalanceService` thread calls `mqClientFactory.doRebalance()` every `waitInterval`
+    // (20s), which walks the registered consumers and calls `tryRebalance()`. That gates on
+    // `enableRebalance` (default true, DefaultMQPullConsumer.java:97) and then runs
+    // `rebalanceImpl.doRebalance(false)` -> allocate -> `messageQueueChanged`.
+    //
+    // Deviation (documented): Java shares one RebalanceService per client instance; this port
+    // gives each facade its own tokio task (same shape as the heartbeat loop above). The
+    // observable behaviour -- which queues this instance owns and when the listener fires -- is
+    // the same, and `balanced` means "this round's allocation equals the previous round's",
+    // which costs at most one extra minInterval confirmation round.
+
+    /// Java `DefaultMQPullConsumer#setEnableRebalance` (:507).
+    ///
+    /// Off, the background round returns without allocating (and reports "balanced", see
+    /// [`do_rebalance`](Self::do_rebalance)), so callers keep computing on the spot through
+    /// [`fetch_message_queues_in_balance`](Self::fetch_message_queues_in_balance).
+    pub fn set_enable_rebalance(&self, enable: bool) {
+        self.update_config(|c| c.enable_rebalance = enable);
+    }
+
+    pub fn is_enable_rebalance(&self) -> bool {
+        self.config().enable_rebalance
+    }
+
+    /// Round period used while the allocation is balanced: Java system property
+    /// `rocketmq.client.rebalance.waitInterval` (20000ms). It is also the wait before the first
+    /// round, exactly like `RebalanceService#run`. Values below 1ms are raised to 1ms: a zero
+    /// period would spin the loop.
+    pub fn set_rebalance_wait_millis(&self, millis: u64) {
+        self.update_config(|c| c.rebalance_wait_millis = millis.max(1));
+    }
+
+    pub fn rebalance_wait_millis(&self) -> u64 {
+        self.config().rebalance_wait_millis
+    }
+
+    /// Retry delay while the allocation keeps changing: Java
+    /// `rocketmq.client.rebalance.minInterval` (1000ms), clamped to a 1ms floor.
+    pub fn set_rebalance_min_interval_millis(&self, millis: u64) {
+        self.update_config(|c| c.rebalance_min_interval_millis = millis.max(1));
+    }
+
+    pub fn rebalance_min_interval_millis(&self) -> u64 {
+        self.config().rebalance_min_interval_millis
+    }
+
+    /// Snapshot of the background rebalance's product: topic -> the queues allocated to this
+    /// instance. A topic that has been visited (even to the empty set after its route vanished)
+    /// is present. The vectors are copies, so a caller cannot mutate the table.
+    pub fn rebalance_table(&self) -> BTreeMap<String, Vec<MessageQueue>> {
+        lock(&self.inner.rebalance_table).clone()
+    }
+
+    /// Java `DefaultMQPullConsumerImpl#tryRebalance` (:398-406).
+    ///
+    /// Runs one round over every registered topic and reports whether the whole assignment is
+    /// balanced. With `enable_rebalance` off Java returns **true** ("nothing left to retry");
+    /// returning false instead would pin the loop at `minInterval` and burn a round-trip every
+    /// second for nothing.
+    pub async fn do_rebalance(&self) -> bool {
+        if !self.is_enable_rebalance() {
+            return true;
+        }
+        let mut balanced = true;
+        for topic in self.register_topics() {
+            if !self.rebalance_by_topic(&topic).await {
+                balanced = false;
+            }
+        }
+        balanced
+    }
+
+    /// Java `RebalanceImpl#rebalanceByTopic` (pull path) + `messageQueueChanged`.
+    ///
+    /// Returns whether this topic is already balanced. The listener fires **only when the
+    /// allocation changed**, with `(topic, mq_all, mq_divided)` -- exactly the three arguments
+    /// `RebalancePullImpl#messageQueueChanged` (:44-53) passes.
+    pub async fn rebalance_by_topic(&self, topic: &str) -> bool {
+        let Ok(client) = self.require_client() else {
+            rmq_debug!("doRebalance, {topic}, consumer not started");
+            return false;
+        };
+        let cfg = self.config();
+        let mut mq_all = client.get_topic_subscribe_info(topic).await;
+        mq_all.retain(|mq| mq.topic == topic);
+        sort_mqs(&mut mq_all);
+
+        if mq_all.is_empty() {
+            // Java notifies with two empty sets and warns "topic not exist"
+            // (BROADCASTING :276-284, CLUSTERING :286-294), then `break`s -- which leaves
+            // `balanced` at **true**. Reporting false here would retry at minInterval forever
+            // while the topic is merely absent. Like Java, the empty callback is only for a topic
+            // that previously had queues: a topic never seen is not an event.
+            let had_queues = {
+                let mut table = lock(&self.inner.rebalance_table);
+                match table.get(topic) {
+                    Some(previous) if !previous.is_empty() => {
+                        table.insert(topic.to_string(), Vec::new());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if had_queues {
+                rmq_warn!(
+                    "doRebalance, {}, {}, the topic not exist",
+                    cfg.consumer_group,
+                    topic
+                );
+                self.notify_queue_changed(topic, &[], &[]);
+            }
+            return true;
+        }
+
+        let divided: Vec<MessageQueue> = if cfg.message_model == MessageModel::BROADCASTING {
+            mq_all.clone()
+        } else {
+            let cid_all = client
+                .get_consumer_id_list_by_group(
+                    topic,
+                    &cfg.consumer_group,
+                    client.mq_client_api_timeout_millis(),
+                )
+                .await;
+            let Some(mut cid_all) = cid_all.filter(|c| !c.is_empty()) else {
+                // Java warns "get consumer id list failed" and NOTIFIES NOTHING, leaving
+                // `balanced` at true so the next round waits the full interval.
+                rmq_debug!(
+                    "doRebalance, {}, {}, get consumer id list failed",
+                    cfg.consumer_group,
+                    topic
+                );
+                return true;
+            };
+            cid_all.sort();
+            let strategy = self.allocate_message_queue_strategy();
+            match strategy.allocate(
+                &cfg.consumer_group,
+                cfg.client_id.as_deref().unwrap_or(""),
+                &mq_all,
+                &cid_all,
+            ) {
+                Ok(got) => {
+                    let mut got: Vec<MessageQueue> =
+                        got.into_iter().filter(|mq| mq.topic == topic).collect();
+                    sort_mqs(&mut got);
+                    got
+                }
+                Err(e) => {
+                    rmq_error!(
+                        "allocate message queue exception. strategy name: {}, ex: {}",
+                        strategy.get_name(),
+                        e
+                    );
+                    return false;
+                }
+            }
+        };
+
+        let balanced = {
+            let mut table = lock(&self.inner.rebalance_table);
+            let balanced = match table.get(topic) {
+                Some(previous) => same_queue_set(previous, &divided),
+                // First sight of the topic: Java's updateProcessQueueTableInRebalance counts
+                // only table additions/removals as a change, so "nothing -> nothing" is no
+                // change -- an empty opening share stays silent and the round is balanced.
+                None => divided.is_empty(),
+            };
+            table.insert(topic.to_string(), divided.clone());
+            balanced
+        };
+        if !balanced {
+            rmq_info!(
+                "client rebalanced result changed. group={}, topic={}, mqAllSize={}, rebalanceResultSize={}",
+                cfg.consumer_group,
+                topic,
+                mq_all.len(),
+                divided.len()
+            );
+            self.notify_queue_changed(topic, &mq_all, &divided);
+        }
+        balanced
+    }
+
+    /// Java `RebalancePullImpl#messageQueueChanged` (:44-53): call the listener when there is
+    /// one, and **swallow anything it throws**. One bad callback must not kill the loop and
+    /// freeze every allocation.
+    pub fn notify_queue_changed(
+        &self,
+        topic: &str,
+        mq_all: &[MessageQueue],
+        mq_divided: &[MessageQueue],
+    ) {
+        let Some(listener) = lock(&self.inner.listener).clone() else {
+            return;
+        };
+        let fired = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            listener.message_queue_changed(topic, mq_all, mq_divided);
+        }));
+        if fired.is_err() {
+            rmq_error!("messageQueueChanged exception, topic={topic}");
+        }
+    }
+
     // ---------------- Pre-delivery filter hooks ----------------
 
     pub fn register_filter_message_hook(&self, hook: Arc<dyn FilterMessageHook>) {
@@ -721,6 +961,7 @@ impl DefaultMQPullConsumer {
             self.send_heartbeat_to_all_broker().await;
         }
         self.spawn_heartbeat_loop();
+        self.spawn_rebalance_loop();
         Ok(())
     }
 
@@ -844,6 +1085,26 @@ impl DefaultMQPullConsumer {
         lock(&self.inner.tasks).push(task);
     }
 
+    /// Spawn the pull-side rebalance task (Java's shared `RebalanceService`; one per facade here).
+    ///
+    /// Tracked with the heartbeat loop: [`shutdown`](Self::shutdown) and `Drop` abort it, so a
+    /// round in flight cannot outlive the consumer, and its sleep is cancellable through the
+    /// same `stop` watch channel.
+    fn spawn_rebalance_loop(&self) {
+        let Some(handle) = self.runtime_handle() else {
+            rmq_warn!("pull consumer: no tokio runtime, rebalance loop disabled");
+            return;
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let rx = self.inner.stop.subscribe();
+        let task = handle.spawn(async move {
+            if let Some(inner) = weak.upgrade() {
+                pull_rebalance_loop(DefaultMQPullConsumer { inner }, rx).await;
+            }
+        });
+        lock(&self.inner.tasks).push(task);
+    }
+
     fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         if let Some(handle) = self.inner.runtime.get() {
             return Some(handle.clone());
@@ -865,9 +1126,30 @@ impl DefaultMQPullConsumer {
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
+    /// The queues this instance is in charge of, per the allocation strategy.
+    ///
+    /// Java `DefaultMQPullConsumerImpl#fetchMessageQueuesInBalance` is a **pure query**: it reads
+    /// what the rebalance produced. This port mirrors that -- once the background round has
+    /// visited `topic`, its table entry is returned (sorted, as a copy); a cold table, or the
+    /// `enable_rebalance` switch being off, falls back to computing on the spot. Neither path
+    /// fires the [`MessageQueueListener`]: computing a view is not a rebalance event, and must
+    /// not be mistaken for one.
     pub async fn fetch_message_queues_in_balance(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
         let cfg = self.config();
+        // Java's `fetchMessageQueuesInBalance` is a pure query over the product of the
+        // rebalance. When the background round has visited this topic, hand its table back --
+        // that is the authoritative answer, and it is not an event: no listener fires and the
+        // table is not touched. A cold table (or the switch being off, in which case the table
+        // only holds stale data) falls through to the on-the-spot computation below, which
+        // likewise notifies nothing.
+        if cfg.enable_rebalance {
+            if let Some(cached) = lock(&self.inner.rebalance_table).get(topic) {
+                let mut out = cached.clone();
+                sort_mqs(&mut out);
+                return Ok(out);
+            }
+        }
         let mut pulled: Vec<MessageQueue> = lock(&self.inner.pull_from_which_node)
             .keys()
             .filter(|mq| mq.topic == topic)
@@ -1347,6 +1629,31 @@ async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool
             continue;
         }
         send_pull_heartbeat(&inner).await;
+    }
+}
+
+/// Pull-side rebalance loop: Java `RebalanceService#run`.
+///
+/// Waits one full `rebalance_wait_millis` **before the first round** (Java does the same), then
+/// runs a round and picks the next delay: `rebalance_wait_millis` when the assignment is
+/// balanced, `rebalance_min_interval_millis` when it is still changing so a queue that just
+/// appeared is claimed quickly. The wait is cancelled by the `stop` watch channel, which is what
+/// lets `shutdown`/`Drop` stop the loop without waiting out a 20s sleep.
+async fn pull_rebalance_loop(consumer: DefaultMQPullConsumer, mut rx: watch::Receiver<bool>) {
+    let mut delay = consumer.rebalance_wait_millis();
+    loop {
+        if wait_or_stop(&mut rx, delay).await {
+            return;
+        }
+        if !consumer.is_started() {
+            continue;
+        }
+        let balanced = consumer.do_rebalance().await;
+        delay = if balanced {
+            consumer.rebalance_wait_millis()
+        } else {
+            consumer.rebalance_min_interval_millis()
+        };
     }
 }
 
@@ -7297,6 +7604,670 @@ mod tests {
         assert!(
             err.to_string().contains("not started"),
             "the error must be the not-started one: {err}"
+        );
+    }
+
+    // ---------------------- Pull-side rebalance (Java DefaultMQPullConsumer.enableRebalance)
+
+    /// Queue identity as a listener/table set member: `(brokerName, queueId)`, so ordering inside
+    /// the reported sets is irrelevant.
+    type QueueKeySet = BTreeSet<(String, i32)>;
+
+    /// One recorded `messageQueueChanged(topic, mqAll, mqDivided)` call.
+    type RebalanceCall = (String, QueueKeySet, QueueKeySet);
+
+    fn queue_key_set(mqs: &[MessageQueue]) -> QueueKeySet {
+        mqs.iter()
+            .map(|mq| (mq.broker_name.clone(), mq.queue_id))
+            .collect()
+    }
+
+    /// Collects the pull consumer's `messageQueueChanged` calls.
+    struct RecordingRebalanceListener {
+        calls: Mutex<Vec<RebalanceCall>>,
+    }
+
+    impl RecordingRebalanceListener {
+        fn new() -> Arc<RecordingRebalanceListener> {
+            Arc::new(RecordingRebalanceListener {
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<RebalanceCall> {
+            lock(&self.calls).clone()
+        }
+    }
+
+    impl MessageQueueListener for RecordingRebalanceListener {
+        fn message_queue_changed(
+            &self,
+            topic: &str,
+            mq_all: &[MessageQueue],
+            mq_divided: &[MessageQueue],
+        ) {
+            lock(&self.calls).push((
+                topic.to_string(),
+                queue_key_set(mq_all),
+                queue_key_set(mq_divided),
+            ));
+        }
+    }
+
+    /// A listener that panics: Java logs and swallows the exception (RebalancePullImpl:49-51).
+    struct ExplodingRebalanceListener;
+
+    impl MessageQueueListener for ExplodingRebalanceListener {
+        fn message_queue_changed(
+            &self,
+            _topic: &str,
+            _mq_all: &[MessageQueue],
+            _mq_divided: &[MessageQueue],
+        ) {
+            panic!("listener exploded");
+        }
+    }
+
+    /// Wraps the real strategy so a test can prove it was (not) consulted.
+    #[derive(Default)]
+    struct CountingStrategy {
+        calls: AtomicUsize,
+    }
+
+    impl CountingStrategy {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AllocateMessageQueueStrategy for CountingStrategy {
+        fn allocate(
+            &self,
+            consumer_group: &str,
+            current_cid: &str,
+            mq_all: &[MessageQueue],
+            cid_all: &[String],
+        ) -> Result<Vec<MessageQueue>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            AllocateMessageQueueAveragely.allocate(consumer_group, current_cid, mq_all, cid_all)
+        }
+
+        fn get_name(&self) -> &str {
+            "COUNTING"
+        }
+    }
+
+    /// Refresh the route cache so a `scale_to` is visible to the rebalance.
+    ///
+    /// Java's rebalance reads the subscribe-info **table** (refreshed by the client instance's own
+    /// periodic task), so a test that changes the queue count must push the new route in first.
+    async fn refresh_pull_route(c: &DefaultMQPullConsumer, topic: &str) {
+        let client = lock(&c.inner.client)
+            .clone()
+            .expect("the consumer must be started");
+        let refreshed = client
+            .update_topic_route_info_from_name_server(topic, 3_000, false)
+            .await
+            .expect("the fake namesrv must answer the route query");
+        assert!(
+            refreshed,
+            "the fake namesrv must return a route for {topic}"
+        );
+    }
+
+    /// The queue ids the rebalance table holds for `topic`, ascending.
+    fn pull_balance_ids(c: &DefaultMQPullConsumer, topic: &str) -> Vec<i32> {
+        let mut ids: Vec<i32> = c
+            .rebalance_table()
+            .get(topic)
+            .map(|mqs| mqs.iter().map(|mq| mq.queue_id).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    }
+
+    fn ids_of(mqs: &[MessageQueue]) -> Vec<i32> {
+        let mut ids: Vec<i32> = mqs.iter().map(|mq| mq.queue_id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// The consumer id this instance was given sorts first: the generated id starts with digits,
+    /// "zzz-other" comes last. Averagely allocation then hands this instance the first slice.
+    const OTHER_CID: &str = "zzz-other";
+
+    #[test]
+    fn pull_rebalance_defaults_match_java() {
+        // Java DefaultMQPullConsumer.java:97 `private boolean enableRebalance = true`;
+        // the intervals are RebalanceService's waitInterval / minInterval.
+        let c = DefaultMQPullConsumer::new("PG_PullReb_Default").expect("the group name is legal");
+        assert!(c.is_enable_rebalance(), "enableRebalance defaults to true");
+        assert_eq!(c.rebalance_wait_millis(), 20_000);
+        assert_eq!(c.rebalance_min_interval_millis(), 1_000);
+        assert!(c.rebalance_table().is_empty(), "no round has run yet");
+    }
+
+    #[test]
+    fn pull_rebalance_switches_round_trip_and_intervals_are_clamped() {
+        let c = DefaultMQPullConsumer::new("PG_PullReb_Switch").expect("the group name is legal");
+        c.set_enable_rebalance(false);
+        assert!(!c.is_enable_rebalance());
+        c.set_enable_rebalance(true);
+        assert!(c.is_enable_rebalance());
+
+        c.set_rebalance_wait_millis(0);
+        c.set_rebalance_min_interval_millis(0);
+        assert_eq!(
+            c.rebalance_wait_millis(),
+            1,
+            "a zero period would spin the loop"
+        );
+        assert_eq!(c.rebalance_min_interval_millis(), 1);
+        c.set_rebalance_wait_millis(2_500);
+        c.set_rebalance_min_interval_millis(250);
+        assert_eq!(c.rebalance_wait_millis(), 2_500);
+        assert_eq!(c.rebalance_min_interval_millis(), 250);
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_disabled_reports_balanced_and_never_allocates() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_off", "PG_PullReb_Off", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+        let strategy = Arc::new(CountingStrategy::default());
+        c.set_allocate_message_queue_strategy(strategy.clone());
+        c.set_enable_rebalance(false);
+
+        // Java tryRebalance returns **true** when the switch is off (:398-402).
+        assert!(
+            c.do_rebalance().await,
+            "off must look balanced, not endless-unbalanced"
+        );
+        assert_eq!(strategy.calls(), 0, "no allocation may run while off");
+        assert!(
+            c.rebalance_table().is_empty(),
+            "nothing may be cached either"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_disabled_keeps_fetch_in_balance_on_the_spot() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_off_fetch", "PG_PullReb_OffFetch", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+        // A stale table must be ignored while the switch is off.
+        lock(&c.inner.rebalance_table).insert("T".to_string(), Vec::new());
+        c.set_enable_rebalance(false);
+
+        let got = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("the on-the-spot view must be computable");
+        assert_eq!(
+            ids_of(&got),
+            vec![0, 1],
+            "falls back to on-the-spot averaging"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_broadcasting_first_round_notifies_with_all_queues() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = DefaultMQPullConsumer::new("PG_PullReb_Bcast").expect("the group name is legal");
+        c.set_instance_name("pull_reb_bcast");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_message_model(MessageModel::BROADCASTING);
+        c.register_topic("T");
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+        c.start()
+            .await
+            .expect("start should succeed against the fake cluster");
+
+        assert!(
+            !c.do_rebalance().await,
+            "the first round changes the empty table"
+        );
+        let calls = listener.calls();
+        assert_eq!(calls.len(), 1, "a change must fire exactly one callback");
+        let (topic, mq_all, divided) = &calls[0];
+        assert_eq!(topic, "T");
+        assert_eq!(mq_all, divided, "broadcasting claims every queue");
+        assert_eq!(
+            mq_all,
+            &queue_key_set(&[
+                queue("T", "broker-a", 0),
+                queue("T", "broker-a", 1),
+                queue("T", "broker-a", 2),
+            ])
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_broadcasting_second_round_is_balanced_and_silent() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = DefaultMQPullConsumer::new("PG_PullReb_Bcast2").expect("the group name is legal");
+        c.set_instance_name("pull_reb_bcast2");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.set_message_model(MessageModel::BROADCASTING);
+        c.register_topic("T");
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+        c.start()
+            .await
+            .expect("start should succeed against the fake cluster");
+
+        assert!(!c.do_rebalance().await);
+        assert!(
+            c.do_rebalance().await,
+            "nothing changed, so the topic is balanced"
+        );
+        assert_eq!(
+            listener.calls().len(),
+            1,
+            "messageQueueChanged fires only on a real change"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_clustering_takes_its_share() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_share", "PG_PullReb_Share", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+
+        c.do_rebalance().await;
+        assert_eq!(
+            pull_balance_ids(&c, "T"),
+            vec![0, 1],
+            "averagely: this cid sorts first and takes the first half"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_two_instances_get_disjoint_shares() {
+        let cluster = FakePullCluster::start_queues(5).await;
+        let a = started_pull("pull_reb_pair_a", "PG_PullReb_Pair", &cluster, "T").await;
+        let b = started_pull("pull_reb_pair_b", "PG_PullReb_Pair", &cluster, "T").await;
+        let mut cids = [a.client_id(), b.client_id()];
+        cids.sort();
+        cluster.set_cid_list(&cids.iter().map(String::as_str).collect::<Vec<&str>>());
+
+        a.do_rebalance().await;
+        b.do_rebalance().await;
+        let sa = queue_key_set(&a.rebalance_table()["T"]);
+        let sb = queue_key_set(&b.rebalance_table()["T"]);
+        assert!(
+            sa.intersection(&sb).next().is_none(),
+            "the same queue must never be owned twice"
+        );
+        assert_eq!(
+            sa.union(&sb).count(),
+            5,
+            "together they cover every queue, missing none"
+        );
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_new_queue_triggers_exactly_one_notification() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = started_pull("pull_reb_grow", "PG_PullReb_Grow", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+
+        assert!(!c.do_rebalance().await);
+        assert_eq!(listener.calls().len(), 1);
+
+        cluster.scale_to(3); // a queue was added
+        refresh_pull_route(&c, "T").await;
+        assert!(!c.do_rebalance().await);
+        let calls = listener.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "exactly one more callback, not one per round"
+        );
+        let every_queue = queue_key_set(&[
+            queue("T", "broker-a", 0),
+            queue("T", "broker-a", 1),
+            queue("T", "broker-a", 2),
+        ]);
+        assert_eq!(calls[1].1, every_queue);
+        assert_eq!(
+            calls[1].2, every_queue,
+            "the sole instance owns all of them"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_missing_consumer_id_list_is_balanced_and_silent() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = started_pull("pull_reb_nocid", "PG_PullReb_NoCid", &cluster, "T").await;
+        cluster.set_cid_list(&[]); // the broker does not know this group
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+
+        // Java (:300-302) only warns; it does not notify and leaves balanced at true.
+        assert!(
+            c.do_rebalance().await,
+            "an unknown consumer list is not 'unbalanced'"
+        );
+        assert!(
+            listener.calls().is_empty(),
+            "no consumer list -> say nothing, keep the old allocation"
+        );
+        assert!(
+            c.rebalance_table().is_empty(),
+            "no allocation may be cached from an empty cid list"
+        );
+        c.shutdown();
+    }
+
+    /// Always hands out nothing: pins Java's updateProcessQueueTableInRebalance semantics --
+    /// only table additions/removals are a change, so "nothing -> nothing" is no change and
+    /// an empty opening share must stay silent and count as balanced.
+    struct EmptyRebalanceStrategy;
+
+    impl AllocateMessageQueueStrategy for EmptyRebalanceStrategy {
+        fn allocate(
+            &self,
+            _consumer_group: &str,
+            _current_cid: &str,
+            _mq_all: &[MessageQueue],
+            _cid_all: &[String],
+        ) -> Result<Vec<MessageQueue>> {
+            Ok(Vec::new())
+        }
+
+        fn get_name(&self) -> &str {
+            "EMPTY"
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_first_empty_share_is_silent_and_balanced() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = started_pull("pull_reb_empty_first", "PG_PullReb_EmptyFirst", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+        c.set_allocate_message_queue_strategy(Arc::new(EmptyRebalanceStrategy));
+
+        assert!(
+            c.do_rebalance().await,
+            "nothing -> nothing must count as a balanced round"
+        );
+        assert!(
+            listener.calls().is_empty(),
+            "an empty opening share must not fire the listener"
+        );
+        assert_eq!(c.rebalance_table().get("T"), Some(&Vec::new()));
+
+        // The share appearing later IS a change (the table grew from nothing).
+        c.set_allocate_message_queue_strategy(Arc::new(AllocateMessageQueueAveragely));
+        assert!(!c.do_rebalance().await);
+        assert_eq!(listener.calls().len(), 1);
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_vanished_topic_clears_the_table_and_notifies_empty() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = started_pull("pull_reb_gone", "PG_PullReb_Gone", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+
+        assert!(!c.do_rebalance().await);
+        assert_eq!(listener.calls().len(), 1);
+
+        cluster.scale_to(0); // not a single read queue left: the route vanished
+        refresh_pull_route(&c, "T").await;
+        // Java notifies with two empty sets and then `break`s, leaving balanced at true. Reporting
+        // false here would retry at minInterval forever while the topic is merely absent.
+        assert!(
+            c.do_rebalance().await,
+            "an absent topic is not 'unbalanced'"
+        );
+        assert_eq!(
+            c.rebalance_table().get("T"),
+            Some(&Vec::new()),
+            "the stale assignment must be cleared"
+        );
+        let calls = listener.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].1.is_empty() && calls[1].2.is_empty());
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_throwing_listener_does_not_escape() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = started_pull("pull_reb_boom", "PG_PullReb_Boom", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        c.set_message_queue_listener(Arc::new(ExplodingRebalanceListener));
+
+        // Java swallows it (RebalancePullImpl:49-51); the round must simply return.
+        assert!(!c.do_rebalance().await);
+        assert_eq!(
+            pull_balance_ids(&c, "T"),
+            vec![0, 1],
+            "the table is still updated even when the listener throws"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_same_queues_in_another_order_do_not_notify() {
+        let cluster = FakePullCluster::start_queues(3).await;
+        let c = started_pull("pull_reb_order", "PG_PullReb_Order", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+
+        assert!(!c.do_rebalance().await);
+        assert_eq!(listener.calls().len(), 1);
+
+        // Same set, different order: not a change.
+        let reversed: Vec<MessageQueue> = lock(&c.inner.rebalance_table)
+            .get("T")
+            .expect("the first round filled the table")
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
+        lock(&c.inner.rebalance_table).insert("T".to_string(), reversed);
+        assert!(
+            c.do_rebalance().await,
+            "same set, different order is not a change"
+        );
+        assert_eq!(listener.calls().len(), 1);
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_fetch_in_balance_prefers_the_table() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_table", "PG_PullReb_Table", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+        lock(&c.inner.rebalance_table).insert("T".to_string(), vec![queue("T", "broker-a", 3)]);
+
+        let got = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("the table-backed view");
+        assert_eq!(
+            ids_of(&got),
+            vec![3],
+            "the background rebalance's product is authoritative"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_fetch_in_balance_sorts_and_isolates_the_table() {
+        let cluster = FakePullCluster::start_queues(1).await;
+        let c = started_pull("pull_reb_iso", "PG_PullReb_Iso", &cluster, "T").await;
+        lock(&c.inner.rebalance_table).insert(
+            "T".to_string(),
+            vec![
+                MessageQueue::new("T", "broker-b", 1),
+                MessageQueue::new("T", "broker-a", 2),
+            ],
+        );
+
+        let mut got = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("the table-backed view");
+        assert_eq!(
+            got.iter()
+                .map(|mq| (mq.broker_name.as_str(), mq.queue_id))
+                .collect::<Vec<(&str, i32)>>(),
+            vec![("broker-a", 2), ("broker-b", 1)],
+            "the table answer is sorted"
+        );
+        got.clear();
+        assert_eq!(
+            c.rebalance_table()["T"].len(),
+            2,
+            "callers must not mutate the table"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_table_snapshot_is_a_copy() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = started_pull("pull_reb_snap", "PG_PullReb_Snap", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+        c.do_rebalance().await;
+
+        let mut snapshot = c.rebalance_table();
+        snapshot.get_mut("T").expect("the round filled it").clear();
+        assert_eq!(
+            c.rebalance_table()["T"].len(),
+            2,
+            "the snapshot must not alias the table"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_fetch_in_balance_computes_when_the_table_is_cold() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_cold", "PG_PullReb_Cold", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+        assert!(c.rebalance_table().is_empty());
+
+        let got = c
+            .fetch_message_queues_in_balance("T")
+            .await
+            .expect("the cold table falls back to the on-the-spot view");
+        assert_eq!(ids_of(&got), vec![0, 1]);
+        assert!(
+            c.rebalance_table().is_empty(),
+            "computing a view must not write the table"
+        );
+        c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pull_rebalance_fetch_in_balance_never_notifies_the_listener() {
+        let cluster = FakePullCluster::start_queues(4).await;
+        let c = started_pull("pull_reb_quiet", "PG_PullReb_Quiet", &cluster, "T").await;
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str(), OTHER_CID]);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+
+        c.fetch_message_queues_in_balance("T")
+            .await
+            .expect("the cold view");
+        assert!(
+            listener.calls().is_empty(),
+            "computing a view is not a rebalance event"
+        );
+
+        c.do_rebalance().await;
+        assert_eq!(listener.calls().len(), 1, "the first round did change");
+        c.fetch_message_queues_in_balance("T")
+            .await
+            .expect("the warm view");
+        assert_eq!(
+            listener.calls().len(),
+            1,
+            "reading the warm table must not notify either"
+        );
+        c.shutdown();
+    }
+
+    /// The background task must run on its own (Java's RebalanceService) and `shutdown` must stop
+    /// it without waiting out the period -- an aborted sleep would otherwise hang the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pull_rebalance_loop_runs_on_its_own_and_shutdown_stops_it() {
+        let cluster = FakePullCluster::start_queues(2).await;
+        let c = DefaultMQPullConsumer::new("PG_PullReb_Loop").expect("the group name is legal");
+        c.set_instance_name("pull_reb_loop");
+        c.set_namesrv_addr(&cluster.namesrv_addr);
+        c.register_topic("T");
+        c.set_rebalance_wait_millis(50);
+        c.set_rebalance_min_interval_millis(20);
+        let listener = RecordingRebalanceListener::new();
+        c.set_message_queue_listener(listener.clone());
+        c.start()
+            .await
+            .expect("start should succeed against the fake cluster");
+        let cid = c.client_id();
+        cluster.set_cid_list(&[cid.as_str()]);
+
+        wait_until(
+            || !c.rebalance_table().is_empty(),
+            "the background loop must rebalance without being asked",
+        )
+        .await;
+        wait_until(
+            || listener.calls().len() == 1,
+            "the first changing round fires the listener once",
+        )
+        .await;
+
+        let started_at = std::time::Instant::now();
+        c.shutdown();
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "shutdown must not wait out the rebalance period"
+        );
+        let frozen = c.rebalance_table();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            c.rebalance_table(),
+            frozen,
+            "no round may run after shutdown"
+        );
+        assert_eq!(
+            listener.calls().len(),
+            1,
+            "and no further callback may fire"
         );
     }
 

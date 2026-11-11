@@ -17,6 +17,8 @@
 #include "rocketmq/remoting/protocol/headers.h"
 #include "rocketmq/remoting/protocol/remoting_command.h"
 
+#include "schedule_util.h"
+
 namespace rocketmq {
 
 namespace {
@@ -98,6 +100,28 @@ void DefaultMQPullConsumer::registerMessageQueueListener(
     }
 }
 
+// ---------------------------------------------------------------- Pull-side rebalance config
+void DefaultMQPullConsumer::setRebalanceWaitMillis(int32_t millis) {
+    // A zero period would spin the loop; Java's waitInterval is a period, not a busy-wait.
+    rebalanceWaitMillis_.store(std::max<int32_t>(1, millis));
+}
+
+void DefaultMQPullConsumer::setRebalanceMinIntervalMillis(int32_t millis) {
+    rebalanceMinIntervalMillis_.store(std::max<int32_t>(1, millis));
+}
+
+std::map<std::string, std::vector<MessageQueue>> DefaultMQPullConsumer::getRebalanceTable() const {
+    // Snapshot by value: callers get their own copy and cannot mutate the live table.
+    std::lock_guard<std::mutex> lk(rebalanceTableMutex_);
+    return rebalanceTable_;
+}
+
+void DefaultMQPullConsumer::setRebalanceTableForTest(const std::string& topic,
+                                                     const std::vector<MessageQueue>& queues) {
+    std::lock_guard<std::mutex> lk(rebalanceTableMutex_);
+    rebalanceTable_[topic] = queues;
+}
+
 // ---------------------------------------------------------------- Lifecycle
 void DefaultMQPullConsumer::start() {
     if (started_) return;
@@ -154,6 +178,9 @@ void DefaultMQPullConsumer::start() {
         logger_debug(std::string("initial heartbeat failed: ") + e.what());
     }
     startHeartbeatLoop();
+    // Java registers the pull consumer's rebalance with the shared RebalanceService in start(); here the
+    // facade drives its own loop (see pull_consumer.h).
+    startRebalanceLoop();
 }
 
 void DefaultMQPullConsumer::shutdown() {
@@ -175,6 +202,10 @@ void DefaultMQPullConsumer::shutdown() {
     if (callbackPool) {
         callbackPool->shutdown(true);
     }
+    // Stop the rebalance thread before the client instance goes away: it calls back into it for routes
+    // and the group's consumer list. The loop sleeps in <=100ms slices, and every RPC it can be inside
+    // is bounded by mqClientApiTimeout_, so the wait below is a ceiling, not a hang.
+    stopRebalanceLoop();
     started_ = false;
     heartbeatStop_.store(true);
     heartbeatCv_.notify_all();
@@ -189,6 +220,13 @@ void DefaultMQPullConsumer::shutdown() {
         mqClient_->shutdown();
         mqClient_.reset();
     }
+}
+
+MQClientInstance& DefaultMQPullConsumer::client() {
+    if (!started_ || mqClient_ == nullptr) {
+        throw MQClientException("consumer not started, call start() first");
+    }
+    return *mqClient_;
 }
 
 // ---------------------------------------------------------------- Queues
@@ -210,6 +248,26 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     const std::string& topic) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
+    }
+    // The background rebalance's product is authoritative while the switch is on (Java reads the keys of
+    // the rebalance's process-queue table here). A topic it has already visited -- including one that
+    // vanished from the route and therefore holds an empty list -- is answered from the table; only a
+    // topic it has not filled yet falls through to the on-the-spot computation below.
+    if (enableRebalance_.load()) {
+        std::vector<MessageQueue> cached;
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(rebalanceTableMutex_);
+            auto it = rebalanceTable_.find(topic);
+            if (it != rebalanceTable_.end()) {
+                cached = it->second;
+                found = true;
+            }
+        }
+        if (found) {
+            std::sort(cached.begin(), cached.end());
+            return cached;
+        }
     }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
 
@@ -260,9 +318,9 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     if (!computed) {
         logger_debug("fetchMessageQueuesInBalance: no route/consumer list for " + consumerGroup_
                      + "/" + topic + ", keep current assignment");
-        // The assignment could not be recomputed, so nothing moved and the listener stays quiet --
-        // unless the pull threads' own view differs from the one last handed out.
-        notifyAssignmentChanged(topic, allOfTopic, pulled);
+        // Pure query: Java's fetchMessageQueuesInBalance never fires messageQueueChanged,
+        // on either path. Only a background rebalance round that actually moved the share
+        // notifies (RebalanceImpl:276/282/291/331/371).
         return pulled;
     }
 
@@ -274,7 +332,7 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
                          mq.queueId));
     }
     std::sort(result.begin(), result.end());
-    notifyAssignmentChanged(topic, allOfTopic, result);
+    // Pure query, no event: see the comment above (Java's fetch path never notifies).
     return result;
 }
 
@@ -338,7 +396,231 @@ bool DefaultMQPullConsumer::notifyAssignmentChanged(
     return true;
 }
 
-// ---------------------------------------------------------------- Pull
+// ---------------------------------------------------------------- Pull-side background rebalance
+// Java drives the pull consumer's rebalance from the shared RebalanceService: every waitInterval it
+// calls tryRebalance(), which gates on enableRebalance (off => true, "no quick retry"), then runs
+// rebalanceImpl.doRebalance(false) -> rebalanceByTopic -> allocate -> messageQueueChanged.
+//
+// Deviation (documented): Java shares one RebalanceService per client instance; here each facade drives
+// its own loop. The observable behaviour -- which queues this instance owns and when the listener
+// fires -- is the same.
+void DefaultMQPullConsumer::startRebalanceLoop() {
+    rebalanceStop_.store(false);
+    {
+        std::lock_guard<std::mutex> lk(rebalanceExitMutex_);
+        rebalanceThreadExited_ = false;
+    }
+    rebalanceThread_ = std::thread([this]() {
+        setThreadName("PullConsumerRebalanceThread");
+        rebalanceLoop();
+    });
+}
+
+void DefaultMQPullConsumer::stopRebalanceLoop() {
+    rebalanceStop_.store(true);
+    {
+        std::unique_lock<std::mutex> lk(rebalanceExitMutex_);
+        // sleepUntilDeadline wakes within 100ms of the flag; an in-flight RPC adds at most
+        // mqClientApiTimeout_ (3s by default). This wait caps shutdown latency, then join is immediate.
+        rebalanceExitCv_.wait_for(lk, std::chrono::milliseconds(5000),
+                                  [this] { return rebalanceThreadExited_; });
+    }
+    if (rebalanceThread_.joinable()) rebalanceThread_.join();
+}
+
+void DefaultMQPullConsumer::rebalanceLoop() {
+    // Java RebalanceService#run: wait, rebalance, then pick the next delay. A balanced round waits the
+    // full waitInterval; an unbalanced round retries after minInterval so a freshly appeared queue is
+    // claimed quickly. sleepUntilDeadline stops on `stop == true`, hence rebalanceStop_ being the flag
+    // (passing a RUNNING flag instead would sleep forever).
+    int32_t waitMillis = rebalanceWaitMillis_.load();
+    auto last = std::chrono::steady_clock::now();
+    while (!rebalanceStop_.load()) {
+        sleepUntilDeadline(rebalanceStop_,
+                           std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMillis));
+        if (rebalanceStop_.load()) break;
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+        const int32_t minInterval = rebalanceMinIntervalMillis_.load();
+        if (elapsed < minInterval) {
+            waitMillis = static_cast<int32_t>(minInterval - elapsed);
+            continue;
+        }
+        bool balanced = true;
+        try {
+            balanced = doRebalance();
+        } catch (const std::exception& e) {
+            logger_warn(std::string("rebalance loop error: ") + e.what());
+            balanced = false;
+        } catch (...) {
+            logger_warn("rebalance loop error: unknown exception");
+            balanced = false;
+        }
+        waitMillis = balanced ? rebalanceWaitMillis_.load() : minInterval;
+        last = std::chrono::steady_clock::now();
+    }
+    {
+        std::lock_guard<std::mutex> lk(rebalanceExitMutex_);
+        rebalanceThreadExited_ = true;
+    }
+    rebalanceExitCv_.notify_all();
+}
+
+bool DefaultMQPullConsumer::doRebalance() {
+    if (!enableRebalance_.load()) {
+        // Java tryRebalance (:398-402) returns **true** when the switch is off: "nothing left to retry".
+        // Returning false would pin the loop at minInterval and burn a round-trip every second for nothing.
+        return true;
+    }
+    bool balanced = true;
+    for (const std::string& topic : registerTopics_) {
+        try {
+            if (!rebalanceByTopic(topic)) balanced = false;
+        } catch (const std::exception& e) {
+            logger_warn("doRebalance, " + consumerGroup_ + ", topic " + topic + " failed: "
+                        + e.what());
+            balanced = false;
+        } catch (...) {
+            logger_warn("doRebalance, " + consumerGroup_ + ", topic " + topic
+                        + " failed: unknown exception");
+            balanced = false;
+        }
+    }
+    return balanced;
+}
+
+bool DefaultMQPullConsumer::rebalanceByTopic(const std::string& topic) {
+    if (mqClient_ == nullptr) return true;  // not started: nothing to balance
+    const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
+
+    // mqAll keeps the route's (namespaced) identity for the allocation strategy; mqAllBare is what the
+    // application sees, matching fetchMessageQueuesInBalance's stripped view.
+    std::vector<MessageQueue> mqAll;
+    std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
+    if (route != nullptr) {
+        mqAll = route->getAllSubscribeMessageQueue(realTopic);
+    }
+    std::sort(mqAll.begin(), mqAll.end());
+    std::vector<MessageQueue> mqAllBare;
+    mqAllBare.reserve(mqAll.size());
+    for (const MessageQueue& mq : mqAll) {
+        mqAllBare.emplace_back(NamespaceUtil::withoutNamespace(mq.topic, namespace_),
+                               mq.brokerName, mq.queueId);
+    }
+
+    if (mqAll.empty()) {
+        // Java (:286-294): a topic that vanished from the route revokes the queues this instance held
+        // and notifies with two empty sets. A topic it never held has nothing to revoke and stays silent.
+        bool hadQueues = false;
+        {
+            std::lock_guard<std::mutex> lk(rebalanceTableMutex_);
+            auto it = rebalanceTable_.find(topic);
+            if (it != rebalanceTable_.end() && !it->second.empty()) {
+                it->second.clear();
+                hadQueues = true;
+            }
+        }
+        if (hadQueues) {
+            logger_warn("doRebalance, " + consumerGroup_ + ", but the topic[" + topic
+                        + "] not exist.");
+            notifyQueueChanged(topic, std::vector<MessageQueue>(), std::vector<MessageQueue>());
+        }
+        // Java `break`s out of the switch here with `balanced` still at its initial true
+        // (BROADCASTING :276-284, CLUSTERING :286-294): an absent topic is not an unbalanced
+        // round. Returning false would pin the loop at minInterval and retry every second
+        // while the topic merely has no route yet.
+        return true;
+    }
+
+    std::vector<MessageQueue> divided;
+    if (messageModel_ == MessageModel::BROADCASTING) {
+        divided = mqAllBare;
+    } else {
+        std::vector<std::string> cidAll =
+            mqClient_->getConsumerIdListByGroup(realTopic, consumerGroup_);
+        if (cidAll.empty()) {
+            // Java (:300-302) only warns, notifies nothing and leaves balanced at true: the next round
+            // waits the full interval instead of hammering a broker that just failed the lookup.
+            logger_warn("doRebalance, " + consumerGroup_ + " " + topic
+                        + ", get consumer id list failed");
+            return true;
+        }
+        std::sort(cidAll.begin(), cidAll.end());
+        std::vector<MessageQueue> allocated;
+        try {
+            allocated = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
+        } catch (const std::exception& e) {
+            logger_error("allocate message queue exception. strategy name: "
+                         + allocateStrategy_->getName() + ", ex: " + e.what());
+            return false;
+        }
+        divided.reserve(allocated.size());
+        for (const MessageQueue& mq : allocated) {
+            // The strategy only hands back queues it was given; the filter guards against a custom
+            // strategy mixing another topic into this instance's pull set.
+            if (mq.topic != realTopic) continue;
+            divided.emplace_back(NamespaceUtil::withoutNamespace(mq.topic, namespace_),
+                                 mq.brokerName, mq.queueId);
+        }
+        std::sort(divided.begin(), divided.end());
+    }
+
+    // `balanced` = this round's allocation equals the previous round's (Java compares against the
+    // updated process-queue table). Only a change triggers the listener: an empty opening allocation is
+    // "nothing -> nothing" and Java's updateProcessQueueTableInRebalance reports no change there, so it
+    // must stay silent too (a re-order of the same set is likewise not a change).
+    bool balanced = false;
+    {
+        std::lock_guard<std::mutex> lk(rebalanceTableMutex_);
+        auto it = rebalanceTable_.find(topic);
+        if (it == rebalanceTable_.end()) {
+            balanced = divided.empty();
+        } else {
+            balanced = !assignmentChanged(it->second, divided);
+        }
+        rebalanceTable_[topic] = divided;
+    }
+    if (!balanced) {
+        logger_info("client rebalanced result changed. Group: " + consumerGroup_ + ", topic: "
+                    + topic + ", mqAllSize: " + std::to_string(mqAll.size())
+                    + ", rebalanceResultSize: " + std::to_string(divided.size()));
+        notifyQueueChanged(topic, mqAllBare, divided);
+    }
+    return balanced;
+}
+
+void DefaultMQPullConsumer::notifyQueueChanged(const std::string& topic,
+                                               const std::vector<MessageQueue>& all,
+                                               const std::vector<MessageQueue>& divided) {
+    std::shared_ptr<MessageQueueListener> perTopic;
+    std::shared_ptr<MessageQueueListener> global;
+    {
+        std::lock_guard<std::mutex> lk(assignmentNotifyMutex_);
+        auto it = messageQueueListeners_.find(topic);
+        if (it != messageQueueListeners_.end()) {
+            perTopic = it->second;
+        }
+        global = messageQueueListener_;
+    }
+    auto tell = [&topic, &all, &divided](const std::shared_ptr<MessageQueueListener>& listener) {
+        if (listener == nullptr) return;
+        try {
+            listener->messageQueueChanged(topic, all, divided);
+        } catch (const std::exception& e) {
+            // Java logs and swallows (RebalancePullImpl:49-51): the loop must survive a bad callback.
+            logger_error("messageQueueChanged exception: " + std::string(e.what()));
+        } catch (...) {
+            logger_error("messageQueueChanged exception: unknown");
+        }
+    };
+    // Java has one listener; this port also offers the topic-keyed registration, so both sinks are told
+    // (unless the application handed the same object to both).
+    tell(perTopic);
+    if (global != perTopic) {
+        tell(global);
+    }
+}
 PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string& subExpression,
                                       int64_t offset, int32_t maxNums, int32_t timeoutMillis) {
     return pull(mq, MessageSelector::byTag(subExpression), offset, maxNums, timeoutMillis);

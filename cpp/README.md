@@ -315,7 +315,8 @@ consumer.setMessageQueueListener(std::make_shared<QueueHandover>());
 
 ### 拉消费者
 
-无后台 rebalance，队列集合与位点都由调用方掌握：
+位点由调用方掌握；队列份额默认由后台重平衡线程按 `enableRebalance`（默认 true，对齐 Java）
+每 `setRebalanceWaitMillis`（默认 20000ms）周期分配，`setEnableRebalance(false)` 可关闭并退回现场计算：
 
 ```cpp
 #include "rocketmq/client/pull_consumer.h"

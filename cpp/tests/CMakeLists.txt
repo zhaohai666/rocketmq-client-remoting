@@ -311,6 +311,17 @@ add_executable(rmq_test_rebalance_change test_rebalance_change.cpp)
 target_link_libraries(rmq_test_rebalance_change PRIVATE rocketmq::remoting)
 add_test(NAME rebalance_change COMMAND rmq_test_rebalance_change)
 
+# Pull-side background rebalance (Java DefaultMQPullConsumer.enableRebalance, default true):
+# the switch's default/round-trip/clamps, "off reports balanced and never allocates", BROADCASTING
+# takes all and notifies once, CLUSTERING takes its share (two instances disjoint), a new queue /
+# vanished topic notifies exactly once, a missing consumer list stays balanced and silent, a throwing
+# listener does not escape, a re-ordered same set is not a change, and fetchMessageQueuesInBalance
+# prefers the table (copy, sorted) over the on-the-spot computation. The resident thread itself is
+# pinned by driving it with a 50ms period on the fake endpoint.
+add_executable(rmq_test_pull_rebalance test_pull_rebalance.cpp)
+target_link_libraries(rmq_test_pull_rebalance PRIVATE rocketmq::remoting)
+add_test(NAME pull_rebalance COMMAND rmq_test_pull_rebalance)
+
 # Shutdown unregister UNREGISTER_CLIENT(35): mock broker pins the header shape (a blank group slot is not sent online at all) and
 # the "every broker incl. slaves" fan-out (the broker-side check is group != null, invisible on a real machine).
 # The real-machine evidence is in examples/live_producer_unregister.cpp (frame capture + 204 before/after comparison).
@@ -407,8 +418,8 @@ target_link_libraries(rmq_test_pull_consumer_heartbeat PRIVATE rocketmq::remotin
 add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
 
 # The balance view of the pull-mode consumer (the internal convention of fetchMessageQueuesInBalance): the official example
-# relies on it to decide "pull only my share". This port has no background
-# rebalance thread; the view is computed on the spot by the same formula as rebalanceByTopic, so the criteria land on: single instance full set,
+# relies on it to decide "pull only my share". Before the background rebalance has visited a topic
+# the view is computed on the spot by the same formula as rebalanceByTopic, so the criteria land on: single instance full set,
 # two instances non-overlapping and together covering all, keeping the current allocation when it cannot compute (never monopolizing all), broadcast ignoring cidAll,
 # throwing directly when not started, and returning the already-stripped namespace.
 add_executable(rmq_test_pull_consumer_balance_view test_pull_consumer_balance_view.cpp)

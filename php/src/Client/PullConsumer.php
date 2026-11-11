@@ -41,10 +41,19 @@ if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
 /**
  * Pull-mode consumer, following the classic remoting protocol's PULL_MESSAGE path.
  *
- * Essential difference from the push consumer: the caller pulls queue by queue itself via
- * ``pull($mq, $offset)`` and manages offsets itself; there is no local buffer, no background
- * pull thread and no rebalance, so a threadless model fits it naturally with zero PHP
- * adaptation drift.
+ * The caller pulls queue by queue itself via ``pull($mq, $offset)`` and manages offsets
+ * itself; there is no local buffer and no background pull thread.
+ *
+ * Rebalance: Java's pull consumer is **not** the "no rebalance" shape this port used to
+ * document. ``DefaultMQPullConsumer.java:97`` declares ``enableRebalance = true`` and the
+ * shared ``RebalanceService`` calls ``tryRebalance()`` every
+ * ``rocketmq.client.rebalance.waitInterval`` (20 s, ``minInterval`` 1 s), which allocates
+ * this instance's queues and fires ``messageQueueChanged(topic, mqAll, mqDivided)`` when a
+ * queue set changes. PHP has no background thread, so this port exposes the same round as
+ * ``tickRebalance()``: the caller's own loop alternates it with ``tick()``, and the method
+ * decides from the clock whether this beat is due. That is a **necessary deviation** (no
+ * thread), matching the tick style of ``PullSchedule``; the observable result -- allocation
+ * table, change-only callback, wait/min interval pacing -- is the Java one.
  */
 final class DefaultMQPullConsumer
 {
@@ -112,9 +121,31 @@ final class DefaultMQPullConsumer
     public ?SocksProxyConfig $socksProxy = null;
     public ?MessageQueueListener $messageQueueListener = null;
     /**
+     * Pull-side rebalance switch (default true, Java ``DefaultMQPullConsumer.java:97``).
+     * Off, ``doRebalance()`` returns balanced without allocating anything and
+     * ``fetchMessageQueuesInBalance()`` computes its answer on the spot.
+     */
+    public bool $enableRebalance = true;
+    /** Full round period, Java system property ``rocketmq.client.rebalance.waitInterval`` (20000 ms). */
+    public int $rebalanceWaitMillis = 20000;
+    /** Retry period after an unbalanced round, ``rocketmq.client.rebalance.minInterval`` (1000 ms). */
+    public int $rebalanceMinIntervalMillis = 1000;
+    /**
+     * topic -> this instance's share, the **product** of the rebalance (Java reads the keys of
+     * the rebalance's process-queue table). A topic absent from the table has not been
+     * rebalanced yet; an empty list means the rebalance found no queue for it.
+     *
+     * @var array<string,list<MessageQueue>>
+     */
+    private array $rebalanceTable = [];
+    /** When the next tickRebalance() beat is due (seconds); 0 = run on the first beat after start. */
+    private float $nextRebalanceAt = 0.0;
+    /** Whether the last round was balanced; reported on beats that are not due yet. */
+    private bool $rebalanceBalanced = true;
+    /**
      * Queue allocation strategy (AVG by default; setters/getters do not validate values).
-     * In this pull-mode port the caller manages queues itself, so it exists purely as
-     * configuration and is validated by start().
+     * Used by {@see rebalanceByTopic()} and by the on-the-spot fallback of
+     * {@see fetchMessageQueuesInBalance()}; start() owns validity.
      */
     public ?AllocateMessageQueueStrategy $allocateMessageQueueStrategy;
     /** @var list<object> Pre-delivery filter hooks, registered into pull-result processing at start() */
@@ -283,6 +314,81 @@ final class DefaultMQPullConsumer
     public function setMessageQueueListener(MessageQueueListener $listener): void
     {
         $this->messageQueueListener = $listener;
+    }
+
+    /**
+     * Java ``DefaultMQPullConsumer#registerMessageQueueListener``: registers the topic **and**
+     * installs the listener in one call. The topic matters -- the rebalance walks
+     * ``registerTopics``, so a listener installed by the setter alone would never fire.
+     * A null listener keeps the current one (Java overwrites only when non-null); a blank
+     * topic is ignored entirely.
+     */
+    public function registerMessageQueueListener(string $topic, ?MessageQueueListener $listener): void
+    {
+        if (trim($topic) === '') {
+            return;
+        }
+        $this->registerTopic($topic);
+        if ($listener !== null) {
+            $this->messageQueueListener = $listener;
+        }
+    }
+
+    /** @return list<string> The topics the rebalance walks (registration order is not part of the contract). */
+    public function getRegisterTopics(): array
+    {
+        return array_keys($this->registerTopics);
+    }
+
+    // ---------------- Pull-side rebalance configuration ----------------
+
+    /** Java ``setEnableRebalance``: off makes doRebalance() a no-op that still reports balanced. */
+    public function setEnableRebalance(bool $enable): void
+    {
+        $this->enableRebalance = $enable;
+    }
+
+    public function isEnableRebalance(): bool
+    {
+        return $this->enableRebalance;
+    }
+
+    /** Period of a full round; clamped to at least 1 ms so a zero value cannot spin the caller's loop. */
+    public function setRebalanceWaitMillis(int $millis): void
+    {
+        $this->rebalanceWaitMillis = max(1, $millis);
+    }
+
+    public function getRebalanceWaitMillis(): int
+    {
+        return $this->rebalanceWaitMillis;
+    }
+
+    /** Retry period after an unbalanced round; clamped to at least 1 ms like the wait period. */
+    public function setRebalanceMinIntervalMillis(int $millis): void
+    {
+        $this->rebalanceMinIntervalMillis = max(1, $millis);
+    }
+
+    public function getRebalanceMinIntervalMillis(): int
+    {
+        return $this->rebalanceMinIntervalMillis;
+    }
+
+    /**
+     * Snapshot of the rebalance's product (topic -> this instance's queues). The arrays are
+     * copied, so a caller can clear or reorder its copy without touching the table; the
+     * MessageQueue values are shared, exactly as the table holds them.
+     *
+     * @return array<string,list<MessageQueue>>
+     */
+    public function getRebalanceTable(): array
+    {
+        $snapshot = [];
+        foreach ($this->rebalanceTable as $topic => $queues) {
+            $snapshot[$topic] = array_values($queues);
+        }
+        return $snapshot;
     }
 
     /** Set the queue allocation strategy: the setter does not validate; start() owns validity. */
@@ -514,9 +620,24 @@ final class DefaultMQPullConsumer
         return $this->requireClient()->getTopicSubscribeInfo($topic);
     }
 
+    /**
+     * The queues this instance is responsible for "after balancing" -- the caller's pull loop
+     * uses it to decide what to pull.
+     *
+     * Java reads the keys of the rebalance's process-queue table. This port keeps the equivalent
+     * per-topic ``$rebalanceTable``: when the switch is on and the topic has been rebalanced,
+     * that product is authoritative. Only when the switch is off, or the topic has not been
+     * filled yet, is the allocation computed on the spot with the same formula as
+     * {@see rebalanceByTopic()} (BROADCASTING all; CLUSTERING route -> consumer list ->
+     * strategy). Neither path notifies the listener and neither writes the table: this is a
+     * query, not a rebalance round.
+     */
     public function fetchMessageQueuesInBalance(string $topic): array
     {
         $client = $this->requireClient();
+        if ($this->enableRebalance && array_key_exists($topic, $this->rebalanceTable)) {
+            return $this->sortedQueues($this->rebalanceTable[$topic], $topic);
+        }
         $pulled = array_values(array_filter(
             $this->pulledQueues,
             static fn(MessageQueue $mq): bool => $mq->topic === $topic,
@@ -557,6 +678,185 @@ final class DefaultMQPullConsumer
         }
         ksort($out);
         return array_values($out);
+    }
+
+    // ---------------- Pull-side rebalance (Java DefaultMQPullConsumerImpl :388-406) ----------------
+
+    /**
+     * One beat of the rebalance loop, run by the caller's loop beside ``tick()``.
+     *
+     * Java's ``RebalanceService`` owns a thread, waits ``waitInterval`` between rounds and loops
+     * after ``minInterval`` when the last round was unbalanced. PHP has no thread, so the whole
+     * loop body is this method: it decides from ``$now`` whether this beat is due and otherwise
+     * reports the previous answer. ``$now`` is seconds since the epoch (the same clock
+     * ``tick()`` converts its milliseconds into); passing it explicitly lets a test drive the
+     * pacing without sleeping. The first beat after start runs at once -- a tick-polled loop has
+     * no wait of its own to spend, and before the first round
+     * ``fetchMessageQueuesInBalance()`` computes on the spot anyway.
+     *
+     * @return bool whether the consumer is balanced (Java ``tryRebalance``'s answer)
+     */
+    public function tickRebalance(?float $now = null): bool
+    {
+        if (!$this->started) {
+            return true;
+        }
+        $now ??= microtime(true);
+        if ($this->nextRebalanceAt > 0.0 && $now < $this->nextRebalanceAt) {
+            return $this->rebalanceBalanced;
+        }
+        $balanced = $this->doRebalance();
+        $this->rebalanceBalanced = $balanced;
+        $this->nextRebalanceAt = $now
+            + ($balanced ? $this->rebalanceWaitMillis : $this->rebalanceMinIntervalMillis) / 1000.0;
+        return $balanced;
+    }
+
+    /**
+     * Java ``DefaultMQPullConsumerImpl#tryRebalance`` (:398-406): the first line is the switch
+     * gate, and **off returns true** ("nothing left to retry"). Returning false would pin the
+     * loop at minInterval and burn a round-trip every second for nothing.
+     */
+    public function doRebalance(): bool
+    {
+        if (!$this->enableRebalance) {
+            return true;
+        }
+        $balanced = true;
+        $topics = array_keys($this->registerTopics);
+        sort($topics);
+        foreach ($topics as $topic) {
+            try {
+                if (!$this->rebalanceByTopic($topic)) {
+                    $balanced = false;
+                }
+            } catch (\Throwable $e) {
+                Logger::debug(sprintf('rebalance topic %s failed: %s', $topic, $e->getMessage()));
+                $balanced = false;
+            }
+        }
+        return $balanced;
+    }
+
+    /**
+     * Java ``RebalanceImpl#rebalanceByTopic`` on the pull path, plus ``messageQueueChanged``.
+     *
+     * BROADCASTING gives every queue; CLUSTERING sorts the route, asks the broker for the group's
+     * consumer ids and hands both to this instance's strategy. A missing consumer list only
+     * warns -- Java (:300-302) notifies nothing and leaves the round balanced, never falling
+     * back to "owning all queues" (that would make instances consume each other's messages).
+     * An empty route clears a previously non-empty share and notifies with two empty sets, then
+     * still reports balanced (Java ``break``s, leaving ``balanced`` at true; reporting
+     * "unbalanced" would retry every minInterval while the topic is merely absent).
+     *
+     * The listener fires **only when the set changed**, with ``(topic, mqAll, mqDivided)``.
+     *
+     * Deviation (documented): Java compares the allocation against the freshly updated process
+     * queue table; here "balanced" means "identical to the previous round", which costs at most
+     * one extra minInterval confirmation round and never hammers.
+     */
+    public function rebalanceByTopic(string $topic): bool
+    {
+        $client = $this->requireClient();
+        $mqAll = $this->sortedQueues($client->getTopicSubscribeInfo($topic), $topic);
+        if ($mqAll === []) {
+            if (($this->rebalanceTable[$topic] ?? []) !== []) {
+                $this->rebalanceTable[$topic] = [];
+                $this->notifyQueueChanged($topic, [], []);
+            }
+            return true;
+        }
+        if ($this->messageModel === MessageModel::BROADCASTING) {
+            $divided = $mqAll;
+        } else {
+            $cidAll = $client->getConsumerIdListByGroup($topic, $this->consumerGroup);
+            if ($cidAll === null || $cidAll === []) {
+                Logger::debug(sprintf('doRebalance, %s %s, get consumer id list failed',
+                    $this->consumerGroup, $topic));
+                return true;
+            }
+            sort($cidAll);
+            $strategy = $this->allocateMessageQueueStrategy;
+            if ($strategy === null) {
+                Logger::error('allocate message queue strategy is null');
+                return false;
+            }
+            try {
+                $allocated = $strategy->allocate(
+                    $this->consumerGroup,
+                    $this->clientId ?? '',
+                    $mqAll,
+                    $cidAll,
+                );
+            } catch (\Throwable $e) {
+                Logger::error(sprintf('allocate message queue exception, strategy=%s: %s',
+                    $strategy->getName(), $e->getMessage()));
+                return false;
+            }
+            $divided = $this->sortedQueues($allocated, $topic);
+        }
+        $previous = $this->rebalanceTable[$topic] ?? null;
+        if ($previous === null) {
+            // First sight of the topic: Java's updateProcessQueueTableInRebalance counts only
+            // table additions/removals as a change, so "nothing -> nothing" is no change -- an
+            // empty opening share stays silent and the round counts as balanced.
+            $balanced = $divided === [];
+        } else {
+            $balanced = self::sameMqSet($previous, $divided);
+        }
+        $this->rebalanceTable[$topic] = $divided;
+        if (!$balanced) {
+            Logger::info(sprintf(
+                'client rebalanced result changed. Group: %s, topic: %s, mqAllSize: %d, rebalanceResultSize: %d',
+                $this->consumerGroup,
+                $topic,
+                count($mqAll),
+                count($divided),
+            ));
+            $this->notifyQueueChanged($topic, $mqAll, $divided);
+        }
+        return $balanced;
+    }
+
+    /**
+     * Java ``RebalancePullImpl#messageQueueChanged`` (:44-53): call the listener when there is
+     * one, and **swallow its exception into the log** (:49-51) -- one bad callback must not kill
+     * the loop and freeze every allocation.
+     *
+     * @param list<MessageQueue> $mqAll
+     * @param list<MessageQueue> $mqDivided
+     */
+    public function notifyQueueChanged(string $topic, array $mqAll, array $mqDivided): void
+    {
+        if ($this->messageQueueListener === null) {
+            return;
+        }
+        try {
+            $this->messageQueueListener->messageQueueChanged($topic, $mqAll, $mqDivided);
+        } catch (\Throwable $e) {
+            Logger::error('messageQueueChanged exception: ' . $e->getMessage());
+        }
+    }
+
+    /** Whether two queue lists hold the same queues, regardless of order. */
+    private static function sameMqSet(array $left, array $right): bool
+    {
+        if (count($left) !== count($right)) {
+            return false;
+        }
+        $rightKeys = [];
+        foreach ($right as $mq) {
+            $rightKeys[self::mqKey($mq)] = true;
+        }
+        if (count($rightKeys) !== count($left)) {
+            return false;
+        }
+        foreach ($left as $mq) {
+            if (!isset($rightKeys[self::mqKey($mq)])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public function pull(

@@ -325,9 +325,11 @@ public:
 consumer.setMessageQueueListener(std::make_shared<QueueHandover>());
 ```
 
-`DefaultMQPullConsumer` has no background rebalance -- the caller supplies the queue set, so it owes only
-the notification half: the same callback fires when its own balance view changes (compared as sets), with
-no version restamp and no extra heartbeat.
+`DefaultMQPullConsumer` has a background rebalance, as Java's does (`enableRebalance`, default true):
+a resident thread divides each registered topic every `setRebalanceWaitMillis` (20s) and the queue
+listener fires when this instance's share moves (compared as sets), with no version restamp and no
+extra heartbeat. `setEnableRebalance(false)` turns that work off and makes
+`fetchMessageQueuesInBalance` compute the share on the spot.
 
 Also available: `suspend()` / `resume()`, `setPullBatchSize` / `setPullThresholdForQueue`
 (pre-pull flow control), `setAllocateMessageQueueStrategy` (six queue-allocation strategies),
@@ -336,7 +338,7 @@ and `updateCorePoolSize(n)` to change concurrency at runtime.
 
 ### Pull Consumer
 
-No background rebalance — the caller owns both the queue set and the offsets:
+The caller owns the offsets; the queue share is maintained by the background rebalance (see above):
 
 ```cpp
 #include "rocketmq/client/pull_consumer.h"

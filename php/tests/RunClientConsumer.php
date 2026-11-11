@@ -1364,8 +1364,8 @@ final class RunClientConsumer
         $this->checkSame(2, (int) ($backs[0]['delayLevel'] ?? -1), 'send-back delayLevel=2');
         $this->checkSame(16, $backs[0]['maxReconsumeTimes'] ?? null, 'pull send-back carries the default retry ceiling 16');
 
-        // fetchMessageQueuesInBalance: pull mode has no background rebalance, so compute this instance's
-        // queues on the spot with the same formula as rebalanceByTopic.
+        // fetchMessageQueuesInBalance: no tickRebalance() has run here, so the rebalance table is
+        // still empty and the answer is computed on the spot with the same formula as rebalanceByTopic.
         // The group contains only this instance (RMQ_CONSUMER_MAP registers only CONS-P) -> the whole share is mine.
         $balanced = $c->fetchMessageQueuesInBalance('DTopic');
         $this->checkSame(1, count($balanced), 'balanced view gives the 1 queue this instance owns');

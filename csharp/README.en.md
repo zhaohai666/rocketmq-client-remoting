@@ -338,6 +338,12 @@ Queue-change notifications: `pull.SetMessageQueueListener(listener)` or
 `pull.RegisterMessageQueueListener(topic, listener)`
 (`IMessageQueueListener.MessageQueueChanged(mqAll, mqDivided)`).
 Pull-mode consumers send consumer heartbeats by default: `HeartbeatEnabled`, `HeartbeatBrokerIntervalMillis`.
+Pull mode **also rebalances in the background** (Java `enableRebalance`, default true): while
+`EnableRebalance` is on, one round runs every `RebalanceWaitMillis` (default 20000, i.e.
+`rocketmq.client.rebalance.waitInterval`) and the listener fires only when an allocation moved;
+an unbalanced round retries after `RebalanceMinIntervalMillis` (default 1000).
+`FetchMessageQueuesInBalance` prefers the rebalance's product and computes on the spot only when
+the switch is off or the topic has not been through a round yet.
 
 ### LitePullConsumer (poll and commit yourself, incl. topic queue-set change listener)
 

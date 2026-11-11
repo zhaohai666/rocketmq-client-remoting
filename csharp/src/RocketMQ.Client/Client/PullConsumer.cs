@@ -1,9 +1,15 @@
 // The difference from a push consumer (DefaultMQPushConsumer): **the caller does the
-// pulling and manages the offsets itself**. There is no background pulling thread, no
-// rebalance and no consume listener; only:
-//   FetchSubscribeMessageQueues / Pull / PullAsync / PullBlockIfNotFound /
-//   FetchConsumeOffset / UpdateConsumeOffset / SearchOffset / MaxOffset / MinOffset /
-//   EarliestMsgStoreTime / SendMessageBack / CreateTopic.
+// pulling and manages the offsets itself**. There is no background pulling thread and no
+// consume listener. There IS a background rebalance, exactly like Java's pull consumer
+// (DefaultMQPullConsumer.java:97 `enableRebalance = true`): a per-facade thread runs one
+// round every RebalanceWaitMillis (20s, `rocketmq.client.rebalance.waitInterval`) -- or
+// RebalanceMinIntervalMillis (1s) after an unbalanced round -- allocating each registered
+// topic's queues per the strategy and firing MessageQueueChanged only when a topic's queue
+// SET moved. EnableRebalance=false returns it to the old "the caller owns the assignment"
+// behaviour, where FetchMessageQueuesInBalance computes on the spot every call.
+// Surface: FetchSubscribeMessageQueues / FetchMessageQueuesInBalance / Pull / PullAsync /
+//   PullBlockIfNotFound / FetchConsumeOffset / UpdateConsumeOffset / SearchOffset /
+//   MaxOffset / MinOffset / EarliestMsgStoreTime / SendMessageBack / CreateTopic.
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -51,11 +57,35 @@ public sealed class DefaultMQPullConsumer
         new(StringComparer.Ordinal);
     private IMessageQueueListener? _messageQueueListener;
     /// <summary>Per topic, the queue SET last handed to the listeners: a round that re-publishes
-    /// the same set is not a change. Keys are (topic, brokerName, queueId) identities.</summary>
+    /// the same set is not a change. Keys are (topic, brokerName, queueId) identities. Used by
+    /// <see cref="NotifyAssignmentChanged"/>; the background rebalance compares its own table
+    /// instead, so a lookup never feeds back into this history.</summary>
     private readonly Dictionary<string, HashSet<string>> _lastBalancedQueues =
         new(StringComparer.Ordinal);
     private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy =
         new AllocateMessageQueueAveragely();
+
+    // ---- Pull-side rebalance (Java DefaultMQPullConsumer.java:97 / impl :388-406) ----
+    // Java's pull consumer DOES rebalance: the shared RebalanceService thread calls
+    // `mqClientFactory.doRebalance()` every `rocketmq.client.rebalance.waitInterval` (20s),
+    // which walks every registered consumer and calls its `tryRebalance()`; that gates on
+    // `enableRebalance` (default true) and then runs `rebalanceImpl.doRebalance(false)` ->
+    // allocate -> `messageQueueChanged(topic, mqAll, mqDivided)`.
+    // Deviation (documented): Java shares ONE RebalanceService per client instance, this
+    // port gives each facade its own loop, the same shape as the heartbeat loop above; the
+    // observable behaviour -- which queues this instance owns and when the listener fires --
+    // is the same. Also, `balanced` here means "this round's allocation equals the previous
+    // round's", so a changed-then-already-in-place topic costs at most one extra 1s round.
+    private bool _enableRebalance = true;
+    private int _rebalanceWaitMillis = 20000;
+    private int _rebalanceMinIntervalMillis = 1000;
+    /// <summary>The product of the background rebalance: topic -> the queues allocated to this
+    /// instance (bare topic names). Java reads the keys of the rebalance's process-queue table;
+    /// this is the equivalent, and FetchMessageQueuesInBalance prefers it when it is warm.</summary>
+    private readonly Dictionary<string, List<MessageQueue>> _rebalanceTable =
+        new(StringComparer.Ordinal);
+    private volatile bool _rebalanceStop;
+    private Thread? _rebalanceThread;
 
     private readonly int _brokerSuspendMaxTimeMillis = 20000;
     private readonly int _consumerPullTimeoutMillis = 10000;
@@ -118,10 +148,15 @@ public sealed class DefaultMQPullConsumer
             return;
         }
 
-        _registerTopics.Add(topic);
-        if (listener is not null)
+        // Locked: the background rebalance thread snapshots both tables while it walks the
+        // registered topics, and a registration may well happen after Start().
+        lock (_lock)
         {
-            _messageQueueListeners[topic] = listener;
+            _registerTopics.Add(topic);
+            if (listener is not null)
+            {
+                _messageQueueListeners[topic] = listener;
+            }
         }
     }
 
@@ -278,6 +313,49 @@ public sealed class DefaultMQPullConsumer
     /// machine).</summary>
     public long HeartbeatCount => Interlocked.Read(ref _heartbeatCount);
 
+    /// <summary>Java DefaultMQPullConsumer.java:97 (`enableRebalance = true`). Off means
+    /// DoRebalance/RebalanceByTopic allocate nothing and FetchMessageQueuesInBalance goes back
+    /// to computing the assignment on the spot every call.</summary>
+    public bool EnableRebalance
+    {
+        get => _enableRebalance;
+        set => _enableRebalance = value;
+    }
+
+    /// <summary>Round period: Java system property `rocketmq.client.rebalance.waitInterval`
+    /// (20000ms). Clamped to 1 -- a zero period would spin the loop.</summary>
+    public int RebalanceWaitMillis
+    {
+        get => _rebalanceWaitMillis;
+        set => _rebalanceWaitMillis = value > 0 ? value : 1;
+    }
+
+    /// <summary>Lower bound between two rounds: Java `rocketmq.client.rebalance.minInterval`
+    /// (1000ms). Used as the delay after an unbalanced round so a newly appeared queue is
+    /// claimed quickly. Clamped to 1.</summary>
+    public int RebalanceMinIntervalMillis
+    {
+        get => _rebalanceMinIntervalMillis;
+        set => _rebalanceMinIntervalMillis = value > 0 ? value : 1;
+    }
+
+    /// <summary>Snapshot of the background rebalance's product (topic -> this instance's
+    /// queues). The lists are copies: a caller cannot mutate what the next round compares
+    /// against.</summary>
+    public Dictionary<string, List<MessageQueue>> GetRebalanceTable()
+    {
+        lock (_lock)
+        {
+            var snapshot = new Dictionary<string, List<MessageQueue>>(StringComparer.Ordinal);
+            foreach (KeyValuePair<string, List<MessageQueue>> kv in _rebalanceTable)
+            {
+                snapshot[kv.Key] = new List<MessageQueue>(kv.Value);
+            }
+
+            return snapshot;
+        }
+    }
+
     // ---------------- ACL authentication ----------------
     /// <summary>Must be called before Start(): the hook is bound to the MqClient inside
     /// Start().</summary>
@@ -379,6 +457,9 @@ public sealed class DefaultMQPullConsumer
             // SUBSCRIPTION_NOT_EXIST until the next periodic heartbeat.
             _mqClient.RegisterConsumerHeartbeat(_consumerGroup, SendHeartbeatToBroker);
             StartHeartbeatLoop();
+            // Java registers the pull consumer with the shared RebalanceService in start();
+            // here the facade drives its own loop (see the field comment).
+            StartRebalanceLoop();
         }
     }
 
@@ -392,6 +473,14 @@ public sealed class DefaultMQPullConsumer
             }
 
             _started = false;
+            // Stop rebalancing before the client instance goes away: the loop calls back into
+            // it (subscribe info / consumer id list). The wait is sliced, so the join below
+            // returns promptly even between two rounds.
+            _rebalanceStop = true;
+            if (_rebalanceThread is { IsAlive: true })
+            {
+                _rebalanceThread.Join(2000);
+            }
             _heartbeatStop = true;
             if (_heartbeatThread is { IsAlive: true })
             {
@@ -610,16 +699,21 @@ public sealed class DefaultMQPullConsumer
             throw new MQClientException("topic is null");
         }
 
+        // The background rebalance's product is authoritative when it has already produced a
+        // view of this topic: Java reads the keys of its process-queue table here. The list is
+        // the caller's spelling (bare topic) and a copy, so mutating it cannot corrupt the
+        // round that produced it. Off (or not yet warmed) falls through to the on-the-spot
+        // formula below.
+        if (_enableRebalance && TryGetRebalanceView(topic, out List<MessageQueue> cached))
+        {
+            return cached;
+        }
+
         string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
         List<MessageQueue> pulled = PulledQueues(realTopic);
-        // The FULL route set of the topic, in the caller's (namespace-free) spelling -- this is
-        // what a queue-change listener is handed next to this instance's share of it.
-        var allOfTopic = new List<MessageQueue>();
-        foreach (MessageQueue mq in SubscribeQueuesOfTopic(c, realTopic))
-        {
-            allOfTopic.Add(new MessageQueue(
-                NamespaceUtil.WithoutNamespace(mq.Topic, _namespace), mq.BrokerName, mq.QueueId));
-        }
+        // Pure query: Java's fetchMessageQueuesInBalance only reads the process-queue table
+        // (DefaultMQPullConsumerImpl:120-135) and never calls messageQueueChanged -- the
+        // listener belongs to the rebalance round, not to a lookup.
 
         List<MessageQueue>? allocated = null;
         if (_messageModel == MessageModel.Broadcasting)
@@ -668,10 +762,286 @@ public sealed class DefaultMQPullConsumer
         }
 
         outList.Sort();
-        outList = DedupeQueues(outList);
-        // The classic pull consumer owes only this half of an assignment change: the application's
-        // listener hears about the topics whose queue SET actually moved, and nothing else.
-        NotifyAssignmentChanged(topic, allOfTopic, outList);
+        return DedupeQueues(outList);
+    }
+
+    // ---------------- Pull-side rebalance (Java DefaultMQPullConsumerImpl :388-406) ----------------
+
+    /// <summary>One rebalance round over every registered topic. Java
+    /// `DefaultMQPullConsumerImpl#tryRebalance` (:398-406): with the switch off it returns
+    /// **true** ("nothing left to retry") -- returning false would pin the loop at
+    /// minInterval and burn a round-trip every second for nothing. The answer is the
+    /// "balanced" verdict the loop uses to pick the next delay.</summary>
+    public bool DoRebalance()
+    {
+        if (!_enableRebalance)
+        {
+            return true;
+        }
+
+        string[] topics;
+        lock (_lock)
+        {
+            topics = new string[_registerTopics.Count];
+            _registerTopics.CopyTo(topics);
+        }
+
+        bool balanced = true;
+        foreach (string topic in topics)
+        {
+            try
+            {
+                if (!RebalanceByTopic(topic))
+                {
+                    balanced = false;
+                }
+            }
+            catch (Exception e)
+            {
+                // The loop must survive one bad topic (a broker that stopped answering, a
+                // strategy that threw): log it and report the round as unbalanced.
+                ClientLog.Warn("rebalance topic " + topic + " failed: " + e.Message);
+                balanced = false;
+            }
+        }
+
+        return balanced;
+    }
+
+    /// <summary>Java `RebalanceImpl#rebalanceByTopic` (pull path) + `RebalancePullImpl#messageQueueChanged`
+    /// (:44-53). Returns whether this topic is already balanced.
+    ///
+    /// BROADCASTING divides all queues to this instance; CLUSTERING asks the broker for the
+    /// group's client ids and runs the allocation strategy, keeping only the queues of this
+    /// topic. The listener fires **only when the allocation changed**, with
+    /// `(topic, mqAll, mqDivided)`, exactly the three arguments Java passes -- and inside
+    /// try/catch there too, so a throwing listener cannot kill the loop. A topic whose route
+    /// vanished clears the table and (when it had queues) notifies with two empty sets while
+    /// still reporting balanced (:276-294); a missing consumer list only warns, notifies
+    /// nothing and also stays balanced (:300-302); only a throwing strategy is unbalanced.</summary>
+    public bool RebalanceByTopic(string topic)
+    {
+        MQClientInstance c = RequireClient();
+        string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
+        List<MessageQueue> mqAll = SubscribeQueuesOfTopic(c, realTopic);
+        if (mqAll.Count == 0)
+        {
+            bool hadQueues;
+            lock (_lock)
+            {
+                hadQueues = _rebalanceTable.TryGetValue(topic, out List<MessageQueue>? previous)
+                            && previous.Count > 0;
+                _rebalanceTable[topic] = new List<MessageQueue>();
+            }
+
+            if (hadQueues)
+            {
+                ClientLog.Warn("doRebalance, " + _consumerGroup + ", but the topic[" + topic
+                               + "] not exist.");
+                NotifyQueueChanged(topic, Array.Empty<MessageQueue>(), Array.Empty<MessageQueue>());
+            }
+
+            // Java's BROADCASTING (:276-284) and CLUSTERING (:286-294) branches both `break`
+            // after that warn, leaving `balanced` at its initial true. Reporting false would
+            // switch the loop to minInterval and spin once per second for a topic that is
+            // merely temporarily absent -- the same reason the missing-cid path stays true.
+            return true;
+        }
+
+        List<MessageQueue> divided;
+        if (_messageModel == MessageModel.Broadcasting)
+        {
+            divided = DedupeQueues(BareQueues(mqAll));
+        }
+        else
+        {
+            List<string>? cidAll = c.GetConsumerIdListByGroup(realTopic, _consumerGroup);
+            if (cidAll is null || cidAll.Count == 0)
+            {
+                // Java (:300-302) only warns: it does NOT notify and leaves balanced at true,
+                // so the next round waits the full interval. Never fall back to "owning all
+                // queues" -- several instances of the group would consume each other's messages.
+                ClientLog.Warn("doRebalance, " + _consumerGroup + " " + topic
+                               + ", get consumer id list failed");
+                return true;
+            }
+
+            cidAll.Sort(StringComparer.Ordinal);
+            List<MessageQueue>? allocated;
+            try
+            {
+                IAllocateMessageQueueStrategy strategy = _allocateMessageQueueStrategy
+                    ?? throw new MQClientException("allocateMessageQueueStrategy is null");
+                allocated = strategy.Allocate(_consumerGroup, _clientId, mqAll, cidAll);
+            }
+            catch (Exception e)
+            {
+                // Java keeps the current assignment and ends the round (catch Throwable ->
+                // log error -> return false); a topic's queues must never be revoked here.
+                ClientLog.Error("allocate message queue exception. strategy name: "
+                                + (_allocateMessageQueueStrategy?.GetName() ?? "null")
+                                + ", ex: " + e.Message);
+                return false;
+            }
+
+            var mine = new List<MessageQueue>();
+            foreach (MessageQueue mq in allocated ?? new List<MessageQueue>())
+            {
+                if (mq.Topic == realTopic)
+                {
+                    mine.Add(new MessageQueue(
+                        NamespaceUtil.WithoutNamespace(mq.Topic, _namespace), mq.BrokerName, mq.QueueId));
+                }
+            }
+
+            mine.Sort();
+            divided = DedupeQueues(mine);
+        }
+
+        bool balanced;
+        lock (_lock)
+        {
+            // Deviation: balanced means "identical to the previous round" (Java compares the
+            // allocate result with the freshly updated process-queue table). It costs at most
+            // one extra minInterval round and never reports a change that did not happen.
+            // First sight of the topic: Java's updateProcessQueueTableInRebalance counts only
+            // table additions/removals as a change, so "nothing -> nothing" is no change -- an
+            // empty opening share stays silent and the round counts as balanced.
+            bool hasPrevious = _rebalanceTable.TryGetValue(topic, out List<MessageQueue>? previous)
+                               && previous is not null;
+            balanced = hasPrevious
+                ? ToKeySet(_rebalanceTable[topic]).SetEquals(ToKeySet(divided))
+                : divided.Count == 0;
+            _rebalanceTable[topic] = new List<MessageQueue>(divided);
+        }
+
+        if (!balanced)
+        {
+            ClientLog.Info("client rebalanced result changed. Group: " + _consumerGroup
+                           + ", topic: " + topic + ", mqAllSize: " + mqAll.Count
+                           + ", rebalanceResultSize: " + divided.Count);
+            NotifyQueueChanged(topic, BareQueues(mqAll), divided);
+        }
+
+        return balanced;
+    }
+
+    /// <summary>Java `RebalancePullImpl#messageQueueChanged` (:44-53): hand the change to the
+    /// application's listeners. A listener that throws is logged and swallowed -- the loop must
+    /// survive one bad callback. Nothing is filtered here: the caller has already established
+    /// that the queue SET moved.</summary>
+    public void NotifyQueueChanged(string topic, IReadOnlyList<MessageQueue> mqAll,
+        IReadOnlyList<MessageQueue> divided)
+    {
+        IMessageQueueListener? perTopic;
+        IMessageQueueListener? global;
+        lock (_lock)
+        {
+            _messageQueueListeners.TryGetValue(topic, out perTopic);
+            global = _messageQueueListener;
+        }
+
+        if (perTopic is not null)
+        {
+            Fire(perTopic, topic, mqAll, divided);
+        }
+
+        // The single listener is a different sink from the topic-keyed one; it is skipped only
+        // when the application handed the same object to both.
+        if (global is not null && !ReferenceEquals(global, perTopic))
+        {
+            Fire(global, topic, mqAll, divided);
+        }
+    }
+
+    private void StartRebalanceLoop()
+    {
+        _rebalanceStop = false;
+        _rebalanceThread = new Thread(RebalanceLoop)
+        {
+            IsBackground = true,
+            Name = "rmq-pull-rebalance-" + _consumerGroup,
+        };
+        _rebalanceThread.Start();
+    }
+
+    /// <summary>Java `RebalanceService#run` shape: wait, rebalance, then pick the next delay --
+    /// the full waitInterval when the round was balanced, minInterval otherwise so a freshly
+    /// appeared queue is claimed quickly.</summary>
+    private void RebalanceLoop()
+    {
+        int wait = _rebalanceWaitMillis;
+        while (!_rebalanceStop)
+        {
+            // Sliced wait: Shutdown() interrupts within one slice instead of one full period.
+            if (SleepUnlessStopped(wait))
+            {
+                break;
+            }
+
+            if (!_started)
+            {
+                continue;
+            }
+
+            try
+            {
+                bool balanced = DoRebalance();
+                wait = balanced ? _rebalanceWaitMillis : _rebalanceMinIntervalMillis;
+            }
+            catch (Exception e)
+            {
+                // The boundary of the resident loop: anything escaping here would kill the
+                // thread, so no allocation would ever be refreshed again.
+                ClientLog.Warn("rebalance loop error: " + e.Message);
+                wait = _rebalanceMinIntervalMillis;
+            }
+        }
+    }
+
+    /// <summary>Slices the wait so a stop lands within 100ms; returns true when stopped.</summary>
+    private bool SleepUnlessStopped(int millis)
+    {
+        for (int slept = 0; slept < millis && !_rebalanceStop;)
+        {
+            int slice = Math.Min(100, millis - slept);
+            Thread.Sleep(slice);
+            slept += slice;
+        }
+
+        return _rebalanceStop;
+    }
+
+    /// <summary>The rebalance table's view of one topic as a sorted copy, or false when the
+    /// round has not produced one yet.</summary>
+    private bool TryGetRebalanceView(string topic, out List<MessageQueue> view)
+    {
+        lock (_lock)
+        {
+            if (_rebalanceTable.TryGetValue(topic, out List<MessageQueue>? cached))
+            {
+                view = new List<MessageQueue>(cached);
+                view.Sort();
+                return true;
+            }
+        }
+
+        view = new List<MessageQueue>();
+        return false;
+    }
+
+    /// <summary>Namespace-free copies in the house ordering: what a listener is handed is the
+    /// caller's spelling of the topic, never this facade's wrapped resource name.</summary>
+    private List<MessageQueue> BareQueues(List<MessageQueue> queues)
+    {
+        var outList = new List<MessageQueue>(queues.Count);
+        foreach (MessageQueue mq in queues)
+        {
+            outList.Add(new MessageQueue(
+                NamespaceUtil.WithoutNamespace(mq.Topic, _namespace), mq.BrokerName, mq.QueueId));
+        }
+
+        outList.Sort();
         return outList;
     }
 
@@ -679,7 +1049,12 @@ public sealed class DefaultMQPullConsumer
     /// differs from the set last handed out. A re-ordering of the same queues is not a change; a
     /// same-count swap to another broker is. The very first view reports a change only when this
     /// instance actually owns queues -- an empty opening has nothing for the application to react
-    /// to. A listener that throws is logged and never breaks the caller's lookup.</summary>
+    /// to. A listener that throws is logged and never breaks the caller's lookup.
+    ///
+    /// Helper for callers that compute their own assignment and want the standard change
+    /// detection; <see cref="FetchMessageQueuesInBalance"/> is a pure query and does NOT call it
+    /// (Java's is a pure query too), the background rebalance notifies through
+    /// <see cref="NotifyQueueChanged"/>.</summary>
     public bool NotifyAssignmentChanged(string topic, IReadOnlyList<MessageQueue> mqAll,
         IReadOnlyList<MessageQueue> divided)
     {

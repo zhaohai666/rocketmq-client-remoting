@@ -29,17 +29,18 @@
 //     `reconsumeTimes(0) >= -1` is true, so -1 would send EVERY bounced message
 //     straight to %DLQ%.
 //
-// Deliberate simplification: this
-// port does not install a pull-side rebalance THREAD, so the queue set is not
-// pushed into a process-queue table behind the caller's back. `FetchSubscribeMessageQueues`
-// gives the whole topic and `FetchMessageQueuesInBalance` computes "my share"
-// on demand with the same allocation formula the push consumer's doRebalance
-// uses, so a caller iterating balanced shares sees what a rebalanced group
-// would hand out. The strategy is
-// configuration for that computation and is validated at Start.
-// The message-queue listener fan-out and persistConsumerOffset over the
-// process-queue table stay out of scope: there is no such table on this path.
-// The caller keeps the offsets itself — which is exactly what the class is for.
+// The queue set is maintained by a pull-side rebalance, the same shape Java
+// uses: EnableRebalance (default true, DefaultMQPullConsumer.java:97) gates a
+// background goroutine that periodically runs doRebalance(), allocating this
+// instance's share per topic and calling the queue listener only when the
+// allocation changed. FetchMessageQueuesInBalance reads that table when it is
+// warm and otherwise computes the same allocation on the spot.
+//
+// Deviation (documented): Java shares one RebalanceService per client instance;
+// this port gives each facade its own goroutine, the same shape as the heartbeat
+// loop. Which queues this instance owns, and when the listener fires, is
+// unchanged. The caller still keeps the offsets itself — which is exactly what
+// the class is for.
 package client
 
 import (
@@ -72,6 +73,16 @@ const (
 	// defaultPullSendBackTimeoutMillis is the send-back RPC timeout on the
 	// pull path (the push path uses 5000).
 	defaultPullSendBackTimeoutMillis = int64(3000)
+
+	// DefaultRebalanceWaitMillis is the round period of the pull-side
+	// rebalance (Java `rocketmq.client.rebalance.waitInterval`).
+	DefaultRebalanceWaitMillis = int64(20000)
+	// DefaultRebalanceMinIntervalMillis is the retry period after an
+	// unbalanced round (Java `rocketmq.client.rebalance.minInterval`).
+	DefaultRebalanceMinIntervalMillis = int64(1000)
+	// pullRebalanceShutdownWait bounds how long Shutdown waits for the
+	// rebalance goroutine to notice the stop signal.
+	pullRebalanceShutdownWait = 2 * time.Second
 )
 
 // DefaultMQPullConsumer is the active pull consumer.
@@ -110,10 +121,33 @@ type DefaultMQPullConsumer struct {
 	consumerTimeoutMillisWhenSuspend int64
 	maxReconsumeTimes                int32
 
-	// allocateStrategy is validated at Start and kept for the
-	// caller to use; this port does not run a pull-side rebalance.
+	// allocateStrategy is validated at Start and drives the pull-side
+	// rebalance's per-topic allocation.
 	allocateStrategy AllocateMessageQueueStrategy
 	queueListener    MessageQueueListener
+
+	// enableRebalance is Java DefaultMQPullConsumer#enableRebalance (default
+	// true): off makes doRebalance report "balanced" without allocating
+	// anything, so the caller keeps computing on the spot through
+	// FetchMessageQueuesInBalance.
+	enableRebalance bool
+	// rebalanceWaitMillis / rebalanceMinIntervalMillis mirror RebalanceService:
+	// the full wait after a balanced round, the short retry otherwise.
+	rebalanceWaitMillis        int64
+	rebalanceMinIntervalMillis int64
+	// rebalanceTable is the product of the background rebalance: topic -> the
+	// queues allocated to this instance. Java reads the keys of the rebalance's
+	// process-queue table; this port keeps an equivalent per-topic table, which
+	// FetchMessageQueuesInBalance prefers when it is warm. Guarded by mu.
+	rebalanceTable map[string][]common.MessageQueue
+	// rebalanceStopCh / rebalanceStopOnce / rebalanceWG drive one goroutine per
+	// facade (see the file header's deviation note); rebalanceWakeCh is the
+	// NOTIFY_CONSUMER_IDS_CHANGED kick, coalesced to capacity 1 so a burst of
+	// notifications costs one round.
+	rebalanceStopCh   chan struct{}
+	rebalanceStopOnce sync.Once
+	rebalanceWakeCh   chan struct{}
+	rebalanceWG       sync.WaitGroup
 
 	// registerTopics: every one of them is subscribed
 	// with SUB_ALL at Start before the client registers, which is what
@@ -147,8 +181,8 @@ type DefaultMQPullConsumer struct {
 	pullCallbackPool atomic.Pointer[boundedPool]
 
 	// offsetQueues is the local-offset queue set: every queue whose offset the
-	// caller has parked in offsetStore. There is no pull-side rebalance and no
-	// process-queue table to derive this set from, so it is tracked here.
+	// caller has parked in offsetStore. The rebalance table describes queue
+	// OWNERSHIP only and carries no offsets, so this set is still tracked here.
 	// It matters
 	// because the broker-backed offset store's PersistAll REMOVES the entries
 	// for queues
@@ -187,6 +221,13 @@ func NewDefaultMQPullConsumer(group string) (*DefaultMQPullConsumer, error) {
 		registerTopics:                   map[string]struct{}{},
 		subscription:                     map[string]*remoting.SubscriptionData{},
 		offsetQueues:                     map[common.MessageQueue]struct{}{},
+		// Pull-side rebalance defaults: on, 20s period, 1s retry.
+		enableRebalance:            true,
+		rebalanceWaitMillis:        DefaultRebalanceWaitMillis,
+		rebalanceMinIntervalMillis: DefaultRebalanceMinIntervalMillis,
+		rebalanceTable:             map[string][]common.MessageQueue{},
+		rebalanceStopCh:            make(chan struct{}),
+		rebalanceWakeCh:            make(chan struct{}, 1),
 		// Average allocation is the default, and Start refuses a nil strategy,
 		// so it must never be nil by default.
 		allocateStrategy: AllocateMessageQueueAveragely{},
@@ -455,6 +496,74 @@ func (c *DefaultMQPullConsumer) SetMessageQueueListener(l MessageQueueListener) 
 	c.queueListener = l
 }
 
+// SetEnableRebalance is Java DefaultMQPullConsumer#setEnableRebalance: off means
+// doRebalance/tryRebalance return without allocating anything, so the caller's
+// own FetchMessageQueuesInBalance keeps computing on the spot.
+func (c *DefaultMQPullConsumer) SetEnableRebalance(enable bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enableRebalance = enable
+}
+
+// IsEnableRebalance reports the switch (default true).
+func (c *DefaultMQPullConsumer) IsEnableRebalance() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enableRebalance
+}
+
+// SetRebalanceWaitMillis sets the round period (Java
+// `rocketmq.client.rebalance.waitInterval`, 20000). Non-positive values fall
+// back to 1ms: a zero period would spin the loop.
+func (c *DefaultMQPullConsumer) SetRebalanceWaitMillis(millis int64) {
+	if millis <= 0 {
+		millis = 1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rebalanceWaitMillis = millis
+}
+
+// RebalanceWaitMillis returns the round period.
+func (c *DefaultMQPullConsumer) RebalanceWaitMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rebalanceWaitMillis
+}
+
+// SetRebalanceMinIntervalMillis sets the retry period (Java
+// `rocketmq.client.rebalance.minInterval`, 1000). Non-positive values fall back
+// to 1ms.
+func (c *DefaultMQPullConsumer) SetRebalanceMinIntervalMillis(millis int64) {
+	if millis <= 0 {
+		millis = 1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rebalanceMinIntervalMillis = millis
+}
+
+// RebalanceMinIntervalMillis returns the retry period.
+func (c *DefaultMQPullConsumer) RebalanceMinIntervalMillis() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rebalanceMinIntervalMillis
+}
+
+// GetRebalanceTable returns a snapshot of the background rebalance's product:
+// topic -> the queues allocated to this instance. Both the map and every slice
+// are copied, so a caller can neither mutate the table nor observe it changing
+// underneath.
+func (c *DefaultMQPullConsumer) GetRebalanceTable() map[string][]common.MessageQueue {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string][]common.MessageQueue, len(c.rebalanceTable))
+	for topic, mqs := range c.rebalanceTable {
+		out[topic] = append([]common.MessageQueue(nil), mqs...)
+	}
+	return out
+}
+
 // RegisterFilterMessageHook appends a filter hook; the hooks run
 // inside processPullResult, i.e. on the pull path before the caller sees the
 // messages.
@@ -554,11 +663,263 @@ func (c *DefaultMQPullConsumer) subscriptionAutomatically(topic string) {
 	c.subscription[topic] = sub
 }
 
+// ---------------------------------------------------------------- pull-side rebalance
+//
+// Java's pull consumer DOES rebalance: the shared RebalanceService thread calls
+// mqClientFactory.doRebalance() every waitInterval (20s), which walks every
+// registered consumer and calls tryRebalance(); that gates on enableRebalance
+// (default true) and then runs rebalanceImpl.doRebalance(false) -> allocate ->
+// messageQueueChanged(topic, mqAll, mqDivided). This port drives the same
+// allocation formula from one goroutine per facade (the documented deviation).
+
+// rebalanceLoop is Java RebalanceService#run: wait, rebalance, then pick the
+// next delay. `balanced` -> wait the full waitInterval; otherwise retry after
+// minInterval so a freshly appeared queue is claimed quickly. A wake (the
+// NOTIFY_CONSUMER_IDS_CHANGED kick) cuts the wait short and runs a round now.
+func (c *DefaultMQPullConsumer) rebalanceLoop() {
+	defer c.rebalanceWG.Done()
+	c.mu.Lock()
+	interval := c.rebalanceWaitMillis
+	stop := c.rebalanceStopCh
+	c.mu.Unlock()
+	for {
+		timer := time.NewTimer(time.Duration(interval) * time.Millisecond)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-c.rebalanceWakeCh:
+			timer.Stop()
+		case <-timer.C:
+		}
+		if !c.IsStarted() {
+			return
+		}
+		balanced := c.doRebalance()
+		c.mu.Lock()
+		if balanced {
+			interval = c.rebalanceWaitMillis
+		} else {
+			interval = c.rebalanceMinIntervalMillis
+		}
+		c.mu.Unlock()
+	}
+}
+
+// stopRebalanceLoop closes the stop channel and waits — bounded — for the loop
+// to return. Called before the client instance is torn down: the loop calls
+// back into it for subscribe info and the group's consumer list.
+func (c *DefaultMQPullConsumer) stopRebalanceLoop() {
+	c.mu.Lock()
+	stop := c.rebalanceStopCh
+	c.mu.Unlock()
+	if stop != nil {
+		c.rebalanceStopOnce.Do(func() { close(stop) })
+	}
+	done := make(chan struct{})
+	go func() {
+		c.rebalanceWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(pullRebalanceShutdownWait):
+		common.LogWarnf("pull consumer %s: timed out waiting for the rebalance loop to stop", c.consumerGroup)
+	}
+}
+
+// doRebalance is Java DefaultMQPullConsumerImpl#tryRebalance (:398-406): walk
+// every registered topic and report whether the round left everything balanced.
+//
+// With enableRebalance == false Java returns **true** (its "nothing left to
+// retry" answer). Returning false instead would pin the loop at minInterval and
+// burn a round every second for nothing.
+func (c *DefaultMQPullConsumer) doRebalance() bool {
+	c.mu.Lock()
+	enabled := c.enableRebalance
+	started := c.started
+	instance := c.instance
+	topics := make([]string, 0, len(c.registerTopics))
+	for topic := range c.registerTopics {
+		topics = append(topics, topic)
+	}
+	c.mu.Unlock()
+	if !enabled {
+		return true
+	}
+	if !started || instance == nil {
+		return true
+	}
+	sort.Strings(topics)
+	balanced := true
+	for _, topic := range topics {
+		if !c.rebalanceTopicSafely(topic, instance) {
+			balanced = false
+		}
+	}
+	return balanced
+}
+
+// rebalanceTopicSafely isolates one topic's round: Java wraps rebalanceByTopic
+// in try/catch inside doRebalance, so one broken strategy or a bad allocation
+// cannot stop the remaining topics from being balanced.
+func (c *DefaultMQPullConsumer) rebalanceTopicSafely(topic string, instance *Instance) (balanced bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			common.LogErrorf("rebalance topic %s failed: %v", topic, r)
+			balanced = false
+		}
+	}()
+	return c.rebalanceByTopic(topic, instance)
+}
+
+// rebalanceByTopic is Java RebalanceImpl#rebalanceByTopic (pull path) plus
+// messageQueueChanged. It returns whether the topic is already balanced.
+//
+// The listener fires **only when the allocation changed**, with
+// (topic, mqAll, mqDivided) — exactly the three arguments
+// RebalancePullImpl#messageQueueChanged (:44-53) passes.
+//
+// Deviation (documented): Java compares allocateResultSet against the freshly
+// updated process-queue table, so a "changed then already in place" round can
+// report balanced immediately. Here balanced means "identical to the previous
+// round", which costs at most one extra minInterval confirmation round and never
+// hammers.
+func (c *DefaultMQPullConsumer) rebalanceByTopic(topic string, instance *Instance) bool {
+	c.mu.Lock()
+	model := c.messageModel
+	group := c.consumerGroup
+	clientID := c.clientID
+	strategy := c.allocateStrategy
+	c.mu.Unlock()
+	if strategy == nil {
+		strategy = AllocateMessageQueueAveragely{}
+	}
+
+	mqAll := append([]common.MessageQueue(nil), instance.GetTopicSubscribeInfo(topic)...)
+	sort.Slice(mqAll, func(i, j int) bool { return mqAll[i].CompareTo(mqAll[j]) < 0 })
+	if len(mqAll) == 0 {
+		// Java RebalanceImpl:276-294 notifies with two empty sets and warns
+		// when the topic's route disappears, then leaves `balanced` at its
+		// initial true. Reporting unbalanced here would pin the loop at
+		// minInterval and spin once a second while the topic is briefly gone.
+		c.mu.Lock()
+		hadQueues := len(c.rebalanceTable[topic]) > 0
+		if hadQueues {
+			c.rebalanceTable[topic] = []common.MessageQueue{}
+		}
+		c.mu.Unlock()
+		if hadQueues {
+			common.LogWarnf("doRebalance, %s, topic %s not exist, notify empty queue set", group, topic)
+			c.notifyQueueChanged(topic, []common.MessageQueue{}, []common.MessageQueue{})
+		}
+		return true
+	}
+
+	var divided []common.MessageQueue
+	if model == MessageModelBroadcasting {
+		// BROADCASTING: every queue, without consulting the consumer list.
+		divided = append([]common.MessageQueue(nil), mqAll...)
+	} else {
+		cidAll, answered := instance.GetConsumerIDListByGroup(topic, group, 0)
+		if !answered || len(cidAll) == 0 {
+			// Java (:300-302) warns "get consumer id list failed" and NOTIFIES
+			// NOTHING, leaving balanced at true so the next round waits the full
+			// interval.
+			common.LogDebugf("doRebalance, %s %s, get consumer id list failed", group, topic)
+			return true
+		}
+		sort.Strings(cidAll)
+		got := strategy.Allocate(group, clientID, mqAll, cidAll)
+		if reporter, ok := strategy.(AllocateErrReporter); ok {
+			if err := reporter.AllocateErr(); err != nil {
+				common.LogErrorf("allocate message queue exception. strategy name: %s, group=%s: %v",
+					strategyName(strategy), group, err)
+				return false
+			}
+		}
+		// Never let a strategy's surprising return value leak another topic
+		// into this topic's assignment.
+		for _, mq := range got {
+			if mq.Topic == topic {
+				divided = append(divided, mq)
+			}
+		}
+		sort.Slice(divided, func(i, j int) bool { return divided[i].CompareTo(divided[j]) < 0 })
+	}
+
+	c.mu.Lock()
+	previous, hadPrevious := c.rebalanceTable[topic]
+	var balanced bool
+	if !hadPrevious {
+		// First sight of this topic: Java's updateProcessQueueTableInRebalance counts only
+		// table additions/removals as a change, so "nothing -> nothing" is no change -- an
+		// empty opening share stays silent and the round counts as balanced.
+		balanced = len(divided) == 0
+	} else {
+		balanced = sameMQSet(previous, divided)
+	}
+	c.rebalanceTable[topic] = append([]common.MessageQueue(nil), divided...)
+	c.mu.Unlock()
+	if !balanced {
+		common.LogInfof("client rebalanced result changed. Group: %s, topic: %s, mqAllSize: %d, rebalanceResultSize: %d",
+			group, topic, len(mqAll), len(divided))
+		c.notifyQueueChanged(topic, mqAll, divided)
+	}
+	return balanced
+}
+
+// notifyQueueChanged is Java RebalancePullImpl#messageQueueChanged (:44-53):
+// the listener is optional, and a failing listener is logged and swallowed so
+// one bad callback cannot kill the loop and freeze every allocation.
+func (c *DefaultMQPullConsumer) notifyQueueChanged(topic string, mqAll, mqDivided []common.MessageQueue) {
+	c.mu.Lock()
+	listener := c.queueListener
+	c.mu.Unlock()
+	if listener == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			common.LogErrorf("messageQueueChanged exception: %v", r)
+		}
+	}()
+	listener.MessageQueueChanged(topic, mqAll, mqDivided)
+}
+
+// sameMQSet reports whether two allocations hold the same queues. Order carries
+// no meaning, and "lost one, gained another" must count as a change even though
+// the count is unchanged (the rule both Java's allocateResultSet comparison and
+// the push-side rebalance use).
+func sameMQSet(left, right []common.MessageQueue) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftSet := make(map[common.MessageQueue]struct{}, len(left))
+	for _, mq := range left {
+		leftSet[mq] = struct{}{}
+	}
+	rightSet := make(map[common.MessageQueue]struct{}, len(right))
+	for _, mq := range right {
+		rightSet[mq] = struct{}{}
+	}
+	if len(leftSet) != len(rightSet) {
+		return false
+	}
+	for mq := range rightSet {
+		if _, ok := leftSet[mq]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // ---------------------------------------------------------------- lifecycle
 
-// Start brings the consumer up. Unlike the push consumer
-// there is no rebalance loop, no consume service and no pull goroutine: after
-// Start the caller drives everything through Pull.
+// Start brings the consumer up. The caller still drives every pull through
+// Pull; Start additionally installs the pull-side rebalance goroutine
+// (EnableRebalance, 20s period) so the queue set is kept balanced in the
+// background, the same shape Java's RebalanceService gives this consumer.
 func (c *DefaultMQPullConsumer) Start() error {
 	c.mu.Lock()
 	if c.started {
@@ -638,6 +999,14 @@ func (c *DefaultMQPullConsumer) Start() error {
 	// destroyPullAsyncExecutors is the mirror image.
 	c.initPullAsyncExecutors()
 	c.started = true
+	// A restart gets a fresh stop channel (the previous Shutdown closed the old
+	// one); the wake channel is reused, so drain any kick left from before.
+	c.rebalanceStopCh = make(chan struct{})
+	c.rebalanceStopOnce = sync.Once{}
+	select {
+	case <-c.rebalanceWakeCh:
+	default:
+	}
 	topics := make([]string, 0, len(c.subscription))
 	for t := range c.subscription {
 		topics = append(topics, t)
@@ -655,6 +1024,10 @@ func (c *DefaultMQPullConsumer) Start() error {
 			common.LogDebugf("initial route refresh failed for %s: %v", topic, err)
 		}
 	}
+	// Java registers the pull consumer with the shared RebalanceService in
+	// start(); here the facade owns the loop (see the deviation note).
+	c.rebalanceWG.Add(1)
+	go c.rebalanceLoop()
 	return nil
 }
 
@@ -728,6 +1101,11 @@ func (c *DefaultMQPullConsumer) Shutdown() {
 		return
 	}
 	c.mu.Unlock()
+
+	// Stop the pull-side rebalance first: its rounds call back into the client
+	// instance (subscribe info / consumer list) and into the user listener, so
+	// it must be gone before anything below is torn down. Wait bounded.
+	c.stopRebalanceLoop()
 
 	// Drain the async-pull executors BEFORE leaving the RUNNING state (same
 	// ordering reason as the persist below): the in-flight pulls still pass
@@ -1118,11 +1496,11 @@ func (c *DefaultMQPullConsumer) UpdateConsumeOffsetToBroker(mq common.MessageQue
 }
 
 // PersistConsumerOffset flushes every queue this consumer knows about. The
-// flush set is whatever this consumer has touched, not a process-queue
-// table: there is no pull-side rebalance here, so the set is the union of the two
-// ways a queue can enter this consumer's world — the queues it has PULLED
-// (pullFromWhichNode) and the queues whose offset the CALLER parked locally
-// (offsetQueues). Both halves are needed: the remote store's PersistAll
+// rebalance table describes queue ownership, not offsets (the caller owns the
+// cursor), so the flush set is the union of the two ways a queue can enter this
+// consumer's world — the queues it has PULLED (pullFromWhichNode) and the queues
+// whose offset the CALLER parked locally (offsetQueues). Both halves are needed:
+// the remote store's PersistAll
 // drops the entries for queues left out, so a short set is silent data loss,
 // while a queue with no local entry costs nothing (persistAll skips it —
 // the store only sends entries it holds).
@@ -1252,11 +1630,13 @@ func (c *DefaultMQPullConsumer) ParseSubscribeMessageQueues(queues []common.Mess
 // pulling, so pulling "all queues" instead is the classic duplicate-consumption
 // bug in a multi-instance group.
 //
-// A process-queue table filled by a background rebalance thread is the usual
-// way to answer this, but this client runs no pull-side rebalance
-// thread (see the
-// file header), so the view is computed on demand with the exact allocation
-// formula the push consumer's doRebalance() runs.
+// When EnableRebalance is on (the default, as in Java
+// DefaultMQPullConsumer.java:97) the background rebalance keeps
+// rebalanceTable[topic] up to date and this method returns that table's answer,
+// which is what Java's "read the keys of the process-queue table" does. Only
+// when the switch is off — or the table has not been filled for this topic yet
+// — is the share computed on demand with the exact allocation formula the push
+// consumer's doRebalance() runs.
 // One formula, two call sites: if they ever disagree, a
 // single queue gets claimed by two instances.
 //   - BROADCASTING: every queue, without consulting the consumer list;
@@ -1281,7 +1661,19 @@ func (c *DefaultMQPullConsumer) FetchMessageQueuesInBalance(topic string) ([]com
 	group := c.consumerGroup
 	clientID := c.clientID
 	strategy := c.allocateStrategy
+	var cached []common.MessageQueue
+	var hasCached bool
+	if c.enableRebalance {
+		// A warm table is authoritative: it is the background rebalance's
+		// product, not a second guess at the same allocation.
+		cached, hasCached = c.rebalanceTable[topic]
+	}
 	c.mu.Unlock()
+	if hasCached {
+		out := append([]common.MessageQueue(nil), cached...)
+		sort.Slice(out, func(i, j int) bool { return out[i].CompareTo(out[j]) < 0 })
+		return out, nil
+	}
 	if strategy == nil {
 		strategy = AllocateMessageQueueAveragely{}
 	}
@@ -1495,38 +1887,26 @@ func (c *DefaultMQPullConsumer) CreateTopic(key, newTopic string, queueNum, topi
 
 // ---------------------------------------------------------------- Consumer impl
 
-// RebalanceImmediately is the fan-out of broker's NOTIFY_CONSUMER_IDS_CHANGED
-// (40). A pull consumer has no assignment to recompute, so this refreshes the
-// routes of the subscribed topics and tells the listener what the queue set
-// looks like now. That refresh is the whole contract of this notification.
+// RebalanceImmediately is Java DefaultMQPullConsumerImpl#rebalanceImmediately:
+// the NOTIFY_CONSUMER_IDS_CHANGED(40) fan-out target. It kicks the background
+// rebalance, which then runs the same doRebalance() every periodic round uses —
+// one path, not a second ad-hoc computation.
+//
+// Like the push consumer's method it only SIGNALS: this runs on the remoting
+// read goroutine, so any synchronous RPC here (route refresh, consumer list)
+// would deadlock the connection. The wake channel is capacity 1, so a burst of
+// notifications coalesces into one round.
 func (c *DefaultMQPullConsumer) RebalanceImmediately() {
-	instance := c.Instance()
-	if instance == nil {
+	c.mu.Lock()
+	started := c.started
+	wake := c.rebalanceWakeCh
+	c.mu.Unlock()
+	if !started || wake == nil {
 		return
 	}
-	c.mu.Lock()
-	topics := make([]string, 0, len(c.subscription))
-	for t := range c.subscription {
-		topics = append(topics, t)
-	}
-	listener := c.queueListener
-	c.mu.Unlock()
-	sort.Strings(topics)
-
-	for _, topic := range topics {
-		if _, err := instance.UpdateTopicRouteInfoFromNameServer(topic, 0, false); err != nil {
-			common.LogDebugf("route refresh failed for %s: %v", topic, err)
-		}
-		if listener == nil {
-			continue
-		}
-		mqAll := instance.GetTopicSubscribeInfo(topic)
-		if len(mqAll) == 0 {
-			continue
-		}
-		// mqDivided == mqAll: this port assigns nothing, and telling the caller
-		// that a subset is "its" would be a lie it might act on.
-		listener.MessageQueueChanged(topic, mqAll, mqAll)
+	select {
+	case wake <- struct{}{}:
+	default:
 	}
 }
 

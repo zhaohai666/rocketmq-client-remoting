@@ -14,6 +14,8 @@ import {
 } from './offset_store.ts';
 import type { OffsetStore } from './offset_store.ts';
 import { PullStatus, PullResult, MessageSelector } from './consumer_result.ts';
+import { AllocateMessageQueueAveragely } from './allocate.ts';
+import type { AllocateMessageQueueStrategy } from './allocate.ts';
 import { MessageModel, ConsumeType } from '../remoting/heartbeat.ts';
 import { MessageQueue, MessageExt } from '../common/message.ts';
 import { clientMsgId } from '../common/messageClientIdSetter.ts';
@@ -93,12 +95,39 @@ export class DefaultMQPullConsumer {
   // Page size of the paged metadata admin calls (maxTopicNum / maxGroupNum).
   maxPageSizeInGetMetadata = 2000;
 
+  // ---- pull-side rebalance (Java DefaultMQPullConsumer.java:97 / impl :388-406) ----
+  // Java's pull consumer DOES rebalance: the shared RebalanceService thread calls
+  // `mqClientFactory.doRebalance()` every `waitInterval` (20s, system property
+  // `rocketmq.client.rebalance.waitInterval`), which walks the registered consumers
+  // and calls `tryRebalance()`; that gates on `enableRebalance` (default true) and
+  // then runs `rebalanceImpl.doRebalance(false)` -> allocate -> `messageQueueChanged`.
+  //
+  // Deviation (documented): Java runs ONE RebalanceService per client instance, this
+  // port gives each facade its own timer. The observable behaviour -- which queues
+  // this instance owns and when the listener fires -- is the same.
+  enableRebalance = true;
+  rebalanceWaitMillis = 20000;
+  rebalanceMinIntervalMillis = 1000;
+  // The allocation strategy: used by the background rebalance and by
+  // fetchMessageQueuesInBalance's on-the-spot computation, so both always agree on
+  // which queues are mine (diverging would have two instances claim one queue).
+  allocateMessageQueueStrategy: AllocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
+  // messageQueueChanged callback, in this port's function shape (the push consumer
+  // uses the same one). Java passes two Sets; arrays with stable order are used here.
+  messageQueueListener:
+    ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null = null;
+  // The product of the background rebalance: topic -> the queues allocated to this
+  // instance. Java reads the keys of the rebalance's process-queue table; here it is
+  // a plain table, and fetchMessageQueuesInBalance prefers it when it is warm.
+  private rebalanceTable = new Map<string, MessageQueue[]>();
+  // Topics registered for rebalance. Java's registerMessageQueueListener(topic,
+  // listener) fills this; subscribe() fills `subscription`. The rebalance walks the
+  // union, so either registration path gets an allocation.
+  private registerTopics = new Set<string>();
+  private _rebalanceTimer: NodeJS.Timeout | null = null;
+  private _rebalanceActive = false;
+
   private subscription = new Map<string, SubscriptionData>();
-  // Each topic's most recently computed share — serving as the rebalance result
-  // table in this implementation; fetchMessageQueuesInBalance preserves exactly
-  // this when it cannot get the route or the consumer list (see that method's
-  // comment).
-  private balancedQueues = new Map<string, MessageQueue[]>();
   started = false;
   // The internal producer the send-back fallback sends through; built lazily on
   // the first refused bounce and torn down with the consumer.
@@ -178,6 +207,55 @@ export class DefaultMQPullConsumer {
     return this;
   }
   getMaxPageSizeInGetMetadata(): number { return this.maxPageSizeInGetMetadata; }
+
+  // ---- pull-side rebalance configuration ----
+
+  // Java DefaultMQPullConsumer#setEnableRebalance (:507). Off means
+  // doRebalance/tryRebalance return without allocating anything, so the caller's
+  // own fetchMessageQueuesInBalance keeps computing on the spot.
+  setEnableRebalance(enable: boolean): this { this.enableRebalance = enable === true; return this; }
+  isEnableRebalance(): boolean { return this.enableRebalance; }
+  // Round period: Java system property `rocketmq.client.rebalance.waitInterval` (20000).
+  setRebalanceWaitMillis(ms: number): this {
+    this.rebalanceWaitMillis = Number.isFinite(ms) ? Math.max(1, Math.floor(ms)) : 1;
+    return this;
+  }
+  // Lower bound between two rounds: Java `rocketmq.client.rebalance.minInterval` (1000).
+  setRebalanceMinIntervalMillis(ms: number): this {
+    this.rebalanceMinIntervalMillis = Number.isFinite(ms) ? Math.max(1, Math.floor(ms)) : 1;
+    return this;
+  }
+  setAllocateMessageQueueStrategy(strategy: AllocateMessageQueueStrategy): this {
+    // start()/the rebalance would otherwise fail on every round; like Java, an
+    // explicit null is rejected rather than silently replaced.
+    if (strategy == null) throw new Error('allocateMessageQueueStrategy is null');
+    this.allocateMessageQueueStrategy = strategy;
+    return this;
+  }
+  setMessageQueueListener(
+    listener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null): this {
+    this.messageQueueListener = listener;
+    return this;
+  }
+  // Java DefaultMQPullConsumer#registerMessageQueueListener (:328-335): registers the
+  // topic AND installs the listener in one call. The topic matters because the
+  // background rebalance only visits registered topics; a listener installed without
+  // one would silently never fire. A null listener keeps the current one.
+  registerMessageQueueListener(topic: string,
+    listener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null): this {
+    if (topic == null || !String(topic).trim()) return this;
+    this.registerTopics.add(this._withNamespace(String(topic)));
+    if (listener != null) this.messageQueueListener = listener;
+    return this;
+  }
+  getRegisterTopics(): Set<string> { return new Set(this.registerTopics); }
+  // Snapshot of the background rebalance's product. Callers get fresh arrays, so
+  // mutating the answer cannot change which queues this instance owns.
+  getRebalanceTable(): Map<string, MessageQueue[]> {
+    const out = new Map<string, MessageQueue[]>();
+    for (const [topic, mqs] of this.rebalanceTable) out.set(topic, [...mqs]);
+    return out;
+  }
   getConsumerGroup(): string { return this.consumerGroup; }
   isStarted(): boolean { return this.started; }
 
@@ -269,17 +347,25 @@ export class DefaultMQPullConsumer {
     this.pullAPI = new PullAPI(client, this.consumerGroup);
     await this.offsetStore.load().catch((e) =>
       logger.warning('load offset store failed: %s', (e as Error).message));
-    for (const topic of this.subscription.keys()) {
+    for (const topic of this._rebalanceTopics()) {
       await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
     }
     // Register the group at the broker immediately (see lite_pull_consumer:
     // the client heartbeat loop's 30s cadence is too slow for first rebalance).
     await client.sendHeartbeatToAllBrokers().catch(() => {});
     this.started = true;
+    // Java registers the pull consumer's rebalance with the shared RebalanceService
+    // in start(); here the facade drives its own unref'd timer (see the field block).
+    this._rebalanceActive = true;
+    this._startRebalanceLoop();
   }
 
   async shutdown(): Promise<void> {
     if (!this.started) return;
+    // Stop the rebalance loop first: it calls back into the client instance which is
+    // about to be handed back to the manager.
+    this._rebalanceActive = false;
+    if (this._rebalanceTimer) { clearTimeout(this._rebalanceTimer); this._rebalanceTimer = null; }
     try { await this.persistConsumeOffset(); } catch (e) { /* best effort */ }
     if (this.mqClient) {
       await this.mqClient.unregisterClientAllBrokers('', this.consumerGroup).catch(() => {});
@@ -469,6 +555,11 @@ export class DefaultMQPullConsumer {
     return this.mqClient.getMaxOffset(addr, fullMq.getTopic(), fullMq.getQueueId());
   }
 
+  // fetchMessageQueuesInBalance is Java DefaultMQPullConsumerImpl's pure query
+  // (:408-...): when the background rebalance has already produced this topic's
+  // share, that table IS the answer. Otherwise (rebalance off, or the table is
+  // still cold) the same allocation is computed on the spot. Neither path fires
+  // the listener or writes the table — a read must not look like a queue change.
   async fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {
     const queues = await this._fetchMessageQueuesInBalance(this._withNamespace(topic));
     return queues.map((mq) => this._bareQueue(mq));
@@ -476,12 +567,17 @@ export class DefaultMQPullConsumer {
 
   private async _fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {
     if (!this.mqClient) throw new Error('consumer not started');
-    const client = this.mqClient;
+    // A warm table is authoritative. While the switch is off the stale table must
+    // be ignored: the caller asked for the on-the-spot allocation.
+    if (this.enableRebalance) {
+      const cached = this.rebalanceTable.get(topic);
+      if (cached !== undefined) {
+        return [...cached].sort((a, b) => a.compareTo(b));
+      }
+    }
     const keep = (why: string): MessageQueue[] => {
       logger.debug(`fetchMessageQueuesInBalance: ${why} for ${this.consumerGroup}/${topic}`
         + ', keep current assignment');
-      const last = this.balancedQueues.get(topic);
-      if (last) return last;
       const api = this.pullAPI;
       if (!api) return [];
       return api.pulledQueues().filter(mq => mq.getTopic() === topic)
@@ -494,51 +590,211 @@ export class DefaultMQPullConsumer {
     } catch (e) {
       return keep(`no route (${(e as Error).message})`);
     }
-    mqAll.sort((a, b) => a.compareTo(b));
-    if (this.messageModel === MessageModel.BROADCASTING) {
-      if (!mqAll.length) return keep('no readable queue in the route');
-      this.balancedQueues.set(topic, mqAll);
-      return mqAll;
-    }
+    mqAll = [...mqAll].sort((a, b) => a.compareTo(b));
     if (!mqAll.length) return keep('no readable queue in the route');
+    if (this.messageModel === MessageModel.BROADCASTING) return mqAll;
 
-    const route = client.getTopicRouteData(topic)!;
+    // The broker learns about a group only from a HEARTBEAT carrying its
+    // ConsumerData. start() beats once before any topic route is cached, so a
+    // consumer that starts without subscribe() has an empty address table and
+    // that beat reaches nobody. This one-shot query beats again; the background
+    // rebalance does not (it is the heartbeat loop's job, as in Java).
+    const ids = await this._getConsumerIdsFor(topic, true);
+    if (!ids) return keep('the group is unknown to the broker');
+    try {
+      const got = this.allocateMessageQueueStrategy.allocate(
+        this.consumerGroup, this.clientID, mqAll, [...ids].sort());
+      return (got || []).filter(mq => mq.getTopic() === topic)
+        .sort((a, b) => a.compareTo(b));
+    } catch (e) {
+      return keep(`allocation failed (${(e as Error).message})`);
+    }
+  }
+
+  // _getConsumerIdsFor asks one master broker for the group's consumer id list.
+  // `null` means "unavailable" (no route, no master, a failed query or an empty
+  // list) — both callers keep the existing assignment and never read it as
+  // "I am the only one, so I own everything".
+  private async _getConsumerIdsFor(topic: string, sendHeartbeat = false): Promise<string[] | null> {
+    const client = this.mqClient;
+    if (!client) return null;
+    const route = client.getTopicRouteData(topic);
+    if (!route) return null;
     let addr: string | null = null;
     for (const bd of route.brokerDatas || []) {
       const m = bd.brokerAddrs || {};
       if (MixAll.MASTER_ID in m) { addr = m[MixAll.MASTER_ID]; break; }
     }
-    if (!addr) return keep('no master broker in the route');
-
-    // The broker learns about a group only from a HEARTBEAT carrying its
-    // ConsumerData. start() beats once before any topic route is cached, so a
-    // consumer that starts without subscribe() has an empty address table and
-    // that beat reaches nobody. Query the consumer list without beating again
-    // here and the broker reports the group as unknown, so allocation assigns
-    // no queue at all.
-    await client.sendHeartbeatToAllBrokers().catch(() => {});
-
-    let ids: string[];
+    if (!addr) return null;
+    if (sendHeartbeat) await client.sendHeartbeatToAllBrokers().catch(() => {});
     try {
       const response = await client.getConsumerListByGroup(addr, this.consumerGroup);
-      if (response.code !== ResponseCode.SUCCESS) return keep(`broker answered ${response.code}`);
+      if (response.code !== ResponseCode.SUCCESS) return null;
       const body = response.body && response.body.length
         ? RemotingSerializable.decode(response.body) : null;
       const raw = Array.isArray(body) ? body
         : (body && Array.isArray(body['consumerIdList'])) ? body['consumerIdList'] : [];
-      ids = raw.map(String);
+      const ids = raw.map(String);
+      return ids.length ? ids : null;
     } catch (e) {
-      return keep(`consumer list query failed: ${(e as Error).message}`);
+      return null;
     }
-    if (!ids.length) return keep('the group is unknown to the broker');
+  }
 
-    const { AllocateMessageQueueAveragely } = await import('./allocate.ts');
-    const got = new AllocateMessageQueueAveragely().allocate(
-      this.consumerGroup, this.clientID, mqAll, ids.slice().sort());
-    const mine = (got || []).filter(mq => mq.getTopic() === topic)
-      .sort((a, b) => a.compareTo(b));
-    this.balancedQueues.set(topic, mine);
-    return mine;
+  // ---------------------------------------------------------------- rebalance
+
+  // _rebalanceTopics is the union of subscribe()'d topics and topics named by
+  // registerMessageQueueListener(): Java stores them in two tables and the pull
+  // rebalance must serve either registration path.
+  private _rebalanceTopics(): string[] {
+    return [...new Set([...this.subscription.keys(), ...this.registerTopics])].sort();
+  }
+
+  // _startRebalanceLoop drives one rebalance round per timer tick, unref'd so a
+  // live consumer never keeps the Node process alive on its own (shutdown clears
+  // the handle explicitly). Deviation from Java's shared RebalanceService is
+  // documented on the enableRebalance field.
+  private _startRebalanceLoop(): void {
+    if (this._rebalanceTimer) return;
+    const schedule = (delayMillis: number): void => {
+      if (!this._rebalanceActive) return;
+      this._rebalanceTimer = setTimeout(() => {
+        this._rebalanceTimer = null;
+        if (!this._rebalanceActive) return;
+        void (async () => {
+          let balanced = true;
+          try {
+            balanced = await this.doRebalance();
+          } catch (e) {
+            logger.debug('rebalance loop error: %s', (e as Error).message);
+            balanced = false;
+          }
+          // balanced -> the full period; otherwise retry quickly so a freshly
+          // appeared queue is claimed without waiting out 20s.
+          schedule(balanced ? this.rebalanceWaitMillis : this.rebalanceMinIntervalMillis);
+        })();
+      }, delayMillis);
+      // unref(): a pending rebalance round must not pin the event loop at exit.
+      if (typeof this._rebalanceTimer.unref === 'function') this._rebalanceTimer.unref();
+    };
+    schedule(this.rebalanceWaitMillis);
+  }
+
+  // doRebalance is Java DefaultMQPullConsumerImpl#tryRebalance (:398-406).
+  // With enableRebalance off Java returns TRUE ("nothing left to retry"); returning
+  // false would pin the loop at minInterval and burn a round-trip every second.
+  async doRebalance(): Promise<boolean> {
+    if (!this.enableRebalance) return true;
+    if (!this.mqClient) return true;
+    let balanced = true;
+    for (const topic of this._rebalanceTopics()) {
+      try {
+        if (!(await this.rebalanceByTopic(topic))) balanced = false;
+      } catch (e) {
+        logger.debug('rebalance topic %s failed: %s', topic, (e as Error).message);
+        balanced = false;
+      }
+    }
+    return balanced;
+  }
+
+  // rebalanceByTopic is Java RebalanceImpl#rebalanceByTopic (pull path) plus
+  // RebalancePullImpl#messageQueueChanged. Returns whether this topic is already
+  // balanced. The listener fires ONLY when the allocation changed, receiving
+  // (topic, mqAll, mqDivided) — the same three arguments RebalancePullImpl
+  // (:44-53) passes.
+  //
+  // Deviation (documented): Java compares allocateResultSet with the freshly
+  // updated process-queue table, so a "changed then already in place" round can
+  // report balanced immediately. Here balanced means "identical to the previous
+  // round", which costs at most one extra minInterval confirmation round.
+  async rebalanceByTopic(topic: string): Promise<boolean> {
+    const client = this.mqClient;
+    if (!client) return true;
+    // Java reads the cached subscribe-info table (the route refresh loop keeps it
+    // warm); warm it here too when a listener-only topic has never been routed.
+    let route = client.getTopicRouteData(topic);
+    if (!route) {
+      await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
+      route = client.getTopicRouteData(topic);
+    }
+    const mqAll = (route ? route.getAllSubscribeMessageQueue(topic) : [])
+      .slice().sort((a, b) => a.compareTo(b));
+    if (mqAll.length === 0) {
+      // Java warns "topic not exist" and notifies with two empty sets, then
+      // `break`s — which leaves balanced at TRUE. Returning false here would
+      // retry at minInterval forever while the topic is merely absent.
+      const previous = this.rebalanceTable.get(topic);
+      if (previous && previous.length > 0) {
+        this.rebalanceTable.set(topic, []);
+        logger.warning('doRebalance, %s, topic not exist: %s', this.consumerGroup, topic);
+        this.notifyQueueChanged(topic, [], []);
+      }
+      return true;
+    }
+
+    let divided: MessageQueue[];
+    if (this.messageModel === MessageModel.BROADCASTING) {
+      divided = [...mqAll];
+    } else {
+      const ids = await this._getConsumerIdsFor(topic);
+      if (!ids) {
+        // Java warns "get consumer id list failed" and NOTIFIES NOTHING, leaving
+        // balanced at true so the next round waits the full interval.
+        logger.warning('doRebalance, %s %s, get consumer id list failed',
+          this.consumerGroup, topic);
+        return true;
+      }
+      let allocated: MessageQueue[];
+      try {
+        allocated = this.allocateMessageQueueStrategy.allocate(
+          this.consumerGroup, this.clientID, mqAll, [...ids].sort());
+      } catch (e) {
+        logger.error('allocate message queue exception. strategy name: %s, ex: %s',
+          this.allocateMessageQueueStrategy.name(), (e as Error).message);
+        return false;
+      }
+      divided = (allocated || []).filter(mq => mq.getTopic() === topic)
+        .sort((a, b) => a.compareTo(b));
+    }
+
+    const previous = this.rebalanceTable.get(topic);
+    // First sight of the topic: Java's updateProcessQueueTableInRebalance counts only table
+    // additions/removals as a change, so "nothing -> nothing" is no change -- an empty
+    // opening share stays silent and the round counts as balanced.
+    const balanced = previous === undefined
+        ? divided.length === 0
+        : this._sameMqSet(previous, divided);
+    this.rebalanceTable.set(topic, [...divided]);
+    if (!balanced) {
+      logger.info('client rebalanced result changed. Group: %s, topic: %s, '
+        + 'mqAllSize: %d, rebalanceResultSize: %d',
+      this.consumerGroup, topic, mqAll.length, divided.length);
+      this.notifyQueueChanged(topic, mqAll, divided);
+    }
+    return balanced;
+  }
+
+  // _sameMqSet compares queue identities, not order: losing one queue and gaining
+  // another keeps the count while changing who owns what.
+  private _sameMqSet(left: MessageQueue[], right: MessageQueue[]): boolean {
+    if (left.length !== right.length) return false;
+    const seen = new Set(left.map(mqKey));
+    for (const mq of right) if (!seen.has(mqKey(mq))) return false;
+    return true;
+  }
+
+  // notifyQueueChanged is RebalancePullImpl#messageQueueChanged (:44-53): a null
+  // listener is fine, and a throwing one is logged and swallowed — one bad
+  // callback must not kill the loop and freeze every allocation.
+  notifyQueueChanged(topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]): void {
+    const listener = this.messageQueueListener;
+    if (!listener) return;
+    try {
+      listener(topic, mqAll, mqDivided);
+    } catch (e) {
+      logger.error('messageQueueChanged exception: %s', (e as Error).message);
+    }
   }
 
   // sendMessageBack redelivers one message via CONSUMER_SEND_MSG_BACK(36).

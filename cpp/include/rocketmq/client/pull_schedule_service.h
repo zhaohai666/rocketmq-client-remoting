@@ -2,8 +2,10 @@
 // owns the queue-dimension pull scheduling (which queue's round is due, and when the next one runs)
 // (detector-thread style: stop flag + sleepUntilDeadline, see src/client/schedule_util.h); it periodically
 // recomputes **this instance's share** of every registered topic (fetchMessageQueuesInBalance for
-// CLUSTERING / fetchSubscribeMessageQueues for BROADCASTING -- this service has no rebalance thread, so the
-// refresh doubles as the queue-change notification), fans the share out into queue-dimension tasks
+// CLUSTERING -- which prefers the consumer's background rebalance table once it is warm -- /
+// fetchSubscribeMessageQueues for BROADCASTING; this service drives no rebalance itself, so the
+// periodic refresh also picks up a share the background rebalance has not visited yet), fans the
+// share out into queue-dimension tasks
 // (putTask) and dispatches due tasks onto a ConsumeExecutor worker pool ("PullMsgThread", pullThreadNums
 // wide, 20 by default).
 //
@@ -101,7 +103,8 @@ public:
 
     void setPullThreadNums(int32_t n) { pullThreadNums_ = n > 0 ? n : 1; }
     int32_t pullThreadNums() const { return pullThreadNums_; }
-    // How often the scheduler recomputes this instance's share (polled here, since no rebalance thread pushes it).
+    // How often the scheduler re-reads this instance's share. It is polled here rather than pushed by a
+    // callback: the consumer's own rebalance may run at a different period (or be switched off).
     void setQueueRefreshIntervalMillis(int32_t millis) {
         queueRefreshIntervalMillis_ = millis > 0 ? millis : 1;
     }
