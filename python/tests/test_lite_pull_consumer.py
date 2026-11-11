@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -68,6 +68,9 @@ class MockClient:
         # The broker-suspend budget of every pull: the knob has to reach the wire, not just
         # pass the start-up validation.
         self.pull_suspend_timeouts: List[int] = []
+        # The broker id every pull carried: None while the connectBrokerByUser pin is off
+        # (the address then comes from the route), the pinned id while it is on.
+        self.pull_broker_ids: List[Optional[int]] = []
 
     def start(self) -> None:
         pass
@@ -126,7 +129,8 @@ class MockClient:
     def pull_message(self, consumer_group, mq, queue_offset, max_msg_nums, sys_flag,
                      commit_offset, subscription, sub_version, expression_type,
                      timeout_millis=30000, max_msg_bytes=-1, suspend_timeout_millis=15000,
-                     addr=None, request_source=0) -> PullResult:
+                     addr=None, request_source=0, broker_id=None) -> PullResult:
+        self.pull_broker_ids.append(broker_id)
         self.pull_requests.append(queue_offset)
         self.pull_sys_flags.append(sys_flag)
         self.pull_expression_types.append(expression_type)

@@ -508,3 +508,11 @@ add_test(NAME send_back_fallback COMMAND rmq_test_send_back_fallback)
 add_executable(rmq_test_client_msg_id_parity test_client_msg_id_parity.cpp)
 target_link_libraries(rmq_test_client_msg_id_parity PRIVATE rocketmq::remoting)
 add_test(NAME client_msg_id_parity COMMAND rmq_test_client_msg_id_parity)
+
+# The capability gaps closed against the Java 5.x reference client: the six ConsumeFromWhere
+# values, the LitePull connectBrokerByUser / defaultBrokerId pin (the only way to read from a
+# slave), and the admin's adminExtGroup. All three are facade values read through the accessors;
+# nothing dials.
+add_executable(rmq_test_capability_closeout test_capability_closeout.cpp)
+target_link_libraries(rmq_test_capability_closeout PRIVATE rocketmq::remoting)
+add_test(NAME capability_closeout COMMAND rmq_test_capability_closeout)

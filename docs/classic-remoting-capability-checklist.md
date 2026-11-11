@@ -53,7 +53,7 @@
 | POP 消费（ack / changeInvisibleTime / popDelayLevel / 8 段 CK） | `DefaultMQPushConsumerImpl` POP 族 | `live_pop`、`live_pop_consumer`、`run_go_pop_live.sh`、`php live_pop.php` |
 | 主动拉取 pull（短轮询） | `DefaultMQPullConsumerImpl` | `live_pull`（七端） |
 | LitePullConsumer（assign/subscribe/seek/commit） | `DefaultLitePullConsumer` | `live_lite_pull`、`live_lite_pull_code`、`live_lite_pull_cursor` |
-| **PullConsumerScheduleService（定时 PullTask）** | `MQPullConsumerScheduleService` | ✅py ✅go ✅cs；🟡cpp/node/rust/php 待补 |
+| **PullConsumerScheduleService（定时 PullTask）** | `MQPullConsumerScheduleService` | 实现 7/7（py `client/pull_schedule_service.py`、cpp `pull_schedule_service.cpp/.h`、rust `pull_schedule_service.rs`、node `pull_schedule_service.ts`、php `PullSchedule.php`、go `pull_schedule_service.go`、cs `PullConsumerScheduleService.cs`）；live 入口 ✅cpp/cs/rust（`live_scheduled_intervals`），🟡py/go/node/php 待补（当前仅离线覆盖：py `tests/test_pull_schedule_service.py`、go `pull_schedule_service_test.go`、php 离线套件 `tests/RunClientPullSchedule.php`） |
 | 广播 / 集群消费位点 | `LocalFileOffsetStore` / `RemoteBrokerOffsetStore` | `tests/test_local_offsets`、各端位点单测 |
 | TopicMessageQueueChangeListener | `DefaultLitePullConsumer#registerTopicMessageQueueChangeListener` | `live_lite_topic_queue_change`（七端） |
 | 位点重置（220/222） / offset illegal 恢复 | `RemoteBrokerOffsetStore` / broker 回推 | `live_reset_offset`、`live_offset_illegal` |
@@ -71,8 +71,9 @@
 | createTopic（普通 + 静态 513 + TBW102 归属） | `MqClientAdminImpl#updateOrCreateTopic` | `live_admin`、`live_admin_batch`（七端） |
 | topicStats / consumeTimeSpan / consumerConnection / topicsByConsumer | `MqClientAdminImpl` | `live_admin`（七端） |
 | queryMessage（UNIQ_KEY/OFFSET）/ viewMessage | `MqClientAdminImpl#queryMessage` | `live_admin` |
+| viewMessage 三门面（producer/push/pull 单腿 33 + admin 两段 uniq 兜底） | `MQAdminImpl#viewMessage:267`、`DefaultMQAdminExtImpl#viewMessage:578` | `live_admin`（七端，uniq 兜底腿全命中） |
 | resetOffset / 消费位点管理 | `invokeBrokerToResetOffset` | `live_reset_offset`、`live_admin` |
-| consumeMessageDirectly(309) / consumerRunningInfo(307) | `ClientRemotingProcessor` | 各端 307/309 单测 + `live_admin` |
+| consumeMessageDirectly(309) / consumerRunningInfo(307) | `ClientRemotingProcessor` | 各端 307/309 单测 + `live_admin`（msgId 不中时各端明确报 client error，Java 此处潜在 NPE） |
 | 集群信息 / deleteTopic / deleteKvConfig / deleteSubGroup | `MqClientAdminImpl` | `live_admin` |
 
 ## 7. 故障规避 / 延迟
@@ -87,8 +88,9 @@
 |---|---|---|
 | SendMessage / ConsumeMessage / EndTransaction / CheckForbidden / FilterMessage 五类钩子 | `client.hook.*` | `live_hook`、`verify_hook_live.py` |
 | 消息轨迹（AsyncTraceDispatcher + RMQ_SYS_TRACE_TOPIC） | `client.trace.*` | `live_trace`、`verify_trace_live.py`（broker 需 traceTopicEnable=true） |
-| **OpenTracing 钩子三件套** | `trace.hook.*OpenTracingHookImpl` | ✅php；🟡其余六端待补 |
-| recall 轨迹钩子 | `DefaultRecallMessageTraceHook` | 仅 php/node 有入口（其余端未实现 recall） |
+| 消费侧 msgId 语义（`MessageClientExt.getMsgId()`=UNIQ_KEY parity） | `MessageClientExt.java:29-37`、`ConsumeMessageTraceHookImpl:70`、`MQClientAPIImpl:1691`、`DefaultMQPushConsumerImpl:792` | 七端统一 `clientMsgId(msg)` helper（非空 UNIQ_KEY 属性 ?: offset id）：SubBefore/SubAfter bean、send-back originMsgId、retry 兜底 ORIGIN_MESSAGE_ID 全走它；离线回归 `test_client_msg_id_parity`（py/cpp/cs/go/rs/node/php）+ 真机 trace 五腿（py/cpp/cs/rust/node）2026-11-10 全绿 |
+| **OpenTracing 钩子三件套** | `trace.hook.*OpenTracingHookImpl` | ✅七端全齐（2026-11-10 复核证伪旧结论）：可插拔 Tracer SPI 三 hook php `OpenTracingHook.php`、py `client/open_tracing_hook.py:90,138`、cpp `open_tracing_hook.h:92,135,193`、cs `OpenTracingHook.cs:79,109,190`、go `client/open_tracing_hook.go:76,118,173`、rs `open_tracing_hook.rs:91`、node `open_tracing_hook.ts:66,108`；另有 W3C traceparent 消息级透传接线到发送路径（py `client/trace_context.py`、cpp `client/trace_context.h`、cs `TraceParentContext.cs`、go `client/trace_context.go`、node `client/traceparent.ts`、rust `client/trace_context.rs`） |
+| recall 撤回 + 轨迹钩子 | `DefaultRecallMessageTraceHook` + RECALL 请求族 | 实现 7/7（py producer/trace、cpp `common/recall_message_handle.cpp`、go `common/recall_handle.go`、cs `Client/RecallMessageHandle.cs`、rust `common/recall_message_handle.rs`、node `common/recall_message_handle.ts`、php）；live 入口 ✅py（`verify_recall_live.py`）✅cpp（`recall_live.cpp`）✅cs（`LiveRecall.cs`）✅rust（`live_producer` P9 + `live_rebalance_and_trace`），🟡go/node/php 待补 |
 
 ## 9. 静态主题（单元化主题）
 
@@ -108,7 +110,35 @@
   （协议契约：拉取地址用端点重写名、wire header 保留
   逻辑名），静态主题逻辑队列永远拉不到。
 
-## 10. 真机能力矩阵验证流程
+## 10. 2026-11-11 与 Java 参考实现的能力对齐（本轮结论）
+
+逐条比对 Java 5.x `client`/`common`/`tools` 三个模块后，**真缺口 3 项**、**证伪 2 项**。
+每项的七端离线回归入口统一为 `capability_closeout`（py `tests/test_capability_closeout.py`、
+cpp `tests/test_capability_closeout.cpp`、cs `tests/.../CapabilityCloseoutTests.cs`、
+go `client/capability_closeout_test.go`、rust `pull_consumer.rs`/`admin.rs` 的 `#[cfg(test)]`、
+node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`）。
+
+| 项 | Java 出处 | 结论 | 语义要点 |
+|---|---|---|---|
+| `ConsumeFromWhere` 六值 | `common/.../consumer/ConsumeFromWhere.java:20-29` | ✅ 七端补齐（2026-11-11） | 三个"废弃"值**不是死值**：`RebalancePushImpl#computePullFromWhereWithException:171-173` 把它们与 `CONSUME_FROM_LAST_OFFSET` 并入同一 case 分支，所以"暴露常量 + 心跳可原样序列化"即是全部行为，offset 初始化逻辑无需新分支。补齐前 py/rs/node/php 各缺 3 个、go 缺 `MAX_OFFSET`；go `client/listener.go` 的 `ConsumeFromWhereLastOffsetNow` 命名对应错了值（且无引用者），已更名为 `ConsumeFromWhereLastOffsetAndFromMinWhenBootFirst` |
+| LitePull `connectBrokerByUser` / `defaultBrokerId` | `DefaultLitePullConsumer.java:411-424` → `PullAPIWrapper#recalculatePullFromWhichNode:285-293` | ✅ 七端补齐（2026-11-11） | 开关打开后每轮拉取一律问 `defaultBrokerId` 且**忽略** broker 回的 `suggestWhichBrokerId`——这是从 slave 消费的唯一入口。分两类落地：node/go 有共享 pull-api 建议表，改在 `recalculatePullFromWhichNode` 首行；py/cpp/cs/rust/php 的 lite 路径本就没有建议表（拉取直接进 `MQClientInstance`），故"关"保持历史形状=**请求不带 brokerId**（地址仍走路由解析），"开"才带 id |
+| Push `setAwaitTerminationMillisWhenShutdown` | `DefaultMQPushConsumer.java:996-1002` | ✅ 七端齐（node 本轮补） | 其余六端早已有（默认 0=不等）；node 原本把 drain 预算写死 30000，现改为可配 + 保留 30000 默认（**有意 deviation**：进程立刻退出会截断 `CONSUMER_SEND_MSG_BACK(36)`，见 `shutdown()` 注释） |
+| Pull `setEnableRebalance` | `DefaultMQPullConsumer.java:503-509` → `DefaultMQPullConsumerImpl#doRebalance/tryRebalance:388-404` | ❌ **证伪，不是缺口** | 该开关只 gate `doRebalance()` / `tryRebalance()`，而七端 `DefaultMQPullConsumer` **根本没有 pull 侧重平衡机制**（文件头即写明"no rebalance"；分配结果需主动 `fetchSubscribeMessageQueues` + `fetchMessageQueuesInBalance` 取）。`enableRebalance=false` 描述的正是七端的既有不变行为，单加一个常量没有可 gate 的代码。真要补，应补"pull 侧重平衡 + MessageQueueListener 周期回调"整块，属新特性而非开关 |
+| Admin `setAdminExtGroup` / `getAdminExtGroup` | `DefaultMQAdminExt.java:85,105-111,706-712` | ✅ 七端补齐（七端均为新增，node 原只有构造参数） | 默认 `"admin_ext_group"`。Java 只用它做 admin 在 client 实例里的注册键 + 日志；七端 admin 不发合成 consumer 心跳，故**没有 wire 影响**，纯身份位。已按此写入各端注释，避免后来者误以为能改心跳组 |
+| `MessageConst` 六个属性（`CORRECTION_FLAG`/`MQ2_FLAG`/`SHARDING_KEY`/`DLQ_ORIGIN_MESSAGE_ID`/`DLQ_ORIGIN_TOPIC`/`TRANSACTION_ID`） | `common/.../message/MessageConst.java` | ❌ **证伪，不是缺口** | 在 Java client 内**无调用者**（仅常量定义或 broker/proxy 侧使用）；reply 消息的 `PROPERTY_MESSAGE_TTL`（wire `"TTL"`）七端概念上已有 TTL 支持 |
+| 7 个推送请求码（40/39/220/221/307/309/326） | `ClientRemotingProcessor` | ✅ 七端全齐（既有） | 复核确认，非缺口 |
+| Admin 门面规模 | `tools/.../DefaultMQAdminExt.java`（125 个 public 方法） | ✅ 七端已覆盖（147–194 个，含内部辅助） | 未移植者仅 trivial 访问器 |
+
+## 11. 已知未移植（P3 边缘，按需再补）
+
+| Java 侧类 | 说明 | 各端现状 |
+|---|---|---|
+| `MQClientAPIFactory` + `common.NameserverAccessConfig` | proxy/sdk 场景的多实例 `MQClientAPIImpl` 工厂（instanceName 自动编号）+ NS 域名配置持有器；经典 remoting 直连用不到 | 七端均无，按需补 |
+| `trace.TraceView` | 轨迹查看工具类，非运行时能力 | 七端均无，可忽略 |
+
+已知**有意差异**（非缺口）：go 心跳 V2 指纹留 0 走 V1。
+
+## 12. 真机能力矩阵验证流程
 
 统一用「起集群 + 等端口 + 跑测试 + kill 在同一条 Bash 命令」的既有约定
 （每条 live 入口脚本自身就是完整流程）：

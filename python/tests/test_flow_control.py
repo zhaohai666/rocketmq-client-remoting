@@ -1058,7 +1058,7 @@ class _ScriptedLiteClient(object):
     def pull_message(self, consumer_group, mq, queue_offset, max_msg_nums, sys_flag,
                      commit_offset, subscription, sub_version, expression_type,
                      timeout_millis=30000, max_msg_bytes=-1, suspend_timeout_millis=15000,
-                     addr=None, request_source=0):
+                     addr=None, request_source=0, broker_id=None):
         self.requests.append((mq.queue_id, queue_offset))
         if self._error is not None and mq.queue_id == self._error_queue_id:
             error = self._error
