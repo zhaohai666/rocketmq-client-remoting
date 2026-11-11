@@ -71,6 +71,7 @@ internal static class Program
                 "reset-offset" => LiveResetOffset.Run(rest),
                 "publish-route-master" => LivePublishRouteMaster.Run(rest),
                 "clean-expired-msg" => LiveCleanExpiredMsg.Run(rest),
+                "capability-closeout" => LiveCapabilityCloseout.Run(rest),
                 _ => Unknown(command),
             };
         }
@@ -139,6 +140,8 @@ internal static class Program
               publish-route-master [namesrv] [master] [slave]
                                             publish route skipping a broker with no master integration (stop a master once: the publish queues drop to zero, the subscription does not change, and consumption from the slave still works)
               clean-expired-msg [namesrv] real cluster cleanExpiredMsg escape hatch integration (hang the listener past the timeout -> the sweep resends -> the %RETRY% redelivery arrives; about 4 minutes)
+              capability-closeout [namesrv]
+                                            real cluster 2026-11-11 capability closeout integration (the three deprecated consumeFromWhere values fold into LAST_OFFSET with the baseline measured on this end, the LitePull pin rides the pull request, and a custom-group admin still serves an RPC)
             """);
     }
 }

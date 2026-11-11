@@ -179,3 +179,10 @@ target_link_libraries(rmq_live_clean_expired_msg PRIVATE rocketmq::remoting)
 # (not packed into ctest)
 add_executable(rmq_live_pop_mode live_pop_mode.cpp)
 target_link_libraries(rmq_live_pop_mode PRIVATE rocketmq::remoting)
+
+# Capability closeout real-machine integration (L1 ConsumeFromWhere folding, L2 LitePull pin,
+# L3 adminExtGroup identity). The target name matches the shared runner
+# scripts/run_capability_closeout_live.sh, which expects cpp/build/examples/live_capability_closeout.
+# (not packed into ctest)
+add_executable(live_capability_closeout live_capability_closeout.cpp)
+target_link_libraries(live_capability_closeout PRIVATE rocketmq::remoting)
