@@ -1073,6 +1073,17 @@ final class DefaultLitePullConsumer
     public int $pollTimeoutMillis = 5000;
     public int $pollNameServerInterval = 30000;
     public bool $autoCommit = true;
+    /**
+     * Pull-from-which-node pin — Java DefaultLitePullConsumer#setConnectBrokerByUser /
+     * #setDefaultBrokerId, backed by PullAPIWrapper. While the switch is on, every pull round
+     * asks $defaultBrokerId and the broker's suggestWhichBrokerId is ignored: the only way to
+     * read from a slave. This lite path keeps no suggestion table (its rounds go straight to
+     * MQClientInstance::pullMessage), so "pin off" means "no broker id on the request" and the
+     * client resolves the address from the route exactly as it did before — see
+     * LiteBrokerIdFor().
+     */
+    public bool $connectBrokerByUser = false;
+    public int $defaultBrokerId = MixAll::MASTER_ID;
     /** Period of the auto-commit sweep; only a value of at least 1000 ms can be set, shorter ones are ignored. */
     public int $autoCommitIntervalMillis = 5000;
     public int $consumerTimeoutMillisWhenSuspend = 30000;
@@ -1223,6 +1234,28 @@ final class DefaultLitePullConsumer
     public function setAutoCommit(bool $auto): void
     {
         $this->autoCommit = $auto;
+    }
+
+    /** Java DefaultLitePullConsumer#setConnectBrokerByUser. */
+    public function setConnectBrokerByUser(bool $connectBrokerByUser): void
+    {
+        $this->connectBrokerByUser = $connectBrokerByUser;
+    }
+
+    public function isConnectBrokerByUser(): bool
+    {
+        return $this->connectBrokerByUser;
+    }
+
+    /** Java DefaultLitePullConsumer#setDefaultBrokerId (0 = master, >0 = that slave). */
+    public function setDefaultBrokerId(int $defaultBrokerId): void
+    {
+        $this->defaultBrokerId = $defaultBrokerId;
+    }
+
+    public function getDefaultBrokerId(): int
+    {
+        return $this->defaultBrokerId;
     }
 
     /**
@@ -1875,6 +1908,16 @@ final class DefaultLitePullConsumer
      * The queue's round starts with the cache gates: a refused round sends nothing, commits
      * nothing and moves no cursor, it only re-schedules this queue 50 ms later.
      */
+    /**
+     * Java PullAPIWrapper#recalculatePullFromWhichNode for the lite path: the pinned
+     * $defaultBrokerId while $connectBrokerByUser is on, and null (no broker id on the
+     * request — the client instance resolves the route) otherwise.
+     */
+    private function liteBrokerIdFor(MessageQueue $mq): ?int
+    {
+        return $this->connectBrokerByUser ? $this->defaultBrokerId : null;
+    }
+
     private function pullOne(MessageQueue $mq): bool
     {
         $key = self::mqKey($mq);
@@ -1923,6 +1966,7 @@ final class DefaultLitePullConsumer
                 timeoutMillis: 30000,
                 maxMsgBytes: -1,
                 suspendTimeoutMillis: $this->brokerSuspendMaxTimeMillis,
+                brokerId: $this->liteBrokerIdFor($mq),
             );
         } catch (\Throwable $e) {
             Logger::debug("lite pull_one failed for $mq->topic@$mq->queueId: " . $e->getMessage());

@@ -614,6 +614,14 @@ SubscriptionData DefaultLitePullConsumer::subscriptionDataFor(const std::string&
     return SubscriptionData(topic, subscriptionFor(topic));
 }
 
+// Java PullAPIWrapper#recalculatePullFromWhichNode, reduced to the pin: this lite path keeps no
+// suggestion table, so "pin off" is "no broker id on the request" (the address then comes from
+// the route, exactly as before this switch existed).
+std::optional<int64_t> DefaultLitePullConsumer::liteBrokerIdFor(const MessageQueue& /*mq*/) const {
+    if (!connectBrokerByUser_.load(std::memory_order_relaxed)) return std::nullopt;
+    return defaultBrokerId_.load(std::memory_order_relaxed);
+}
+
 bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
     int64_t offset = 0;
     bool known = false;
@@ -656,7 +664,9 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
                                         FilterAPI::pullExpression(subData),
                                         FilterAPI::pullSubVersionOf(subData), subData.expressionType,
                                         /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
-                                        /*suspendTimeoutMillis=*/brokerSuspendMaxTimeMillis_);
+                                        /*suspendTimeoutMillis=*/brokerSuspendMaxTimeMillis_,
+                                        /*addr=*/std::string(), /*requestSource=*/0,
+                                        liteBrokerIdFor(mq));
     } catch (const MQBrokerException& e) {
         // MQBrokerException is a sibling of RemotingTimeoutException under std::runtime_error, so
         // catching it before catch(...) is live code and unmapped broker codes reach the mapping.

@@ -116,6 +116,14 @@ type pullAPI struct {
 
 	mu                sync.Mutex
 	pullFromWhichNode map[common.MessageQueue]int64
+	// connectBrokerByUser / defaultBrokerID mirror PullAPIWrapper's two fields: while the
+	// switch is on, recalculatePullFromWhichNode answers defaultBrokerID and never consults
+	// the suggestion table. That is the only way to pin a lite-pull consumer to a slave
+	// (Java PullAPIWrapper#recalculatePullFromWhichNode, DefaultLitePullConsumer
+	// #setConnectBrokerByUser). Both live under mu because the setters run on the caller's
+	// goroutine while pull rounds read them from the pull service.
+	connectBrokerByUser bool
+	defaultBrokerID     int64
 }
 
 func newPullAPI(instance *Instance, group string) *pullAPI {
@@ -123,16 +131,46 @@ func newPullAPI(instance *Instance, group string) *pullAPI {
 		instance:          instance,
 		group:             group,
 		pullFromWhichNode: map[common.MessageQueue]int64{},
+		defaultBrokerID:   int64(common.MasterID),
 	}
 }
 
 func (p *pullAPI) recalculatePullFromWhichNode(mq common.MessageQueue) int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.connectBrokerByUser {
+		return p.defaultBrokerID
+	}
 	if id, ok := p.pullFromWhichNode[mq]; ok {
 		return id
 	}
 	return int64(common.MasterID)
+}
+
+// setConnectBrokerByUser / setDefaultBrokerID are the two knobs behind Java
+// DefaultLitePullConsumer#setConnectBrokerByUser / #setDefaultBrokerId.
+func (p *pullAPI) setConnectBrokerByUser(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.connectBrokerByUser = on
+}
+
+func (p *pullAPI) isConnectBrokerByUser() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.connectBrokerByUser
+}
+
+func (p *pullAPI) setDefaultBrokerID(id int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.defaultBrokerID = id
+}
+
+func (p *pullAPI) getDefaultBrokerID() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.defaultBrokerID
 }
 
 // PullFromWhichNode reads the table (diagnostics/tests).

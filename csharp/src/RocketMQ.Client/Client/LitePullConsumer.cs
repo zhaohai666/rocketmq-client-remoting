@@ -82,6 +82,16 @@ public sealed class DefaultLitePullConsumer
     private int _autoCommitIntervalMillis = 5000;
     private int _pullIntervalMillis = 50;
 
+    // Pull-from-which-node pin (Java DefaultLitePullConsumer#setConnectBrokerByUser /
+    // #setDefaultBrokerId, backed by PullAPIWrapper). While it is on, every pull round asks
+    // _defaultBrokerId and the broker's suggestWhichBrokerId is ignored -- the only way to read
+    // from a slave. This lite path keeps no suggestion table (its rounds go straight to
+    // MQClientInstance.PullMessage), so "pin off" means "no broker id on the request" and the
+    // address comes from the route exactly as before (LiteBrokerIdFor). Written by the caller's
+    // thread, read by the pull service: hence Volatile.
+    private bool _connectBrokerByUser;
+    private long _defaultBrokerId = MixAll.MasterId;
+
     // ---- local-buffer flow control (the four budgets the pull round checks before it
     // builds a request). Plain budgets, deliberately unvalidated and unclamped: a
     // threshold of 0 means "trip on the first cached message", which is a legal
@@ -353,6 +363,22 @@ public sealed class DefaultLitePullConsumer
     public void SetBrokerSuspendMaxTimeMillis(int ms) => _brokerSuspendMaxTimeMillis = ms;
 
     public void SetPullIntervalMillis(int ms) => _pullIntervalMillis = Math.Max(0, ms);
+
+    /// <summary>Java <c>DefaultLitePullConsumer#setConnectBrokerByUser</c>: while it is on,
+    /// every pull round asks <see cref="SetDefaultBrokerId"/>'s id and the broker's
+    /// <c>suggestWhichBrokerId</c> is ignored -- the only way to make this consumer read from
+    /// a slave.</summary>
+    public void SetConnectBrokerByUser(bool connectBrokerByUser) =>
+        Volatile.Write(ref _connectBrokerByUser, connectBrokerByUser);
+
+    public bool IsConnectBrokerByUser => Volatile.Read(ref _connectBrokerByUser);
+
+    /// <summary>Java <c>DefaultLitePullConsumer#setDefaultBrokerId</c> (0 = master, &gt;0 =
+    /// that slave).</summary>
+    public void SetDefaultBrokerId(long defaultBrokerId) =>
+        Volatile.Write(ref _defaultBrokerId, defaultBrokerId);
+
+    public long DefaultBrokerId => Volatile.Read(ref _defaultBrokerId);
 
     /// <summary><c>pullThresholdForAll</c> (default 10000): the budget for the messages the
     /// <b>pending pull rounds</b> could still deliver -- a capacity projection, not the count
@@ -1391,6 +1417,16 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
+    // Java PullAPIWrapper#recalculatePullFromWhichNode, reduced to the pin: this lite path keeps no
+    // suggestion table, so "pin off" is "no broker id on the request" (the address then comes from
+    // the route, exactly as before this switch existed).
+    private long? LiteBrokerIdFor(MessageQueue mq) =>
+        Volatile.Read(ref _connectBrokerByUser) ? Volatile.Read(ref _defaultBrokerId) : null;
+
+    /// <summary>Unit-test entry: see <see cref="LiteBrokerIdFor"/>. The broker id a round
+    /// carries is otherwise only observable from a real broker's request log.</summary>
+    public long? LiteBrokerIdForTest(MessageQueue mq) => LiteBrokerIdFor(mq);
+
     private bool PullOne(MessageQueue mq)
     {
         long offset;
@@ -1427,7 +1463,8 @@ public sealed class DefaultLitePullConsumer
             // because the budget is a constant.
             result = RequireClient().PullMessage(_consumerGroup, mq, offset, _pullBatchSize, sysFlag, 0,
                 sub, subVersion, exprType, /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
-                /*suspendTimeoutMillis=*/_brokerSuspendMaxTimeMillis);
+                /*suspendTimeoutMillis=*/_brokerSuspendMaxTimeMillis,
+                /*addrIn=*/null, /*requestSource=*/0, /*brokerId=*/LiteBrokerIdFor(mq));
         }
         catch (MQBrokerException e)
         {

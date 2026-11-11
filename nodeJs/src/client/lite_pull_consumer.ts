@@ -162,6 +162,14 @@ export class DefaultLitePullConsumer {
   brokerSuspendMaxTimeMillis = 20000;
   consumerTimeoutMillisWhenSuspend = 30000;
 
+  // Pull-from-which-node pin (Java DefaultLitePullConsumer#setConnectBrokerByUser /
+  // #setDefaultBrokerId, backed by PullAPIWrapper). With the switch on, every pull round
+  // asks defaultBrokerId and ignores the broker's suggestWhichBrokerId -- the only way to
+  // read from a slave. Held here rather than only on PullAPI because the setters are legal
+  // before start(), and PullAPI is built inside start().
+  connectBrokerByUser = false;
+  defaultBrokerId: number = MixAll.MASTER_ID;
+
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
   // The CONSUME_FROM_TIMESTAMP start instant ("yyyyMMddHHmmss"); the format is checked at start().
   setConsumeTimestamp(ts: string): this { this.consumeTimestamp = ts; return this; }
@@ -301,6 +309,26 @@ export class DefaultLitePullConsumer {
     return this;
   }
   getConsumerTimeoutMillisWhenSuspend(): number { return this.consumerTimeoutMillisWhenSuspend; }
+
+  // Java DefaultLitePullConsumer#setConnectBrokerByUser / #isConnectBrokerByUser: pin every
+  // pull round to defaultBrokerId instead of the broker-suggested node. Applies on the next
+  // round; when start() has not run yet the value is carried into the PullAPI it builds.
+  setConnectBrokerByUser(on: boolean): this {
+    this.connectBrokerByUser = on;
+    if (this.pullAPI) this.pullAPI.connectBrokerByUser = on;
+    return this;
+  }
+  isConnectBrokerByUser(): boolean {
+    return this.pullAPI ? this.pullAPI.connectBrokerByUser : this.connectBrokerByUser;
+  }
+  setDefaultBrokerId(id: number): this {
+    this.defaultBrokerId = id;
+    if (this.pullAPI) this.pullAPI.defaultBrokerId = id;
+    return this;
+  }
+  getDefaultBrokerId(): number {
+    return this.pullAPI ? this.pullAPI.defaultBrokerId : this.defaultBrokerId;
+  }
 
   // Sets the topic metadata comparison period (anything below the floor or
   // otherwise illegal is clamped to the floor).
@@ -529,6 +557,10 @@ export class DefaultLitePullConsumer {
       this.offsetStore = new RemoteBrokerOffsetStore(client, this.consumerGroup);
     }
     this.pullAPI = new PullAPI(client, this.consumerGroup);
+    // Carry the pre-start pin onto the PullAPI that start() just built (the setters above
+    // only reach it once it exists).
+    this.pullAPI.connectBrokerByUser = this.connectBrokerByUser;
+    this.pullAPI.defaultBrokerId = this.defaultBrokerId;
     await this.offsetStore.load().catch((e) =>
       logger.warning('load offset store failed: %s', (e as Error).message));
     // Warm the route cache for every topic this consumer will pull: the

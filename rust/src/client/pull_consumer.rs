@@ -1745,6 +1745,14 @@ struct LiteState {
     /// Per-queue pull parks armed by a cache gate or a broker throttle, keyed like `assigned`.
     pull_parks: BTreeMap<String, PullPark>,
     last_rebalance_ts: i64,
+    /// Pull-from-which-node pin (Java DefaultLitePullConsumer#setConnectBrokerByUser /
+    /// #setDefaultBrokerId, backed by PullAPIWrapper). While it is on, every pull round asks
+    /// `default_broker_id` and the broker's suggestWhichBrokerId is ignored -- the only way to
+    /// read from a slave. This lite path keeps no suggestion table (its rounds go straight to
+    /// `MQClientInstance::pull_message`), so "pin off" means "no broker id on the request".
+    connect_broker_by_user: bool,
+    /// The broker id the pin answers (0 = master, >0 = the slave with that id).
+    default_broker_id: i64,
 }
 
 impl Default for LiteState {
@@ -1765,6 +1773,8 @@ impl Default for LiteState {
             paused: BTreeSet::new(),
             pull_parks: BTreeMap::new(),
             last_rebalance_ts: 0,
+            connect_broker_by_user: false,
+            default_broker_id: MixAll::MASTER_ID as i64,
         }
     }
 }
@@ -2199,6 +2209,26 @@ impl DefaultLitePullConsumer {
     pub fn set_consume_timestamp(&self, ts: &str) {
         let ts = ts.to_string();
         self.update_config(|c| c.consume_timestamp = ts);
+    }
+
+    /// Java `DefaultLitePullConsumer#setConnectBrokerByUser`: while it is on, every pull round
+    /// asks [`default_broker_id`](Self::set_default_broker_id) and the broker's
+    /// `suggestWhichBrokerId` is ignored -- the only way to make this consumer read from a slave.
+    pub fn set_connect_broker_by_user(&self, connect_broker_by_user: bool) {
+        lock(&self.inner.state).connect_broker_by_user = connect_broker_by_user;
+    }
+
+    pub fn is_connect_broker_by_user(&self) -> bool {
+        lock(&self.inner.state).connect_broker_by_user
+    }
+
+    /// Java `DefaultLitePullConsumer#setDefaultBrokerId` (0 = master, >0 = that slave).
+    pub fn set_default_broker_id(&self, default_broker_id: i64) {
+        lock(&self.inner.state).default_broker_id = default_broker_id;
+    }
+
+    pub fn get_default_broker_id(&self) -> i64 {
+        lock(&self.inner.state).default_broker_id
     }
 
     pub fn set_namesrv_addr(&self, addr: &str) {
@@ -3688,6 +3718,13 @@ impl DefaultLitePullConsumer {
         };
         // Same class-filter rule as the pull path above: the bit stays clear, the type travels.
         let sys_flag = lite_pull_sys_flag();
+        // Pull-from-which-node pin, read once per round: Some(default_broker_id) while
+        // connect_broker_by_user is on (Java PullAPIWrapper#recalculatePullFromWhichNode),
+        // None otherwise -- no id on the request, the client instance resolves the route.
+        let broker_id = {
+            let st = lock(&self.inner.state);
+            st.connect_broker_by_user.then_some(st.default_broker_id)
+        };
         let result = match client
             .pull_message(
                 &cfg.consumer_group,
@@ -3706,7 +3743,7 @@ impl DefaultLitePullConsumer {
                 cfg.broker_suspend_max_time_millis,
                 None,
                 0,
-                None,
+                broker_id,
             )
             .await
         {
@@ -8622,6 +8659,62 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "shutdown must escape the parked round promptly, not wait out the 60 s deadline"
+        );
+    }
+
+    // ---------------------------------------------------------- Capability closeout
+
+    /// All six values of Java `common/.../consumer/ConsumeFromWhere.java`. The three
+    /// "deprecated" ones are not dead: Java folds them into the `CONSUME_FROM_LAST_OFFSET`
+    /// branch of the offset-init switch (`RebalancePushImpl#computePullFromWhereWithException`
+    /// lines 171-173), so accepting them here is the whole of their behaviour.
+    #[test]
+    fn consume_from_where_carries_all_six_java_values() {
+        let values = [
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST,
+            ConsumeFromWhere::CONSUME_FROM_MIN_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_MAX_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET,
+            ConsumeFromWhere::CONSUME_FROM_TIMESTAMP,
+        ];
+        let expected = [
+            "CONSUME_FROM_LAST_OFFSET",
+            "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST",
+            "CONSUME_FROM_MIN_OFFSET",
+            "CONSUME_FROM_MAX_OFFSET",
+            "CONSUME_FROM_FIRST_OFFSET",
+            "CONSUME_FROM_TIMESTAMP",
+        ];
+        assert_eq!(values, expected, "each constant must equal its wire string");
+    }
+
+    /// Java `DefaultLitePullConsumer#setConnectBrokerByUser` / `#setDefaultBrokerId`, backed by
+    /// `PullAPIWrapper`. The pin defaults off and to MASTER_ID, and both ends round-trip.
+    #[test]
+    fn lite_broker_pin_matches_java_defaults_and_round_trips() {
+        let c = DefaultLitePullConsumer::new("GID_PinDefaults").expect("group is legal");
+        assert!(!c.is_connect_broker_by_user(), "the pin defaults to off");
+        assert_eq!(
+            c.get_default_broker_id(),
+            MixAll::MASTER_ID as i64,
+            "defaultBrokerId defaults to MASTER_ID"
+        );
+
+        c.set_connect_broker_by_user(true);
+        c.set_default_broker_id(2);
+        assert!(c.is_connect_broker_by_user(), "the pin reports on");
+        assert_eq!(c.get_default_broker_id(), 2, "the id round-trips");
+
+        c.set_connect_broker_by_user(false);
+        assert!(
+            !c.is_connect_broker_by_user(),
+            "unpinning restores the historic request shape (no latch)"
+        );
+        assert_eq!(
+            c.get_default_broker_id(),
+            2,
+            "unpinning keeps the id, only the switch decides whether it is used"
         );
     }
 }

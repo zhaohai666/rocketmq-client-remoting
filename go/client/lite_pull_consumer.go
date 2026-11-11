@@ -202,6 +202,14 @@ type DefaultLitePullConsumer struct {
 	messageQueuesForTopic      map[string][]common.MessageQueue
 	topicMetadataCheckInterval int64
 
+	// Pull-from-which-node pin (Java DefaultLitePullConsumer#setConnectBrokerByUser /
+	// #setDefaultBrokerId, backed by PullAPIWrapper). With the switch on every pull round
+	// asks the chosen broker id and ignores the broker's suggestWhichBrokerId -- the only
+	// way to read from a slave. Kept here rather than only on pullAPI because both setters
+	// are legal before Start, and pullAPI is built inside Start. Guarded by mu.
+	connectBrokerByUser bool
+	defaultBrokerID     int64
+
 	// ---- consumer state, all guarded by mu ----
 	// subscription is topic -> raw expression (subscribe mode).
 	subscription map[string]string
@@ -462,6 +470,51 @@ func (c *DefaultLitePullConsumer) SetConsumeTimestamp(ts string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.consumeTimestamp = ts
+}
+
+// SetConnectBrokerByUser is Java DefaultLitePullConsumer#setConnectBrokerByUser: while it
+// is on, every pull round asks DefaultBrokerID and the broker's suggestWhichBrokerId is
+// ignored -- the only way to make this consumer read from a slave.
+func (c *DefaultLitePullConsumer) SetConnectBrokerByUser(on bool) {
+	c.mu.Lock()
+	c.connectBrokerByUser = on
+	api := c.pullAPI
+	c.mu.Unlock()
+	if api != nil {
+		api.setConnectBrokerByUser(on)
+	}
+}
+
+// IsConnectBrokerByUser reports the current pull-from-which-node pin.
+func (c *DefaultLitePullConsumer) IsConnectBrokerByUser() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pullAPI != nil {
+		return c.pullAPI.isConnectBrokerByUser()
+	}
+	return c.connectBrokerByUser
+}
+
+// SetDefaultBrokerID is Java DefaultLitePullConsumer#setDefaultBrokerId: the broker id the
+// pin above answers (0 = master, >0 = the slave with that id).
+func (c *DefaultLitePullConsumer) SetDefaultBrokerID(id int64) {
+	c.mu.Lock()
+	c.defaultBrokerID = id
+	api := c.pullAPI
+	c.mu.Unlock()
+	if api != nil {
+		api.setDefaultBrokerID(id)
+	}
+}
+
+// DefaultBrokerID reports the pinned broker id (MASTER_ID when never set).
+func (c *DefaultLitePullConsumer) DefaultBrokerID() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pullAPI != nil {
+		return c.pullAPI.getDefaultBrokerID()
+	}
+	return c.defaultBrokerID
 }
 
 // SetPollNameServerInterval is ClientConfig#pollNameServerInterval.
@@ -1064,6 +1117,9 @@ func (c *DefaultLitePullConsumer) Start() error {
 	c.mu.Lock()
 	instance.RegisterConsumerGroup(c.consumerGroup)
 	c.pullAPI = newPullAPI(instance, c.consumerGroup)
+	// Carry a pin configured before Start onto the pullAPI Start just built.
+	c.pullAPI.setConnectBrokerByUser(c.connectBrokerByUser)
+	c.pullAPI.setDefaultBrokerID(c.defaultBrokerID)
 	if c.messageModel == MessageModelBroadcasting {
 		c.offsetStore = NewLocalFileOffsetStore(c.clientID, c.consumerGroup)
 	} else {

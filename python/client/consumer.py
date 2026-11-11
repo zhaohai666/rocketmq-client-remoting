@@ -5245,6 +5245,16 @@ class DefaultLitePullConsumer:
         self.consume_max_span = 2000
         # The period of the background comparison of the queue sets of topics registered with register_topic_message_queue_change_listener, default 30s.
         self.topic_metadata_check_interval_millis = 30 * 1000
+        # ---- Pull-from-which-node pin (Java DefaultLitePullConsumer#setConnectBrokerByUser /
+        # #setDefaultBrokerId, backed by PullAPIWrapper) ----
+        # While ``connect_broker_by_user`` is on, every pull round asks ``default_broker_id``
+        # and the broker's suggestWhichBrokerId is ignored: the only way to read from a slave.
+        # This port keeps no suggestion table on the lite path (its pulls go straight to
+        # MQClientInstance.pull_message), so "pin off" means "no broker id on the request" and
+        # the client instance resolves the address exactly as it did before -- see
+        # ``_recalculate_pull_from_which_node``.
+        self.connect_broker_by_user = False
+        self.default_broker_id = MixAll.MASTER_ID
         # ---- Heartbeat V2 / VIP channel switches (both default false) ----
         # ``use_heartbeat_v2`` puts this consumer's HEART_BEAT(34) rounds on the fingerprint-gated
         # path (client/heartbeat_v2.py); ``vip_channel_enabled`` sends the send/reply RPCs and the
@@ -5456,6 +5466,24 @@ class DefaultLitePullConsumer:
 
     def set_pull_interval_millis(self, ms: int) -> None:
         self.pull_interval_millis = max(0, int(ms))
+
+    def set_connect_broker_by_user(self, connect_broker_by_user: bool) -> None:
+        """Java DefaultLitePullConsumer#setConnectBrokerByUser.
+
+        While it is on, every pull round asks ``default_broker_id`` and ignores the
+        broker-suggested next hop -- the only way to make this consumer read from a slave.
+        """
+        self.connect_broker_by_user = bool(connect_broker_by_user)
+
+    def is_connect_broker_by_user(self) -> bool:
+        return self.connect_broker_by_user
+
+    def set_default_broker_id(self, default_broker_id: int) -> None:
+        """Java DefaultLitePullConsumer#setDefaultBrokerId (0 = master, >0 = that slave)."""
+        self.default_broker_id = int(default_broker_id)
+
+    def get_default_broker_id(self) -> int:
+        return self.default_broker_id
 
     def set_pull_threshold_for_all(self, n: int) -> None:
         """Message-count budget of the **whole** local buffer, summed over every queue.
@@ -5963,6 +5991,18 @@ class DefaultLitePullConsumer:
             return self._assign_sub_expr[topic]
         return "*"
 
+    def _recalculate_pull_from_which_node(self, mq: MessageQueue) -> Optional[int]:
+        """Java PullAPIWrapper#recalculatePullFromWhichNode for the lite path.
+
+        Returns the pinned ``default_broker_id`` while ``connect_broker_by_user`` is on, and
+        ``None`` otherwise. ``None`` (rather than ``MixAll.MASTER_ID``) is this port's shape
+        for "no id on the request": MQClientInstance.pull_message then resolves the address
+        from the route, which is what every lite pull round did before this switch existed.
+        """
+        if self.connect_broker_by_user:
+            return self.default_broker_id
+        return None
+
     def _pull_one(self, mq: MessageQueue) -> bool:
         offset = self._next_offset.get(mq)
         if offset is None:
@@ -5992,7 +6032,8 @@ class DefaultLitePullConsumer:
                 self.consumer_group, mq, offset, self.pull_batch_size,
                 sys_flag, 0, sub, sub_version, exp_type,
                 timeout_millis=30000, max_msg_bytes=-1,
-                suspend_timeout_millis=self.broker_suspend_max_time_millis)
+                suspend_timeout_millis=self.broker_suspend_max_time_millis,
+                broker_id=self._recalculate_pull_from_which_node(mq))
         except MQBrokerException as e:
             # A broker FLOW_CONTROL(215) answer is not an error on this path: it is transient
             # producer-side throttling, so **this queue's** next round waits the short broker delay

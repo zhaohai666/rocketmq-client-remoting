@@ -48,14 +48,22 @@ export class PullAPI {
   // pullFromWhichNode maps mqKey -> the brokerId to ask next round.
   private pullFromWhichNode = new Map<string, number>();
 
+  // connectBrokerByUser / defaultBrokerId mirror PullAPIWrapper's two fields: when the
+  // switch is on, recalculatePullFromWhichNode answers defaultBrokerId unconditionally and
+  // the suggestion table is never consulted. That is the only way to pin a lite-pull
+  // consumer to a slave (Java DefaultLitePullConsumer#setConnectBrokerByUser).
+  connectBrokerByUser = false;
+  defaultBrokerId: number = MixAll.MASTER_ID;
+
   constructor(mqClient: MQClient, group: string) {
     this.mqClient = mqClient;
     this.group = group;
   }
 
-  // recalculatePullFromWhichNode: the table value, or MASTER_ID when the queue
-  // has no entry.
+  // recalculatePullFromWhichNode: defaultBrokerId while the user pin is on, otherwise
+  // the table value, or MASTER_ID when the queue has no entry.
   recalculatePullFromWhichNode(mq: MessageQueue): number {
+    if (this.connectBrokerByUser) return this.defaultBrokerId;
     const id = this.pullFromWhichNode.get(mqKey(mq));
     return id === undefined ? MixAll.MASTER_ID : id;
   }

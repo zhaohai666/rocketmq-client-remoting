@@ -111,6 +111,19 @@ public:
 
     void setConsumeFromWhere(const std::string& where) { consumeFromWhere_ = where; }
     void setConsumeTimestamp(const std::string& ts) { consumeTimestamp_ = ts; }
+    // ---------------- Pull-from-which-node pin ----------------
+    // Java DefaultLitePullConsumer#setConnectBrokerByUser / #setDefaultBrokerId, backed by
+    // PullAPIWrapper#recalculatePullFromWhichNode. While the switch is on, every pull round asks
+    // defaultBrokerId and the broker's suggestWhichBrokerId is ignored -- the only way to make
+    // this consumer read from a slave. This lite path keeps no suggestion table (its rounds go
+    // straight to MQClientInstance::pullMessage), so "pin off" means "no broker id on the
+    // request" and the address comes from the route exactly as before (liteBrokerIdFor()).
+    void setConnectBrokerByUser(bool connectBrokerByUser) {
+        connectBrokerByUser_ = connectBrokerByUser;
+    }
+    bool isConnectBrokerByUser() const { return connectBrokerByUser_; }
+    void setDefaultBrokerId(int64_t defaultBrokerId) { defaultBrokerId_ = defaultBrokerId; }
+    int64_t defaultBrokerId() const { return defaultBrokerId_; }
     // Messages one pull round asks for (pullBatchSize, default 10 for a lite pull -- a push consumer
     // uses 32). The value doubles as the multiplier of the aggregate cache gate: every pending round
     // is budgeted with a whole batch.
@@ -261,6 +274,11 @@ public:
     // Test-only entries. Offline reachability of the gate, its accumulators and its counters follows
     // the push path's pattern (flowControlHitForTest + lastPullPauseMillis): what the pull thread
     // decides between rounds is otherwise invisible, and a real broker run cannot pin it either.
+    // Unit-test entry: see liteBrokerIdFor(). The broker id a round carries is otherwise only
+    // observable from a real broker's request log.
+    std::optional<int64_t> liteBrokerIdForTest(const MessageQueue& mq) const {
+        return liteBrokerIdFor(mq);
+    }
     bool cacheFlowControlHitForTest(const MessageQueue& mq);
     // Stage a backlog directly into the local buffer (and its accumulators) without a pull, so a test
     // controls the cached count / storeSize sum / offset span exactly.
@@ -298,6 +316,11 @@ private:
     // mode is refused.
     void claimMode(bool assign);
     bool pullOne(const MessageQueue& mq);
+    // The broker id this round's pull request carries: defaultBrokerId_ while the pin is on, and
+    // std::nullopt (no id -- resolve the address from the route) otherwise. Java
+    // PullAPIWrapper#recalculatePullFromWhichNode, which this lite path reduces to the pin because
+    // it keeps no suggestion table.
+    std::optional<int64_t> liteBrokerIdFor(const MessageQueue& mq) const;
     std::string subscriptionFor(const std::string& topic) const;
     // The registered SubscriptionData that describes this topic's subscription (expression type and
     // version), falling back to the plain tag form of the raw table entry.
@@ -352,6 +375,11 @@ private:
     std::string messageModel_ = MessageModel::CLUSTERING;
     std::string consumeFromWhere_ = ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET;
     std::string consumeTimestamp_;
+    // Pull-from-which-node pin (see setConnectBrokerByUser above). std::atomic rather than a
+    // plain field: the setters run on the caller's thread while the pull service reads them,
+    // the same "volatile" shape PullAPIWrapper uses on the Java side.
+    std::atomic<bool> connectBrokerByUser_{false};
+    std::atomic<int64_t> defaultBrokerId_{MixAll::MASTER_ID};
 
     int32_t brokerSuspendMaxTimeMillis_ = 20000;
     int32_t consumerTimeoutMillisWhenSuspend_ = 30000;
