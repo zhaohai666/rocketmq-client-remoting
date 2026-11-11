@@ -136,6 +136,7 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 
 | Java 侧类 | 说明 | 各端现状 |
 |---|---|---|
+| `ConsumeMessagePopOrderlyService`（**有序 POP 消费**，368 行） | 不是边缘项：POP 模式下 `MessageListenerOrderly` 的完整消费链——队列锁、`COMMIT`/`ROLLBACK`、`checkReconsumeTimes`、`sendMessageBack`、`submitConsumeRequestLater`、revive 重投 | **七端均未实现**（P2）。python/cpp 有空转骨架（请求入队后 `run()` 拿到队列锁即返回，**既不消费也不 ack**，broker 到 `invisibleTime` 后 revive 重投；`python/tests/test_pop_orderly.py` 用断言把该行为锁死）；go 干脆不请求有序 POP（`client/pop_consumer.go:238` "this port does not do orderly POP"）；cs/rs/node/php 无相关代码。宏观症状：**有序监听 + POP 收不到消息且积压不下降**。补齐需七端同步做，且要先定 queue lock 与 COMMIT/ROLLBACK 的跨端契约 |
 | `MQClientAPIFactory` + `common.NameserverAccessConfig` | proxy/sdk 场景的多实例 `MQClientAPIImpl` 工厂（instanceName 自动编号）+ NS 域名配置持有器；经典 remoting 直连用不到 | 七端均无，按需补 |
 | `trace.TraceView` | 轨迹查看工具类，非运行时能力 | 七端均无，可忽略 |
 
