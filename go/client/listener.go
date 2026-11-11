@@ -114,15 +114,24 @@ type MessageListenerOrderly interface {
 }
 
 // ConsumeType / MessageModel / ConsumeFromWhere wire strings.
+//
+// All six values of Java common/.../consumer/ConsumeFromWhere.java are here, with the Java
+// names. The three tail ones are not "unused": Java folds them into the
+// CONSUME_FROM_LAST_OFFSET branch of the offset-init switch
+// (RebalancePushImpl#computePullFromWhereWithException lines 171-173), so accepting them is
+// the whole of their behavior.
 const (
 	ConsumeTypePassively = "CONSUME_PASSIVELY"
 	ConsumeTypeActively  = "CONSUME_ACTIVELY"
 
-	ConsumeFromWhereLastOffset    = "CONSUME_FROM_LAST_OFFSET"
-	ConsumeFromWhereFirstOffset   = "CONSUME_FROM_FIRST_OFFSET"
-	ConsumeFromWhereTimestamp     = "CONSUME_FROM_TIMESTAMP"
-	ConsumeFromWhereLastOffsetNow = "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST"
-	ConsumeFromWhereMinOffsetBoot = "CONSUME_FROM_MIN_OFFSET_WHEN_BOOT_FIRST"
+	ConsumeFromWhereLastOffset  = "CONSUME_FROM_LAST_OFFSET"
+	ConsumeFromWhereFirstOffset = "CONSUME_FROM_FIRST_OFFSET"
+	ConsumeFromWhereTimestamp   = "CONSUME_FROM_TIMESTAMP"
+	// ConsumeFromWhereLastOffsetAndFromMinWhenBootFirst: this constant used to be called
+	// ConsumeFromWhereLastOffsetNow, which named the wrong value; nothing referenced it.
+	ConsumeFromWhereLastOffsetAndFromMinWhenBootFirst = "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST"
+	ConsumeFromWhereMinOffset                         = "CONSUME_FROM_MIN_OFFSET"
+	ConsumeFromWhereMaxOffset                         = "CONSUME_FROM_MAX_OFFSET"
 
 	MessageModelClustering   = "CLUSTERING"
 	MessageModelBroadcasting = "BROADCASTING"

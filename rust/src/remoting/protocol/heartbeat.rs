@@ -50,6 +50,12 @@ impl ConsumeFromWhere {
     pub const CONSUME_FROM_LAST_OFFSET: &'static str = "CONSUME_FROM_LAST_OFFSET";
     pub const CONSUME_FROM_FIRST_OFFSET: &'static str = "CONSUME_FROM_FIRST_OFFSET";
     pub const CONSUME_FROM_TIMESTAMP: &'static str = "CONSUME_FROM_TIMESTAMP";
+    /// Java parity: these three share the `CONSUME_FROM_LAST_OFFSET` branch in
+    /// `RebalancePushImpl#computePullFromWhereWithException` (lines 171-173).
+    pub const CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST: &'static str =
+        "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST";
+    pub const CONSUME_FROM_MIN_OFFSET: &'static str = "CONSUME_FROM_MIN_OFFSET";
+    pub const CONSUME_FROM_MAX_OFFSET: &'static str = "CONSUME_FROM_MAX_OFFSET";
 }
 
 /// `ExpressionType`

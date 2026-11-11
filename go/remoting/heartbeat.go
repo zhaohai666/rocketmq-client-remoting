@@ -36,6 +36,11 @@ const (
 	ConsumeFromWhereLastOffset  = "CONSUME_FROM_LAST_OFFSET"
 	ConsumeFromWhereFirstOffset = "CONSUME_FROM_FIRST_OFFSET"
 	ConsumeFromWhereTimestamp   = "CONSUME_FROM_TIMESTAMP"
+	// Java parity: these three share the CONSUME_FROM_LAST_OFFSET branch in
+	// RebalancePushImpl#computePullFromWhereWithException (lines 171-173).
+	ConsumeFromWhereLastOffsetAndFromMinWhenBootFirst = "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST"
+	ConsumeFromWhereMinOffset                         = "CONSUME_FROM_MIN_OFFSET"
+	ConsumeFromWhereMaxOffset                         = "CONSUME_FROM_MAX_OFFSET"
 
 	ExpressionTypeTag         = "TAG"
 	ExpressionTypeSQL92       = "SQL92"
