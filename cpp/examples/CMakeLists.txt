@@ -186,3 +186,12 @@ target_link_libraries(rmq_live_pop_mode PRIVATE rocketmq::remoting)
 # (not packed into ctest)
 add_executable(live_capability_closeout live_capability_closeout.cpp)
 target_link_libraries(live_capability_closeout PRIVATE rocketmq::remoting)
+
+# Pull-side background rebalance real-machine integration: two instances split a multi-queue
+# topic (disjoint shares covering the whole topic), the listener really fires with
+# mqAll = the topic's full set, and enableRebalance=false stops the loop while
+# fetchMessageQueuesInBalance keeps computing on the spot. The target name matches the
+# shared runner scripts/run_pull_rebalance_live.sh, which expects cpp/build/examples/live_pull_rebalance.
+# (not packed into ctest)
+add_executable(live_pull_rebalance live_pull_rebalance.cpp)
+target_link_libraries(live_pull_rebalance PRIVATE rocketmq::remoting)

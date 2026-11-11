@@ -209,3 +209,34 @@ ROCKETMQ_NS_PORT=9941 ROCKETMQ_BROKER_PORT=10981 RMQ_CAP_WORK=/tmp/rmq_cap_a \
 
 单 broker 集群没有 slave，所以 L2 只能证明"id 真的进了请求"，"从 slave 读到数据"这条腿
 需要多 broker 拓扑，属已知未覆盖项。
+
+### 12.3 Pull 侧重平衡真机矩阵（`scripts/run_pull_rebalance_live.sh {end|all}`）
+
+第 10 节 Pull `setEnableRebalance`（七端补齐）的真机入口与 2026-11-11 实测结果。每端探针
+三腿同构：**L1** 同组两实例对 8 队列 topic 完成互斥切分（并集 == 全 topic，"切分成立"只能
+来自两边读到同一份 broker 侧消费者表 + 同一分配公式）；**L2** listener 真的被回调，且
+`mqAll` = topic 全队列集（分配按真实路由算，不是本地发明的）、`mqDivided` == 该实例表内份额；
+**L3** `enableRebalance=false` 后零回调 + 重平衡表保持空，而 `fetchMessageQueuesInBalance`
+现场计算仍然出活。跑法与 §12.1 相同：脚本自起集群、自等 TBW102 路由、按端口收尾。
+
+```bash
+bash scripts/run_pull_rebalance_live.sh all    # 七端串行，共用一套集群
+```
+
+| 端 | L1 切分 | L2 listener | L3 开关关 | 断言数 | 探针 |
+|---|---|---|---|---|---|
+| python | ✅ | ✅ | ✅ | 10 / 0 | `python/verify_pull_rebalance_live.py` |
+| go | ✅ | ✅ | ✅ | 8 / 0 | `go/examples/live_pull_rebalance/` |
+| node | ✅ | ✅ | ✅ | 10 / 0 | `nodeJs/examples/live_pull_rebalance.ts` |
+| php | ✅ | ✅ | ✅ | 11 / 0 | `php/examples/live_pull_rebalance.php` |
+| rust | ✅ | ✅ | ✅ | 10 / 0 | `rust/examples/live_pull_rebalance.rs` |
+| cpp | ✅ | ✅ | ✅ | 10 / 0 | `cpp/examples/live_pull_rebalance.cpp` |
+| csharp | ✅ | ✅ | ✅ | 10 / 0 | `csharp/.../LivePullRebalance.cs`（`pull-rebalance` 子命令） |
+
+（断言数 = PASS / FAIL。各端探针断言粒度一致：L1 三条 + fetch 表回读一条、L2 三条、L3 三条；
+go 少 2 条是 go 探针未含 mqDivided/mqAll 细分断言，php 多 1 条是 tick 驱动的额外检查。）
+
+一条**别再当 bug 查**的实测结论：同组两实例各拿 **4/4** 是唯一稳定形状（8 队列 ÷ 2 客户端、
+averagely 策略）；若探针里第二实例没设独立 `instanceName`，broker 的
+`GET_CONSUMER_LIST_BY_GROUP` 只会看到 1 个 clientId，两实例会各拿全量 8 队列——这是探针
+写错，不是重平衡没生效。

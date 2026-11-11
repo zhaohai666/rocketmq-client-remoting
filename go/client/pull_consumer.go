@@ -619,6 +619,18 @@ func (c *DefaultMQPullConsumer) RegisterTopic(topic string) {
 	c.registerTopics[topic] = struct{}{}
 }
 
+// RegisterMessageQueueListener is Java DefaultMQPullConsumer#registerMessageQueueListener
+// (:328-335): registers the topic AND installs the listener in one call. The topic is the
+// part that matters: the background rebalance iterates registerTopics, so a listener
+// without a registered topic would never fire. A nil listener keeps the current one
+// (Java only overwrites when non-null).
+func (c *DefaultMQPullConsumer) RegisterMessageQueueListener(topic string, listener MessageQueueListener) {
+	if listener != nil {
+		c.SetMessageQueueListener(listener)
+	}
+	c.RegisterTopic(topic)
+}
+
 // Subscribe is the explicit form of subscriptionAutomatically: it registers the
 // topic and installs the subExpression filter.
 func (c *DefaultMQPullConsumer) Subscribe(topic, subExpression string) error {

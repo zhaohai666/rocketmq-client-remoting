@@ -38,6 +38,7 @@ internal static class Program
                 "redelivery" => LiveRedelivery.Run(rest),
                 "acl" => LiveAcl.Run(rest),
                 "pull" => LivePull.Run(rest),
+                "pull-rebalance" => LivePullRebalance.Run(rest),
                 "pull-heartbeat" => LivePullHeartbeat.Run(rest),
                 "lite-pull" => LiveLitePull.Run(rest),
                 "lite-pull-cursor" => LiveLitePullCursor.Run(rest),
@@ -105,6 +106,7 @@ internal static class Program
               redelivery    [namesrv]       real cluster consume-side capability integration (resend/offsets/orderly/broadcasting/flow control)
               acl     [namesrv] [ak] [sk]   real cluster ACL authentication integration (needs the broker authenticationEnabled)
               pull         [namesrv]        real cluster active pull consumer integration (manual pull / manual offsets / resend)
+              pull-rebalance [namesrv]      real cluster pull-side background rebalance integration (two instances split an 8-queue topic, the listener fires with the topic's full set, EnableRebalance=false stops the loop)
               pull-heartbeat [namesrv] [master] [slave]
                                             pull-mode consumer heartbeat integration (203/38 visible on master and slave, 35 unregister removes it at once, ghost group control)
               lite-pull    [namesrv]       real cluster lightweight pull consumer integration (both subscribe/assign modes + poll)
