@@ -87,6 +87,9 @@ const DEFAULT_CONSUME_MESSAGE_BATCH_MAX_SIZE = 1;
 const DEFAULT_CONSUME_THREAD_MIN = 20;
 const DEFAULT_CONSUME_THREAD_MAX = 20;
 const DEFAULT_ADJUST_THREAD_POOL_NUMS_THRESH = 100000;
+// Java's default is 0 (do not wait); this port waits, see the field's note. The value is also
+// the historic hard-coded drain budget shutdown() used before the knob existed.
+const DEFAULT_AWAIT_TERMINATION_MILLIS_WHEN_SHUTDOWN = 30000;
 const DEFAULT_CONSUME_CONCURRENTLY_MAX_SPAN = 2000;
 const DEFAULT_PULL_THRESHOLD_FOR_QUEUE = 1000;
 const DEFAULT_PULL_THRESHOLD_SIZE_FOR_QUEUE = 100;
@@ -213,6 +216,14 @@ export class DefaultMQPushConsumer {
   consumeThreadMax = DEFAULT_CONSUME_THREAD_MAX;
   corePoolSize = DEFAULT_CONSUME_THREAD_MIN;
   adjustThreadPoolNumsThreshold = DEFAULT_ADJUST_THREAD_POOL_NUMS_THRESH;
+
+  // awaitTerminationMillisWhenShutdown (Java DefaultMQPushConsumer#setAwaitTerminationMillisWhenShutdown):
+  // how long shutdown() waits for in-flight listener calls before detaching them.
+  // DEVIATION: Java defaults this to 0 ("do not wait"). This port keeps its historic 30000
+  // because an immediate process exit can cut a CONSUMER_SEND_MSG_BACK(36) short and the
+  // message then never reaches %RETRY%/%DLQ% — see the drain in shutdown(). Both 0 and the
+  // 30s window are reachable through the setter, so Java-configured code keeps its meaning.
+  awaitTerminationMillisWhenShutdown = DEFAULT_AWAIT_TERMINATION_MILLIS_WHEN_SHUTDOWN;
 
   consumeConcurrentlyMaxSpan = DEFAULT_CONSUME_CONCURRENTLY_MAX_SPAN;
   pullThresholdForQueue = DEFAULT_PULL_THRESHOLD_FOR_QUEUE;
@@ -357,6 +368,13 @@ export class DefaultMQPushConsumer {
   setConsumeThreadNums(n: number): this {
     this.consumeThreadMin = n; this.consumeThreadMax = n; this.corePoolSize = n; return this;
   }
+  // Java DefaultMQPushConsumer#setAwaitTerminationMillisWhenShutdown: the shutdown() drain
+  // budget for in-flight listener calls. 0 = do not wait (detach what is running).
+  setAwaitTerminationMillisWhenShutdown(ms: number): this {
+    this.awaitTerminationMillisWhenShutdown = Math.max(0, Math.floor(ms));
+    return this;
+  }
+  getAwaitTerminationMillisWhenShutdown(): number { return this.awaitTerminationMillisWhenShutdown; }
   setPullBatchSize(n: number): this { this.pullBatchSize = n; return this; }
   setPullBatchSizeInBytes(n: number): this { this.pullBatchSizeInBytes = n; return this; }
   setPullInterval(ms: number): this { this.pullInterval = ms; return this; }
@@ -707,8 +725,10 @@ export class DefaultMQPushConsumer {
     // Wait (bounded) for in-flight batches — the listener call and its
     // send-back. Without this window an immediate process exit can cut a
     // CONSUMER_SEND_MSG_BACK(36) short and the message never reaches
-    // %RETRY%/%DLQ%.
-    await this._waitInFlightDrain(30000);
+    // %RETRY%/%DLQ%. The budget is awaitTerminationMillisWhenShutdown (Java
+    // DefaultMQPushConsumer#setAwaitTerminationMillisWhenShutdown); 0 means do
+    // not wait at all, which detaches whatever is running.
+    await this._waitInFlightDrain(this.awaitTerminationMillisWhenShutdown);
     // Persist a second time at the end, mirroring the MQClient instance's
     // flush on shutdown: offsets the
     // drain just advanced must land too.

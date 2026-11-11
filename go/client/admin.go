@@ -39,6 +39,10 @@ import (
 // DefaultAdminTimeoutMillis is the classic admin default timeout (5000 * 3).
 const DefaultAdminTimeoutMillis = int64(5000 * 3)
 
+// DefaultAdminExtGroup is Java DefaultMQAdminExt's default adminExtGroup. Same string as the
+// other ports.
+const DefaultAdminExtGroup = "admin_ext_group"
+
 // adminReadPermByDefault is the protocol's default topic permission
 // (READ | WRITE).
 const adminReadPermByDefault = int32(common.PermRead | common.PermWrite)
@@ -71,6 +75,11 @@ type DefaultMQAdminExt struct {
 	// MaxPageSizeInGetMetadata is the page size sent as maxTopicNum /
 	// maxGroupNum by the metadata paging loops (default 2000).
 	MaxPageSizeInGetMetadata int
+	// AdminExtGroup is Java DefaultMQAdminExt's adminExtGroup ("admin_ext_group"
+	// by default): the group identity the admin announces. This port's admin
+	// sends no synthetic consumer heartbeat, so nothing travels on the wire
+	// under this name; it exists so Java-configured code keeps its meaning.
+	adminExtGroup string
 
 	mqClient *Instance
 	started  bool
@@ -83,7 +92,22 @@ func NewDefaultMQAdminExt(rpcHook remoting.RPCHook) *DefaultMQAdminExt {
 		RpcHook:                      rpcHook,
 		TimeoutMillis:                DefaultAdminTimeoutMillis,
 		MaxPageSizeInGetMetadata:     DefaultMaxPageSizeInGetMetadata,
+		adminExtGroup:                DefaultAdminExtGroup,
 	}
+}
+
+// SetAdminExtGroup is Java DefaultMQAdminExt#setAdminExtGroup.
+func (a *DefaultMQAdminExt) SetAdminExtGroup(group string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.adminExtGroup = group
+}
+
+// AdminExtGroup reports the group identity (Java #getAdminExtGroup).
+func (a *DefaultMQAdminExt) AdminExtGroup() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.adminExtGroup
 }
 
 // SetNamesrvAddr sets the nameserver list from a `;`-separated string.

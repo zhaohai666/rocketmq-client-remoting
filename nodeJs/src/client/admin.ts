@@ -241,6 +241,11 @@ export class DefaultMQAdminExt {
   setNameServerAddressList(addrs: string[]): void { this.namesrvAddr = addrs.join(';'); }
   setInstanceName(name: string): void { this.instanceName = name; }
   setUnitName(unitName: string): void { this.unitName = unitName; }
+  // Java DefaultMQAdminExt#setAdminExtGroup / #getAdminExtGroup. The group identity the admin
+  // announces; this port's admin sends no synthetic consumer heartbeat, so nothing travels
+  // under this name — present for Java-configured code and for the start/shutdown log lines.
+  setAdminExtGroup(group: string): void { this.adminExtGroup = group; }
+  getAdminExtGroup(): string { return this.adminExtGroup; }
   setVipChannelEnabled(enable: boolean): void {
     this.vipChannelEnabled = enable;
     // The offset / consumer-list requests are issued on the shared instance, so

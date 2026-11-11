@@ -60,6 +60,8 @@ pub const DEFAULT_QUERY_MESSAGE_MAX_NUM: i32 = 32;
 pub const NAMESPACE_ORDER_TOPIC_CONFIG: &str = "ORDER_TOPIC_CONFIG";
 /// Default page size for the metadata paging calls (`maxTopicNum` / `maxGroupNum`).
 pub const DEFAULT_MAX_PAGE_SIZE_IN_GET_METADATA: i32 = 2000;
+/// Java DefaultMQAdminExt's default adminExtGroup. Same string as the other ports.
+pub const DEFAULT_ADMIN_EXT_GROUP: &str = "admin_ext_group";
 /// The query window upper bound of `query_message_by_uniq_key` (`now + 60 * 60 * 1000`).
 const UNIQ_QUERY_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
 
@@ -79,6 +81,10 @@ pub struct AdminConfig {
     /// Page size sent as `maxTopicNum` / `maxGroupNum` when paging metadata (default 2000).
     pub max_page_size_in_get_metadata: i32,
     pub kv_namespace_to_delete_list: Vec<String>,
+    /// Java DefaultMQAdminExt's adminExtGroup ("admin_ext_group" by default): the group identity
+    /// the admin announces. This port's admin sends no synthetic consumer heartbeat, so nothing
+    /// travels on the wire under this name; present so Java-configured code keeps its meaning.
+    pub admin_ext_group: String,
 }
 
 impl Default for AdminConfig {
@@ -96,6 +102,7 @@ impl Default for AdminConfig {
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
             max_page_size_in_get_metadata: DEFAULT_MAX_PAGE_SIZE_IN_GET_METADATA,
             kv_namespace_to_delete_list: Vec::new(),
+            admin_ext_group: DEFAULT_ADMIN_EXT_GROUP.to_string(),
         }
     }
 }
@@ -590,6 +597,17 @@ impl DefaultMQAdminExt {
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
+    }
+
+    /// Java `DefaultMQAdminExt#setAdminExtGroup`.
+    pub fn set_admin_ext_group(&self, group: &str) {
+        let group = group.to_string();
+        self.update_config(|c| c.admin_ext_group = group);
+    }
+
+    /// Java `DefaultMQAdminExt#getAdminExtGroup`.
+    pub fn admin_ext_group(&self) -> String {
+        read_cfg(&self.inner.cfg).admin_ext_group
     }
 
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
@@ -7906,5 +7924,21 @@ mod tests {
             .expect_err("the broker error must surface");
         assert_eq!(err.response_code(), Some(response_code::SYSTEM_ERROR));
         admin.shutdown();
+    }
+
+    /// Java `DefaultMQAdminExt#setAdminExtGroup` / `#getAdminExtGroup` ("admin_ext_group" by
+    /// default). This port's admin sends no synthetic consumer heartbeat, so the value has no
+    /// wire effect -- it exists so Java-configured code keeps its meaning, and it must at least
+    /// round-trip.
+    #[test]
+    fn admin_ext_group_matches_java() {
+        assert_eq!(DEFAULT_ADMIN_EXT_GROUP, "admin_ext_group");
+        let admin = DefaultMQAdminExt::new();
+        assert_eq!(admin.admin_ext_group(), "admin_ext_group");
+        admin.set_admin_ext_group("custom-admin-group");
+        assert_eq!(admin.admin_ext_group(), "custom-admin-group");
+        // A config built by hand (the examples' shape) carries the default too.
+        let configured = DefaultMQAdminExt::with_config(AdminConfig::default());
+        assert_eq!(configured.admin_ext_group(), DEFAULT_ADMIN_EXT_GROUP);
     }
 }

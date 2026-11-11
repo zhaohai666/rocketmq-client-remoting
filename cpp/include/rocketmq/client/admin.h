@@ -113,6 +113,13 @@ public:
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
+    // Java DefaultMQAdminExt#setAdminExtGroup / #getAdminExtGroup ("admin_ext_group" by
+    // default): the group identity the admin announces. This port's admin sends no synthetic
+    // consumer heartbeat, so nothing travels on the wire under this name; present so
+    // Java-configured code keeps its meaning.
+    void setAdminExtGroup(const std::string& group) { adminExtGroup_ = group; }
+    const std::string& getAdminExtGroup() const { return adminExtGroup_; }
+
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
     const std::string& unitName() const { return unitName_; }
     // When true every request carries the extension field `ReqT=0`, and the clientId gains a trailing `@STREAM` segment.
@@ -641,6 +648,8 @@ private:
     AdminToolResult<T> adminToolExecute(const std::function<AdminToolResult<T>()>& handler) const;
 
     std::string instanceName_;
+    // Java DefaultMQAdminExt's adminExtGroup default.
+    std::string adminExtGroup_ = "admin_ext_group";
     std::string clientId_;
     std::string unitName_;
     std::string namespaceV2_;

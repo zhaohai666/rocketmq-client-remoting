@@ -58,6 +58,10 @@ logger = get_logger()
 # (the admin implementation's own default, not the facade constructor's 5000).
 DEFAULT_TIMEOUT = 20000
 
+# Java DefaultMQAdminExt's default adminExtGroup ("admin_ext_group"): the group identity the
+# admin announces. Same string as the other ports.
+DEFAULT_ADMIN_EXT_GROUP = "admin_ext_group"
+
 NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG"
 
 # Hardcoded budgets of the admin RPC families that do not follow the admin default:
@@ -142,6 +146,11 @@ class DefaultMQAdminExt:
         self.rpc_hook = rpc_hook
         self.kv_namespace_to_delete_list: List[str] = []
         self.timeout_millis = int(kwargs.get("timeout_millis", DEFAULT_TIMEOUT))
+        # Java DefaultMQAdminExt#setAdminExtGroup / #getAdminExtGroup, default "admin_ext_group".
+        # It is the admin's own group identity (Java keys the admin registration by it); this
+        # port's admin sends no synthetic consumer heartbeat, so nothing goes on the wire under
+        # this name -- it exists so Java-configured code keeps its meaning.
+        self.admin_ext_group = str(kwargs.get("admin_ext_group", DEFAULT_ADMIN_EXT_GROUP))
         self.max_page_size_in_get_metadata = int(
             kwargs.get("max_page_size_in_get_metadata", 2000))
         self._mq_client: Optional[MQClientInstance] = None
@@ -156,6 +165,14 @@ class DefaultMQAdminExt:
 
     def set_instance_name(self, name: str) -> None:
         self.instance_name = name
+
+    def set_admin_ext_group(self, admin_ext_group: str) -> None:
+        """Java DefaultMQAdminExt#setAdminExtGroup."""
+        self.admin_ext_group = str(admin_ext_group)
+
+    def get_admin_ext_group(self) -> str:
+        """Java DefaultMQAdminExt#getAdminExtGroup."""
+        return self.admin_ext_group
 
     def set_unit_name(self, unit_name: Optional[str]) -> None:
         pass

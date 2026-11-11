@@ -110,9 +110,19 @@ class DefaultMQAdminExt
     /** Namespace name storing the order route config in the NameServer KV. */
     public const NAMESPACE_ORDER_TOPIC_CONFIG = 'ORDER_TOPIC_CONFIG';
 
+    /** Java DefaultMQAdminExt's default adminExtGroup. Same string as the other ports. */
+    public const DEFAULT_ADMIN_EXT_GROUP = 'admin_ext_group';
+
     public string $namespace;
 
     public string $instanceName = 'ADMIN';
+
+    /**
+     * The admin's own group identity — Java DefaultMQAdminExt#setAdminExtGroup /
+     * #getAdminExtGroup. This port's admin sends no synthetic consumer heartbeat, so nothing
+     * travels on the wire under this name; it exists so Java-configured code keeps its meaning.
+     */
+    public string $adminExtGroup = self::DEFAULT_ADMIN_EXT_GROUP;
 
     public ?string $clientId = null;
 
@@ -216,6 +226,18 @@ class DefaultMQAdminExt
     public function setInstanceName(string $name): void
     {
         $this->instanceName = $name;
+    }
+
+    /** Java DefaultMQAdminExt#setAdminExtGroup. */
+    public function setAdminExtGroup(string $group): void
+    {
+        $this->adminExtGroup = $group;
+    }
+
+    /** Java DefaultMQAdminExt#getAdminExtGroup. */
+    public function getAdminExtGroup(): string
+    {
+        return $this->adminExtGroup;
     }
 
     /** Unit name: affects the clientId suffix and the dynamic address-lookup URL. */

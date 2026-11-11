@@ -58,12 +58,18 @@ public sealed class DefaultMQAdminExt
 {
     // Corresponds to DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
     public const int DefaultTimeout = 5000 * 3;
+    // Java DefaultMQAdminExt's default adminExtGroup.
+    public const string DefaultAdminExtGroup = "admin_ext_group";
 
     private string _instanceName;
     private string _clientId = string.Empty;
     private List<string> _nameServerAddrs = new();
     private readonly List<string> _kvNamespaceToDeleteList = new();
     private int _timeoutMillis = DefaultTimeout;
+    // The admin's own group identity (Java adminExtGroup). This port's admin sends no synthetic
+    // consumer heartbeat, so nothing travels on the wire under this name; present so
+    // Java-configured code keeps its meaning.
+    private string _adminExtGroup = DefaultAdminExtGroup;
 
     private MQClientInstance? _mqClient;
     private bool _started;
@@ -96,6 +102,14 @@ public sealed class DefaultMQAdminExt
 
     /// <summary>Change instanceName at runtime (does not rebuild the client).</summary>
     public void SetInstanceName(string name) => _instanceName = name;
+
+    /// <summary>Java <c>DefaultMQAdminExt#setAdminExtGroup</c>.</summary>
+    public void SetAdminExtGroup(string group) => _adminExtGroup = group;
+
+    /// <summary>Java <c>DefaultMQAdminExt#getAdminExtGroup</c>.</summary>
+    public string GetAdminExtGroup() => _adminExtGroup;
+
+    public string AdminExtGroup => _adminExtGroup;
 
     /// <summary>instanceName is rewritten in place by Start(), so this reads the actual post-start value.</summary>
     public string GetInstanceName() => _instanceName;
