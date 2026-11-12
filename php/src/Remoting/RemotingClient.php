@@ -461,6 +461,27 @@ final class RemotingClient
     {
         $this->applyBeforeRequestHooks($addr, $cmd);
         $conn = $this->getOrCreateConn($addr);
+        // Liveness probe (one zero-timeout read): a socket the peer already closed still
+        // accepts writes locally — the frame goes into the kernel buffer and dies there, so a
+        // oneway command (END_TRANSACTION is oneway!) is lost with ZERO feedback, and a sync
+        // request pays a full read timeout before the EOF is even noticed. Draining first
+        // surfaces the EOF now: the frame then goes out on a freshly reconnected socket, and
+        // any bytes the peer queued before closing are dispatched instead of sitting unread
+        // ahead of the answer we are about to wait for (2026-11-12: "send after a 130s idle"
+        // surfaced "write timeout" on a dead nameserver connection, and the transaction
+        // COMMIT leg lost its oneway END_TRANSACTION the same way).
+        if (!$this->readFrom($addr, $conn) || ($this->conns[$addr] ?? null) !== $conn
+            || !$this->readFrom($addr, $conn) || ($this->conns[$addr] ?? null) !== $conn) {
+            // EOF (readFrom already failed the channel) or a dispatched frame closed/replaced
+            // the connection while draining: write on a fresh socket, never on the dead one.
+            // The probe reads TWICE, and that second read is load-bearing: on non-blocking
+            // streams the FIRST fread that hits a peer-close returns '' with feof() still
+            // false -- the EOF flag only turns true on the NEXT read (measured on macOS:
+            // single-read probe -> EOF missed -> frame written into the dead socket ->
+            // the later pump detects it and failFast throws 'connection closed' at the
+            // caller, elapsed 0ms, no reconnect). flaky 2/3 before the double read, 0/5 after.
+            $conn = $this->getOrCreateConn($addr);
+        }
         $data = $cmd->encode();
         try {
             $this->writeAll($conn, $data, $this->invokeTimeoutMillis / 1000.0);
@@ -472,6 +493,37 @@ final class RemotingClient
         // clock restarts here.
         $this->lastActivityMillis[$addr] = self::monoMillis();
         return $conn;
+    }
+
+    /**
+     * One zero-timeout drain pass over every open connection: reads whatever is pending and
+     * dispatches it, and drops connections the peer has closed. PHP has no IO thread; the
+     * broker-initiated requests (CHECK_TRANSACTION_STATE 39, PUSH_REPLY_MESSAGE_TO_CLIENT 326,
+     * NOTIFY_*) ride channels this instance may not be actively waiting on, so a host that
+     * never pumps (e.g. a consumer-driven wait while the producer's channel holds the
+     * transaction check-back) gets them delivered here instead of leaving half messages
+     * parked in RMQ_SYS_TRANS_HALF_TOPIC forever. Returns the number of connections that had
+     * data or EOF.
+     */
+    public function drainIncoming(): int
+    {
+        $touched = 0;
+        foreach (array_keys($this->conns) as $addr) {
+            $conn = $this->conns[$addr] ?? null;
+            if ($conn === null || !is_resource($conn)) {
+                continue;
+            }
+            $r = [$conn];
+            $w = [];
+            $e = [];
+            $n = @stream_select($r, $w, $e, 0, 0);
+            if ($n === false || $n === 0 || $r === []) {
+                continue;
+            }
+            $touched++;
+            $this->readFrom($addr, $conn);
+        }
+        return $touched;
     }
 
     private function writeAll($conn, string $data, float $budgetSec): void

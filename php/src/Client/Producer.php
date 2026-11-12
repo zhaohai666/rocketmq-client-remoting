@@ -1430,6 +1430,24 @@ class DefaultMQProducer
         $this->startTraceDispatcher();
     }
 
+    /**
+     * One round of the client instance's periodic work — the PHP-threadless substitute for the
+     * Netty IO thread plus the scheduled tasks. For a producer the load-bearing part is the
+     * inbound drain: the broker's transaction check-back CHECK_TRANSACTION_STATE(39) arrives on
+     * THIS producer's channel, and a host that only ticks consumers never reads it — the half
+     * message whose commit leg was lost (or that answered UNKNOW) then stays parked in
+     * RMQ_SYS_TRANS_HALF_TOPIC forever, i.e. "SEND_OK, local commit executed, but the message
+     * is invisible" (2026-11-12 live S1c/S3). tick() also carries the heartbeat that keeps a
+     * producer-only group registered and the idle-connection sweep. Long-running producer
+     * hosts should call this on a loop; short scripts get the drain riding every send.
+     */
+    public function tick(): void
+    {
+        if ($this->mqClient !== null) {
+            $this->mqClient->tick();
+        }
+    }
+
     private function startTraceDispatcher(): void
     {
         if ($this->enableTrace) {

@@ -972,10 +972,34 @@ final class RunRemoting
         $client4 = new RemotingClient(1000, 5000);
         $connF = self::connectAndAccept($client4, $addr4, $server4);
 
-        // 4a. sync: connection already closed by the server -> RemotingSendRequestException (not a timeout)
+        // 4a. sync: connection already closed by the server -> transparent reconnect. Java
+        // parity: a dead cached channel never surfaces as an error — the send() liveness probe
+        // drains the EOF first, reconnects, and the frame goes out on the FRESH socket (the
+        // 2026-11-12 defect: the frame was written into the dead socket, "succeeding" locally
+        // while dying in the kernel buffer — a oneway command is then lost with zero feedback
+        // and a sync request pays a full write/read timeout). The caller only ever sees the
+        // server's silence (timeout), never the stale channel.
         $reqF = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
-        fclose($connF); // server side closes; the client will reconnect on next send
-        $this->checkThrows(static fn(): RemotingCommand => $client4->invokeSync($addr4, $reqF, 5000), RemotingSendRequestException::class, 'connection closed -> sync throws RemotingSendRequestException');
+        fclose($connF); // server side closes; the client must NOT write into the dead socket
+        $t4a = microtime(true);
+        $err4a = null;
+        try {
+            $client4->invokeSync($addr4, $reqF, 2000);
+        } catch (\Throwable $e) {
+            $err4a = $e;
+        }
+        $elapsed4a = (int) ((microtime(true) - $t4a) * 1000);
+        $connF1 = stream_socket_accept($server4, 2);
+        $this->check(is_resource($connF1), 'connection closed -> the request went out on a reconnected socket (no silent loss)');
+        if (is_resource($connF1)) {
+            stream_set_blocking($connF1, true);
+            self::readFrame($connF1); // the frame must be ON the new connection
+            fclose($connF1);
+        }
+        $this->check($err4a instanceof RemotingTimeoutException, 'no response -> the caller sees the server silence as a timeout',
+            $err4a !== null ? get_class($err4a) : 'no exception');
+        $this->check(!$err4a instanceof RemotingSendRequestException, 'the dead channel itself never surfaces to the caller');
+        $this->check($elapsed4a < 4500, 'the reconnect + wait stays inside the budget', $elapsed4a . 'ms');
 
         // 4b. async: connection drops after the request is sent, before the response -> onFailure(RemotingSendRequestException)
         $asyncErr4 = null;

@@ -773,6 +773,17 @@ class MQClientInstance
             Logger::warning('transport idle sweep exception: ' . $e->getMessage());
         }
 
+        // (0b) Inbound drain: broker-initiated requests ride channels this instance may not be
+        //   actively waiting on. CHECK_TRANSACTION_STATE(39) arrives on the PRODUCER's channel
+        //   while the host may only be ticking consumers; without a drain the check-back is
+        //   never read, the half message stays parked in RMQ_SYS_TRANS_HALF_TOPIC, and a
+        //   committed transaction looks "invisible" forever (2026-11-12 live S1c).
+        try {
+            $this->remotingClient->drainIncoming();
+        } catch (\Throwable $e) {
+            Logger::warning('transport inbound drain exception: ' . $e->getMessage());
+        }
+
         if (!$this->started) {
             return;
         }
