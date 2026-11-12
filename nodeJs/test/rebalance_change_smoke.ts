@@ -126,7 +126,9 @@ async function harness(group: string, pop = false): Promise<any> {
     notifications.push({ topic, all: mqAll.length, divided: mqDivided.length }));
   // Offline stubs for the background work a rebuild kicks off; the table rebuild,
   // the version stamping, the beat and the notification all run for real.
-  c.computePullFromWhere = async () => -1;
+  // A real cursor: a queue whose compute "fails" is now dropped from the round
+  // (fail-visible, rebalance_stall_repair_smoke), so the stub must resolve.
+  c.computePullFromWhere = async () => 42;
   c._queuePullLoop = async () => {};
   c._sleepOrStop = async () => true;
   client.popMessage = async () => { throw new Error('no broker in this smoke'); };

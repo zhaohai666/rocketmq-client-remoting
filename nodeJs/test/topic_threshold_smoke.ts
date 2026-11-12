@@ -250,7 +250,9 @@ async function rebalanceHarness(group: string): Promise<any> {
   // Offline stubs for the loops the rebalance kicks off: the pull kernel and
   // the initial-offset RPC are covered by other suites; the table rebuild —
   // the part the division's ORDER depends on — runs for real.
-  c.computePullFromWhere = async () => -1;
+  // A real cursor: a queue whose compute "fails" is now dropped from the round
+  // (fail-visible, rebalance_stall_repair_smoke), so the stub must resolve.
+  c.computePullFromWhere = async () => 42;
   c._queuePullLoop = async () => {};
   return c;
 }

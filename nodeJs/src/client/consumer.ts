@@ -949,7 +949,6 @@ export class DefaultMQPushConsumer {
   async doRebalance(): Promise<void> {
     if (!this.mqClient || !this.started) return;
     const client = this.mqClient;
-    const was = new Set(this.assigned.map(mqKey));
     const wasByTopic = queuesByTopicKeySet(this.assigned);
     const topics = Array.from(this.subscription.keys()).sort();
     const assigned: MessageQueue[] = [];
@@ -993,12 +992,26 @@ export class DefaultMQPushConsumer {
     const skipped: MessageQueue[] = [];
     if (!this.popMode) {
       for (const mq of assigned) {
-        if (was.has(mqKey(mq))) continue;
-        if (!this.subscription.has(mq.getTopic())) continue;
+        // The gate is "does this queue still have a live cursor", NOT "was it
+        // assigned before". A queue that stayed assigned can still lose its
+        // offsetTable entry: syncPullLoops' self-heal sweep and the OFFSET_ILLEGAL
+        // fix both route through _retireQueue, which deletes it (Java: the same
+        // removeOffset on revoke). Gating on the previous assignment skipped the
+        // recompute for exactly those queues, so the rebuilt pull loop read
+        // offset === undefined, spun silently in its backoff branch, and the
+        // queue never pulled again (2026-11-12: orderly/transaction live test).
         if (this.offsetTable.has(mqKey(mq))) continue;
+        if (!this.subscription.has(mq.getTopic())) continue;
         try {
           const next = await this.computePullFromWhere(mq);
-          if (next < 0) continue;
+          if (next < 0) {
+            // Same fail-visible semantics as the catch below: an owned queue
+            // with no cursor means the rebuilt pull loop spins on
+            // offset === undefined forever. Drop it from this round; the next
+            // round retries the compute.
+            skipped.push(mq);
+            continue;
+          }
           if (!this.offsetTable.has(mqKey(mq))) this.offsetTable.set(mqKey(mq), next);
           if (this.offsetStore) this.offsetStore.updateOffset(mq, next, false);
         } catch (e) {
@@ -1408,6 +1421,9 @@ export class DefaultMQPushConsumer {
       if (offset === undefined) {
         // No cursor for this queue yet, so the round never reached the wire:
         // a failed round like any other, so it waits the generic backoff.
+        // Logged at debug so a queue stuck here is diagnosable — this branch
+        // spinning forever was the 2026-11-12 permanent-stall defect.
+        logger.debug('no cursor yet for %s, wait for the next rebalance round', key);
         if (await this._sleepOrStop(retryDelayMillis, stopFlag)) return;
         continue;
       }
