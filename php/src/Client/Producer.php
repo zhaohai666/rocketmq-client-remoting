@@ -1221,6 +1221,24 @@ class DefaultMQProducer
         }
     }
 
+    /**
+     * Drive one round of the trace dispatcher's flush loop. PHP has no background thread; the
+     * Java AsyncTraceDispatcher flushes from its own worker (batchNum or 5s interval), the PHP
+     * equivalent pumps here after each send so Pub trace records leave the queue even when the
+     * process stays alive without reaching shutdown(). pumpOnce() only sends when the queue has
+     * batchNum contexts or 5s passed since the last flush, so this is free in the common case.
+     */
+    private function pumpTraceDispatcher(): void
+    {
+        if ($this->traceDispatcher !== null && $this->traceDispatcher->isStarted) {
+            try {
+                $this->traceDispatcher->pumpOnce();
+            } catch (\Throwable $e) {
+                Logger::debug('trace dispatcher pump error: ' . $e->getMessage());
+            }
+        }
+    }
+
     private function buildSendContext(
         Message $msg,
         MessageQueue $mq,
@@ -1320,10 +1338,12 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             $context->exception = $e;
             $this->executeSendMessageHookAfter($context);
+            $this->pumpTraceDispatcher();
             throw $e;
         }
         $context->sendResult = $result;
         $this->executeSendMessageHookAfter($context);
+        $this->pumpTraceDispatcher();
         return $result;
     }
 
@@ -2346,6 +2366,7 @@ class DefaultMQProducer
                 $context->exception = $error;
             }
             $this->executeSendMessageHookAfter($context);
+            $this->pumpTraceDispatcher();
         }
         try {
             if ($error === null) {

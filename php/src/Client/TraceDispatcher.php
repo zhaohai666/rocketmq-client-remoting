@@ -219,7 +219,12 @@ final class AsyncTraceDispatcher
             $this->isStarted = true;
         }
         $this->accessChannel = $accessChannel ?? AccessChannel::LOCAL;
-        // PHP has no threads: do not start a worker; flushing is driven explicitly by flush()/pumpOnce().
+        // PHP has no threads: do not start a worker. The Java dispatcher drives
+        // flushTraceContext from a background loop (batchNum or 5s interval, AsyncTraceDispatcher
+        // 240-287); the PHP equivalent is host-driven: the consumer pumps from PushConsumer::tick()
+        // and the producer pumps from its send paths via pumpOnce(). Forgetting the pump means
+        // SubBefore/SubAfter records pile up in traceContextQueue and the trace topic stays empty
+        // (2026-11-12 live-cluster root cause of "consumed but no consume trace" on the PHP side).
         $this->stopped = false;
     }
 

@@ -1193,6 +1193,13 @@ final class DefaultMQPushConsumer
                 Logger::debug('persist offsets error: ' . $e->getMessage());
             }
         }
+
+        // 9) Trace flush. PHP has no background thread; the Java dispatcher's flush loop
+        //    (batchNum or 5s interval) is driven here so SubBefore/SubAfter reach the trace
+        //    topic while the consumer keeps running instead of only on shutdown().
+        if ($this->traceDispatcher !== null && $this->traceDispatcher->isStarted) {
+            $this->traceDispatcher->pumpOnce();
+        }
     }
 
     /** Alias of tick(). */

@@ -919,6 +919,45 @@ namespace {
             $this->checkSame(true, $d->stopped, 'shutdown sets stopped');
         }
 
+        private function testDispatcherPumpBelowThresholdKeepsQueue(): void
+        {
+            $d = self::makeDispatcher();
+            $d->append(self::pubContext());
+            $d->pumpOnce(false);
+            $this->checkSame([], $d->traceProducer->sent,
+                'pumpOnce below batchNum and within the interval sends nothing');
+            $this->checkSame(1, count($d->traceContextQueue),
+                'pumpOnce below batchNum and within the interval keeps the context queued');
+        }
+
+        private function testDispatcherPumpBatchDrivenFlush(): void
+        {
+            $d = self::makeDispatcher();
+            for ($i = 0; $i < $d->batchNum; $i++) {
+                $d->append(self::pubContext(msgId: MSG_ID_1 . '_' . $i));
+            }
+            $d->pumpOnce(false);
+            $this->checkSame(1, count($d->traceProducer->sent),
+                'pumpOnce flushes once the queue holds batchNum contexts');
+            $this->checkSame(0, count($d->traceContextQueue), 'the batch flush drains the queue');
+            $records = substr_count((string) $d->traceProducer->sent[0][1], STX);
+            $this->checkSame($d->batchNum, $records, 'the flushed body carries one record per context');
+        }
+
+        private function testDispatcherPumpTimeDrivenFlush(): void
+        {
+            $d = self::makeDispatcher();
+            $d->append(self::pubContext());
+            // Simulate the 5s flush window having elapsed (Java: the AsyncTraceDispatcher thread
+            // wakes up and takes the interval branch of flushTraceContext; PHP: the host's
+            // tick/send path calls pumpOnce() on the same cadence).
+            $d->lastFlushTime -= AsyncTraceDispatcher::FLUSH_TRACE_INTERVAL + 1;
+            $d->pumpOnce(false);
+            $this->checkSame(1, count($d->traceProducer->sent),
+                'pumpOnce flushes when the flush interval has elapsed');
+            $this->checkSame(0, count($d->traceContextQueue), 'the interval flush drains the queue');
+        }
+
         // ============================================================ Send hook
 
         private function testSendHookRoundTrip(): void
@@ -1174,6 +1213,9 @@ namespace {
             $this->testDispatcherSplitsOverMaxSize();
             $this->testDispatcherQueueFullDiscards();
             $this->testDispatcherShutdownFlushes();
+            $this->testDispatcherPumpBelowThresholdKeepsQueue();
+            $this->testDispatcherPumpBatchDrivenFlush();
+            $this->testDispatcherPumpTimeDrivenFlush();
             $this->testSendHookRoundTrip();
             $this->testSendHookSkipsTraceTopicItself();
             $this->testSendHookSkipsTraceOffOrNoRegion();
