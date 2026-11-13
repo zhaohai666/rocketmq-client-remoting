@@ -362,6 +362,8 @@ final class DefaultMQPushConsumer
 
     // ---- Message trace ----
     public bool $enableTrace = false;
+    /** Trace dispatch channel (LOCAL by default; mirrors Java ClientConfig#accessChannel). */
+    public AccessChannel $accessChannel = AccessChannel::LOCAL;
     public ?string $traceTopic = null;
     public int $traceMsgBatchNum = 10;
     /** @var list<object> */
@@ -606,6 +608,16 @@ final class DefaultMQPushConsumer
     public function setTraceTopic(?string $topic): void
     {
         $this->traceTopic = $topic;
+    }
+
+    public function setAccessChannel(AccessChannel $ch): void
+    {
+        $this->accessChannel = $ch;
+    }
+
+    public function getAccessChannel(): AccessChannel
+    {
+        return $this->accessChannel;
     }
 
     public function registerConsumeMessageHook(object $hook): void
@@ -879,7 +891,7 @@ final class DefaultMQPushConsumer
         }
         if ($this->traceDispatcher !== null) {
             try {
-                $this->traceDispatcher->start(implode(';', $this->nameServerAddrs), AccessChannel::LOCAL);
+                $this->traceDispatcher->start(implode(';', $this->nameServerAddrs), $this->getAccessChannel());
             } catch (\Throwable $e) {
                 Logger::warning('trace dispatcher start failed: ' . $e->getMessage());
             }
@@ -3211,7 +3223,7 @@ final class DefaultMQPushConsumer
         $context = new ConsumeMessageContext($this->consumerGroup, $msgs, $mq);
         $context->success = false;
         $context->props = [];
-        $context->accessChannel = AccessChannel::LOCAL;
+        $context->accessChannel = $this->getAccessChannel();
         return $context;
     }
 

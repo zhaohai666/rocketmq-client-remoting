@@ -405,6 +405,11 @@ type DefaultMQProducer struct {
 	traceMsgBatchNum int
 	traceTopic       string
 	traceDispatcher  *AsyncTraceDispatcher
+	// accessChannel selects the trace topic flavour: LOCAL (default) writes to
+	// the system trace topic, CLOUD writes to rmq_sys_TRACE_DATA_<region>. It is
+	// forwarded to the dispatcher at Start and copied into consume hook contexts.
+	// Mirrors Java ClientConfig#accessChannel.
+	accessChannel string
 	// enableTraceContext is the W3C traceparent passthrough switch; it is
 	// independent of enableTrace and defaults from ROCKETMQ_TRACE_CONTEXT_ENABLE.
 	enableTraceContext bool
@@ -499,6 +504,7 @@ func NewDefaultMQProducer(producerGroup string) (*DefaultMQProducer, error) {
 		enableConcurrentHeartbeat:         false,
 		concurrentHeartbeatThreadPoolSize: 0,
 		traceMsgBatchNum:                  defaultTraceMsgBatchNum,
+		accessChannel:                     AccessChannelLocal,
 		enableTraceContext:                TraceContextEnabledFromEnv(),
 		retryResponseCodes: map[int32]struct{}{
 			// RetryResponseCodes: only these codes
@@ -693,6 +699,14 @@ func (p *DefaultMQProducer) SetEnableTrace(enable bool) { p.enableTrace = enable
 // IsEnableTrace reports the tracing switch.
 func (p *DefaultMQProducer) IsEnableTrace() bool { return p.enableTrace }
 
+// SetAccessChannel selects the trace access channel. LOCAL (the default)
+// writes to the system trace topic; CLOUD writes to rmq_sys_TRACE_DATA_<region>.
+// Mirrors Java ClientConfig#setAccessChannel.
+func (p *DefaultMQProducer) SetAccessChannel(ch string) { p.accessChannel = ch }
+
+// GetAccessChannel reports the current trace access channel.
+func (p *DefaultMQProducer) GetAccessChannel() string { return p.accessChannel }
+
 // SetTraceMsgBatchNum sets how many trace records are batched before a flush;
 // the dispatcher caps it at 20.
 func (p *DefaultMQProducer) SetTraceMsgBatchNum(n int) { p.traceMsgBatchNum = n }
@@ -885,6 +899,7 @@ func (p *DefaultMQProducer) startTraceDispatcher() {
 	group := p.producerGroup
 	nameSrv := strings.Join(p.nameServerAddrs, ";")
 	rpcHook := p.rpcHook
+	accessChannel := p.accessChannel
 	dispatcher := p.traceDispatcher
 	if enable && dispatcher == nil {
 		dispatcher = NewAsyncTraceDispatcher(group, TraceDispatcherProduce, batchNum, topic, rpcHook)
@@ -898,7 +913,7 @@ func (p *DefaultMQProducer) startTraceDispatcher() {
 		p.RegisterEndTransactionHook(NewEndTransactionTraceHook(dispatcher))
 	}
 	if dispatcher != nil {
-		if err := dispatcher.Start(nameSrv, AccessChannelLocal); err != nil {
+		if err := dispatcher.Start(nameSrv, accessChannel); err != nil {
 			common.LogWarnf("trace dispatcher start failed: %v", err)
 		}
 	}

@@ -87,7 +87,7 @@
 | 能力 | 参考实现出处 | live 入口 |
 |---|---|---|
 | SendMessage / ConsumeMessage / EndTransaction / CheckForbidden / FilterMessage 五类钩子 | `client.hook.*` | `live_hook`、`verify_hook_live.py` |
-| 消息轨迹（AsyncTraceDispatcher + RMQ_SYS_TRACE_TOPIC） | `client.trace.*` | `live_trace`、`verify_trace_live.py`（broker 需 traceTopicEnable=true） |
+| 消息轨迹（AsyncTraceDispatcher + RMQ_SYS_TRACE_TOPIC） | `client.trace.*` | `live_trace`、`verify_trace_live.py`（broker 需 traceTopicEnable=true）；CLOUD 路由见 `verify_trace_cloud_live.py` + `scripts/run_trace_cloud_live.sh`（§12.4） |
 | 消费侧 msgId 语义（`MessageClientExt.getMsgId()`=UNIQ_KEY parity） | `MessageClientExt.java:29-37`、`ConsumeMessageTraceHookImpl:70`、`MQClientAPIImpl:1691`、`DefaultMQPushConsumerImpl:792` | 七端统一 `clientMsgId(msg)` helper（非空 UNIQ_KEY 属性 ?: offset id）：SubBefore/SubAfter bean、send-back originMsgId、retry 兜底 ORIGIN_MESSAGE_ID 全走它；离线回归 `test_client_msg_id_parity`（py/cpp/cs/go/rs/node/php）+ 真机 trace 五腿（py/cpp/cs/rust/node）2026-11-10 全绿 |
 | **OpenTracing 钩子三件套** | `trace.hook.*OpenTracingHookImpl` | ✅七端全齐（2026-11-10 复核证伪旧结论）：可插拔 Tracer SPI 三 hook php `OpenTracingHook.php`、py `client/open_tracing_hook.py:90,138`、cpp `open_tracing_hook.h:92,135,193`、cs `OpenTracingHook.cs:79,109,190`、go `client/open_tracing_hook.go:76,118,173`、rs `open_tracing_hook.rs:91`、node `open_tracing_hook.ts:66,108`；另有 W3C traceparent 消息级透传接线到发送路径（py `client/trace_context.py`、cpp `client/trace_context.h`、cs `TraceParentContext.cs`、go `client/trace_context.go`、node `client/traceparent.ts`、rust `client/trace_context.rs`） |
 | recall 撤回 + 轨迹钩子 | `DefaultRecallMessageTraceHook` + RECALL 请求族 | 实现 7/7（py producer/trace、cpp `common/recall_message_handle.cpp`、go `common/recall_handle.go`、cs `Client/RecallMessageHandle.cs`、rust `common/recall_message_handle.rs`、node `common/recall_message_handle.ts`、php）；live 入口 ✅py（`verify_recall_live.py`）✅cpp（`recall_live.cpp`）✅cs（`LiveRecall.cs`）✅rust（`live_producer` P9 + `live_rebalance_and_trace`），🟡go/node/php 待补 |
@@ -112,8 +112,10 @@
 
 ## 10. 2026-11-11 与 Java 参考实现的能力对齐（本轮结论）
 
-逐条比对 Java 5.x `client`/`common`/`tools` 三个模块后，**真缺口 4 项**、**证伪 2 项**
-（两条是 2026-11-11 二次复核纠正的：①「有序 POP」首轮按行数误判成 P2 缺口，读方法体后确认
+逐条比对 Java 5.x `client`/`common`/`tools` 三个模块后，**真缺口 5 项**、**证伪 2 项**
+（第 5 项 `AccessChannel=CLOUD` 是 2026-11-13 由真机观察（轨迹只进 `RMQ_SYS_TRACE_TOPIC`）反查
+补入：dispatcher/encoder 的 region 分支七端早已齐备，缺的是门面入口与传值链路。
+两条证伪是 2026-11-11 二次复核纠正的：①「有序 POP」首轮按行数误判成 P2 缺口，读方法体后确认
 Java 自身即骨架 → 证伪；②「Pull `setEnableRebalance`」首轮误判成证伪，实际 Java 默认 true、
 七端确实缺整套 pull 侧重平衡 → 转为真缺口并补齐。见下方判定纪律）。
 每项的七端离线回归入口统一为 `capability_closeout`（py `tests/test_capability_closeout.py`、
@@ -128,6 +130,7 @@ node `test/capability_closeout_smoke.ts`、php `tests/RunCapabilityCloseout.php`
 | Push `setAwaitTerminationMillisWhenShutdown` | `DefaultMQPushConsumer.java:996-1002` | ✅ 七端齐（node 本轮补） | 其余六端早已有（默认 0=不等）；node 原本把 drain 预算写死 30000，现改为可配 + 保留 30000 默认（**有意 deviation**：进程立刻退出会截断 `CONSUMER_SEND_MSG_BACK(36)`，见 `shutdown()` 注释） |
 | Pull `setEnableRebalance` + pull 侧重平衡 | `DefaultMQPullConsumer.java:97,503-509` → `DefaultMQPullConsumerImpl#doRebalance/tryRebalance:388-406` → `RebalanceImpl#rebalanceByTopic` → `RebalancePullImpl#messageQueueChanged:44-53` | ✅ **七端补齐（2026-11-11 二次复核，此前误判为「证伪」）** | **旧结论错在哪**：首轮看到七端都写着 "no rebalance"，就把这当成「Java 也不需要」，判为证伪。实际 `DefaultMQPullConsumer.java:97` 是 `enableRebalance = true`——Java 的 pull consumer 由共享 `RebalanceService`（`waitInterval=20000ms` / `minInterval=1000ms`）周期驱动 `tryRebalance()`，计算分配并在**变化时**回调 `MessageQueueListener.messageQueueChanged(topic, mqAll, mqDivided)`；七端缺的是**驱动**，不是 listener 接口（七端本就都有 `MessageQueueListener`，cpp 甚至有独立头文件）。落地要点：`enableRebalance=false` 时 `tryRebalance` 必须回 **true**（回 false 会让循环每 1s 狂刷）；listener 抛异常必须吞掉（Java `:49-51`，否则一条坏回调冻死全部分配）；`cid_all` 拿不到时只 warn 不回调且保持 balanced；`fetchMessageQueuesInBalance` 优先读重平衡产出的表。deviation：每 facade 自起一条循环（Java 每 client instance 共享一条），可观测行为一致 |
 | Admin `setAdminExtGroup` / `getAdminExtGroup` | `DefaultMQAdminExt.java:85,105-111,706-712` | ✅ 七端补齐（七端均为新增，node 原只有构造参数） | 默认 `"admin_ext_group"`。Java 只用它做 admin 在 client 实例里的注册键 + 日志；七端 admin 不发合成 consumer 心跳，故**没有 wire 影响**，纯身份位。已按此写入各端注释，避免后来者误以为能改心跳组 |
+| `ClientConfig.setAccessChannel`（轨迹 CLOUD 路由入口） | `ClientConfig.java:53,444` → `DefaultMQProducer.java:401` / `DefaultMQPushConsumer.java:781` / `DefaultLitePullConsumer.java:239` → `AsyncTraceDispatcher#sendTraceData:305-322` | ✅ 七端补齐（2026-11-13） | dispatcher/encoder 的 CLOUD→`rmq_sys_TRACE_DATA_<regionId>` 分支七端**早已齐备但无入口**：①门面（producer + push consumer）缺 `setAccessChannel`，dispatcher 启动处写死 `LOCAL`；②消费 hook context 构造处写死 `LOCAL`（Java `ConsumeMessageConcurrentlyService:410` 等五处取门面值）；③node 额外两处深层缺口——flush 没有 CLOUD 分支（常量+encoder 是死的）、`TraceContext.accessChannel` 默认 `LOCAL`（Java `TraceContext:38` 默认 **null**，写死 LOCAL 会挡住「context 无值回落 dispatcher」的链路）、内部轨迹 producer 未挂 host rpcHook（ACL 集群上记录一条都发不出，Java `getAndCreateTraceProducer:167-177` 是 `new DefaultMQProducer(rpcHook)`）；cpp 内部 producer 同样未挂 hook（构造时补 `setRPCHook`）。regionId 来源（真机可验）：broker 把 `MSG_REGION=DefaultRegion`（`BrokerConfig:136` 默认）同时盖进 send 响应头（`SendMessageProcessor:716`）与消息属性（`AbstractSendMessageProcessor:374`），故 Pub（SendResult.region_id）与 Sub（消息属性）记录都带 regionId；region 主题 `rmq_sys_TRACE_DATA_*` 以 `rmq_sys_` 前缀命中 `TopicValidator.isSystemTopic:179-181`，broker 拒建——云上由平台预建，自建集群验证需 `validateSystemTopicWhenUpdateTopic=false`。离线回归：py `tests/test_trace.py`、cpp `tests/test_access_channel.cpp`、cs `TraceTests.cs`、go `client/access_channel_test.go`、rust producer/consumer/trace_dispatcher `#[cfg(test)]`、node `test/access_channel_smoke.ts`、php `tests/RunClientTrace.php` |
 | `MessageConst` 六个属性（`CORRECTION_FLAG`/`MQ2_FLAG`/`SHARDING_KEY`/`DLQ_ORIGIN_MESSAGE_ID`/`DLQ_ORIGIN_TOPIC`/`TRANSACTION_ID`） | `common/.../message/MessageConst.java` | ❌ **证伪，不是缺口** | 在 Java client 内**无调用者**（仅常量定义或 broker/proxy 侧使用）；reply 消息的 `PROPERTY_MESSAGE_TTL`（wire `"TTL"`）七端概念上已有 TTL 支持 |
 | 有序 POP 消费（`MessageListenerOrderly` + POP） | `client/.../consumer/ConsumeMessagePopOrderlyService.java:315-324` | ❌ **证伪，不是缺口**（2026-11-11 复核，**此前误判为 P2 缺口，已更正**） | Java 5.5.1 这个类**自己就是未完成的骨架**：`ConsumeRequest#run()` 取到锁对象后**方法即结束**——没有 `synchronized (objLock)`、不调 `messageListener.consumeMessage`、不 ack；本类的 `processConsumeResult` 是 `return true` 且**无任何调用者**；4 参 `submitConsumeRequest` 直接抛 `UnsupportedOperationException`。对照同目录的真实现即可分辨：`ConsumeMessageOrderlyService:397/462/517`（`synchronized` + `consumeMessage` + `processConsumeResult(msgs,…)`）、`ConsumeMessagePopConcurrentlyService:97`（`consumeMessage`）。故七端「有序监听 + POP 收不到消息、积压不下降」是与 Java 完全一致的 parity；python/cpp 的空转骨架（`python/tests/test_pop_orderly.py` 用断言锁死"不消费不 ack"）与 go 的「不请求有序 POP」（`client/pop_consumer.go:238`）是同一行为的两种表达 |
 | 7 个推送请求码（40/39/220/221/307/309/326） | `ClientRemotingProcessor` | ✅ 七端全齐（既有） | 复核确认，非缺口 |
@@ -240,3 +243,28 @@ go 少 2 条是 go 探针未含 mqDivided/mqAll 细分断言，php 多 1 条是 
 averagely 策略）；若探针里第二实例没设独立 `instanceName`，broker 的
 `GET_CONSUMER_LIST_BY_GROUP` 只会看到 1 个 clientId，两实例会各拿全量 8 队列——这是探针
 写错，不是重平衡没生效。
+
+### 12.4 AccessChannel=CLOUD 轨迹路由真机矩阵（2026-11-13，`scripts/run_trace_cloud_live.sh`）
+
+跑法与 §12.1 相同（脚本自起集群、等 TBW102 路由、按端口收尾），集群额外带
+`validateSystemTopicWhenUpdateTopic=false`——`rmq_sys_TRACE_DATA_*` 以 `rmq_sys_` 前缀命中
+`TopicValidator.isSystemTopic`，云上由平台预建，自建集群只能靠这个开关模拟。
+
+python 参考端六场景全绿（12 断言 0 失败，`python/verify_trace_cloud_live.py`）：
+
+| 场景 | 断言 | 结果 |
+|---|---|---|
+| C1 | region 主题可经 broker 创建（非 SYSTEM_TOPIC_SET 精确名，但前缀命中 → 需关校验开关） | ✅ |
+| C2 | `setAccessChannel(CLOUD)` producer 发送成功，SendResult.region_id=DefaultRegion（响应头 `MSG_REGION`） | ✅ |
+| C3 | CLOUD producer 的 Pub 落 `rmq_sys_TRACE_DATA_DefaultRegion`，record regionId/topic 正确 | ✅ |
+| C4 | 默认 LOCAL producer 的 Pub 落 `RMQ_SYS_TRACE_TOPIC` 且不漏进 region 主题 | ✅ |
+| C5 | CLOUD consumer 的 SubBefore 落 region 主题（regionId 取 broker 盖进消息属性的 `MSG_REGION`） | ✅ |
+| C6 | 默认 LOCAL consumer 的 SubBefore 落 classic 且不漏（用**独立消息**验证——同一消息会被先前 CLOUD 消费者消费，其 region 主题记录是正确路由而非泄漏） | ✅ |
+
+其余六端以七端离线回归覆盖（§10 AccessChannel 行列出的各端测试；门禁：py 1867 /
+cpp ctest 80 / cs 1255 / go `-race` 全绿 / rs 1251 / node selfcheck ALL GREEN / php 5492）。
+真机探针遵循既有先例（`verify_trace_live.py` 即 python-only 参考入口）。
+
+一条**别再当 bug 查**的实测结论：真机探针首轮 4 条 FAIL 全是**探针自身 bug**——①python
+`TraceType` 枚举成员名是 `PUB`/`SUB_BEFORE`，写成 `name == "Pub"` 恒假；②C6 的"泄漏"其实是
+CLOUD 消费者对同一条消息的正确路由。真机失败先怀疑探针，再次应验。

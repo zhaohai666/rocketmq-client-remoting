@@ -12,7 +12,8 @@ import {
   ConsumeMessageHook, SendMessageHook, SendMessageContext, ConsumeMessageContext,
 } from './hook.ts';
 import {
-  TraceContext, TraceType, TraceBean, AccessChannelLocal, traceBeanFromMessageExt,
+  TraceContext, TraceType, TraceBean, DefaultTraceRegionId, AccessChannelLocal,
+  traceBeanFromMessageExt,
 } from './trace_context.ts';
 import type { AsyncTraceDispatcher } from './trace_dispatcher.ts';
 import { createUniqID } from '../common/messageClientIdSetter.ts';
@@ -45,8 +46,11 @@ export class SendMessageTraceHookImpl extends SendMessageHook {
       context.traceType = TraceType.PUB;
       context.timeStamp = Date.now();
       context.isSuccess = true;
-      context.accessChannel = AccessChannelLocal;
-      context.regionId = ctx.brokerAddr || '';
+      // Java's Pub context carries no accessChannel of its own: the dispatcher's
+      // channel (start(namesrv, accessChannel)) decides the topic. The encoder also
+      // reads this value for SubAfter's CLOUD wire shape, so it must be concrete.
+      context.accessChannel = this.dispatcher.accessChannel || AccessChannelLocal;
+      context.regionId = ctx.brokerAddr || DefaultTraceRegionId;
       context.groupName = ctx.producerGroup || '';
       const bean = new TraceBean();
       const msg = ctx.message;
@@ -110,7 +114,17 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
       context.traceType = TraceType.SUB_BEFORE;
       context.timeStamp = Date.now();
       context.isSuccess = true;
-      context.accessChannel = AccessChannelLocal;
+      // Java ConsumeMessageConcurrentlyService:410 stamps the facade's channel on the
+      // consume context; the hook forwards it (Java's SubBefore falls back to the
+      // dispatcher, but this port's encoder needs a concrete value).
+      context.accessChannel = ctx.accessChannel || this.dispatcher.accessChannel || AccessChannelLocal;
+      // Java ConsumeMessageTraceHookImpl:61 reads MSG_REGION off the message. A blank
+      // region makes AsyncTraceDispatcher skip the record (:316-318), so use the
+      // broker's default region when the property is absent.
+      const first = msgs[0];
+      const region = first && typeof first.getProperty === 'function'
+        ? first.getProperty(MessageConst.PROPERTY_MSG_REGION) : null;
+      context.regionId = region || DefaultTraceRegionId;
       context.groupName = ctx.consumerGroup || '';
       // The request id joins SubBefore and SubAfter of one consume.
       context.requestId = createUniqID();
@@ -143,7 +157,10 @@ export class ConsumeMessageTraceHookImpl extends ConsumeMessageHook {
         after.costTime = Date.now() - before.timeStamp;
         after.isSuccess = ctx.success === true;
         after.contextCode = contextCode;
-        after.accessChannel = AccessChannelLocal;
+        // Java ConsumeMessageTraceHookImpl:102 copies the consume context's channel
+        // onto SubAfter (it decides both the topic and the CLOUD wire shape).
+        after.accessChannel = ctx.accessChannel || this.dispatcher.accessChannel || AccessChannelLocal;
+        after.regionId = before.regionId;
         after.timeStamp = before.timeStamp;
         after.groupName = before.groupName;
         const bean = traceBeanFromMessageExt(msgs[i], false);
@@ -211,6 +228,7 @@ export class DefaultRecallMessageTraceHook {
 
       const context = new TraceContext();
       context.regionId = regionId;
+      context.accessChannel = this.dispatcher.accessChannel || AccessChannelLocal;
       context.traceBeans = [bean];
       context.traceType = TraceType.RECALL;
       context.groupName = group;

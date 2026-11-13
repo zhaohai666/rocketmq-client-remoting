@@ -278,7 +278,7 @@ export function processPopResult(c: DefaultMQPushConsumer, mq: MessageQueue,
     ctx.msgList = kept;
     ctx.mq = mq;
     ctx.unitMode = c.unitMode;
-    ctx.accessChannel = 'LOCAL';
+    ctx.accessChannel = c.accessChannel;
     for (const hook of hooks.slice()) {
       try {
         hook.filterMessage(ctx);

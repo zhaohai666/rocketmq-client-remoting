@@ -121,7 +121,7 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 			}
 			continue
 		}
-		result = c.pullAPI.processPullResult(mq, result, sub)
+		result = c.pullAPI.processPullResult(mq, result, sub, c.accessChannel)
 
 		c.mu.Lock()
 		if !c.started {

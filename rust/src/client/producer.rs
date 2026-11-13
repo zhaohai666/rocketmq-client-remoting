@@ -65,7 +65,7 @@ use crate::client::request_reply::{
 use crate::client::result::{LocalTransactionState, SendResult, SendStatus, TransactionSendResult};
 use crate::client::shutdown::{run_finalize_blocking, SHUTDOWN_FINALIZE_BUDGET};
 use crate::client::top_addressing::DefaultTopAddressing;
-use crate::client::trace::TraceContext;
+use crate::client::trace::{AccessChannel, TraceContext};
 use crate::client::trace_context::{inject_trace_context, trace_context_enabled_from_env};
 use crate::client::trace_dispatcher::{
     AsyncTraceDispatcher, TraceDispatcherConfig, TraceDispatcherType, TraceHost, TraceProducer,
@@ -320,7 +320,7 @@ pub trait TransactionListener: Send + Sync + 'static {
 /// then reshapes it into the form the hook needs.
 pub trait TraceDispatcherChannel: Send + Sync {
     /// Corresponds to `TraceDispatcher::start`.
-    fn start(&self, name_server_addr: &str) -> Result<()>;
+    fn start(&self, name_server_addr: &str, access_channel: AccessChannel) -> Result<()>;
 
     /// Corresponds to `TraceDispatcher::shutdown`.
     fn shutdown(&self);
@@ -339,8 +339,8 @@ impl<T> TraceDispatcherChannel for T
 where
     T: TraceDispatcher + TraceReportSink + Send + Sync,
 {
-    fn start(&self, name_server_addr: &str) -> Result<()> {
-        TraceDispatcher::start(self, name_server_addr)
+    fn start(&self, name_server_addr: &str, access_channel: AccessChannel) -> Result<()> {
+        TraceDispatcher::start(self, name_server_addr, access_channel)
     }
 
     fn shutdown(&self) {
@@ -465,6 +465,8 @@ pub struct ProducerConfig {
     pub detect_timeout: i64,
     pub detect_interval: i64,
     pub enable_trace: bool,
+    /// Trace dispatch channel (LOCAL by default; mirrors Java `ClientConfig#accessChannel`).
+    pub access_channel: AccessChannel,
     /// `trace_topic` (`None` → the system default trace topic).
     pub trace_topic: Option<String>,
     pub trace_msg_batch_num: i32,
@@ -543,6 +545,7 @@ impl Default for ProducerConfig {
             detect_timeout: 200,
             detect_interval: 2 * 1000,
             enable_trace: false,
+            access_channel: AccessChannel::default(),
             trace_topic: None,
             trace_msg_batch_num: 10,
             request_timeout: DEFAULT_REQUEST_TIMEOUT_MILLIS,
@@ -1245,6 +1248,16 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.trace_msg_batch_num = n);
     }
 
+    /// Set the trace dispatch channel (mirrors Java `ClientConfig#setAccessChannel`).
+    pub fn set_access_channel(&self, channel: AccessChannel) {
+        self.write_cfg(|c| c.access_channel = channel);
+    }
+
+    /// Current trace dispatch channel (LOCAL by default).
+    pub fn access_channel(&self) -> AccessChannel {
+        self.read_cfg(|c| c.access_channel)
+    }
+
     /// Inject the trace dispatcher (implementation note 4). Passing `None` revokes the injection.
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *self.inner.trace.lock().unwrap_or_else(|e| e.into_inner()) = dispatcher;
@@ -1683,7 +1696,7 @@ impl DefaultMQProducer {
                 self.register_end_transaction_hook(Arc::new(EndTransactionTraceHook::new(sink)));
             }
         }
-        if let Err(e) = dispatcher.start(&self.namesrv_addr()) {
+        if let Err(e) = dispatcher.start(&self.namesrv_addr(), cfg.access_channel) {
             rmq_warn!("trace dispatcher start failed: {e}");
         }
     }
@@ -4301,6 +4314,52 @@ mod tests {
         assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT_MILLIS);
         assert_eq!(cfg.tls_enable, None);
         assert_eq!(cfg.enable_trace_context, None);
+    }
+
+    // ---------------- Facade AccessChannel (CLOUD entry) ----------------
+
+    /// A `TraceDispatcher + TraceReportSink` pair (so it satisfies the `TraceDispatcherChannel`
+    /// blanket impl) that records the access channel handed to `start`.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        channel: std::sync::Mutex<Option<AccessChannel>>,
+    }
+
+    impl TraceDispatcher for RecordingDispatcher {
+        fn start(&self, _addr: &str, channel: AccessChannel) -> Result<()> {
+            *self.channel.lock().unwrap() = Some(channel);
+            Ok(())
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    impl TraceReportSink for RecordingDispatcher {
+        fn trace_topic_name(&self) -> String {
+            String::new()
+        }
+
+        fn report(&self, _ctx: TraceContext) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn cloud_access_channel_reaches_trace_dispatcher() {
+        let p = producer("GID_trace");
+        assert_eq!(p.access_channel(), AccessChannel::Local);
+        p.set_access_channel(AccessChannel::Cloud);
+        assert_eq!(p.access_channel(), AccessChannel::Cloud);
+
+        let rec = std::sync::Arc::new(RecordingDispatcher::default());
+        let channel: std::sync::Arc<dyn TraceDispatcherChannel> = rec.clone();
+        p.set_trace_dispatcher(Some(channel));
+        p.start_trace_dispatcher();
+        assert_eq!(*rec.channel.lock().unwrap(), Some(AccessChannel::Cloud));
     }
 
     #[test]

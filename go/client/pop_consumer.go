@@ -304,7 +304,7 @@ func (c *DefaultMQPushConsumer) filterPopFound(mq common.MessageQueue, sub *remo
 			MQ:            mq,
 			UnitMode:      c.IsUnitMode(),
 			Props:         map[string]string{},
-			AccessChannel: AccessChannelLocal,
+			AccessChannel: c.accessChannel,
 		}
 		executeFilterHooks(hooks, ctx)
 		kept = ctx.MsgList

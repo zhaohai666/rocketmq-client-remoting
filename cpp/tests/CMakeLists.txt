@@ -202,6 +202,14 @@ add_executable(rmq_test_trace test_trace.cpp)
 target_link_libraries(rmq_test_trace PRIVATE rocketmq::remoting)
 add_test(NAME trace COMMAND rmq_test_trace)
 
+# AccessChannel=CLOUD facade entry + ACL hook inheritance for the internal trace producer:
+# producer setter/read-back, dispatcher.start channel read-back and the CLOUD fallback
+# (context without accessChannel -> rmq_sys_TRACE_DATA_<regionId>), context-channel precedence,
+# and the internal producer carrying the host's RPC hook (ACL signing).
+add_executable(rmq_test_access_channel test_access_channel.cpp)
+target_link_libraries(rmq_test_access_channel PRIVATE rocketmq::remoting)
+add_test(NAME access_channel COMMAND rmq_test_access_channel)
+
 # Hooks: CheckForbiddenHook (does not swallow exceptions) and FilterMessageHook (swallows exceptions + pull/POP difference)
 # and the comparison vectors for subscription semantics tagsSet/codeSet
 add_executable(rmq_test_hook test_hook.cpp)

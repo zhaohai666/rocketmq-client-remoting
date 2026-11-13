@@ -100,6 +100,7 @@ type DefaultMQPullConsumer struct {
 	tlsEnable     *bool
 	socksProxy    *remoting.SocksProxyConfig
 	rpcHook       remoting.RPCHook
+	accessChannel string
 
 	messageModel     string
 	consumeFromWhere string
@@ -210,6 +211,7 @@ func NewDefaultMQPullConsumer(group string) (*DefaultMQPullConsumer, error) {
 		consumerGroup:                    group,
 		instanceName:                     common.DefaultInstanceName,
 		messageModel:                     MessageModelClustering,
+		accessChannel:                    AccessChannelLocal,
 		consumeFromWhere:                 ConsumeFromWhereLastOffset,
 		pollNamesrvIntv:                  defaultConsumerPollNamesrvInterval,
 		decodeReadBody:                   true,
@@ -1354,6 +1356,7 @@ func (c *DefaultMQPullConsumer) pullSyncWithMaxBytes(mq common.MessageQueue, sub
 	namespace := c.namespace
 	consumeHooks := c.consumeMessageHooks
 	group := c.consumerGroup
+	accessChannel := c.accessChannel
 	c.mu.Unlock()
 	if api == nil {
 		return nil, common.ClientError("consumer not started, call Start() first")
@@ -1377,7 +1380,7 @@ func (c *DefaultMQPullConsumer) pullSyncWithMaxBytes(mq common.MessageQueue, sub
 	if err != nil {
 		return nil, err
 	}
-	result = api.processPullResult(mq, result, sub)
+	result = api.processPullResult(mq, result, sub, accessChannel)
 	resetTopicForNamespace(result.MsgFoundList, namespace)
 
 	// The consume hook pair runs around the pull RESULT (the pull
@@ -1390,7 +1393,7 @@ func (c *DefaultMQPullConsumer) pullSyncWithMaxBytes(mq common.MessageQueue, sub
 			MsgList:       result.MsgFoundList,
 			Success:       true,
 			Status:        "CONSUME_SUCCESS",
-			AccessChannel: AccessChannelLocal,
+			AccessChannel: accessChannel,
 			Namespace:     namespace,
 		}
 		executeConsumeHookBefore(consumeHooks, ctx)

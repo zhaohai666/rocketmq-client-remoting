@@ -537,7 +537,11 @@ impl FakeDispatcher {
 }
 
 impl TraceDispatcher for FakeDispatcher {
-    fn start(&self, _name_server_addr: &str) -> rocketmq_client_remoting::error::Result<()> {
+    fn start(
+        &self,
+        _name_server_addr: &str,
+        _access_channel: rocketmq_client_remoting::client::trace::AccessChannel,
+    ) -> rocketmq_client_remoting::error::Result<()> {
         self.inner.started.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }

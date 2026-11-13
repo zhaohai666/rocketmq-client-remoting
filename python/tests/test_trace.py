@@ -696,3 +696,60 @@ def test_decode_round_trip_keeps_bean_msg_id_and_offset_msg_id():
     assert back.trace_beans[0].offset_msg_id == OFFSET_MSG_ID
     assert back.is_success is True
     assert back.time_stamp == 1700000000000
+
+
+# ---------------------------------------------------------------- access channel plumbing
+# Java ClientConfig#setAccessChannel is the *only* entry to the CLOUD branch of
+# AsyncTraceDispatcher#sendTraceData (:319-322). Without a facade-level entry the region
+# topic code is reachable only by constructing TraceContext by hand in a unit test.
+class _RecordingDispatcher:
+    def __init__(self):
+        self.started_with = []
+
+    def start(self, name_srv_addr, access_channel=None):
+        self.started_with.append((name_srv_addr, access_channel))
+
+    def shutdown(self):
+        pass
+
+
+def test_producer_access_channel_is_handed_to_the_trace_dispatcher():
+    from client.producer import DefaultMQProducer
+
+    p = DefaultMQProducer("GID_ac")
+    assert p.get_access_channel() == AccessChannel.LOCAL
+    p.trace_dispatcher = _RecordingDispatcher()
+    p._start_trace_dispatcher()
+    assert p.trace_dispatcher.started_with[-1][1] == AccessChannel.LOCAL
+
+    p.set_access_channel(AccessChannel.CLOUD)
+    p._start_trace_dispatcher()
+    assert p.get_access_channel() == AccessChannel.CLOUD
+    assert p.trace_dispatcher.started_with[-1][1] == AccessChannel.CLOUD
+
+
+def test_consumer_access_channel_reaches_dispatcher_and_consume_context():
+    from client.consumer import DefaultMQPushConsumer
+
+    c = DefaultMQPushConsumer("CID_ac")
+    assert c.get_access_channel() == AccessChannel.LOCAL
+    c.trace_dispatcher = _RecordingDispatcher()
+    c._start_trace_dispatcher()
+    assert c.trace_dispatcher.started_with[-1][1] == AccessChannel.LOCAL
+
+    c.set_access_channel(AccessChannel.CLOUD)
+    c._start_trace_dispatcher()
+    assert c.trace_dispatcher.started_with[-1][1] == AccessChannel.CLOUD
+    # ConsumeMessageConcurrentlyService:410 copies the facade value onto the context;
+    # ConsumeMessageTraceHookImpl:102 then copies it onto SubAfter.
+    ctx = c._build_consume_hook_context([], MessageQueue())
+    assert ctx.access_channel == AccessChannel.CLOUD
+
+
+def test_dispatcher_cloud_channel_is_the_fallback_for_contexts_without_one():
+    d = _make_dispatcher()
+    d.access_channel = AccessChannel.CLOUD  # what start(ns, CLOUD) installs
+    ctx = _pub_context()
+    ctx.access_channel = None
+    d._send_trace_data([ctx])
+    assert d.trace_producer.sent[0][0] == "rmq_sys_TRACE_DATA_DefaultRegion"

@@ -197,6 +197,10 @@ public:
     const std::string& getTraceTopic() const { return traceTopic_; }
     void setTraceMsgBatchNum(int32_t n) { traceMsgBatchNum_ = n; }
     int32_t getTraceMsgBatchNum() const { return traceMsgBatchNum_; }
+    // Message-trace access channel: CLOUD routes trace data to the region-scoped topic
+    // (rmq_sys_TRACE_DATA_<regionId>); default LOCAL. Passed to the trace dispatcher at start().
+    void setAccessChannel(AccessChannel ch) { accessChannel_ = ch; }
+    AccessChannel accessChannel() const { return accessChannel_; }
 
     void registerSendMessageHook(std::shared_ptr<SendMessageHook> hook) {
         if (hook) sendMessageHookList_.push_back(std::move(hook));
@@ -493,6 +497,7 @@ protected:
     bool enableTrace_ = false;
     std::string traceTopic_;                     // empty => use MixAll::TRACE_TOPIC
     int32_t traceMsgBatchNum_ = 10;
+    AccessChannel accessChannel_ = AccessChannel::LOCAL;
     std::vector<std::shared_ptr<SendMessageHook>> sendMessageHookList_;
     std::vector<std::shared_ptr<EndTransactionHook>> endTransactionHookList_;
     std::vector<std::shared_ptr<CheckForbiddenHook>> checkForbiddenHookList_;

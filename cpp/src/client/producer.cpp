@@ -584,7 +584,7 @@ void DefaultMQProducer::startTraceDispatcher() {
         dispatcher->setNamespaceV2(namespaceV2_);
         dispatcher->setHostProducer(this);
         dispatcher->setHostClientId(clientId_);
-        dispatcher->start(getNamesrvAddr());
+        dispatcher->start(getNamesrvAddr(), accessChannel_);
         traceDispatcher_ = dispatcher;
         registerSendMessageHook(std::make_shared<SendMessageTraceHook>(dispatcher.get()));
         registerEndTransactionHook(std::make_shared<EndTransactionTraceHook>(dispatcher.get()));

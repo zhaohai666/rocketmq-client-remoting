@@ -984,6 +984,9 @@ class DefaultMQPushConsumer:
         # namespaceV2 (5.x server-side namespace): when non-empty, every request carries
         # nsd=true / ns=<value>, see the NamespaceRpcHook in remoting/rpchook.py.
         self.namespace_v2 = ""
+        # Java ClientConfig#accessChannel (default LOCAL): CLOUD routes trace records to
+        # rmq_sys_TRACE_DATA_<regionId> and is copied into every consume hook context.
+        self.access_channel: AccessChannel = AccessChannel.LOCAL
         self.message_model = message_model
         self.consume_from_where = ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         self.consume_timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time() - 30 * 60))
@@ -1451,6 +1454,17 @@ class DefaultMQPushConsumer:
         self.allocate_strategy = strategy
 
     # ---------------- Message trace ----------------
+    def set_access_channel(self, access_channel: AccessChannel) -> None:
+        """Java ClientConfig#setAccessChannel: the value is handed to the trace dispatcher
+        at start() and copied into every ConsumeMessageContext (CLOUD keeps the region's
+        trace topic; LOCAL keeps RMQ_SYS_TRACE_TOPIC)."""
+        if not isinstance(access_channel, AccessChannel):
+            raise ValueError("access_channel must be an AccessChannel value")
+        self.access_channel = access_channel
+
+    def get_access_channel(self) -> AccessChannel:
+        return self.access_channel
+
     def set_enable_msg_trace(self, enable: bool) -> None:
         """Toggle consumer-side message tracing (the consumer's ``enable_trace`` flag)."""
         self.enable_trace = enable
@@ -1521,11 +1535,12 @@ class DefaultMQPushConsumer:
 
     def _build_consume_hook_context(self, msgs: List[MessageExt],
                                     mq: MessageQueue) -> ConsumeMessageContext:
-        """Build the consume hook context: success=False, props is an empty dict, access_channel=LOCAL."""
+        """Build the consume hook context: success=False, props is an empty dict,
+        access_channel taken from the facade (Java ConsumeMessageConcurrentlyService:410)."""
         context = ConsumeMessageContext(self.consumer_group, msgs, mq)
         context.success = False
         context.props = {}
-        context.access_channel = AccessChannel.LOCAL
+        context.access_channel = self.access_channel
         return context
 
     def _consume_return_type(self, status, has_exception: bool, consume_rt_ms: float,
@@ -1901,7 +1916,7 @@ class DefaultMQPushConsumer:
                 logger.error("system mqtrace hook init failed ,maybe can't send msg trace data: %s", e)
         if self.trace_dispatcher is not None:
             try:
-                self.trace_dispatcher.start(";".join(self.name_server_addrs), AccessChannel.LOCAL)
+                self.trace_dispatcher.start(";".join(self.name_server_addrs), self.access_channel)
             except Exception as e:  # noqa: BLE001
                 logger.warning("trace dispatcher start failed: %s", e)
 

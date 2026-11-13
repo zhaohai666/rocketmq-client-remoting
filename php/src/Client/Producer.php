@@ -512,6 +512,8 @@ class DefaultMQProducer
 
     // ---- Message tracing (enableTrace / traceTopic / traceMsgBatchNum) ----
     public bool $enableTrace = false;
+    /** Trace dispatch channel (LOCAL by default; mirrors Java ClientConfig#accessChannel). */
+    public AccessChannel $accessChannel = AccessChannel::LOCAL;
     public ?string $traceTopic = null; // null -> use RMQ_SYS_TRACE_TOPIC
     public int $traceMsgBatchNum = 10;
     /** @var list<SendMessageHook> */
@@ -1146,6 +1148,16 @@ class DefaultMQProducer
         $this->traceMsgBatchNum = $n;
     }
 
+    public function setAccessChannel(AccessChannel $ch): void
+    {
+        $this->accessChannel = $ch;
+    }
+
+    public function getAccessChannel(): AccessChannel
+    {
+        return $this->accessChannel;
+    }
+
     public function registerSendMessageHook(SendMessageHook $hook): void
     {
         $this->sendMessageHookList[] = $hook;
@@ -1470,7 +1482,7 @@ class DefaultMQProducer
         }
         if ($this->traceDispatcher !== null) {
             try {
-                $this->traceDispatcher->start($this->getNamesrvAddr(), AccessChannel::LOCAL);
+                $this->traceDispatcher->start($this->getNamesrvAddr(), $this->getAccessChannel());
             } catch (\Throwable $e) {
                 Logger::warning('trace dispatcher start failed: ' . $e->getMessage());
             }

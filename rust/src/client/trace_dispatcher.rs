@@ -1204,12 +1204,14 @@ impl TraceDispatcher for AsyncTraceDispatcher {
     /// The only synchronously visible error: the current thread is not in a tokio runtime context and no handle was
     /// bound earlier
     /// => `Err`. Callers that can await should use [`AsyncTraceDispatcher::start`].
-    fn start(&self, name_server_addr: &str) -> Result<()> {
+    fn start(&self, name_server_addr: &str, access_channel: AccessChannel) -> Result<()> {
         let handle = self.inner.runtime_handle()?;
         let me = self.clone();
         let addr = name_server_addr.to_string();
         handle.spawn(async move {
-            if let Err(e) = AsyncTraceDispatcher::start(&me, &addr, None).await {
+            // Propagate the facade's access channel into the async start (whose `None` would
+            // otherwise reset it to LOCAL); this is the wiring point for AccessChannel=CLOUD.
+            if let Err(e) = AsyncTraceDispatcher::start(&me, &addr, Some(access_channel)).await {
                 rmq_error!("trace dispatcher start failed: {e}");
             }
         });
@@ -2346,7 +2348,7 @@ mod tests {
     async fn trait_start_requires_and_uses_runtime() {
         // Design point 4: the synchronous entry throws the whole start into a tokio task
         let (d, recorder) = dispatcher();
-        TraceDispatcher::start(&d, "127.0.0.1:9876").unwrap();
+        TraceDispatcher::start(&d, "127.0.0.1:9876", AccessChannel::Local).unwrap();
         for _ in 0..100 {
             if d.is_started() {
                 break;
@@ -2356,6 +2358,23 @@ mod tests {
         assert!(d.is_started());
         assert_eq!(recorder.started.load(Ordering::Acquire), 1);
         assert_eq!(d.access_channel(), AccessChannel::Local);
+        TraceDispatcher::shutdown(&d);
+    }
+
+    #[tokio::test]
+    async fn trait_start_propagates_cloud_access_channel() {
+        // The synchronous TraceDispatcher::start must forward the facade's channel into the
+        // async start; previously it hard-coded `None`, which reset CLOUD back to LOCAL.
+        let (d, _recorder) = dispatcher();
+        TraceDispatcher::start(&d, "127.0.0.1:9876", AccessChannel::Cloud).unwrap();
+        for _ in 0..100 {
+            if d.access_channel() == AccessChannel::Cloud {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(d.is_started());
+        assert_eq!(d.access_channel(), AccessChannel::Cloud);
         TraceDispatcher::shutdown(&d);
     }
 

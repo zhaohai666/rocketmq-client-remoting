@@ -481,6 +481,8 @@ pub struct ConsumerConfig {
     pub pop_timeout_millis: i64,
     /// Whether to report consume traces.
     pub enable_trace: bool,
+    /// Trace dispatch channel (LOCAL by default; mirrors Java `ClientConfig#accessChannel`).
+    pub access_channel: AccessChannel,
     /// Custom trace topic; unset -> `RMQ_SYS_TRACE_TOPIC`.
     pub trace_topic: Option<String>,
     /// Trace batch upload size, default 10.
@@ -552,6 +554,7 @@ impl Default for ConsumerConfig {
             pop_poll_time_millis: 15_000,
             pop_timeout_millis: 25_000,
             enable_trace: false,
+            access_channel: AccessChannel::default(),
             trace_topic: None,
             trace_msg_batch_num: 10,
             post_subscription_when_pull: false,
@@ -1282,6 +1285,16 @@ impl DefaultMQPushConsumer {
             .clone()
     }
 
+    /// Set the trace dispatch channel (mirrors Java `ClientConfig#setAccessChannel`).
+    pub fn set_access_channel(&self, channel: AccessChannel) {
+        self.update_config(|c| c.access_channel = channel);
+    }
+
+    /// Current trace dispatch channel (LOCAL by default).
+    pub fn access_channel(&self) -> AccessChannel {
+        read_cfg(&self.inner).access_channel
+    }
+
     /// Inject the trace dispatcher (structural trade-off 5).
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *lock(&self.inner.trace) = dispatcher;
@@ -1840,7 +1853,7 @@ impl DefaultMQPushConsumer {
             let sink: Arc<dyn TraceReportSink> = Arc::new(SinkAdapter(dispatcher.clone()));
             self.register_consume_message_hook(Arc::new(ConsumeMessageTraceHook::new(sink)));
         }
-        if let Err(e) = dispatcher.start(&self.namesrv_addr()) {
+        if let Err(e) = dispatcher.start(&self.namesrv_addr(), cfg.access_channel) {
             rmq_warn!("trace dispatcher start failed: {e}");
         }
     }
@@ -4699,11 +4712,13 @@ fn build_consume_hook_context(
     msgs: &[MessageExt],
     mq: &MessageQueue,
 ) -> ConsumeMessageContext {
-    let group = read_cfg(inner).consumer_group;
+    let cfg = read_cfg(inner);
+    let access_channel = cfg.access_channel;
+    let group = cfg.consumer_group;
     let mut context = ConsumeMessageContext::new(&group, Some(msgs.to_vec()), Some(mq.clone()));
     context.success = false;
     context.props = Some(Default::default());
-    context.access_channel = Some(AccessChannel::Local.name().to_string());
+    context.access_channel = Some(access_channel.name().to_string());
     context
 }
 
@@ -6110,6 +6125,7 @@ impl DefaultMQPushConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::mq_client::TraceDispatcher;
     use crate::client::result::PullResult;
     use crate::common::message::Message;
     use crate::common::message_const::PROPERTY_KEYS;
@@ -6133,6 +6149,63 @@ mod tests {
             s.tags_set = expression.split("||").map(str::to_string).collect();
         }
         s
+    }
+
+    // ---------------- Facade AccessChannel (CLOUD entry) ----------------
+
+    /// A `TraceDispatcher + TraceReportSink` pair (so it satisfies the `TraceDispatcherChannel`
+    /// blanket impl) that records the access channel handed to `start`.
+    #[derive(Default)]
+    struct RecordingDispatcher {
+        channel: std::sync::Mutex<Option<AccessChannel>>,
+    }
+
+    impl TraceDispatcher for RecordingDispatcher {
+        fn start(&self, _addr: &str, channel: AccessChannel) -> Result<()> {
+            *self.channel.lock().unwrap() = Some(channel);
+            Ok(())
+        }
+
+        fn shutdown(&self) {}
+    }
+
+    impl TraceReportSink for RecordingDispatcher {
+        fn trace_topic_name(&self) -> String {
+            String::new()
+        }
+
+        fn report(&self, _ctx: crate::client::trace::TraceContext) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn cloud_access_channel_reaches_trace_dispatcher() {
+        let c = DefaultMQPushConsumer::new("CID_trace").unwrap();
+        assert_eq!(c.access_channel(), AccessChannel::Local);
+        c.set_access_channel(AccessChannel::Cloud);
+        assert_eq!(c.access_channel(), AccessChannel::Cloud);
+
+        let rec = std::sync::Arc::new(RecordingDispatcher::default());
+        let channel: std::sync::Arc<dyn TraceDispatcherChannel> = rec.clone();
+        c.set_trace_dispatcher(Some(channel));
+        c.start_trace_dispatcher();
+        assert_eq!(*rec.channel.lock().unwrap(), Some(AccessChannel::Cloud));
+    }
+
+    #[test]
+    fn consume_hook_context_carries_facade_access_channel() {
+        let c = DefaultMQPushConsumer::new("CID_trace").unwrap();
+        let mq = MessageQueue::new("TopicTest", "broker-a", 0);
+        let ctx = build_consume_hook_context(&*c.inner, &[], &mq);
+        assert_eq!(ctx.access_channel, Some("LOCAL".to_string()));
+        c.set_access_channel(AccessChannel::Cloud);
+        let ctx_cloud = build_consume_hook_context(&*c.inner, &[], &mq);
+        assert_eq!(ctx_cloud.access_channel, Some("CLOUD".to_string()));
     }
 
     /// The plan takes NO subscription argument at all: the start offset is decided by the

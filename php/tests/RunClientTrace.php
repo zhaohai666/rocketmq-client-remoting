@@ -1191,6 +1191,67 @@ namespace {
             $this->checkSame(2, count($d->appended), 'endTransaction on the trace topic itself does not enqueue');
         }
 
+        // ============================================================ Facade AccessChannel (CLOUD entry)
+
+        private static function invokePrivate(object $obj, string $method, array $args = []): mixed
+        {
+            $rm = new \ReflectionMethod($obj, $method);
+            $rm->setAccessible(true);
+            return $rm->invokeArgs($obj, $args);
+        }
+
+        private function testFacadeAccessChannel(): void
+        {
+            $producer = new \RocketMQ\Client\DefaultMQProducer();
+            $this->checkSame(AccessChannel::LOCAL, $producer->getAccessChannel(), 'producer accessChannel defaults to LOCAL');
+            $producer->setAccessChannel(AccessChannel::CLOUD);
+            $this->checkSame(AccessChannel::CLOUD, $producer->getAccessChannel(), 'producer setAccessChannel(CLOUD) round-trips');
+
+            $consumer = new \RocketMQ\Client\DefaultMQPushConsumer('CID_test');
+            $this->checkSame(AccessChannel::LOCAL, $consumer->getAccessChannel(), 'consumer accessChannel defaults to LOCAL');
+            $consumer->setAccessChannel(AccessChannel::CLOUD);
+            $this->checkSame(AccessChannel::CLOUD, $consumer->getAccessChannel(), 'consumer setAccessChannel(CLOUD) round-trips');
+
+            // Facade CLOUD must reach AsyncTraceDispatcher::start (previously hard-coded LOCAL).
+            $pd = self::makeDispatcher();
+            $pd->isStarted = true; // skip the internal producer start() (FakeTraceProducer has no start())
+            $producer->traceDispatcher = $pd;
+            self::invokePrivate($producer, 'startTraceDispatcher');
+            $this->checkSame(AccessChannel::CLOUD, $pd->accessChannel, 'producer CLOUD reaches traceDispatcher.start');
+
+            $cd = self::makeDispatcher();
+            $cd->isStarted = true;
+            $consumer->traceDispatcher = $cd;
+            self::invokePrivate($consumer, 'startTraceDispatcher');
+            $this->checkSame(AccessChannel::CLOUD, $cd->accessChannel, 'consumer CLOUD reaches traceDispatcher.start');
+
+            // Consume hook context carries the facade's current channel.
+            $mq = new MessageQueue('TopicTest', 'broker-a', 0);
+            $ctxCloud = self::invokePrivate($consumer, 'buildConsumeHookContext', [[], $mq]);
+            $this->checkSame(AccessChannel::CLOUD, $ctxCloud->accessChannel, 'buildConsumeHookContext carries facade CLOUD');
+            $consumer->setAccessChannel(AccessChannel::LOCAL);
+            $ctxLocal = self::invokePrivate($consumer, 'buildConsumeHookContext', [[], $mq]);
+            $this->checkSame(AccessChannel::LOCAL, $ctxLocal->accessChannel, 'buildConsumeHookContext carries facade LOCAL');
+        }
+
+        private function testDispatcherCloudFallback(): void
+        {
+            // context without accessChannel falls back to the dispatcher's CLOUD -> region topic
+            $d = self::makeDispatcher();
+            $d->isStarted = true;
+            $d->start('127.0.0.1:9876', AccessChannel::CLOUD);
+            $this->checkSame(AccessChannel::CLOUD, $d->accessChannel, 'dispatcher.start(CLOUD) records CLOUD');
+            $ctx = self::pubContext();
+            $this->checkSame(null, $ctx->accessChannel, 'precondition: context has no accessChannel');
+            $d->append($ctx);
+            $d->flush();
+            $this->checkSame(
+                'rmq_sys_TRACE_DATA_DefaultRegion',
+                $d->traceProducer->sent[0][0],
+                'context without accessChannel falls back to dispatcher CLOUD -> region topic'
+            );
+        }
+
         // ============================================================ Teardown
 
         public function run(): int
@@ -1227,6 +1288,8 @@ namespace {
             $this->testConsumeHookAfterWithoutBefore();
             $this->testConsumeHookBeanMsgIdPrefersUniqKey();
             $this->testEndTransactionHook();
+            $this->testFacadeAccessChannel();
+            $this->testDispatcherCloudFallback();
 
             if ($this->failures === []) {
                 printf("ALL TESTS PASSED (%d checks)\n", $this->passed);

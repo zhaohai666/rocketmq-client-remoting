@@ -24,6 +24,10 @@ export const TraceInstanceName = 'PID_CLIENT_INNER_TRACE_PRODUCER';
 export const TraceTopicPrefix = 'rmq_sys_TRACE_DATA_';
 export const AccessChannelLocal = 'LOCAL';
 export const AccessChannelCloud = 'CLOUD';
+// Java MixAll.DEFAULT_TRACE_REGION_ID: the region the broker stamps on messages when it
+// does not carry MSG_REGION. A TraceContext with no region at all is *dropped* by
+// AsyncTraceDispatcher#sendTraceData (:316-318), so every hook must fill this in.
+export const DefaultTraceRegionId = 'DefaultRegion';
 
 // Trace event types. The type string is the first field of every encoded record, a wire literal.
 export const TraceType = {
@@ -69,7 +73,10 @@ export class TraceContext {
   isSuccess = true;
   requestId = '';
   contextCode = 0;
-  accessChannel: string = AccessChannelLocal;
+  // Java TraceContext.accessChannel is NULL by default (:38, no initializer): a
+  // context without one falls back to the dispatcher's channel in sendTraceData
+  // (:311-315). Defaulting to LOCAL would break that fallback, so this stays null.
+  accessChannel: string | null = null;
   traceBeans: TraceBean[] = [];
 }
 

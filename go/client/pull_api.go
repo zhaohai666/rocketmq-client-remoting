@@ -297,7 +297,7 @@ func (p *pullAPI) pullKernelWithCode(code int32, group string, mq common.Message
 }
 
 func (p *pullAPI) processPullResult(mq common.MessageQueue, result *PullResult,
-	sub *remoting.SubscriptionData) *PullResult {
+	sub *remoting.SubscriptionData, accessChannel string) *PullResult {
 
 	brokerID := int64(common.MasterID)
 	if result.SuggestWhichBrokerID != nil {
@@ -323,7 +323,7 @@ func (p *pullAPI) processPullResult(mq common.MessageQueue, result *PullResult,
 			MsgList:       msgs,
 			MQ:            mq,
 			UnitMode:      p.unitMode,
-			AccessChannel: "LOCAL",
+			AccessChannel: accessChannel,
 		}
 		executeFilterHooks(p.hooks, ctx)
 		msgs = ctx.MsgList

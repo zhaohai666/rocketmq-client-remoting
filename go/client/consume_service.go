@@ -609,7 +609,7 @@ func (c *DefaultMQPushConsumer) buildConsumeHookContext(msgs []*common.MessageEx
 		MQ:            mq,
 		Success:       false,
 		Props:         map[string]string{},
-		AccessChannel: AccessChannelLocal,
+		AccessChannel: c.accessChannel,
 	}
 }
 

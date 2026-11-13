@@ -21,6 +21,7 @@
 
 #include "rocketmq/client/producer.h"
 #include "rocketmq/client/trace.h"
+#include "rocketmq/remoting/rpchook.h"
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message.h"
 #include "rocketmq/common/message_const.h"
@@ -60,6 +61,15 @@ AsyncTraceDispatcher::AsyncTraceDispatcher(const std::string& group, TraceDispat
     // ⚠ DefaultMQProducer has no enableTrace switch (the anti-recursion guard lives on the hook side),
     //   so it is enough to ensure it registers no trace hooks.
     traceProducer_ = std::make_unique<DefaultMQProducer>(genGroupNameForTrace());
+    // Java parity: getAndCreateTraceProducer(RPCHook rpcHook) == new DefaultMQProducer(rpcHook).
+    // The internal trace producer must inherit the host's RPC hook (ACL signing), otherwise an
+    // ACL-enabled broker rejects every unsigned trace request and no trace ever gets delivered.
+    // Install it here, before traceProducer_->start() (which installs the hook chain on the transport).
+    // rpcHook_ is stored as shared_ptr<void> to avoid a header include cycle with RPCHook; its actual
+    // origin is the facade's shared_ptr<RPCHook> (producer.cpp / consumer.cpp), so casting back is safe.
+    if (rpcHook_) {
+        traceProducer_->setRPCHook(std::static_pointer_cast<RPCHook>(rpcHook_));
+    }
     traceProducer_->setSendMsgTimeout(5000);
     traceProducer_->setMaxMessageSize(maxMsgSize_);
 }
@@ -89,7 +99,7 @@ void AsyncTraceDispatcher::start(const std::string& nameSrvAddr, AccessChannel a
             // The trace producer inherits the host's 5.x namespace:
             // it must be set before traceProducer_->start() (which installs the hook chain) so the first batch carries nsd/ns.
             traceProducer_->setNamespaceV2(namespaceV2_);
-            traceProducer_->start();
+            startInternalProducer();
             started_.store(true);
         }
     }
@@ -98,6 +108,10 @@ void AsyncTraceDispatcher::start(const std::string& nameSrvAddr, AccessChannel a
         stopped_.store(false);
         worker_ = std::thread(&AsyncTraceDispatcher::asyncRun, this);
     }
+}
+
+void AsyncTraceDispatcher::startInternalProducer() {
+    traceProducer_->start();
 }
 
 void AsyncTraceDispatcher::shutdown() {

@@ -735,4 +735,132 @@ public class TraceTests
 
         return list;
     }
+
+    // ------------------------------------------------------------ AccessChannel
+
+    [Fact]
+    public void ProducerAccessChannelDefaultsToLocal()
+    {
+        var producer = new DefaultMQProducer("GID_access_default");
+        Assert.Equal(RocketMQ.Client.AccessChannel.Local, producer.AccessChannel);
+    }
+
+    [Fact]
+    public void ConsumerAccessChannelDefaultsToLocal()
+    {
+        var consumer = new DefaultMQPushConsumer("CID_access_default");
+        Assert.Equal(RocketMQ.Client.AccessChannel.Local, consumer.AccessChannel);
+    }
+
+    [Fact]
+    public void ProducerPassesCloudToTraceDispatcherOnStart()
+    {
+        var producer = new DefaultMQProducer("GID_access_cloud")
+        {
+            AccessChannel = RocketMQ.Client.AccessChannel.Cloud,
+        };
+        Assert.Equal(RocketMQ.Client.AccessChannel.Cloud, producer.AccessChannel);
+
+        var dispatcher = new AsyncTraceDispatcher("GID_access_cloud", TraceDispatcherType.Produce);
+        StartDispatcherHarmlessly(dispatcher, producer.AccessChannel);
+        Assert.Equal(RocketMQ.Client.AccessChannel.Cloud, DispatcherAccessChannel(dispatcher));
+    }
+
+    [Fact]
+    public void ConsumerPassesCloudToTraceDispatcherOnStart()
+    {
+        var consumer = new DefaultMQPushConsumer("CID_access_cloud")
+        {
+            AccessChannel = RocketMQ.Client.AccessChannel.Cloud,
+        };
+        Assert.Equal(RocketMQ.Client.AccessChannel.Cloud, consumer.AccessChannel);
+
+        var dispatcher = new AsyncTraceDispatcher("CID_access_cloud", TraceDispatcherType.Consume);
+        StartDispatcherHarmlessly(dispatcher, consumer.AccessChannel);
+        Assert.Equal(RocketMQ.Client.AccessChannel.Cloud, DispatcherAccessChannel(dispatcher));
+    }
+
+    [Fact]
+    public void ConsumerConsumeHookContextCarriesCloud()
+    {
+        var consumer = new DefaultMQPushConsumer("CID_access_cloud_ctx")
+        {
+            AccessChannel = RocketMQ.Client.AccessChannel.Cloud,
+        };
+        MethodInfo build = typeof(DefaultMQPushConsumer).GetMethod("BuildConsumeHookContext",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var ctx = (ConsumeMessageContext)build.Invoke(consumer, new object?[]
+        {
+            new List<MessageExt>(),
+            new MessageQueue("TopicTest", "broker-a", 0),
+        })!;
+        Assert.Equal(RocketMQ.Client.AccessChannel.Cloud, ctx.AccessChannel!.Value);
+    }
+
+    [Fact]
+    public void SendTraceDataFallsBackToDispatcherCloudRegionTopic()
+    {
+        const string region = "RegionX";
+        string regionTopic = TraceConstants.TraceTopicPrefix + region;
+
+        using var cluster = MockCluster.Start(1);
+        var dispatcher = new AsyncTraceDispatcher("GID_access_fallback", TraceDispatcherType.Produce);
+        // Start with CLOUD: connects the internal producer to the mock cluster
+        // and records CLOUD as the dispatcher's fallback channel.
+        dispatcher.Start(new List<string> { cluster.NamesrvAddr },
+            RocketMQ.Client.AccessChannel.Cloud);
+        try
+        {
+            var ctx = new TraceContext
+            {
+                TraceType = RocketMQ.Client.TraceType.Pub,
+                RegionId = region,
+                GroupName = "GID_access_fallback",
+                RequestId = "REQ-ACCESS-1",
+                AccessChannel = null, // empty -> fall back to the dispatcher's CLOUD
+                TraceBeans = new List<TraceBean> { MakeBean() },
+            };
+            MethodInfo send = typeof(AsyncTraceDispatcher).GetMethod("SendTraceData",
+                BindingFlags.NonPublic | BindingFlags.Instance)!;
+            send.Invoke(dispatcher, new object[] { new List<TraceContext> { ctx } });
+
+            bool onRegionTopic = false;
+            for (int i = 0; i < 100 && !onRegionTopic; ++i)
+            {
+                onRegionTopic = cluster.Records().Any(r =>
+                    r.Ext.TryGetValue("topic", out var t) && t == regionTopic);
+                if (!onRegionTopic)
+                {
+                    Thread.Sleep(20);
+                }
+            }
+            Assert.True(onRegionTopic, "trace data must be sent to " + regionTopic);
+        }
+        finally
+        {
+            dispatcher.Shutdown();
+        }
+    }
+
+    // Drive Start without spawning any real thread: the internal producer is
+    // marked already-started (so Start() returns immediately instead of failing
+    // on a missing name server) and a placeholder _worker keeps Start from
+    // creating a flush thread. _accessChannel is still recorded.
+    private static void StartDispatcherHarmlessly(AsyncTraceDispatcher d,
+        RocketMQ.Client.AccessChannel ac)
+    {
+        FieldInfo producerField = typeof(AsyncTraceDispatcher).GetField("_traceProducer",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var prod = (DefaultMQProducer)producerField.GetValue(d)!;
+        typeof(DefaultMQProducer).GetField("_started",
+            BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(prod, true);
+        typeof(AsyncTraceDispatcher).GetField("_worker",
+            BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(d, new Thread(() => { }) { IsBackground = true });
+        d.Start(new List<string>(), ac);
+    }
+
+    private static RocketMQ.Client.AccessChannel DispatcherAccessChannel(AsyncTraceDispatcher d) =>
+        (RocketMQ.Client.AccessChannel)typeof(AsyncTraceDispatcher).GetField("_accessChannel",
+            BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(d)!;
 }

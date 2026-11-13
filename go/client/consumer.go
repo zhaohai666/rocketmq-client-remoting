@@ -202,6 +202,10 @@ type DefaultMQPushConsumer struct {
 	traceMsgBatchNum int
 	traceTopic       string
 	traceDispatcher  *AsyncTraceDispatcher
+	// accessChannel selects the trace topic flavour (LOCAL by default, CLOUD
+	// for rmq_sys_TRACE_DATA_<region>). Forwarded to the dispatcher at Start and
+	// copied into consume hook contexts. Mirrors Java ClientConfig#accessChannel.
+	accessChannel string
 
 	instance    *Instance
 	pullAPI     *pullAPI
@@ -295,6 +299,7 @@ func NewDefaultMQPushConsumer(consumerGroup string) (*DefaultMQPushConsumer, err
 		suspendCurrentQueueTimeMs:     defaultSuspendCurrentQueueTimeMs,
 		consumeTimeout:                defaultConsumeTimeout,
 		traceMsgBatchNum:              defaultTraceMsgBatchNum,
+		accessChannel:                 AccessChannelLocal,
 		popThresholdForQueue:          defaultPopThresholdForQueue,
 		popInvisibleTime:              defaultPopInvisibleTime,
 		popBatchNums:                  defaultPopBatchNums,
@@ -896,6 +901,13 @@ func (c *DefaultMQPushConsumer) IsEnableTrace() bool {
 	return c.enableTrace
 }
 
+// SetAccessChannel selects the trace access channel (LOCAL by default, CLOUD
+// for rmq_sys_TRACE_DATA_<region>). Mirrors Java ClientConfig#setAccessChannel.
+func (c *DefaultMQPushConsumer) SetAccessChannel(ch string) { c.accessChannel = ch }
+
+// GetAccessChannel reports the current trace access channel.
+func (c *DefaultMQPushConsumer) GetAccessChannel() string { return c.accessChannel }
+
 // SetTraceMsgBatchNum sets how many trace records are batched before a flush
 // (the dispatcher caps it at 20).
 func (c *DefaultMQPushConsumer) SetTraceMsgBatchNum(n int) {
@@ -1444,6 +1456,7 @@ func (c *DefaultMQPushConsumer) startTraceDispatcher() {
 	group := c.consumerGroup
 	nameSrv := strings.Join(c.nameServerAddrs, ";")
 	rpcHook := c.rpcHook
+	accessChannel := c.accessChannel
 	dispatcher := c.traceDispatcher
 	if enable && dispatcher == nil {
 		dispatcher = NewAsyncTraceDispatcher(group, TraceDispatcherConsume, batchNum, topic, rpcHook)
@@ -1456,7 +1469,7 @@ func (c *DefaultMQPushConsumer) startTraceDispatcher() {
 		c.RegisterConsumeMessageHook(NewConsumeMessageTraceHook(dispatcher))
 	}
 	if dispatcher != nil {
-		if err := dispatcher.Start(nameSrv, AccessChannelLocal); err != nil {
+		if err := dispatcher.Start(nameSrv, accessChannel); err != nil {
 			common.LogWarnf("trace dispatcher start failed: %v", err)
 		}
 	}

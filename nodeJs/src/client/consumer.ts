@@ -49,6 +49,7 @@ import {
   ConsumeConcurrentlyContext, ConsumeOrderlyContext, MessageSelector,
 } from './consumer_result.ts';
 import { ConsumeMessageContext, FilterMessageContext, FilterMessageHook } from './hook.ts';
+import { AccessChannelLocal, AccessChannelCloud } from './trace_context.ts';
 import { SendMessageRequestHeader, PullMessageRequestHeader } from '../remoting/headers.ts';
 import {
   ConsumerSendMsgBackRequestHeader, LockBatchMqRequestHeader, UnlockBatchMqRequestHeader,
@@ -200,6 +201,9 @@ export class DefaultMQPushConsumer {
   // producer's `rpcHook`. Registered AFTER the namespace hook so the ACL
   // signature covers every extField the namespace hook stamps.
   rpcHook: AclRPCHook | null = null;
+  // Java ClientConfig#accessChannel (default LOCAL): CLOUD routes trace records to
+  // rmq_sys_TRACE_DATA_<regionId> and is stamped onto every consume hook context.
+  accessChannel: string = AccessChannelLocal;
   instanceName = 'DEFAULT';
   clientID = '';
   unitMode = false;
@@ -352,6 +356,16 @@ export class DefaultMQPushConsumer {
   // Server-side namespace accessor, read live per request by NamespaceRpcHook.
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
+  // Java ClientConfig#setAccessChannel: the trace dispatcher and every consume
+  // hook context read this. Set it before start(); LOCAL is the default.
+  setAccessChannel(channel: string): this {
+    if (channel !== AccessChannelLocal && channel !== AccessChannelCloud) {
+      throw new Error(`invalid accessChannel: ${channel}`);
+    }
+    this.accessChannel = channel;
+    return this;
+  }
+  getAccessChannel(): string { return this.accessChannel; }
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   setUnitMode(mode: boolean): this { this.unitMode = mode; return this; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
@@ -795,13 +809,18 @@ export class DefaultMQPushConsumer {
         // Propagate the namespace to the
         // internal trace producer, so trace rows land in the same namespace.
         dispatcher.setNamespaceV2(this.namespaceV2);
+        // The internal trace producer must carry the host's ACL hook (Java builds it
+        // with `new DefaultMQProducer(rpcHook)`), and the dispatcher must know the
+        // facade's channel to pick the region topic in CLOUD mode.
+        dispatcher.rpcHook = this.rpcHook;
+        dispatcher.accessChannel = this.accessChannel;
         this.traceDispatcher = dispatcher;
         if (this.consumerGroup) {
           import('./trace_hook.ts').then((th: any) => {
             this.registerConsumeMessageHook(new th.ConsumeMessageTraceHookImpl(dispatcher));
           }).catch((e) => logger.warning('trace hook load failed: %s', (e as Error).message));
         }
-        dispatcher.start(this.nameServerAddr).catch((e: Error) =>
+        dispatcher.start(this.nameServerAddr, this.accessChannel).catch((e: Error) =>
           logger.warning('trace dispatcher start failed: %s', e.message));
       }).catch((e) => logger.warning('trace dispatcher load failed: %s', (e as Error).message));
     } catch (e) {
@@ -1665,7 +1684,7 @@ export class DefaultMQPushConsumer {
       ctx.msgList = msgs;
       ctx.mq = mq;
       ctx.unitMode = this.unitMode;
-      ctx.accessChannel = 'LOCAL';
+      ctx.accessChannel = this.accessChannel;
       for (const hook of this.filterMessageHookList.slice()) {
         try { hook.filterMessage(ctx); } catch (e) { /* swallowed by contract */ }
       }
@@ -1910,7 +1929,8 @@ export class DefaultMQPushConsumer {
       hookCtx.mq = mq;
       hookCtx.success = false;
       hookCtx.props = {};
-      hookCtx.accessChannel = 'LOCAL';
+      // Java ConsumeMessageConcurrentlyService:410 stamps the facade's channel.
+      hookCtx.accessChannel = this.accessChannel;
       for (const hook of hooks.slice()) {
         try { hook.consumeMessageBefore(hookCtx); } catch (e) { /* hook errors don't stop delivery */ }
       }
@@ -2111,7 +2131,8 @@ export class DefaultMQPushConsumer {
       hookCtx.mq = mq;
       hookCtx.success = false;
       hookCtx.props = {};
-      hookCtx.accessChannel = 'LOCAL';
+      // Java ConsumeMessageConcurrentlyService:410 stamps the facade's channel.
+      hookCtx.accessChannel = this.accessChannel;
       for (const hook of hooks.slice()) {
         try { hook.consumeMessageBefore(hookCtx); } catch (e) { /* ignore */ }
       }

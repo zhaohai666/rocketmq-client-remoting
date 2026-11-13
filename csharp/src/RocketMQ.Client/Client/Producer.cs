@@ -89,6 +89,17 @@ public class DefaultMQProducer
     private bool _enableTrace;
     private string _traceTopic = MixAll.TraceTopic;
     private int _traceMsgBatchNum = 10;
+    // AccessChannel.Local (enum value 0) by default; forwarded to the trace
+    // dispatcher at Start. Mirrors Java ClientConfig#accessChannel.
+    private AccessChannel _accessChannel;
+
+    /// <summary>Trace access channel (Local by default; Cloud selects the
+    /// region-prefixed trace topic). Mirrors Java ClientConfig#accessChannel.</summary>
+    public AccessChannel AccessChannel
+    {
+        get => _accessChannel;
+        set => _accessChannel = value;
+    }
     private readonly List<ISendMessageHook> _sendMessageHooks = new();
     private readonly List<IEndTransactionHook> _endTransactionHooks = new();
     private readonly List<ICheckForbiddenHook> _checkForbiddenHooks = new();
@@ -1488,7 +1499,7 @@ public class DefaultMQProducer
         {
             try
             {
-                _traceDispatcher.Start(_nameServerAddrs, AccessChannel.Local);
+                _traceDispatcher.Start(_nameServerAddrs, this.AccessChannel);
             }
             catch (Exception e)
             {

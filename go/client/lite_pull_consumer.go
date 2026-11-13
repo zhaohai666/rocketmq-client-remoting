@@ -147,6 +147,7 @@ type DefaultLitePullConsumer struct {
 	tlsEnable     *bool
 	socksProxy    *remoting.SocksProxyConfig
 	rpcHook       remoting.RPCHook
+	accessChannel string
 
 	nameServerAddrs []string
 	pollNamesrvIntv int64
@@ -265,6 +266,7 @@ func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) 
 		consumerGroup:                    group,
 		instanceName:                     common.DefaultInstanceName,
 		messageModel:                     MessageModelClustering,
+		accessChannel:                    AccessChannelLocal,
 		consumeFromWhere:                 ConsumeFromWhereLastOffset,
 		consumeTimestamp:                 defaultConsumeTimestamp(),
 		pollNamesrvIntv:                  defaultConsumerPollNamesrvInterval,
@@ -2131,7 +2133,7 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 	// Every response feeds processPullResult (suggest-which-broker bookkeeping),
 	// and FOUND lists come back tag-filtered — the same call the classic pull
 	// consumer makes.
-	result = api.processPullResult(mq, result, sub)
+	result = api.processPullResult(mq, result, sub, c.accessChannel)
 
 	c.mu.Lock()
 	intact := c.nextOffset[mq] == offset

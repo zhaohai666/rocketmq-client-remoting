@@ -32,6 +32,7 @@ import { MessageConst } from '../common/messageConst.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { SubscriptionData, ExpressionType } from '../common/subscriptionData.ts';
 import { FilterMessageContext, FilterMessageHook } from './hook.ts';
+import { AccessChannelLocal } from './trace_context.ts';
 import { decodeMessages, decodeInnerBatchMessages } from '../common/messageDecoder.ts';
 import { getLogger } from '../logging.ts';
 import { MQBrokerException } from '../remoting/exception.ts';
@@ -43,6 +44,9 @@ export class PullAPI {
   private mqClient: MQClient;
   private group: string;
   private unitMode = false;
+  // Java ClientConfig#accessChannel, mirrored onto FilterMessageContext by callers.
+  // The pull/lite-pull facades set it before the first delivery.
+  accessChannel: string = AccessChannelLocal;
   hooks: FilterMessageHook[] = [];
 
   // pullFromWhichNode maps mqKey -> the brokerId to ask next round.
@@ -236,7 +240,7 @@ export class PullAPI {
       ctx.msgList = msgs;
       ctx.mq = mq;
       ctx.unitMode = this.unitMode;
-      ctx.accessChannel = 'LOCAL';
+      ctx.accessChannel = this.accessChannel;
       for (const hook of this.hooks.slice()) {
         try { hook.filterMessage(ctx); } catch (e) { /* swallowed by contract */ }
       }

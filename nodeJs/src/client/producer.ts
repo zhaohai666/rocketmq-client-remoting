@@ -44,6 +44,7 @@ import { FairSemaphore, MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE } from './backpr
 import { injectTraceContext, traceContextEnabledFromEnv } from './traceparent.ts';
 import {
   TraceContext, TraceBean, TraceType, TraceMsgType,
+  AccessChannelLocal, AccessChannelCloud,
 } from './trace_context.ts';
 import type { AsyncTraceDispatcher } from './trace_dispatcher.ts';
 import {
@@ -163,6 +164,9 @@ export class DefaultMQProducer {
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
   socksProxyConfig: SocksProxyConfig | null;
   rpcHook: AclRPCHook | null;
+  // Java ClientConfig#accessChannel (default LOCAL). CLOUD routes trace records to
+  // rmq_sys_TRACE_DATA_<regionId>; handed to the trace dispatcher at start().
+  accessChannel: string;
   unitName: string | null;
   instanceName: string;
   sendLatencyFaultEnable: boolean;
@@ -261,6 +265,7 @@ export class DefaultMQProducer {
     this.tlsOptions = null;
     this.socksProxyConfig = null;
     this.rpcHook = null;
+    this.accessChannel = AccessChannelLocal;
     this.unitName = null;
     this.instanceName = MixAll.DEFAULT_INSTANCE_NAME;
     this.sendLatencyFaultEnable = false;
@@ -333,6 +338,17 @@ export class DefaultMQProducer {
   // effect too.
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
+  // Java ClientConfig#setAccessChannel: LOCAL (default) keeps traces in
+  // RMQ_SYS_TRACE_TOPIC, CLOUD writes rmq_sys_TRACE_DATA_<regionId>. The dispatcher
+  // reads it when start() runs, so set it before start().
+  setAccessChannel(channel: string): this {
+    if (channel !== AccessChannelLocal && channel !== AccessChannelCloud) {
+      throw new Error(`invalid accessChannel: ${channel}`);
+    }
+    this.accessChannel = channel;
+    return this;
+  }
+  getAccessChannel(): string { return this.accessChannel; }
   setUnitName(name: string): this { this.unitName = name; return this; }
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   getInstanceName(): string { return this.instanceName; }
@@ -606,6 +622,10 @@ export class DefaultMQProducer {
         // Propagate the namespace to the internal trace producer so its rpcs
         // carry nsd/ns as well.
         dispatcher.setNamespaceV2(this.namespaceV2);
+        // Java builds the internal trace producer with the host's RPCHook; without
+        // it an ACL broker rejects every trace send and no record is written.
+        dispatcher.rpcHook = this.rpcHook;
+        dispatcher.accessChannel = this.accessChannel;
         this._traceDispatcher = dispatcher;
         this._traceHook = new SendMessageTraceHookImpl(dispatcher);
         hookRegistry.registerSendMessageHook(this._traceHook);
@@ -615,7 +635,7 @@ export class DefaultMQProducer {
         const { DefaultRecallMessageTraceHook } = await import('./trace_hook.ts');
         this._recallTraceHook = new DefaultRecallMessageTraceHook(dispatcher);
         this.client.remotingClient.registerRpcHook(this._recallTraceHook);
-        await dispatcher.start(this.namesrvAddr || undefined);
+        await dispatcher.start(this.namesrvAddr || undefined, this.accessChannel);
       } catch (e) {
         logger.warn('trace dispatcher start failed (trace disabled): %s', (e as Error).message);
         this._traceDispatcher = null;

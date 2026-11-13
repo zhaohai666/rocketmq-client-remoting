@@ -146,8 +146,12 @@ pub trait RegisteredConsumer: Send + Sync {
 pub type ConsumerFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
 
 pub trait TraceDispatcher: Send + Sync {
-    /// Start the trace dispatcher (with the name server address).
-    fn start(&self, name_server_addr: &str) -> Result<()>;
+    /// Start the trace dispatcher (with the name server address and access channel).
+    fn start(
+        &self,
+        name_server_addr: &str,
+        access_channel: crate::client::trace::AccessChannel,
+    ) -> Result<()>;
 
     /// Shut down the trace dispatcher.
     fn shutdown(&self);

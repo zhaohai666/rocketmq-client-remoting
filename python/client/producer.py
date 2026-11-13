@@ -295,6 +295,9 @@ class DefaultMQProducer:
         self.unit_name: Optional[str] = None
         self.unit_mode = False
         self.enable_stream_request_type = False
+        # Java ClientConfig#accessChannel (default LOCAL). CLOUD makes the trace dispatcher
+        # publish to rmq_sys_TRACE_DATA_<regionId> instead of RMQ_SYS_TRACE_TOPIC.
+        self.access_channel: AccessChannel = AccessChannel.LOCAL
         self.namespace_v2 = ""
         self.create_topic_key = MixAll.DEFAULT_TOPIC
         self.default_topic_queue_nums = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
@@ -413,6 +416,17 @@ class DefaultMQProducer:
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
+
+    def set_access_channel(self, access_channel: AccessChannel) -> None:
+        """Java ClientConfig#setAccessChannel: LOCAL (default) keeps the trace records in
+        RMQ_SYS_TRACE_TOPIC; CLOUD routes them to ``rmq_sys_TRACE_DATA_<regionId>``. The
+        value is handed to the trace dispatcher at start()."""
+        if not isinstance(access_channel, AccessChannel):
+            raise ValueError("access_channel must be an AccessChannel value")
+        self.access_channel = access_channel
+
+    def get_access_channel(self) -> AccessChannel:
+        return self.access_channel
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
         """Turn the VIP channel on or off (the same flag as
@@ -874,7 +888,7 @@ class DefaultMQProducer:
                 logger.error("system mqtrace hook init failed ,maybe can't send msg trace data: %s", e)
         if self.trace_dispatcher is not None:
             try:
-                self.trace_dispatcher.start(self.get_namesrv_addr(), AccessChannel.LOCAL)
+                self.trace_dispatcher.start(self.get_namesrv_addr(), self.access_channel)
             except Exception as e:  # noqa: BLE001
                 logger.warning("trace dispatcher start failed: %s", e)
 

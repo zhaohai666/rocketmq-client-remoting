@@ -75,12 +75,21 @@ public:
     int64_t discardCount() const { return discardCount_.load(); }
     int32_t batchNum() const { return batchNum_; }
     bool isStarted() const { return started_.load(); }
+    // The channel start() stored; when a TraceContext carries no accessChannel the dispatcher
+    // falls back to this value (CLOUD -> rmq_sys_TRACE_DATA_<regionId>).
+    AccessChannel accessChannel() const { return accessChannel_; }
+    // Test seam: exposes the internal trace producer. Its rpcHook() must carry the host's ACL hook.
+    DefaultMQProducer* traceProducerForTest() const { return traceProducer_.get(); }
 
 protected:
     // Virtual-method seam: lets unit tests capture sends with a fake producer (no real network).
     // Default implementation sends to the traceTopic with the internal producer (body is the encoded trace text, keys are the lookup keys).
     virtual void sendTraceMessage(const std::string& traceTopic, const std::string& body,
                                   const std::string& keys);
+
+    // Virtual seam: lets unit tests run start() without booting the internal producer's network
+    // client. The default implementation is exactly traceProducer_->start().
+    virtual void startInternalProducer();
 
     void sendTraceData(const std::vector<std::shared_ptr<TraceContext>>& contextList);
     void flushData(const std::vector<TraceTransferBean>& transBeanList,

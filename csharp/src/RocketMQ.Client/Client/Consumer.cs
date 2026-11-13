@@ -646,6 +646,17 @@ public sealed class DefaultMQPushConsumer
     private bool _enableTrace;
     private string _traceTopic = MixAll.TraceTopic;
     private int _traceMsgBatchNum = 10;
+    // AccessChannel.Local (enum value 0) by default; forwarded to the trace
+    // dispatcher at Start and copied into consume hook contexts.
+    private AccessChannel _accessChannel;
+
+    /// <summary>Trace access channel (Local by default; Cloud selects the
+    /// region-prefixed trace topic). Mirrors Java ClientConfig#accessChannel.</summary>
+    public AccessChannel AccessChannel
+    {
+        get => _accessChannel;
+        set => _accessChannel = value;
+    }
     private readonly List<IConsumeMessageHook> _consumeMessageHooks = new();
     private readonly List<IFilterMessageHook> _filterMessageHooks = new();
     private long _filteredMessageCount;
@@ -1927,7 +1938,7 @@ public sealed class DefaultMQPushConsumer
         {
             Success = false,
             Props = new PropertyMap(),
-            AccessChannel = AccessChannel.Local,
+            AccessChannel = this.AccessChannel,
         };
 
     /// <summary>returnType verdict (decides the trace SubAfter contextCode).
@@ -2004,7 +2015,7 @@ public sealed class DefaultMQPushConsumer
         {
             try
             {
-                _traceDispatcher.Start(_nameServerAddrs, AccessChannel.Local);
+                _traceDispatcher.Start(_nameServerAddrs, this.AccessChannel);
             }
             catch (Exception e)
             {
