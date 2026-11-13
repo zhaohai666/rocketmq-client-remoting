@@ -161,6 +161,28 @@ async function main(): Promise<void> {
     r2 && r2.sendStatus === SendStatus.SEND_OK && r2.localTransactionState === LocalTransactionState.UNKNOW,
     r2 ? `status=${r2.sendStatus} state=${r2.localTransactionState}` : 'no result');
 
+  // T4: while the UNKNOW half is parked, read RMQ_SYS_TRANS_HALF_TOPIC directly.
+  // The broker only files a row there when the send request's sysFlag carries
+  // TRANSACTION_PREPARED_TYPE (0x1 << 2 = 0x4, Java DefaultMQProducerImpl:951-954);
+  // a missing bit stores the message as NORMAL and the check-back never fires.
+  const halfSeen = { bodies: new Map<string, number>() };
+  const halfReader = new DefaultMQPushConsumer(`GID_Node_half_read_${STAMP}`);
+  halfReader.setNamesrvAddr(NS);
+  halfReader.setConsumeFromWhere('CONSUME_FROM_FIRST_OFFSET');
+  halfReader.subscribe('RMQ_SYS_TRANS_HALF_TOPIC', '*');
+  halfReader.registerMessageListenerConcurrently((msgs: any[]) => {
+    for (const m of msgs) {
+      const body = (m.getBody() || Buffer.alloc(0)).toString('utf8');
+      halfSeen.bodies.set(body, (halfSeen.bodies.get(body) || 0) + 1);
+    }
+    return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+  });
+  await halfReader.start();
+  const halfInTopic = await waitFor(15_000, () => (halfSeen.bodies.get(bodies.unknow) || 0) >= 1);
+  check('T4 the parked half message is really in RMQ_SYS_TRANS_HALF_TOPIC (sysFlag bit 0x4 honored)',
+    halfInTopic, `bodies=${Array.from(halfSeen.bodies.keys()).join(',')}`);
+  await halfReader.shutdown();
+
   const r3 = await txProducer.sendMessageInTransaction(new Message(TX_TOPIC, Buffer.from(bodies.rollback)));
   check('T3 the ROLLBACK leg sent (half message parked)',
     r3 && r3.sendStatus === SendStatus.SEND_OK && r3.localTransactionState === LocalTransactionState.UNKNOW,

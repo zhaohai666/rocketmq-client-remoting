@@ -791,6 +791,15 @@ export class DefaultMQProducer {
     if (this.client == null) throw new MQClientException('producer not started');
     // 1) compression already applied by caller (tryToCompressMessage); ensure sysFlag present.
     let sysFlag = (msg as any)._sysFlag != null ? (msg as any)._sysFlag : 0;
+    // Java DefaultMQProducerImpl:951-954: a half message carries TRAN_MSG="true"
+    // (stamped by sendMessageInTransaction) and the send kernel flags it in
+    // sysFlag — TRANSACTION_PREPARED_TYPE = 0x1 << 2 = 0x4, the same 2-bit
+    // field the commit/rollback header reuses. Without it the broker stores the
+    // row as a normal message: it never enters RMQ_SYS_TRANS_HALF_TOPIC and
+    // endTransaction cannot find the prepared record.
+    if (msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED) === 'true') {
+      sysFlag |= MessageSysFlag.TRANSACTION_PREPARED_TYPE;
+    }
 
     // 2) CheckForbiddenHook — injected AFTER compression/sysflag, exception is NOT swallowed.
     const forbidCtx = new CheckForbiddenContext(this.namespace, this.producerGroup, msg.getTopic(), msg);

@@ -39,7 +39,7 @@
 | 压缩（>4K，ZLIB/LZ4/ZSTD） | `CompressionCodec` | `live_compression` / `scripts/compression_matrix.sh` |
 | 批量发送（显式 batch，msgId=join UNIQ_KEY） | `DefaultMQProducerImpl#send(messages)` | `run_go_autobatch_live.sh`、`live_producer` |
 | 自动攒批 ProduceAccumulator（默认 OFF） | `ProduceAccumulator` | `run_go_autobatch_live.sh`（Go 10/10 + Py 对拍） |
-| 事务消息（半消息 / 提交回滚 / 回查 219） | `TransactionMQProducer` | `verify_transaction_live.py`、`live_producer`(node 事务腿)、go `live_producer` |
+| 事务消息（半消息 / 提交回滚 / 回查 219） | `TransactionMQProducer`、`MessageSysFlag.TRANSACTION_PREPARED_TYPE`（`MessageSysFlag.java:36`，`0x1<<2=0x4`） | `verify_transaction_live.py`、go/cpp/py/cs/rs/php `live_producer`；node `live_orderly_transaction`（`run_node_live.sh orderly_tx`，T4 腿钉死半消息真进 `RMQ_SYS_TRANS_HALF_TOPIC`）。**2026-11-13 修复**：node 发送 kernel 只组压缩位、漏判 `TRAN_MSG` 属性（Java `DefaultMQProducerImpl:951-954` `sysFlag |= TRANSACTION_PREPARED_TYPE`）→ 半消息被 broker 当普通消息直投，回查从未发生（T1/T2 旧探针因此假绿）；kernel 现按 Java 补判，离线 `transaction_sysflag_smoke`（5 checks：常量 0x4 / 半消息带位 / 普通消息事务字段为 0 / 压缩+事务叠加 / 重发幂等）+ 真机 T1-T4 全绿。其余六端 kernel/入口均有该位（py `producer.py:1725-1727`、go `producer.go:272`、cpp `producer.cpp:456`、cs `Producer.cs:1280`、rust `producer.rs:2235`、php `Producer.php:1268`） |
 | MessageQueueSelector（hash/random/machineRoom） | `producer.selector.*` | `live_send_header` |
 | 生产者注销（35 全 broker） | `MQClientInstance#unregisterClient` | `live_producer_unregister` |
 
