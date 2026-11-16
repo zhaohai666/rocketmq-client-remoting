@@ -4,6 +4,11 @@ import { createHash } from 'node:crypto';
 export const MixAll = {
   NAMESRV_ADDR_PROPERTY: 'rocketmq.namesrv.addr',
   NAMESRV_ADDR_ENV: 'NAMESRV_ADDR',
+  // Non-JVM ports have no system properties: the Java property
+  // rocketmq.namesrv.addr (ClientConfig's default namesrvAddr) maps to this
+  // env var, tried before NAMESRV_ADDR.
+  NAMESRV_ADDR_PROPERTY_ENV: 'ROCKETMQ_NAMESRV_ADDR',
+  NAMESRV_DOMAIN_SUBGROUP_ENV: 'ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP',
   MESSAGE_COMPRESS_LEVEL: 'rocketmq.message.compressLevel',
   DEFAULT_TOPIC: 'TBW102',
   BENCHMARK_TOPIC: 'BenchmarkTest',
@@ -142,6 +147,17 @@ export const MixAll = {
   },
   clientIdFor(instanceName, unitName = null, enableStreamRequestType = false) {
     return MixAll.buildMqClientId(MixAll.cachedIpStr(), instanceName, unitName, enableStreamRequestType);
+  },
+  // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+  // address the namesrvAddr field is initialised from the rocketmq.namesrv.addr
+  // property falling back to the NAMESRV_ADDR environment variable. Non-JVM
+  // ports map the property name to ROCKETMQ_NAMESRV_ADDR. Addresses split on
+  // ';' or ',' like setNamesrvAddr does; the facade stores a ';'-joined string.
+  namesrvAddrFromEnv() {
+    const raw = process.env[this.NAMESRV_ADDR_PROPERTY_ENV] || process.env[this.NAMESRV_ADDR_ENV] || '';
+    if (raw.trim() === '') return null;
+    const addrs = raw.split(/[;,]/).map((s) => s.trim()).filter((s) => s !== '');
+    return addrs.length > 0 ? addrs.join(';') : null;
   },
 
   NAMESPACE_SEPARATOR: '%',

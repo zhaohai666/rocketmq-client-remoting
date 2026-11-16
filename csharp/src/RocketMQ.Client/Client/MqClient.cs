@@ -288,7 +288,10 @@ public sealed class MQClientInstance : IDisposable
     public MQClientInstance(string clientId, IReadOnlyList<string> nameServerAddrs,
         int connectTimeoutMillis = 3000, int invokeTimeoutMillis = 15000, bool? tlsEnable = null,
         TlsOptions? tlsOptions = null, SocksProxyConfig? socksProxy = null, string? unitName = null,
-        int pollNameServerIntervalMillis = 30000, bool vipChannelEnabled = false)
+        int pollNameServerIntervalMillis = 30000, bool vipChannelEnabled = false,
+        // Address-server setting (Java rocketmq.namesrv.domain[.subgroup]): explicit values
+        // win over the ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP env vars.
+        string? namesrvDomain = null, string? namesrvSubgroup = null)
     {
         _clientId = clientId;
         _nameServerAddrs = new List<string>(nameServerAddrs);
@@ -298,7 +301,10 @@ public sealed class MQClientInstance : IDisposable
         _vipChannelEnabled = vipChannelEnabled;
         _remotingClient = new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis, tlsEnable, tlsOptions,
             socksProxy);
-        TopAddressing = new DefaultTopAddressing(unitName: unitName);
+        // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+        // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+        TopAddressing = new DefaultTopAddressing(unitName: unitName,
+            domain: namesrvDomain, subgroup: namesrvSubgroup);
 
         _remotingClient.RegisterProcessor(RequestCode.PushReplyMessageToClient, ProcessReplyMessage);
 

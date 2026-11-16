@@ -459,6 +459,14 @@ pub struct ProducerConfig {
     pub back_pressure_for_async_send_size: i64,
     pub topics: Vec<String>,
     pub name_server_addrs: Vec<String>,
+    /// Address-server domain (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. When name server addresses are
+    /// absent, a non-empty domain allows start-up with dynamic addressing.
+    pub namesrv_domain: Option<String>,
+    /// Address-server subgroup (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable, which wins over the
+    /// Java default `"nsaddr"`.
+    pub namesrv_subgroup: Option<String>,
     pub heartbeat_interval_millis: u64,
     pub send_latency_fault_enable: bool,
     pub start_detector_enable: bool,
@@ -539,6 +547,8 @@ impl Default for ProducerConfig {
             back_pressure_for_async_send_size: 100 * 1024 * 1024,
             topics: Vec::new(),
             name_server_addrs: Vec::new(),
+            namesrv_domain: None,
+            namesrv_subgroup: None,
             heartbeat_interval_millis: 30_000,
             send_latency_fault_enable: false,
             start_detector_enable: false,
@@ -814,6 +824,8 @@ impl std::fmt::Debug for DefaultMQProducer {
             .field("instance_name", &cfg.instance_name)
             .field("client_id", &cfg.client_id)
             .field("name_server_addrs", &cfg.name_server_addrs)
+            .field("namesrv_domain", &cfg.namesrv_domain)
+            .field("namesrv_subgroup", &cfg.namesrv_subgroup)
             .field("started", &self.inner.started.load(Ordering::Acquire))
             .field("enable_trace", &cfg.enable_trace)
             .finish()
@@ -926,6 +938,38 @@ impl DefaultMQProducer {
 
     pub fn set_name_server_addresses(&self, addrs: Vec<String>) {
         self.write_cfg(|c| c.name_server_addrs = addrs);
+    }
+
+    /// Address-server domain (Java: system property `rocketmq.namesrv.domain`,
+    /// default `jmenv.tbsite.net`). Explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. Blank = not set.
+    pub fn set_namesrv_domain(&self, domain: &str) {
+        let domain = domain.trim().to_string();
+        self.write_cfg(|c| {
+            c.namesrv_domain = if domain.is_empty() { None } else { Some(domain) }
+        });
+    }
+
+    /// Address-server subgroup (Java: system property
+    /// `rocketmq.namesrv.domain.subgroup`, default `nsaddr`). Explicit setting wins over
+    /// the `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable. Blank = not set.
+    pub fn set_namesrv_subgroup(&self, subgroup: &str) {
+        let subgroup = subgroup.trim().to_string();
+        self.write_cfg(|c| {
+            c.namesrv_subgroup = if subgroup.is_empty() {
+                None
+            } else {
+                Some(subgroup)
+            }
+        });
+    }
+
+    pub fn namesrv_domain(&self) -> Option<String> {
+        self.config().namesrv_domain
+    }
+
+    pub fn namesrv_subgroup(&self) -> Option<String> {
+        self.config().namesrv_subgroup
     }
 
     /// Joined with `;`.
@@ -1373,7 +1417,24 @@ impl DefaultMQProducer {
                 "producerGroup can not equal DEFAULT_PRODUCER, please specify another one.",
             ));
         }
-        if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+        // address, the list is initialised from the ROCKETMQ_NAMESRV_ADDR env var
+        // (the `rocketmq.namesrv.addr` property equivalent) falling back to NAMESRV_ADDR.
+        let cfg = if cfg.name_server_addrs.is_empty() {
+            let env_addrs = MixAll::namesrv_addrs_from_env();
+            if !env_addrs.is_empty() {
+                self.write_cfg(|c| c.name_server_addrs.clone_from(&env_addrs));
+            }
+            self.config()
+        } else {
+            cfg
+        };
+        // Static addresses, the address-server setting or the domain environment
+        // variable: one of the three must be available.
+        if cfg.name_server_addrs.is_empty()
+            && cfg.namesrv_domain.as_deref().unwrap_or_default().is_empty()
+            && !DefaultTopAddressing::is_configured()
+        {
             self.inner.started.store(false, Ordering::Release);
             return Err(Error::client_with_code(
                 client_error_code::NO_NAME_SERVER_EXCEPTION,
@@ -1411,6 +1472,12 @@ impl DefaultMQProducer {
             mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
             enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
             concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
+            // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+            // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+            top_addressing: Some(DefaultTopAddressing::from_settings(
+                cfg.namesrv_domain.as_deref(),
+                cfg.namesrv_subgroup.as_deref(),
+            )),
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -5481,5 +5548,71 @@ mod tests {
         let p = producer("GID_trace_host");
         // the host returns an empty string when it has no _mq_client
         assert_eq!(TraceHost::client_id(&p), "");
+    }
+
+    // ---------------- namesrv domain / subgroup setting ----------------
+
+    /// Serialises every test below that mutates the addressing env vars (`std::env` is
+    /// process-global and Rust tests run on parallel threads); shared with the env tests
+    /// in `mix_all` and `top_addressing`.
+    fn namesrv_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::common::mix_all::test_support::namesrv_env_lock()
+    }
+
+    #[test]
+    fn namesrv_domain_setters_strip_and_blank_clears() {
+        let p = producer("GID_domain_setter");
+        p.set_namesrv_domain("  jmenv.tbsite.net  ");
+        p.set_namesrv_subgroup("  nsaddr-custom  ");
+        assert_eq!(p.namesrv_domain().as_deref(), Some("jmenv.tbsite.net"));
+        assert_eq!(p.namesrv_subgroup().as_deref(), Some("nsaddr-custom"));
+        // Blank = not set.
+        p.set_namesrv_domain("   ");
+        p.set_namesrv_subgroup("");
+        assert_eq!(p.namesrv_domain(), None);
+        assert_eq!(p.namesrv_subgroup(), None);
+    }
+
+    /// With an explicit domain the start guard passes (previously the facade could not be
+    /// started on dynamic addressing alone): the pipeline reaches the address server and
+    /// reports its failure there instead of the plain 10004 guard error.
+    #[tokio::test]
+    async fn explicit_domain_passes_the_start_guard_and_reaches_the_address_server() {
+        let p = producer("GID_domain_guard");
+        p.set_namesrv_domain("127.0.0.1:1"); // nothing listens here: fails fast
+        let err = p.start().await.expect_err("no address server on 127.0.0.1:1");
+        assert!(
+            err.to_string().contains("address server"),
+            "the guard must have passed and reached the address server: {err}"
+        );
+        assert!(!p.is_started());
+        p.shutdown();
+    }
+
+    /// With no explicit address the env chain (`ROCKETMQ_NAMESRV_ADDR` then `NAMESRV_ADDR`)
+    /// populates the address list before the guard runs.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn env_addresses_fill_the_list_before_the_start_guard() {
+        // The env reads inside `start()` (the MixAll default chain + TopAddressing
+        // construction) happen synchronously before its first `.await`, but the vars must
+        // stay set for the whole call: the lock is intentionally held across it.
+        let _g = namesrv_env_lock();
+        if std::env::var(MixAll::NAMESRV_ADDR_PROPERTY_ENV).is_ok()
+            || std::env::var(MixAll::NAMESRV_ADDR_ENV).is_ok()
+        {
+            return;
+        }
+        std::env::set_var(MixAll::NAMESRV_ADDR_ENV, "127.0.0.1:19876");
+        let p = producer("GID_env_addr");
+        p.set_instance_name("env_addr_guard");
+        let started = p.start().await;
+        assert_eq!(p.namesrv_addr(), "127.0.0.1:19876");
+        std::env::remove_var(MixAll::NAMESRV_ADDR_ENV);
+        // The instance may or may not come up depending on the environment; only the
+        // address default chain is under test here.
+        if started.is_ok() {
+            p.shutdown();
+        }
     }
 }

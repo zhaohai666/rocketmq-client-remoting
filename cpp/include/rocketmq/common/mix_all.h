@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "rocketmq/common/types.h"
 
@@ -11,6 +12,13 @@ namespace rocketmq {
 struct MixAll {
     static constexpr const char* NAMESRV_ADDR_PROPERTY = "rocketmq.namesrv.addr";
     static constexpr const char* NAMESRV_ADDR_ENV = "NAMESRV_ADDR";
+    // Non-JVM ports have no system properties, so the Java property
+    // ``rocketmq.namesrv.addr`` (ClientConfig's default namesrvAddr) maps to this env var,
+    // tried before NAMESRV_ADDR (MixAll.NAMESRV_ADDR_ENV on the JVM).
+    static constexpr const char* NAMESRV_ADDR_PROPERTY_ENV = "ROCKETMQ_NAMESRV_ADDR";
+    // Java system property rocketmq.namesrv.domain.subgroup (MixAll.WS_DOMAIN_SUBGROUP);
+    // read here as an environment variable when the subgroup is not set explicitly.
+    static constexpr const char* NAMESRV_DOMAIN_SUBGROUP_ENV = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP";
     static constexpr const char* MESSAGE_COMPRESS_LEVEL = "rocketmq.message.compressLevel";
     static constexpr const char* DEFAULT_TOPIC = "TBW102";
     static constexpr const char* BENCHMARK_TOPIC = "BenchmarkTest";
@@ -86,6 +94,13 @@ struct MixAll {
     static constexpr int32_t READ_PERM_BY_DEFAULT = 4 | 2;  // PERM_READ | PERM_WRITE
 
     static constexpr const char* NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG";
+
+    // Java ClientConfig default chain (ClientConfig.java:45): the namesrvAddr field is
+    // initialised from the system property ``rocketmq.namesrv.addr`` falling back to the
+    // ``NAMESRV_ADDR`` environment variable. Non-JVM ports map the property name to
+    // ``ROCKETMQ_NAMESRV_ADDR`` (env names cannot carry dots). Addresses are split on
+    // ``;`` or ``,`` like setNamesrvAddr does.
+    static std::vector<std::string> namesrvAddrsFromEnv();
 
     static std::string getRetryTopic(const std::string& consumerGroup) {
         return std::string(RETRY_GROUP_TOPIC_PREFIX) + consumerGroup;

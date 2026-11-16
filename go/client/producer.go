@@ -11,6 +11,7 @@ package client
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -374,10 +375,15 @@ type DefaultMQProducer struct {
 	retryResponseCodes      map[int32]struct{}
 	maxMessageSize          int
 
-	rpcHook            remoting.RPCHook
-	namespaceV2        string
-	topics             []string
-	nameServerAddrs    []string
+	rpcHook         remoting.RPCHook
+	namespaceV2     string
+	topics          []string
+	nameServerAddrs []string
+	// nameServerDomain / nameServerSubgroup are the address-server settings;
+	// explicit values win over the ROCKETMQ_NAMESRV_DOMAIN /
+	// ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables.
+	nameServerDomain   string
+	nameServerSubgroup string
 	tlsEnable          *bool
 	socksProxy         *remoting.SocksProxyConfig
 	pollNameServerIntv int64
@@ -745,6 +751,20 @@ func (p *DefaultMQProducer) SetNameServerAddresses(addrs []string) {
 	p.nameServerAddrs = append([]string(nil), addrs...)
 }
 
+// SetNameServerDomain sets the address-server domain (Java: system property
+// rocketmq.namesrv.domain, default jmenv.tbsite.net). The explicit setting
+// wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable.
+func (p *DefaultMQProducer) SetNameServerDomain(domain string) {
+	p.nameServerDomain = strings.TrimSpace(domain)
+}
+
+// SetNameServerSubgroup sets the address-server subgroup (Java: system
+// property rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit
+// setting wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+func (p *DefaultMQProducer) SetNameServerSubgroup(subgroup string) {
+	p.nameServerSubgroup = strings.TrimSpace(subgroup)
+}
+
 // splitNamesrvAddr parses the address-list form: split on ';' and trim.
 func splitNamesrvAddr(addrs string) []string {
 	var out []string
@@ -802,10 +822,16 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 			"producerGroup can not equal %s, please specify another one.", common.DefaultProducerGroup))
 	}
 	if len(p.nameServerAddrs) == 0 {
-		// The protocol surfaces a missing nameserver on the first send (as
-		// 10004); reporting it
-		// here is more predictable, but must use the SAME code so callers do
-		// not have to handle two different values for one failure.
+		// Java ClientConfig default chain (ClientConfig.java:45): with no
+		// explicit address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+		p.nameServerAddrs = common.NamesrvAddrsFromEnv()
+	}
+	if len(p.nameServerAddrs) == 0 && p.nameServerDomain == "" && os.Getenv(common.NamesrvDomainEnv) == "" {
+		// Static addresses, the address-server setting or the domain
+		// environment variable: one of the three must be available. The
+		// protocol surfaces a missing nameserver on the first send (as 10004);
+		// reporting it here is more predictable, but must use the SAME code so
+		// callers do not have to handle two different values for one failure.
 		return false, common.ClientErrorCode(common.NoNameServerException, "name server address is not set")
 	}
 	// Start first converts the instance name to the PID, then builds the
@@ -821,6 +847,8 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	}
 	cfg.SocksProxy = p.socksProxy
 	cfg.PollNameServerIntervalMillis = p.pollNameServerIntv
+	cfg.NamesrvDomain = p.nameServerDomain
+	cfg.NamesrvSubgroup = p.nameServerSubgroup
 	// A producer that asks for the VIP channel seeds the instance-wide switch too,
 	// so the other broker-facing RPCs of this clientId (offsets, locks, the
 	// admin calls riding the same instance) see the same intent.

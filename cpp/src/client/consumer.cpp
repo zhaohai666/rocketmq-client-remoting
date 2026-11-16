@@ -93,6 +93,14 @@ void DefaultMQPushConsumer::setNameServerAddresses(const std::vector<std::string
     nameServerAddrs_ = addrs;
 }
 
+void DefaultMQPushConsumer::setNamesrvDomain(const std::string& domain) {
+    namesrvDomain_ = trim(domain);
+}
+
+void DefaultMQPushConsumer::setNamesrvSubgroup(const std::string& subgroup) {
+    namesrvSubgroup_ = trim(subgroup);
+}
+
 void DefaultMQPushConsumer::setAllocateMessageQueueStrategy(
     std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
     // The setter does not validate: a null strategy is rejected by checkConfig in start().
@@ -399,8 +407,16 @@ void DefaultMQPushConsumer::start() {
             throw MQClientException(
                 "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
         }
-        // Either static addresses or dynamic resolution (ROCKETMQ_NAMESRV_DOMAIN) must be available
-        if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+        // the field is initialised from the rocketmq.namesrv.addr property falling back to
+        // the NAMESRV_ADDR environment variable.
+        if (nameServerAddrs_.empty()) {
+            nameServerAddrs_ = MixAll::namesrvAddrsFromEnv();
+        }
+        // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+        // environment variable: one of the three must be available.
+        if (nameServerAddrs_.empty() && namesrvDomain_.empty()
+                && !DefaultTopAddressing::isConfigured()) {
             throw MQClientException("name server address is not set");
         }
         // A null strategy refuses start outright
@@ -440,7 +456,8 @@ void DefaultMQPushConsumer::start() {
                                              /*connectTimeoutMillis=*/3000,
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
                                              tlsEnable_, unitName_,
-                                             pollNameServerIntervalMillis_));
+                                             pollNameServerIntervalMillis_,
+                                             namesrvDomain_, namesrvSubgroup_));
         // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
         mqClient_->setVipChannelEnabled(vipChannelEnabled_);
         mqClient_->setDecodeReadBody(decodeReadBody_);

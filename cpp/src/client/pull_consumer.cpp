@@ -10,7 +10,9 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/sysflag.h"
+#include "rocketmq/common/top_addressing.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/exception.h"
 #include "rocketmq/remoting/protocol/codes.h"
@@ -90,6 +92,14 @@ void DefaultMQPullConsumer::setNameServerAddresses(const std::vector<std::string
     nameServerAddrs_ = addrs;
 }
 
+void DefaultMQPullConsumer::setNamesrvDomain(const std::string& domain) {
+    namesrvDomain_ = trim(domain);
+}
+
+void DefaultMQPullConsumer::setNamesrvSubgroup(const std::string& subgroup) {
+    namesrvSubgroup_ = trim(subgroup);
+}
+
 void DefaultMQPullConsumer::registerMessageQueueListener(
     const std::string& topic, std::shared_ptr<MessageQueueListener> listener) {
     if (topic.empty()) return;
@@ -133,7 +143,16 @@ void DefaultMQPullConsumer::start() {
         throw MQClientException(
             "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
     }
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+    // the field is initialised from the rocketmq.namesrv.addr property falling back to
+    // the NAMESRV_ADDR environment variable.
     if (nameServerAddrs_.empty()) {
+        nameServerAddrs_ = MixAll::namesrvAddrsFromEnv();
+    }
+    // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+    // environment variable: one of the three must be available.
+    if (nameServerAddrs_.empty() && namesrvDomain_.empty()
+            && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
     }
     if (!allocateStrategy_) {
@@ -149,7 +168,8 @@ void DefaultMQPullConsumer::start() {
                                         /*connectTimeoutMillis=*/3000,
                                         consumerPullTimeoutMillis_,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
-                                        pollNameServerIntervalMillis_));
+                                        pollNameServerIntervalMillis_,
+                                        namesrvDomain_, namesrvSubgroup_));
     // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     mqClient_->setDecodeReadBody(decodeReadBody_);

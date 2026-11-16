@@ -1,6 +1,7 @@
 package common
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -142,5 +143,39 @@ func TestCreateUniqNameShape(t *testing.T) {
 	}
 	if a == b {
 		t.Fatal("consecutive names must differ")
+	}
+}
+
+// Java ClientConfig.java:45 semantics: the namesrvAddr field defaults to the
+// rocketmq.namesrv.addr property falling back to the NAMESRV_ADDR environment
+// variable. Non-JVM ports map the property name to ROCKETMQ_NAMESRV_ADDR.
+func TestNamesrvAddrsFromEnv(t *testing.T) {
+	t.Setenv("NAMESRV_ADDR", "10.0.0.2:9876")
+	os.Setenv("ROCKETMQ_NAMESRV_ADDR", "10.0.0.1:9876")
+	if got := NamesrvAddrsFromEnv(); len(got) != 1 || got[0] != "10.0.0.1:9876" {
+		t.Errorf("ROCKETMQ_NAMESRV_ADDR must win, got %v", got)
+	}
+	os.Unsetenv("ROCKETMQ_NAMESRV_ADDR")
+	if got := NamesrvAddrsFromEnv(); len(got) != 1 || got[0] != "10.0.0.2:9876" {
+		t.Errorf("NAMESRV_ADDR must back the property env, got %v", got)
+	}
+	os.Setenv("NAMESRV_ADDR", " 10.0.0.1:9876 ; 10.0.0.2:9876 ,, 10.0.0.3:9876 ")
+	if got := NamesrvAddrsFromEnv(); len(got) != 3 || got[2] != "10.0.0.3:9876" {
+		t.Errorf("must split on ';' and ',' and trim, got %v", got)
+	}
+	os.Unsetenv("NAMESRV_ADDR")
+	if got := NamesrvAddrsFromEnv(); len(got) != 0 {
+		t.Errorf("unset env must yield an empty list, got %v", got)
+	}
+}
+
+// Java MixAll.getWSAddr URL rules: a domain carrying a port (contains ':')
+// keeps it; otherwise the default :8080 is appended before /rocketmq/<subgroup>.
+func TestWSAddrForDomain(t *testing.T) {
+	if got := WSAddrForDomain("jmenv.tbsite.net", DefaultNamesrvDomainSubgroup); got != "http://jmenv.tbsite.net:8080/rocketmq/nsaddr" {
+		t.Errorf("default port must be appended, got %s", got)
+	}
+	if got := WSAddrForDomain("host:12345", DefaultNamesrvDomainSubgroup); got != "http://host:12345/rocketmq/nsaddr" {
+		t.Errorf("domain with port must keep it, got %s", got)
 	}
 }

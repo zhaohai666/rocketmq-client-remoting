@@ -187,6 +187,14 @@ public:
     // ---------------- Configuration ----------------
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the
+    // ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables;
+    // an empty (or whitespace-only) value resets the setting.
+    void setNamesrvDomain(const std::string& domain);
+    void setNamesrvSubgroup(const std::string& subgroup);
+    const std::string& namesrvDomain() const { return namesrvDomain_; }
+    const std::string& namesrvSubgroup() const { return namesrvSubgroup_; }
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
     // ---------------- unitName / unitMode / enableStreamRequestType ----------------
@@ -1127,6 +1135,9 @@ private:
     bool enableHeartbeatChannelEventListener_ = true;
 
     std::vector<std::string> nameServerAddrs_;
+    // Address-server setting; empty = unset (environment variables then apply).
+    std::string namesrvDomain_;
+    std::string namesrvSubgroup_;
     mutable std::mutex lock_;
     std::map<std::string, SubscriptionData> subscriptionData_;
     std::shared_ptr<MessageListener> messageListener_;

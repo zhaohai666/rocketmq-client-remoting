@@ -64,6 +64,11 @@ public sealed class DefaultMQAdminExt
     private string _instanceName;
     private string _clientId = string.Empty;
     private List<string> _nameServerAddrs = new();
+    // Address-server setting; null/empty = unset (environment variables then apply).
+    // Explicit values win over the ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP
+    // environment variables (Java system properties rocketmq.namesrv.domain[.subgroup]).
+    private string? _namesrvDomain;
+    private string? _namesrvSubgroup;
     private readonly List<string> _kvNamespaceToDeleteList = new();
     private int _timeoutMillis = DefaultTimeout;
     // The admin's own group identity (Java adminExtGroup). This port's admin sends no synthetic
@@ -99,6 +104,25 @@ public sealed class DefaultMQAdminExt
 
     public void SetNameServerAddresses(IReadOnlyList<string> addrs) =>
         _nameServerAddrs = new List<string>(addrs);
+
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the environment
+    // variables; an empty (or whitespace-only) value resets the setting.
+    public string NamesrvDomain
+    {
+        get => _namesrvDomain ?? string.Empty;
+        set => _namesrvDomain = value?.Trim();
+    }
+
+    public string NamesrvSubgroup
+    {
+        get => _namesrvSubgroup ?? string.Empty;
+        set => _namesrvSubgroup = value?.Trim();
+    }
+
+    public void SetNamesrvDomain(string? domain) => NamesrvDomain = domain ?? string.Empty;
+
+    public void SetNamesrvSubgroup(string? subgroup) => NamesrvSubgroup = subgroup ?? string.Empty;
 
     /// <summary>Change instanceName at runtime (does not rebuild the client).</summary>
     public void SetInstanceName(string name) => _instanceName = name;
@@ -214,7 +238,18 @@ public sealed class DefaultMQAdminExt
     public void Start()
     {
         if (_started) return;
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+        // the field is initialised from the rocketmq.namesrv.addr property falling back to
+        // the NAMESRV_ADDR environment variable.
         if (_nameServerAddrs.Count == 0)
+        {
+            _nameServerAddrs = MixAll.NamesrvAddrsFromEnv();
+        }
+
+        // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+        // environment variable: one of the three must be available.
+        if (_nameServerAddrs.Count == 0 && string.IsNullOrEmpty(_namesrvDomain)
+            && !DefaultTopAddressing.IsConfigured())
         {
             throw new MQClientException("name server address is not set");
         }
@@ -229,7 +264,8 @@ public sealed class DefaultMQAdminExt
         _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
             () => new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
                 pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
-                vipChannelEnabled: _vipChannelEnabled));
+                vipChannelEnabled: _vipChannelEnabled,
+                namesrvDomain: _namesrvDomain, namesrvSubgroup: _namesrvSubgroup));
         if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
         {
             ClientLog.Warn("admin rpc hook ignored: MQClientInstance already has one (clientId="

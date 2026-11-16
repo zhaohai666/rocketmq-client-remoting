@@ -280,6 +280,14 @@ pub struct PullConsumerConfig {
     pub poll_name_server_interval_millis: u64,
     /// Name server address list.
     pub name_server_addrs: Vec<String>,
+    /// Address-server domain (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. When name server addresses are
+    /// absent, a non-empty domain allows start-up with dynamic addressing.
+    pub namesrv_domain: Option<String>,
+    /// Address-server subgroup (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable, which wins over the
+    /// Java default `"nsaddr"`.
+    pub namesrv_subgroup: Option<String>,
     /// `None` = defer to the `ROCKETMQ_TLS_ENABLE` environment variable
     /// (the pull consumer had no such field; unified here with the push consumer).
     pub tls_enable: Option<bool>,
@@ -338,6 +346,8 @@ impl Default for PullConsumerConfig {
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
+            namesrv_domain: None,
+            namesrv_subgroup: None,
             tls_enable: None,
             socks_proxy: None,
             message_model: MessageModel::CLUSTERING.to_string(),
@@ -519,6 +529,38 @@ impl DefaultMQPullConsumer {
     pub fn set_name_server_addresses(&self, addrs: &[String]) {
         let addrs = addrs.to_vec();
         self.update_config(|c| c.name_server_addrs = addrs);
+    }
+
+    /// Address-server domain (Java: system property `rocketmq.namesrv.domain`,
+    /// default `jmenv.tbsite.net`). Explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. Blank = not set.
+    pub fn set_namesrv_domain(&self, domain: &str) {
+        let domain = domain.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_domain = if domain.is_empty() { None } else { Some(domain) }
+        });
+    }
+
+    /// Address-server subgroup (Java: system property
+    /// `rocketmq.namesrv.domain.subgroup`, default `nsaddr`). Explicit setting wins over
+    /// the `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable. Blank = not set.
+    pub fn set_namesrv_subgroup(&self, subgroup: &str) {
+        let subgroup = subgroup.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_subgroup = if subgroup.is_empty() {
+                None
+            } else {
+                Some(subgroup)
+            }
+        });
+    }
+
+    pub fn namesrv_domain(&self) -> Option<String> {
+        self.config().namesrv_domain
+    }
+
+    pub fn namesrv_subgroup(&self) -> Option<String> {
+        self.config().namesrv_subgroup
     }
 
     pub fn set_instance_name(&self, name: &str) {
@@ -891,7 +933,24 @@ impl DefaultMQPullConsumer {
                 "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.",
             ));
         }
-        if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+        // address, the list is initialised from the ROCKETMQ_NAMESRV_ADDR env var
+        // (the `rocketmq.namesrv.addr` property equivalent) falling back to NAMESRV_ADDR.
+        let cfg = if cfg.name_server_addrs.is_empty() {
+            let env_addrs = MixAll::namesrv_addrs_from_env();
+            if !env_addrs.is_empty() {
+                self.update_config(|c| c.name_server_addrs.clone_from(&env_addrs));
+            }
+            self.config()
+        } else {
+            cfg
+        };
+        // Static addresses, the address-server setting or the domain environment
+        // variable: one of the three must be available.
+        if cfg.name_server_addrs.is_empty()
+            && cfg.namesrv_domain.as_deref().unwrap_or_default().is_empty()
+            && !DefaultTopAddressing::is_configured()
+        {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
@@ -923,6 +982,12 @@ impl DefaultMQPullConsumer {
             mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
             enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
             concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
+            // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+            // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+            top_addressing: Some(DefaultTopAddressing::from_settings(
+                cfg.namesrv_domain.as_deref(),
+                cfg.namesrv_subgroup.as_deref(),
+            )),
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(
@@ -1677,6 +1742,14 @@ pub struct LitePullConsumerConfig {
     pub poll_name_server_interval_millis: u64,
     /// Name server address list.
     pub name_server_addrs: Vec<String>,
+    /// Address-server domain (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. When name server addresses are
+    /// absent, a non-empty domain allows start-up with dynamic addressing.
+    pub namesrv_domain: Option<String>,
+    /// Address-server subgroup (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable, which wins over the
+    /// Java default `"nsaddr"`.
+    pub namesrv_subgroup: Option<String>,
     /// `tls_enable` (same note as above, unified with the push consumer).
     pub tls_enable: Option<bool>,
     /// SOCKS proxy (same note as above, unified with the push consumer).
@@ -1753,6 +1826,8 @@ impl Default for LitePullConsumerConfig {
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
+            namesrv_domain: None,
+            namesrv_subgroup: None,
             tls_enable: None,
             socks_proxy: None,
             message_model: MessageModel::CLUSTERING.to_string(),
@@ -2548,6 +2623,38 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
+    /// Address-server domain (Java: system property `rocketmq.namesrv.domain`,
+    /// default `jmenv.tbsite.net`). Explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. Blank = not set.
+    pub fn set_namesrv_domain(&self, domain: &str) {
+        let domain = domain.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_domain = if domain.is_empty() { None } else { Some(domain) }
+        });
+    }
+
+    /// Address-server subgroup (Java: system property
+    /// `rocketmq.namesrv.domain.subgroup`, default `nsaddr`). Explicit setting wins over
+    /// the `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable. Blank = not set.
+    pub fn set_namesrv_subgroup(&self, subgroup: &str) {
+        let subgroup = subgroup.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_subgroup = if subgroup.is_empty() {
+                None
+            } else {
+                Some(subgroup)
+            }
+        });
+    }
+
+    pub fn namesrv_domain(&self) -> Option<String> {
+        self.config().namesrv_domain
+    }
+
+    pub fn namesrv_subgroup(&self) -> Option<String> {
+        self.config().namesrv_subgroup
+    }
+
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
@@ -2999,7 +3106,24 @@ impl DefaultLitePullConsumer {
                  than brokerSuspendMaxTimeMillis"
             );
         }
-        if cfg.name_server_addrs.is_empty() && !DefaultTopAddressing::is_configured() {
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+        // address, the list is initialised from the ROCKETMQ_NAMESRV_ADDR env var
+        // (the `rocketmq.namesrv.addr` property equivalent) falling back to NAMESRV_ADDR.
+        let cfg = if cfg.name_server_addrs.is_empty() {
+            let env_addrs = MixAll::namesrv_addrs_from_env();
+            if !env_addrs.is_empty() {
+                self.update_config(|c| c.name_server_addrs.clone_from(&env_addrs));
+            }
+            self.config()
+        } else {
+            cfg
+        };
+        // Static addresses, the address-server setting or the domain environment
+        // variable: one of the three must be available.
+        if cfg.name_server_addrs.is_empty()
+            && cfg.namesrv_domain.as_deref().unwrap_or_default().is_empty()
+            && !DefaultTopAddressing::is_configured()
+        {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
@@ -3035,6 +3159,12 @@ impl DefaultLitePullConsumer {
             mq_client_api_timeout_millis: cfg.mq_client_api_timeout_millis,
             enable_concurrent_heartbeat: cfg.enable_concurrent_heartbeat,
             concurrent_heartbeat_thread_pool_size: cfg.concurrent_heartbeat_thread_pool_size,
+            // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+            // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+            top_addressing: Some(DefaultTopAddressing::from_settings(
+                cfg.namesrv_domain.as_deref(),
+                cfg.namesrv_subgroup.as_deref(),
+            )),
             ..Default::default()
         };
         let client = MQClientInstance::create_mq_client_instance(

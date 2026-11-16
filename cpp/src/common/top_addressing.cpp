@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
 
 namespace rocketmq {
@@ -71,12 +72,27 @@ bool DefaultTopAddressing::isConfigured() {
     return env != nullptr && env[0] != '\0';
 }
 
-void DefaultTopAddressing::configureFromEnv(const std::string& unitName) {
-    const char* env = std::getenv("ROCKETMQ_NAMESRV_DOMAIN");
-    if (env == nullptr || env[0] == '\0') {
+std::string DefaultTopAddressing::resolveSubgroup(const std::string& subgroup) {
+    if (!trimCopy(subgroup).empty()) return subgroup;
+    const char* env = std::getenv(MixAll::NAMESRV_DOMAIN_SUBGROUP_ENV);
+    if (env != nullptr && env[0] != '\0') return std::string(env);
+    return "nsaddr";
+}
+
+void DefaultTopAddressing::configureFromEnv(const std::string& unitName,
+                                            const std::string& domain,
+                                            const std::string& subgroup) {
+    // Explicit domain wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable
+    // (Java reads rocketmq.namesrv.domain from a system property).
+    std::string dom = domain;
+    if (dom.empty()) {
+        const char* env = std::getenv("ROCKETMQ_NAMESRV_DOMAIN");
+        if (env != nullptr && env[0] != '\0') dom = env;
+    }
+    if (dom.empty()) {
         return;
     }
-    wsAddr_ = getWsAddr(env);
+    wsAddr_ = getWsAddr(dom, resolveSubgroup(subgroup));
     unitName_ = unitName;
 }
 

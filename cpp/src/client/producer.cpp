@@ -70,6 +70,14 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
     return out;
 }
 
+std::string stripSetting(const std::string& s) {
+    size_t b = 0;
+    size_t e = s.size();
+    while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
 // Ensure the message carries UNIQ_KEY (a 32-hex-digit unique ID) before sending: generate only when
 // missing, keep an existing one (idempotent). UNIQ_KEY is the client message ID in the classic remoting
 // protocol; broker-side transaction check-back and tracing both correlate on it. The trace hook uses it
@@ -169,6 +177,14 @@ void DefaultMQProducer::setNameServerAddresses(const std::vector<std::string>& a
     nameServerAddrs_ = addrs;
 }
 
+void DefaultMQProducer::setNamesrvDomain(const std::string& domain) {
+    namesrvDomain_ = stripSetting(domain);
+}
+
+void DefaultMQProducer::setNamesrvSubgroup(const std::string& subgroup) {
+    namesrvSubgroup_ = stripSetting(subgroup);
+}
+
 std::string DefaultMQProducer::getNamesrvAddr() const {
     std::string out;
     for (size_t i = 0; i < nameServerAddrs_.size(); ++i) {
@@ -207,8 +223,16 @@ void DefaultMQProducer::start() {
         throw MQClientException(
             "producerGroup can not equal DEFAULT_PRODUCER, please specify another one.");
     }
-    // Either the static addresses or dynamic addressing (ROCKETMQ_NAMESRV_DOMAIN) must be available
-    if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+    // the field is initialised from the rocketmq.namesrv.addr property falling back to the
+    // NAMESRV_ADDR environment variable.
+    if (nameServerAddrs_.empty()) {
+        nameServerAddrs_ = MixAll::namesrvAddrsFromEnv();
+    }
+    // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+    // environment variable: one of the three must be available.
+    if (nameServerAddrs_.empty() && namesrvDomain_.empty()
+            && !DefaultTopAddressing::isConfigured()) {
         // Error code 10004 (the code validateNameServerSetting uses for this same fault):
         // this check is hoisted into start() (more predictable), otherwise the fault would only surface
         // as 10004 on the first send, but callers must not see two different codes.
@@ -227,7 +251,8 @@ void DefaultMQProducer::start() {
                                          /*connectTimeoutMillis=*/3000,
                                          /*invokeTimeoutMillis=*/15000,
                                          tlsEnable_, unitName_,
-                                         pollNameServerIntervalMillis_));
+                                         pollNameServerIntervalMillis_,
+                                         namesrvDomain_, namesrvSubgroup_));
     // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     mqClient_->setDecodeReadBody(decodeReadBody_);

@@ -161,6 +161,20 @@ class DefaultMQAdminExt
     /** @var list<string> */
     public array $nameServerAddrs = [];
 
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``, default
+     * ``jmenv.tbsite.net``). Explicit value wins over the ``ROCKETMQ_NAMESRV_DOMAIN``
+     * environment variable inside DefaultTopAddressing.
+     */
+    public ?string $nameServerDomain = null;
+
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``,
+     * default ``nsaddr``). Explicit value wins over the
+     * ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment variable.
+     */
+    public ?string $nameServerSubgroup = null;
+
     /** TLS switch (null = delegate to env ROCKETMQ_TLS_ENABLE). */
     public ?bool $tlsEnable = null;
 
@@ -221,6 +235,26 @@ class DefaultMQAdminExt
         // it is synced to the client to avoid two address lists drifting between admin and client
         // (invokeNamesrvOne/All read the client side).
         $this->mqClient?->updateNameServerAddressList($this->nameServerAddrs);
+    }
+
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``). The
+     * explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN`` environment variable.
+     * A null / blank value counts as unset.
+     */
+    public function setNameServerDomain(?string $domain): void
+    {
+        $this->nameServerDomain = ($domain !== null && trim($domain) !== '') ? trim($domain) : null;
+    }
+
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``).
+     * The explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment
+     * variable. A null / blank value counts as unset.
+     */
+    public function setNameServerSubgroup(?string $subgroup): void
+    {
+        $this->nameServerSubgroup = ($subgroup !== null && trim($subgroup) !== '') ? trim($subgroup) : null;
     }
 
     public function setInstanceName(string $name): void
@@ -326,6 +360,14 @@ class DefaultMQAdminExt
             return;
         }
         if ($this->nameServerAddrs === []) {
+            // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+            // address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+            $this->nameServerAddrs = MixAll::namesrvAddrsFromEnv();
+        }
+        if ($this->nameServerAddrs === [] && $this->nameServerDomain === null
+            && !DefaultTopAddressing::isConfigured()) {
+            // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+            // environment variable: one of the three must be available.
             throw new MQClientException('name server address is not set');
         }
         // instanceName unconditionally goes through changeInstanceNameToPID;
@@ -352,6 +394,8 @@ class DefaultMQAdminExt
             tlsOptions: $this->tlsOptions,
             socksProxy: $this->socksProxy,
             vipChannelEnabled: $this->vipChannelEnabled,
+            namesrvDomain: $this->nameServerDomain,
+            namesrvSubgroup: $this->nameServerSubgroup,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

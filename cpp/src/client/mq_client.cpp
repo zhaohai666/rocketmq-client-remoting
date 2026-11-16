@@ -298,13 +298,17 @@ MQClientInstance::MQClientInstance(const std::string& clientId,
                                   const std::vector<std::string>& nameServerAddrs,
                                   int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis,
                                   bool tlsEnable, const std::string& unitName,
-                                  int32_t pollNameServerIntervalMillis)
+                                  int32_t pollNameServerIntervalMillis,
+                                  const std::string& namesrvDomain,
+                                  const std::string& namesrvSubgroup)
     : clientId_(clientId), nameServerAddrs_(nameServerAddrs),
       remotingClient_(new RemotingClient(connectTimeoutMillis, invokeTimeoutMillis)),
       pollNameServerIntervalMillis_(pollNameServerIntervalMillis > 0 ? pollNameServerIntervalMillis
                                                                     : 30000),
       tlsEnable_(tlsEnable) {
-    topAddressing_.configureFromEnv(unitName);
+    // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+    // variable inside configureFromEnv (Java ClientConfig semantics).
+    topAddressing_.configureFromEnv(unitName, namesrvDomain, namesrvSubgroup);
     remotingClient_->registerProcessor(
         RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT,
         [](const RemotingCommand& cmd, const std::string& addr) {

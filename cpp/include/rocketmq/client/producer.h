@@ -49,6 +49,14 @@ public:
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     std::string getNamesrvAddr() const;
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the
+    // ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables;
+    // an empty (or whitespace-only) value resets the setting.
+    void setNamesrvDomain(const std::string& domain);
+    void setNamesrvSubgroup(const std::string& subgroup);
+    const std::string& namesrvDomain() const { return namesrvDomain_; }
+    const std::string& namesrvSubgroup() const { return namesrvSubgroup_; }
     void setInstanceName(const std::string& name) { instanceName_ = name; }
     void setTlsEnable(bool b) { tlsEnable_ = b; }
     // TLS strict-validation options (non-empty caCert = strict certificate-chain + hostname validation; clientCert/Key = mTLS).
@@ -486,6 +494,9 @@ protected:
     int32_t compressLevel_ = 5;
     int32_t compressType_ = CompressionType::ZLIB;
     std::vector<std::string> nameServerAddrs_;
+    // Address-server setting; empty = unset (environment variables then apply).
+    std::string namesrvDomain_;
+    std::string namesrvSubgroup_;
     std::string namespace_;
     std::string namespaceV2_;
     MQFaultStrategy mqFaultStrategy_{false};

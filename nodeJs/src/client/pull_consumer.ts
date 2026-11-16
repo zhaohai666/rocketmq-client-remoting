@@ -53,6 +53,11 @@ export class DefaultMQPullConsumer {
   // nsd/ns ext fields), independent of the client-side `namespace`.
   namespaceV2: string | null = null;
   nameServerAddr = '';
+  // Address-server setting; explicit value wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables (Java defaults:
+  // jmenv.tbsite.net / nsaddr).
+  nameServerDomain: string | null = null;
+  nameServerSubgroup: string | null = null;
   messageModel: string = MessageModel.CLUSTERING;
   unitMode = false;
   // instanceName / unitName / enableStreamRequestType: pull consumers enable
@@ -138,6 +143,22 @@ export class DefaultMQPullConsumer {
   }
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
+
+  // Address-server domain (Java: system property rocketmq.namesrv.domain,
+  // default jmenv.tbsite.net). The explicit setting wins over the
+  // ROCKETMQ_NAMESRV_DOMAIN environment variable.
+  setNamesrvDomain(domain: string): this {
+    this.nameServerDomain = domain != null && domain.trim() !== '' ? domain.trim() : null;
+    return this;
+  }
+
+  // Address-server subgroup (Java: system property
+  // rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+  // wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+  setNamesrvSubgroup(subgroup: string): this {
+    this.nameServerSubgroup = subgroup != null && subgroup.trim() !== '' ? subgroup.trim() : null;
+    return this;
+  }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
   // Set/read namespaceV2 (read live per request).
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
@@ -304,7 +325,14 @@ export class DefaultMQPullConsumer {
     // a restart after shutdown does not stack prefixes.
     this.consumerGroup = this._withNamespace(this.consumerGroup);
     Validators.checkGroup(this.consumerGroup);
-    if (!this.nameServerAddr) throw new Error('name server address is not set');
+    if (!this.nameServerAddr) {
+      // Java ClientConfig default chain (ClientConfig.java:45).
+      this.nameServerAddr = MixAll.namesrvAddrFromEnv() || '';
+    }
+    if (!this.nameServerAddr && !this.nameServerDomain
+        && !process.env['ROCKETMQ_NAMESRV_DOMAIN']) {
+      throw new Error('name server address is not set');
+    }
     // No subscription is required to start: a pull consumer names the topic in
     // fetchSubscribeMessageQueues/pull and may pass the expression inline, so
     // subscribe() is only one of the ways to get one.
@@ -321,7 +349,8 @@ export class DefaultMQPullConsumer {
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
-      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr, null,
+        { namesrvDomain: this.nameServerDomain, namesrvSubgroup: this.nameServerSubgroup }));
     if (created) {
       client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);

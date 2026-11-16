@@ -6,6 +6,8 @@ using System.Threading;
 
 using Xunit;
 
+using RocketMQ.Common;
+
 namespace RocketMQ.Client.Tests;
 
 public class TopAddressingTests : IDisposable
@@ -174,7 +176,7 @@ public class TopAddressingTests : IDisposable
     /// <summary>A minimal address server: a hand-written HTTP/1.0 response over
     /// TcpListener. (HttpListener needs ~10s to start and stop on macOS, which is
     /// unusable in a unit test.)</summary>
-    private sealed class HttpListenerMock : IDisposable
+    internal sealed class HttpListenerMock : IDisposable
     {
         private readonly System.Net.Sockets.TcpListener _listener;
         private readonly Thread _thread;
@@ -245,6 +247,261 @@ public class TopAddressingTests : IDisposable
         {
             _running = false;
             try { _listener.Stop(); } catch { /* ignore */ }
+        }
+    }
+}
+
+/// <summary>Setting-surface tests (Java parity): env address parsing, subgroup fallback
+/// and explicit-override rules. WARNING: environment variables are process-global (see the
+/// AssemblyInfo note); every test here sets and restores its variables in a try/finally.</summary>
+public class TopAddressingSettingTests
+{
+    private static void SetEnv(string name, string? value) =>
+        Environment.SetEnvironmentVariable(name, value);
+
+    // ---------------- MixAll.NamesrvAddrsFromEnv (ClientConfig.java:45 chain)
+
+    [Fact]
+    public void NamesrvAddrsFromEnvEmptyWhenUnset()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+            Assert.Empty(MixAll.NamesrvAddrsFromEnv());
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+        }
+    }
+
+    [Fact]
+    public void NamesrvAddrsFromEnvPropertyWinsOverEnv()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, "10.0.0.1:9876");
+            SetEnv(MixAll.NamesrvAddrEnv, "10.0.0.9:9876");
+            Assert.Equal(new[] { "10.0.0.1:9876" }, MixAll.NamesrvAddrsFromEnv());
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+        }
+    }
+
+    [Fact]
+    public void NamesrvAddrsFromEnvFallsBackToNamesrvAddrEnv()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, "10.0.0.2:9876");
+            Assert.Equal(new[] { "10.0.0.2:9876" }, MixAll.NamesrvAddrsFromEnv());
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+        }
+    }
+
+    [Fact]
+    public void NamesrvAddrsFromEnvSplitsOnSemicolonAndComma()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, " a:1 ; , b:2 ,,; ; c:3");
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+            Assert.Equal(new[] { "a:1", "b:2", "c:3" }, MixAll.NamesrvAddrsFromEnv());
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+        }
+    }
+
+    [Fact]
+    public void NamesrvAddrsFromEnvWhitespaceOnlyIsEmpty()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, "   ");
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+            Assert.Empty(MixAll.NamesrvAddrsFromEnv());
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvAddrPropertyEnv, null);
+            SetEnv(MixAll.NamesrvAddrEnv, null);
+        }
+    }
+
+    // ---------------- subgroup default resolution (rocketmq.namesrv.domain.subgroup)
+
+    [Fact]
+    public void ResolveSubgroupDefaultsToNsaddr()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+            Assert.Equal(DefaultTopAddressing.DefaultDomainSubgroup,
+                DefaultTopAddressing.ResolveSubgroup(null));
+            Assert.Equal(DefaultTopAddressing.DefaultDomainSubgroup,
+                DefaultTopAddressing.ResolveSubgroup("   "));
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+        }
+    }
+
+    [Fact]
+    public void ResolveSubgroupReadsEnvFallback()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, "envgrp");
+            Assert.Equal("envgrp", DefaultTopAddressing.ResolveSubgroup(null));
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+        }
+    }
+
+    [Fact]
+    public void ResolveSubgroupExplicitWinsOverEnv()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, "envgrp");
+            Assert.Equal("explicit", DefaultTopAddressing.ResolveSubgroup("explicit"));
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomainSubgroup", null);
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+        }
+    }
+
+    // ---------------- DefaultTopAddressing constructor: env fallback and explicit override
+
+    [Fact]
+    public void ConstructorSubgroupFromEnvLandsInUrl()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, "envgrp");
+            var ta = new DefaultTopAddressing(domain: "h");
+            Assert.Equal("http://h:8080/rocketmq/envgrp", ta.WsAddr);
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+        }
+    }
+
+    [Fact]
+    public void ConstructorExplicitSubgroupWinsOverEnv()
+    {
+        try
+        {
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, "envgrp");
+            var ta = new DefaultTopAddressing(domain: "h", subgroup: "explicitgrp");
+            Assert.Equal("http://h:8080/rocketmq/explicitgrp", ta.WsAddr);
+        }
+        finally
+        {
+            SetEnv(MixAll.NamesrvDomainSubgroupEnv, null);
+        }
+    }
+
+    [Fact]
+    public void ConstructorExplicitDomainWinsOverEnvDomain()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomain", "env-domain:12345");
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", "env-domain:12345");
+            var ta = new DefaultTopAddressing(domain: "h:19999");
+            Assert.Equal("http://h:19999/rocketmq/nsaddr", ta.WsAddr);
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+        }
+    }
+
+    [Fact]
+    public void ConstructorExplicitDomainWorksWithoutEnv()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+            var ta = new DefaultTopAddressing(domain: "h:19999");
+            Assert.Equal("http://h:19999/rocketmq/nsaddr", ta.WsAddr);
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+        }
+    }
+
+    // ---------------- MQClientInstance wiring
+
+    [Fact]
+    public void MqClientInstanceWiresExplicitDomainAndSubgroup()
+    {
+        try
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+            using var mqc = new MQClientInstance("c@dotnetexplicit", Array.Empty<string>(),
+                namesrvDomain: "h:19999", namesrvSubgroup: "subgrp");
+            Assert.Equal("http://h:19999/rocketmq/subgrp", mqc.TopAddressing.WsAddr);
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+        }
+    }
+
+    [Fact]
+    public void MqClientInstanceExplicitDomainFetchesAtStart()
+    {
+        var server = new TopAddressingTests.HttpListenerMock();
+        try
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+            server.Status = 200;
+            server.Body = "127.0.0.1:9876";
+            using var mqc = new MQClientInstance("c@dotnetexplicit2", Array.Empty<string>(),
+                namesrvDomain: "127.0.0.1:" + server.Port);
+            mqc.Start();
+            Assert.Equal(new[] { "127.0.0.1:9876" }, mqc.NameServerAddrs);
+            Assert.Equal(1, server.HitCount);
+            mqc.Shutdown();
+        }
+        finally
+        {
+            SetEnv("RocketMqNamesrvDomain", null);
+            SetEnv("ROCKETMQ_NAMESRV_DOMAIN", null);
+            server.Dispose();
         }
     }
 }

@@ -159,6 +159,11 @@ export class DefaultMQProducer {
   // the client side.
   namespaceV2: string | null;
   namesrvAddr: string | null;
+  // Address-server setting; explicit value wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables (Java defaults:
+  // jmenv.tbsite.net / nsaddr).
+  namesrvDomain: string | null;
+  namesrvSubgroup: string | null;
   tlsEnable: boolean;
   // TLS details (see setTlsOptions); null = test-mode (trust the self-signed cert).
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
@@ -261,6 +266,8 @@ export class DefaultMQProducer {
     this.namespace = null;
     this.namespaceV2 = null;
     this.namesrvAddr = null;
+    this.namesrvDomain = null;
+    this.namesrvSubgroup = null;
     this.tlsEnable = false;
     this.tlsOptions = null;
     this.socksProxyConfig = null;
@@ -332,6 +339,22 @@ export class DefaultMQProducer {
   // ---- lifecycle ----
   // ---- fluent config (mirror the consumer) ----
   setNamesrvAddr(addr: string): this { this.namesrvAddr = addr; return this; }
+
+  // Address-server domain (Java: system property rocketmq.namesrv.domain,
+  // default jmenv.tbsite.net). The explicit setting wins over the
+  // ROCKETMQ_NAMESRV_DOMAIN environment variable.
+  setNamesrvDomain(domain: string): this {
+    this.namesrvDomain = domain != null && domain.trim() !== '' ? domain.trim() : null;
+    return this;
+  }
+
+  // Address-server subgroup (Java: system property
+  // rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+  // wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+  setNamesrvSubgroup(subgroup: string): this {
+    this.namesrvSubgroup = subgroup != null && subgroup.trim() !== '' ? subgroup.trim() : null;
+    return this;
+  }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
   // Server-side namespace accessor. The value is read live by the
   // NamespaceRpcHook on every request, so setting it after start() takes
@@ -559,13 +582,18 @@ export class DefaultMQProducer {
     const instanceName = MixAll.changeInstanceNameToPid(this.instanceName);
     const clientId = MixAll.clientIdFor(instanceName, this.unitName);
     this.producerClientId = clientId;
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+    // address the field is initialised from the rocketmq.namesrv.addr property
+    // falling back to the NAMESRV_ADDR environment variable.
+    if (!this.namesrvAddr) this.namesrvAddr = MixAll.namesrvAddrFromEnv();
 
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(clientId, () => {
       const remotingClient = new RemotingClient({
         tlsEnable: this.tlsEnable, tlsOptions: this.tlsOptions, socksProxyConfig: this.socksProxyConfig,
       });
-      return new MQClient(clientId, this.namesrvAddr, remotingClient);
+      return new MQClient(clientId, this.namesrvAddr, remotingClient,
+        { namesrvDomain: this.namesrvDomain, namesrvSubgroup: this.namesrvSubgroup });
     });
     this.client = client;
     manager.registerClient(clientId, client);

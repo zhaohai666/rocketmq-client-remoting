@@ -441,6 +441,67 @@ func TestInstanceStartFetchesNameServerFromAddressServer(t *testing.T) {
 	}
 }
 
+// The explicit NamesrvDomain setting must build the Java MixAll.getWSAddr URL
+// and drive the start-time address-server fetch exactly like NamesrvWsAddr does.
+func TestInstanceStartFetchesFromNamesrvDomainSetting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rocketmq/grpB" {
+			t.Errorf("want /rocketmq/grpB, got %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte("127.0.0.1:9876\n"))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://") // 127.0.0.1:<port>
+	cfg := testConfig()
+	cfg.NamesrvDomain = host
+	cfg.NamesrvSubgroup = "grpB"
+	inst := CreateOrGetInstance(uniqueClientID(t), nil, cfg)
+	defer inst.Shutdown()
+	if err := inst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if addrs := inst.NameServerAddrs(); len(addrs) != 1 || addrs[0] != "127.0.0.1:9876" {
+		t.Errorf("domain setting fetch must fill the nameserver list, got %v", addrs)
+	}
+}
+
+// The ROCKETMQ_NAMESRV_DOMAIN environment variable backs the explicit setting:
+// an empty config still fetches from the env domain (Java rocketmq.namesrv.domain
+// semantics, read as an environment variable on non-JVM ports).
+func TestInstanceStartFetchesFromNamesrvDomainEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("127.0.0.1:9876\n"))
+	}))
+	defer srv.Close()
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	t.Setenv("ROCKETMQ_NAMESRV_DOMAIN", host)
+	cfg := testConfig()
+	inst := CreateOrGetInstance(uniqueClientID(t), nil, cfg)
+	defer inst.Shutdown()
+	if err := inst.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if addrs := inst.NameServerAddrs(); len(addrs) != 1 || addrs[0] != "127.0.0.1:9876" {
+		t.Errorf("domain env fetch must fill the nameserver list, got %v", addrs)
+	}
+}
+
+// The ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable supplies the
+// subgroup when the config does not set one explicitly.
+func TestNamesrvSubgroupEnvFallback(t *testing.T) {
+	t.Setenv("ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP", "envgrp")
+	if got := common.WSAddrForDomain("jmenv.tbsite.net",
+		common.NamesrvSubgroupSetting("")); got != "http://jmenv.tbsite.net:8080/rocketmq/envgrp" {
+		t.Errorf("subgroup env must back the URL, got %s", got)
+	}
+	if got := common.WSAddrForDomain("jmenv.tbsite.net",
+		common.NamesrvSubgroupSetting("grpX")); got != "http://jmenv.tbsite.net:8080/rocketmq/grpX" {
+		t.Errorf("explicit subgroup must win over the env, got %s", got)
+	}
+}
+
 func TestInstanceStartFailsWhenAddressServerEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(" \n"))

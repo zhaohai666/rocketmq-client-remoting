@@ -9,7 +9,9 @@
 #include "rocketmq/client/exception.h"
 #include "rocketmq/client/validators.h"
 #include "rocketmq/common/logging.h"
+#include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/sysflag.h"
+#include "rocketmq/common/top_addressing.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/codes.h"
 
@@ -35,6 +37,13 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
         start = pos + 1;
     }
     return out;
+}
+
+std::string stripSetting(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::string();
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
 }
 
 int64_t nowMillis() {
@@ -81,6 +90,14 @@ void DefaultLitePullConsumer::setNamesrvAddr(const std::string& addr) {
 
 void DefaultLitePullConsumer::setNameServerAddresses(const std::vector<std::string>& addrs) {
     nameServerAddrs_ = addrs;
+}
+
+void DefaultLitePullConsumer::setNamesrvDomain(const std::string& domain) {
+    namesrvDomain_ = stripSetting(domain);
+}
+
+void DefaultLitePullConsumer::setNamesrvSubgroup(const std::string& subgroup) {
+    namesrvSubgroup_ = stripSetting(subgroup);
 }
 
 void DefaultLitePullConsumer::setAllocateMessageQueueStrategy(
@@ -424,7 +441,16 @@ void DefaultLitePullConsumer::start() {
         consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
     }
     checkConfig();
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+    // the field is initialised from the rocketmq.namesrv.addr property falling back to
+    // the NAMESRV_ADDR environment variable.
     if (nameServerAddrs_.empty()) {
+        nameServerAddrs_ = MixAll::namesrvAddrsFromEnv();
+    }
+    // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+    // environment variable: one of the three must be available.
+    if (nameServerAddrs_.empty() && namesrvDomain_.empty()
+            && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
     }
     parseConsumeTimestamp(consumeTimestamp_);
@@ -438,7 +464,8 @@ void DefaultLitePullConsumer::start() {
                                         /*connectTimeoutMillis=*/3000,
                                         /*invokeTimeoutMillis=*/10000,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
-                                        pollNameServerIntervalMillis_));
+                                        pollNameServerIntervalMillis_,
+                                        namesrvDomain_, namesrvSubgroup_));
     // Broker VIP channel: forwarded to the instance that owns the broker RPCs (off = plain address).
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);
     mqClient_->setDecodeReadBody(decodeReadBody_);

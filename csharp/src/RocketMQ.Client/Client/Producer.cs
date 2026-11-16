@@ -82,6 +82,11 @@ public class DefaultMQProducer
     // Request-Reply default reply wait timeout (ms): 3000.
     private int _requestTimeout = 3000;
     private List<string> _nameServerAddrs = new();
+    // Address-server setting; null/empty = unset (environment variables then apply).
+    // Explicit values win over the ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP
+    // environment variables (Java system properties rocketmq.namesrv.domain[.subgroup]).
+    private string? _namesrvDomain;
+    private string? _namesrvSubgroup;
     // ---------------- Message trace config ----------------
     // When enabled, Start() builds an AsyncTraceDispatcher and registers Send/EndTransaction
     // hooks; the internal trace producer itself stays disabled (EnableTrace=false),
@@ -225,6 +230,25 @@ public class DefaultMQProducer
         get => _nameServerAddrs;
         set => _nameServerAddrs = value ?? new List<string>();
     }
+
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the environment
+    // variables; an empty (or whitespace-only) value resets the setting.
+    public string NamesrvDomain
+    {
+        get => _namesrvDomain ?? string.Empty;
+        set => _namesrvDomain = value?.Trim();
+    }
+
+    public string NamesrvSubgroup
+    {
+        get => _namesrvSubgroup ?? string.Empty;
+        set => _namesrvSubgroup = value?.Trim();
+    }
+
+    public void SetNamesrvDomain(string? domain) => NamesrvDomain = domain ?? string.Empty;
+
+    public void SetNamesrvSubgroup(string? subgroup) => NamesrvSubgroup = subgroup ?? string.Empty;
 
     public string InstanceName
     {
@@ -883,9 +907,18 @@ public class DefaultMQProducer
                                             + ", please specify another one.");
             }
 
-            // Exactly one of static addresses and dynamic addressing
-            // (ROCKETMQ_NAMESRV_DOMAIN) must be usable
-            if (_nameServerAddrs.Count == 0 && !DefaultTopAddressing.IsConfigured())
+            // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+            // address, the field is initialised from the rocketmq.namesrv.addr property
+            // falling back to the NAMESRV_ADDR environment variable.
+            if (_nameServerAddrs.Count == 0)
+            {
+                _nameServerAddrs = MixAll.NamesrvAddrsFromEnv();
+            }
+
+            // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+            // environment variable: one of the three must be available
+            if (_nameServerAddrs.Count == 0 && string.IsNullOrEmpty(_namesrvDomain)
+                && !DefaultTopAddressing.IsConfigured())
             {
                 // Code value 10004 (the code validateNameServerSetting gives for the same
                 // fault): the reference behavior does not check in start(), and the fault
@@ -917,7 +950,8 @@ public class DefaultMQProducer
                     tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, socksProxy: _socksProxyConfig,
                     unitName: _unitName,
                     pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
-                    vipChannelEnabled: _sendMessageWithVIPChannel));
+                    vipChannelEnabled: _sendMessageWithVIPChannel,
+                    namesrvDomain: _namesrvDomain, namesrvSubgroup: _namesrvSubgroup));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("producer rpc hook ignored: MQClientInstance already has one (clientId="

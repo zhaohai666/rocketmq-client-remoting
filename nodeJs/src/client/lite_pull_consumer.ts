@@ -94,6 +94,11 @@ export class DefaultLitePullConsumer {
   // every request with nsd=true / ns=<value>.
   namespaceV2: string | null = null;
   nameServerAddr = '';
+  // Address-server setting; explicit value wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables (Java defaults:
+  // jmenv.tbsite.net / nsaddr).
+  nameServerDomain: string | null = null;
+  nameServerSubgroup: string | null = null;
   messageModel: string = MessageModel.CLUSTERING;
   // wire fields read by MQClient.buildHeartbeatData:
   consumeType: string = ConsumeType.CONSUME_ACTIVELY;
@@ -214,6 +219,22 @@ export class DefaultLitePullConsumer {
   }
 
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
+
+  // Address-server domain (Java: system property rocketmq.namesrv.domain,
+  // default jmenv.tbsite.net). The explicit setting wins over the
+  // ROCKETMQ_NAMESRV_DOMAIN environment variable.
+  setNamesrvDomain(domain: string): this {
+    this.nameServerDomain = domain != null && domain.trim() !== '' ? domain.trim() : null;
+    return this;
+  }
+
+  // Address-server subgroup (Java: system property
+  // rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+  // wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+  setNamesrvSubgroup(subgroup: string): this {
+    this.nameServerSubgroup = subgroup != null && subgroup.trim() !== '' ? subgroup.trim() : null;
+    return this;
+  }
   // Sets/reads the client-side namespace prefix.
   setNamespace(ns: string): this { this.namespace = ns || ''; return this; }
   getNamespace(): string { return this.namespace; }
@@ -517,7 +538,14 @@ export class DefaultLitePullConsumer {
       default:
         break;
     }
-    if (!this.nameServerAddr) throw new Error('name server address is not set');
+    if (!this.nameServerAddr) {
+      // Java ClientConfig default chain (ClientConfig.java:45).
+      this.nameServerAddr = MixAll.namesrvAddrFromEnv() || '';
+    }
+    if (!this.nameServerAddr && !this.nameServerDomain
+        && !process.env['ROCKETMQ_NAMESRV_DOMAIN']) {
+      throw new Error('name server address is not set');
+    }
     // The start instant is checked whatever the policy is: a malformed value must fail here rather
     // than surface mid-consumption as a failed offset resolution on one queue.
     parseConsumeTimestamp(this.consumeTimestamp);
@@ -533,7 +561,8 @@ export class DefaultLitePullConsumer {
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
-      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr, null,
+        { namesrvDomain: this.nameServerDomain, namesrvSubgroup: this.nameServerSubgroup }));
     if (created) {
       client.setPersistConsumerOffsetInterval(this.persistConsumerOffsetInterval);
       if (this.useHeartbeatV2) client.setUseHeartbeatV2(true);

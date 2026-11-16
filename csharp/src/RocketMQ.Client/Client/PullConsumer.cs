@@ -37,6 +37,11 @@ public sealed class DefaultMQPullConsumer
     private string _clientId = string.Empty;
     private string _messageModel = MessageModel.Clustering;
     private readonly List<string> _nameServerAddrs = new();
+    // Address-server setting; null/empty = unset (environment variables then apply).
+    // Explicit values win over the ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP
+    // environment variables (Java system properties rocketmq.namesrv.domain[.subgroup]).
+    private string? _namesrvDomain;
+    private string? _namesrvSubgroup;
     private IRpcHook? _rpcHook;
     private string _unitName = string.Empty;
     private bool _unitMode;
@@ -124,6 +129,25 @@ public sealed class DefaultMQPullConsumer
             _nameServerAddrs.AddRange(addrs);
         }
     }
+
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the environment
+    // variables; an empty (or whitespace-only) value resets the setting.
+    public string NamesrvDomain
+    {
+        get => _namesrvDomain ?? string.Empty;
+        set => _namesrvDomain = value?.Trim();
+    }
+
+    public string NamesrvSubgroup
+    {
+        get => _namesrvSubgroup ?? string.Empty;
+        set => _namesrvSubgroup = value?.Trim();
+    }
+
+    public void SetNamesrvDomain(string? domain) => NamesrvDomain = domain ?? string.Empty;
+
+    public void SetNamesrvSubgroup(string? subgroup) => NamesrvSubgroup = subgroup ?? string.Empty;
 
     public void SetInstanceName(string name) => _instanceName = name;
 
@@ -394,7 +418,18 @@ public sealed class DefaultMQPullConsumer
                                             + ", please specify another one.");
             }
 
+            // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+            // address, the field is initialised from the rocketmq.namesrv.addr property
+            // falling back to the NAMESRV_ADDR environment variable.
             if (_nameServerAddrs.Count == 0)
+            {
+                _nameServerAddrs.AddRange(MixAll.NamesrvAddrsFromEnv());
+            }
+
+            // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+            // environment variable: one of the three must be available.
+            if (_nameServerAddrs.Count == 0 && string.IsNullOrEmpty(_namesrvDomain)
+                && !DefaultTopAddressing.IsConfigured())
             {
                 throw new MQClientException("name server address is not set");
             }
@@ -418,7 +453,8 @@ public sealed class DefaultMQPullConsumer
                 () => new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
                     /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/_consumerPullTimeoutMillis,
                     socksProxy: _socksProxyConfig,
-                    unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
+                    unitName: _unitName, pollNameServerIntervalMillis: _pollNameServerIntervalMillis,
+                    namesrvDomain: _namesrvDomain, namesrvSubgroup: _namesrvSubgroup));
             if (requestHook is not null && !_mqClient.RegisterRpcHook(requestHook))
             {
                 ClientLog.Warn("pull consumer rpc hook ignored: MqClient already has one (clientId="

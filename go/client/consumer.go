@@ -32,6 +32,7 @@ package client
 import (
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -188,9 +189,14 @@ type DefaultMQPushConsumer struct {
 	paused           bool
 
 	nameServerAddrs []string
-	subscription    map[string]*remoting.SubscriptionData
-	listener        any
-	orderly         bool
+	// nameServerDomain / nameServerSubgroup are the address-server settings;
+	// explicit values win over the ROCKETMQ_NAMESRV_DOMAIN /
+	// ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables.
+	nameServerDomain   string
+	nameServerSubgroup string
+	subscription       map[string]*remoting.SubscriptionData
+	listener           any
+	orderly            bool
 
 	consumeMessageHookList []ConsumeMessageHook
 	filterMessageHookList  []FilterMessageHook
@@ -371,6 +377,24 @@ func (c *DefaultMQPushConsumer) NameServerAddresses() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.nameServerAddrs...)
+}
+
+// SetNameServerDomain sets the address-server domain (Java: system property
+// rocketmq.namesrv.domain, default jmenv.tbsite.net). The explicit setting
+// wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable.
+func (c *DefaultMQPushConsumer) SetNameServerDomain(domain string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nameServerDomain = strings.TrimSpace(domain)
+}
+
+// SetNameServerSubgroup sets the address-server subgroup (Java: system
+// property rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit
+// setting wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+func (c *DefaultMQPushConsumer) SetNameServerSubgroup(subgroup string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nameServerSubgroup = strings.TrimSpace(subgroup)
 }
 
 // SetNamespace sets the namespace (the group is prefixed in Start).
@@ -1273,6 +1297,13 @@ func (c *DefaultMQPushConsumer) Start() error {
 			"consumerGroup can not equal %s, please specify another one.", group))
 	}
 	if len(c.nameServerAddrs) == 0 {
+		// Java ClientConfig default chain (ClientConfig.java:45): with no
+		// explicit address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+		c.nameServerAddrs = common.NamesrvAddrsFromEnv()
+	}
+	if len(c.nameServerAddrs) == 0 && c.nameServerDomain == "" && os.Getenv(common.NamesrvDomainEnv) == "" {
+		// Static addresses, the address-server setting or the domain
+		// environment variable: one of the three must be available.
 		c.mu.Unlock()
 		return common.ClientError("name server address is not set")
 	}
@@ -1318,6 +1349,8 @@ func (c *DefaultMQPushConsumer) Start() error {
 	}
 	cfg.SocksProxy = c.socksProxy
 	cfg.UseHeartbeatV2 = c.useHeartbeatV2
+	cfg.NamesrvDomain = c.nameServerDomain
+	cfg.NamesrvSubgroup = c.nameServerSubgroup
 	cfg.DecodeReadBody = c.decodeReadBody
 	cfg.MQClientAPITimeoutMillis = c.mqClientAPITimeoutMillis
 	cfg.EnableConcurrentHeartbeat = c.enableConcurrentHeartbeat

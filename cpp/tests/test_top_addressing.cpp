@@ -19,6 +19,7 @@
 #endif
 
 #include "rocketmq/client/mq_client.h"
+#include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/net_compat.h"
 #include "rocketmq/common/top_addressing.h"
 
@@ -49,6 +50,19 @@ void expectEq(const std::string& actual, const std::string& expected, const std:
         ++fails;
         std::printf("FAIL %s (actual=[%s] expected=[%s])\n", name.c_str(), actual.c_str(),
                     expected.c_str());
+    }
+}
+
+void expectVec(const std::vector<std::string>& actual,
+               const std::vector<std::string>& expected, const std::string& name) {
+    ++checks;
+    if (actual != expected) {
+        ++fails;
+        std::string a;
+        std::string e;
+        for (const auto& s : actual) a += "[" + s + "]";
+        for (const auto& s : expected) e += "[" + s + "]";
+        std::printf("FAIL %s (actual=%s expected=%s)\n", name.c_str(), a.c_str(), e.c_str());
     }
 }
 
@@ -320,6 +334,134 @@ void testConfigureFromEnv(MockAddrServer& s) {
 
 }  // namespace
 
+// ------------------------------------------------------------------ setting-surface tests (Java parity)
+
+namespace {
+
+void testNamesrvAddrsFromEnv() {
+    const std::string propKey = "ROCKETMQ_NAMESRV_ADDR";
+    const std::string envKey = "NAMESRV_ADDR";
+    // 1) both unset => empty
+    {
+        ScopedEnv offProp(propKey.c_str(), "");
+        ScopedEnv offEnv(envKey.c_str(), "");
+        expect(MixAll::namesrvAddrsFromEnv().empty(), "both env unset => empty list");
+    }
+    // 2) ROCKETMQ_NAMESRV_ADDR (the Java property equivalent) wins over NAMESRV_ADDR
+    {
+        ScopedEnv onProp(propKey.c_str(), "10.0.0.1:9876");
+        ScopedEnv onEnv(envKey.c_str(), "10.0.0.9:9876");
+        expectVec(MixAll::namesrvAddrsFromEnv(), {"10.0.0.1:9876"},
+                  "ROCKETMQ_NAMESRV_ADDR wins over NAMESRV_ADDR");
+    }
+    // 3) fall back to NAMESRV_ADDR when the property equivalent is absent
+    {
+        ScopedEnv offProp(propKey.c_str(), "");
+        ScopedEnv onEnv(envKey.c_str(), "10.0.0.2:9876");
+        expectVec(MixAll::namesrvAddrsFromEnv(), {"10.0.0.2:9876"}, "NAMESRV_ADDR fallback");
+    }
+    // 4) split on ';' and ',', trim whitespace, drop blank pieces
+    {
+        ScopedEnv onProp(propKey.c_str(), " a:1 ; , b:2 ,,; ; c:3");
+        expectVec(MixAll::namesrvAddrsFromEnv(), {"a:1", "b:2", "c:3"},
+                  "split on ';' / ',' with blanks dropped");
+    }
+    // 5) a whitespace-only value behaves like unset
+    {
+        ScopedEnv onProp(propKey.c_str(), "   ");
+        ScopedEnv offEnv(envKey.c_str(), "");
+        expect(MixAll::namesrvAddrsFromEnv().empty(), "whitespace-only value => empty list");
+    }
+}
+
+void testResolveSubgroup() {
+    const std::string sgKey = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP";
+    // 1) neither explicit nor env => "nsaddr"
+    {
+        ScopedEnv off(sgKey.c_str(), "");
+        expectEq(DefaultTopAddressing::resolveSubgroup(""), "nsaddr", "env unset => nsaddr");
+        expectEq(DefaultTopAddressing::resolveSubgroup("   "), "nsaddr",
+                 "blank argument => nsaddr");
+    }
+    // 2) env fallback, explicit argument wins over env
+    {
+        ScopedEnv on(sgKey.c_str(), "envgrp");
+        expectEq(DefaultTopAddressing::resolveSubgroup(""), "envgrp", "env subgroup applies");
+        expectEq(DefaultTopAddressing::resolveSubgroup("explicit"), "explicit",
+                 "explicit subgroup wins over env");
+    }
+}
+
+void testConfigureExplicitDomain(MockAddrServer& s) {
+    const std::string domKey = "ROCKETMQ_NAMESRV_DOMAIN";
+    const std::string sgKey = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP";
+    s.setResponse(200, "127.0.0.1:9876");
+    // 1) an explicit domain wins over the env variable
+    {
+        ScopedEnv onDom(domKey.c_str(), "env-domain:12345");
+        ScopedEnv offSg(sgKey.c_str(), "");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("unitA", topAddrDomain(s));
+        expectEq(ta.wsAddr(), topAddrWs(s), "explicit domain wins over env");
+        expectEq(ta.buildUrl(), topAddrWs(s) + "-unitA?nofix=1",
+                 "explicit domain keeps the unitName URL rule");
+        expectEq(ta.fetchNsAddr(false), "127.0.0.1:9876", "explicit domain fetch works");
+    }
+    // 2) explicit domain works without any env variable
+    {
+        ScopedEnv offDom(domKey.c_str(), "");
+        ScopedEnv offSg(sgKey.c_str(), "");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("", topAddrDomain(s));
+        expectEq(ta.wsAddr(), topAddrWs(s), "explicit domain works without env");
+    }
+    // 3) subgroup: env fallback and explicit override land in the URL
+    {
+        ScopedEnv offDom(domKey.c_str(), "");
+        ScopedEnv onSg(sgKey.c_str(), "envgrp");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("", topAddrDomain(s));
+        expectEq(ta.wsAddr(), DefaultTopAddressing::getWsAddr(topAddrDomain(s), "envgrp"),
+                 "subgroup falls back to its env variable");
+    }
+    {
+        ScopedEnv offDom(domKey.c_str(), "");
+        ScopedEnv onSg(sgKey.c_str(), "envgrp");
+        DefaultTopAddressing ta;
+        ta.configureFromEnv("", topAddrDomain(s), "explicitgrp");
+        expectEq(ta.wsAddr(), DefaultTopAddressing::getWsAddr(topAddrDomain(s), "explicitgrp"),
+                 "explicit subgroup wins over env");
+    }
+    // 4) MQClientInstance wiring: the constructor forwards the explicit domain to the addressing config
+    {
+        ScopedEnv offDom(domKey.c_str(), "");
+        ScopedEnv offSg(sgKey.c_str(), "");
+        MQClientInstance mqc("c@cppexplicit", {}, 3000, 15000, false, "unitZ",
+                             30000, topAddrDomain(s));
+        expectEq(mqc.topAddressing().wsAddr(), topAddrWs(s),
+                 "instance builds wsAddr from the explicit domain");
+        expectEq(mqc.topAddressing().unitName(), "unitZ", "instance still carries unitName");
+        mqc.start();
+        const std::vector<std::string> addrs = mqc.nameServerAddrs();
+        expect(addrs.size() == 1 && addrs[0] == "127.0.0.1:9876",
+               "explicit-domain instance fetches addrs at start",
+               "addrs=" + std::to_string(addrs.size()));
+        mqc.shutdown();
+    }
+    // 5) subgroup passes through the constructor too
+    {
+        ScopedEnv offDom(domKey.c_str(), "");
+        ScopedEnv offSg(sgKey.c_str(), "");
+        MQClientInstance mqc("c@cppexplicit2", {}, 3000, 15000, false, "",
+                             30000, topAddrDomain(s), "subgrp");
+        expectEq(mqc.topAddressing().wsAddr(),
+                 DefaultTopAddressing::getWsAddr(topAddrDomain(s), "subgrp"),
+                 "instance forwards the explicit subgroup");
+    }
+}
+
+}  // namespace
+
 int main() {
     testGetWsAddr();
     testBuildUrl();
@@ -334,6 +476,12 @@ int main() {
     {
         MockAddrServer s;
         testConfigureFromEnv(s);
+    }
+    testNamesrvAddrsFromEnv();
+    testResolveSubgroup();
+    {
+        MockAddrServer s;
+        testConfigureExplicitDomain(s);
     }
 
     std::printf("%s: %d checks, %d failed\n", fails == 0 ? "PASS" : "FAIL", checks, fails);

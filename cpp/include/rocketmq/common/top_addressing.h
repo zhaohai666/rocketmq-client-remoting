@@ -20,7 +20,8 @@ class DefaultTopAddressing {
                                   int32_t timeoutMillis = 3000);
 
     static std::string getWsAddr(const std::string& domain, const std::string& subgroup = "nsaddr");
-    // Whether dynamic addressing is configured (ROCKETMQ_NAMESRV_DOMAIN environment variable)
+    // Whether dynamic addressing is configured (ROCKETMQ_NAMESRV_DOMAIN environment variable).
+    // An explicit facade domain set through configureFromEnv is checked separately by the facades.
     static bool isConfigured();
 
     void setWsAddr(std::string wsAddr) { wsAddr_ = std::move(wsAddr); }
@@ -29,7 +30,15 @@ class DefaultTopAddressing {
     void setUnitName(std::string unitName) { unitName_ = std::move(unitName); }
     const std::string& unitName() const { return unitName_; }
 
-    void configureFromEnv(const std::string& unitName = std::string());
+    // Subgroup default resolution chain (Java: rocketmq.namesrv.domain.subgroup, default
+    // "nsaddr"): explicit argument > ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP env > "nsaddr".
+    static std::string resolveSubgroup(const std::string& subgroup);
+
+    // Builds wsAddr from the address-server domain. An explicit (non-empty) domain wins over
+    // the ROCKETMQ_NAMESRV_DOMAIN environment variable; with neither the call is a no-op.
+    void configureFromEnv(const std::string& unitName = std::string(),
+                          const std::string& domain = std::string(),
+                          const std::string& subgroup = std::string());
 
     // URL assembly used when fetching the name server address (unitName / para rules followed item by item)
     std::string buildUrl() const;

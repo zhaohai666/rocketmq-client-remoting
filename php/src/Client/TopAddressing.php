@@ -8,6 +8,11 @@ class DefaultTopAddressing
 {
     public const DEFAULT_NAMESRV_ADDR_LOOKUP = 'jmenv.tbsite.net';
     public const DEFAULT_DOMAIN_SUBGROUP = 'nsaddr';
+    /**
+     * Java: system property ``rocketmq.namesrv.domain.subgroup`` (MixAll.WS_DOMAIN_SUBGROUP).
+     * Non-JVM ports read the same name as an environment variable.
+     */
+    public const DOMAIN_SUBGROUP_ENV = 'ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP';
 
     public string $wsAddr;
 
@@ -36,9 +41,25 @@ class DefaultTopAddressing
         if ($wsAddr !== null && $wsAddr !== '') {
             $this->wsAddr = $wsAddr;
         } else {
-            $dom = $domain ?? (string) getenv('ROCKETMQ_NAMESRV_DOMAIN');
-            $this->wsAddr = $dom !== '' ? self::getWsAddr($dom, $subgroup) : '';
+            $dom = ($domain !== null && trim($domain) !== '') ? trim($domain) : (string) getenv('ROCKETMQ_NAMESRV_DOMAIN');
+            $this->wsAddr = $dom !== '' ? self::getWsAddr($dom, self::resolveSubgroup($subgroup)) : '';
         }
+    }
+
+    /**
+     * Subgroup resolution: explicit > env ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` > ``"nsaddr"``.
+     * A blank explicit value counts as unset.
+     */
+    public static function resolveSubgroup(?string $explicit): string
+    {
+        if ($explicit !== null && trim($explicit) !== '') {
+            return trim($explicit);
+        }
+        $env = getenv(self::DOMAIN_SUBGROUP_ENV);
+        if ($env !== false && trim((string) $env) !== '') {
+            return trim((string) $env);
+        }
+        return self::DEFAULT_DOMAIN_SUBGROUP;
     }
 
     /**

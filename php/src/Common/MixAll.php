@@ -13,6 +13,12 @@ final class MixAll
     public const NAMESRV_ADDR_PROPERTY = 'rocketmq.namesrv.addr';
     public const NAMESRV_ADDR_ENV = 'NAMESRV_ADDR';
     /**
+     * Non-JVM ports have no system properties, so the Java property ``rocketmq.namesrv.addr``
+     * (ClientConfig's default namesrvAddr) maps to this env var, tried before NAMESRV_ADDR
+     * (MixAll.NAMESRV_ADDR_ENV on the JVM).
+     */
+    public const NAMESRV_ADDR_PROPERTY_ENV = 'ROCKETMQ_NAMESRV_ADDR';
+    /**
      * Response ext field: the broker understood the fingerprint-bearing heartbeat body, so later
      * beats to this address may omit the subscription set.
      */
@@ -155,6 +161,45 @@ final class MixAll
     public static function getRetryTopic(string $consumerGroup): string
     {
         return self::RETRY_GROUP_TOPIC_PREFIX . $consumerGroup;
+    }
+
+    /**
+     * Java ClientConfig default chain (ClientConfig.java:45): the namesrvAddr field is
+     * initialised from the system property ``rocketmq.namesrv.addr`` falling back to the
+     * ``NAMESRV_ADDR`` environment variable. Non-JVM ports map the property name to
+     * ``ROCKETMQ_NAMESRV_ADDR``. Addresses are split on ``;`` or ``,`` like the facade
+     * setters do; blank entries are dropped; an unset / blank variable yields [].
+     *
+     * @return list<string>
+     */
+    public static function namesrvAddrsFromEnv(): array
+    {
+        $raw = getenv(self::NAMESRV_ADDR_PROPERTY_ENV);
+        if ($raw === false || trim((string) $raw) === '') {
+            $raw = getenv(self::NAMESRV_ADDR_ENV);
+        }
+        if ($raw === false || trim((string) $raw) === '') {
+            return [];
+        }
+        return self::parseNamesrvAddrs((string) $raw);
+    }
+
+    /**
+     * The pure counterpart of {@see namesrvAddrsFromEnv()}: splits on ``;`` / ``,``
+     * and trims, dropping blank entries.
+     *
+     * @return list<string>
+     */
+    public static function parseNamesrvAddrs(string $raw): array
+    {
+        $out = [];
+        foreach (preg_split('/[;,]/', $raw) as $addr) {
+            $addr = trim($addr);
+            if ($addr !== '') {
+                $out[] = $addr;
+            }
+        }
+        return $out;
     }
 
     public static function isRetryTopic(?string $topic): bool

@@ -239,6 +239,10 @@ export class MQClient {
   // every 2min, initial delay 10s — ONLY when the name server address was not
   // explicitly set.
   _topAddressing: DefaultTopAddressing | null;
+  // Explicit address-server setting (wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables).
+  _namesrvDomain: string | null;
+  _namesrvSubgroup: string | null;
   _namesrvTimer: NodeJS.Timeout | null;
   _namesrvInitialTimer: NodeJS.Timeout | null;
   // adjustThreadPool task: every 1 minute every
@@ -263,6 +267,10 @@ export class MQClient {
     clientId: string,
     nameServerAddr: string | null = null,
     remotingClient: RemotingClient | null = null,
+    // Address-server setting (Java ClientConfig semantics): an explicit domain
+    // wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable; the subgroup
+    // wins over ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP. Defaults "nsaddr".
+    options: { namesrvDomain?: string | null; namesrvSubgroup?: string | null } = {},
   ) {
     this.clientId = clientId;
     this.nameServerAddrList = nameServerAddr ? nameServerAddr.split(';').filter((s) => s.length > 0) : [];
@@ -301,6 +309,10 @@ export class MQClient {
     this._namesrvChosen = null;
     this._running = false;
     this._facadeProcessors = new Map();
+    this._namesrvDomain = options.namesrvDomain != null && options.namesrvDomain.trim() !== ''
+      ? options.namesrvDomain.trim() : null;
+    this._namesrvSubgroup = options.namesrvSubgroup != null && options.namesrvSubgroup.trim() !== ''
+      ? options.namesrvSubgroup.trim() : null;
   }
 
   // ---- name server ----
@@ -1352,7 +1364,8 @@ export class MQClient {
   // explicitly configured: fetchNameServerAddr fires at +10s, then every 2min.
   private _startNamesrvAddressingLoop(): void {
     if (this.nameServerAddress != null) return; // explicitly set — skip the task
-    this._topAddressing = new DefaultTopAddressing(null, null);
+    this._topAddressing = new DefaultTopAddressing(null, null,
+      { domain: this._namesrvDomain, subgroup: this._namesrvSubgroup });
     this._topAddressing.registerChangeCallBack((addrs) => this.onNameServerAddressChange(addrs));
     const beat = () => { void this.fetchNameServerAddr(); };
     const initial = setTimeout(beat, 10_000);

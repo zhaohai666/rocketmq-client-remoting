@@ -411,6 +411,8 @@ class MQClientInstance
         ?int $concurrentHeartbeatThreadPoolSize = null,
         int $channelIdleTimeoutSeconds = self::DEFAULT_CHANNEL_IDLE_TIMEOUT_SECONDS,
         bool $closeChannelOnSyncTimeout = true,
+        ?string $namesrvDomain = null,
+        ?string $namesrvSubgroup = null,
     ) {
         $this->clientId = $clientId;
         $this->nameServerAddrs = array_values($nameServerAddrs);
@@ -491,7 +493,13 @@ class MQClientInstance
 
         // Dynamic name server (DefaultTopAddressing pulls the address list by domain). When
         // ROCKETMQ_NAMESRV_DOMAIN is not configured, wsAddr is an empty string -> fetch is a no-op.
-        $this->topAddressing = new DefaultTopAddressing(unitName: $unitName ?? '');
+        // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+        // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+        $this->topAddressing = new DefaultTopAddressing(
+            unitName: $unitName ?? '',
+            domain: ($namesrvDomain !== null && trim($namesrvDomain) !== '') ? trim($namesrvDomain) : null,
+            subgroup: ($namesrvSubgroup !== null && trim($namesrvSubgroup) !== '') ? trim($namesrvSubgroup) : null,
+        );
         // Consume stats: shared at instance level; multiple producers/consumers share the same stats.
         $this->consumerStatsManager = new ConsumerStatsManager();
 

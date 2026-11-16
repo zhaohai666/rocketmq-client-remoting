@@ -6,6 +6,12 @@ public static class MixAll
 {
     public const string NamesrvAddrProperty = "rocketmq.namesrv.addr";
     public const string NamesrvAddrEnv = "NAMESRV_ADDR";
+    // Non-JVM ports have no system properties, so the Java property ``rocketmq.namesrv.addr``
+    // (ClientConfig's default namesrvAddr) maps to this env var, tried before NAMESRV_ADDR.
+    public const string NamesrvAddrPropertyEnv = "ROCKETMQ_NAMESRV_ADDR";
+    // Java system property rocketmq.namesrv.domain.subgroup (MixAll.WS_DOMAIN_SUBGROUP);
+    // read here as an environment variable when the subgroup is not set explicitly.
+    public const string NamesrvDomainSubgroupEnv = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP";
     public const string MessageCompressLevel = "rocketmq.message.compressLevel";
     public const string DefaultTopic = "TBW102";
     public const string BenchmarkTopic = "BenchmarkTest";
@@ -97,6 +103,37 @@ public static class MixAll
     };
 
     public static string GetRetryTopic(string consumerGroup) => RetryGroupTopicPrefix + consumerGroup;
+
+    /// <summary>Java ClientConfig default chain (ClientConfig.java:45): the namesrvAddr field is
+    /// initialised from the system property ``rocketmq.namesrv.addr`` falling back to the
+    /// ``NAMESRV_ADDR`` environment variable. Non-JVM ports map the property name to
+    /// ``ROCKETMQ_NAMESRV_ADDR`` (env names cannot carry dots). Addresses are split on
+    /// ``;`` or ',' like SetNamesrvAddr does.</summary>
+    public static List<string> NamesrvAddrsFromEnv()
+    {
+        string? raw = Environment.GetEnvironmentVariable(NamesrvAddrPropertyEnv);
+        if (string.IsNullOrEmpty(raw))
+        {
+            raw = Environment.GetEnvironmentVariable(NamesrvAddrEnv);
+        }
+
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return result;
+        }
+
+        foreach (string piece in raw.Split(new[] { ';', ',' }))
+        {
+            string t = piece.Trim();
+            if (t.Length > 0)
+            {
+                result.Add(t);
+            }
+        }
+
+        return result;
+    }
 
     public static bool IsRetryTopic(string topic) => topic.StartsWith(RetryGroupTopicPrefix, StringComparison.Ordinal);
 

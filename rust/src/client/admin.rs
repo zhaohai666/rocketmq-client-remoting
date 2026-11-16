@@ -17,6 +17,7 @@ use crate::common::message::{MessageExt, MessageQueue};
 use crate::common::message_const::{
     INDEX_KEY_TYPE, INDEX_UNIQUE_TYPE, PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX,
 };
+use crate::client::top_addressing::DefaultTopAddressing;
 use crate::common::mix_all::MixAll;
 use crate::common::sysflag::PermName;
 use crate::common::topic_config::TopicConfig;
@@ -77,6 +78,14 @@ pub struct AdminConfig {
     pub vip_channel_enabled: bool,
     pub poll_name_server_interval_millis: u64,
     pub name_server_addrs: Vec<String>,
+    /// Address-server domain (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. When name server addresses are
+    /// absent, a non-empty domain allows start-up with dynamic addressing.
+    pub namesrv_domain: Option<String>,
+    /// Address-server subgroup (`None` = unset): explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable, which wins over the
+    /// Java default `"nsaddr"`.
+    pub namesrv_subgroup: Option<String>,
     pub timeout_millis: i64,
     /// Page size sent as `maxTopicNum` / `maxGroupNum` when paging metadata (default 2000).
     pub max_page_size_in_get_metadata: i32,
@@ -99,6 +108,8 @@ impl Default for AdminConfig {
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
+            namesrv_domain: None,
+            namesrv_subgroup: None,
             timeout_millis: DEFAULT_TIMEOUT_MILLIS,
             max_page_size_in_get_metadata: DEFAULT_MAX_PAGE_SIZE_IN_GET_METADATA,
             kv_namespace_to_delete_list: Vec::new(),
@@ -589,6 +600,30 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
+    /// Address-server domain (Java: system property `rocketmq.namesrv.domain`,
+    /// default `jmenv.tbsite.net`). Explicit setting wins over the
+    /// `ROCKETMQ_NAMESRV_DOMAIN` environment variable. Blank = not set.
+    pub fn set_namesrv_domain(&self, domain: &str) {
+        let domain = domain.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_domain = if domain.is_empty() { None } else { Some(domain) }
+        });
+    }
+
+    /// Address-server subgroup (Java: system property
+    /// `rocketmq.namesrv.domain.subgroup`, default `nsaddr`). Explicit setting wins over
+    /// the `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` environment variable. Blank = not set.
+    pub fn set_namesrv_subgroup(&self, subgroup: &str) {
+        let subgroup = subgroup.trim().to_string();
+        self.update_config(|c| {
+            c.namesrv_subgroup = if subgroup.is_empty() {
+                None
+            } else {
+                Some(subgroup)
+            }
+        });
+    }
+
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
@@ -694,7 +729,24 @@ impl DefaultMQAdminExt {
             return Ok(());
         }
         let cfg = self.config();
-        if cfg.name_server_addrs.is_empty() {
+        // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+        // address, the list is initialised from the ROCKETMQ_NAMESRV_ADDR env var
+        // (the `rocketmq.namesrv.addr` property equivalent) falling back to NAMESRV_ADDR.
+        let cfg = if cfg.name_server_addrs.is_empty() {
+            let env_addrs = MixAll::namesrv_addrs_from_env();
+            if !env_addrs.is_empty() {
+                self.update_config(|c| c.name_server_addrs.clone_from(&env_addrs));
+            }
+            self.config()
+        } else {
+            cfg
+        };
+        // Static addresses, the address-server setting or the domain environment
+        // variable: one of the three must be available.
+        if cfg.name_server_addrs.is_empty()
+            && cfg.namesrv_domain.as_deref().unwrap_or_default().is_empty()
+            && !DefaultTopAddressing::is_configured()
+        {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
@@ -721,6 +773,12 @@ impl DefaultMQAdminExt {
                 enable_stream_request_type: cfg.enable_stream_request_type,
                 route_refresh_interval_millis: cfg.poll_name_server_interval_millis,
                 vip_channel_enabled: cfg.vip_channel_enabled,
+                // Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+                // variable inside DefaultTopAddressing (Java ClientConfig semantics).
+                top_addressing: Some(DefaultTopAddressing::from_settings(
+                    cfg.namesrv_domain.as_deref(),
+                    cfg.namesrv_subgroup.as_deref(),
+                )),
                 ..Default::default()
             },
         );

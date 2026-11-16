@@ -19,6 +19,9 @@ pub const DEFAULT_NAMESRV_ADDR_LOOKUP: &str = "jmenv.tbsite.net";
 pub const DEFAULT_DOMAIN_SUBGROUP: &str = "nsaddr";
 /// Environment variable read when the domain is not given explicitly.
 pub const NAMESRV_DOMAIN_ENV: &str = "ROCKETMQ_NAMESRV_DOMAIN";
+/// Java: system property `rocketmq.namesrv.domain.subgroup` (MixAll.WS_DOMAIN_SUBGROUP).
+/// Non-JVM ports read the same name as an environment variable.
+pub const NAMESRV_DOMAIN_SUBGROUP_ENV: &str = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP";
 pub const DEFAULT_TIMEOUT_MILLIS: u64 = 3000;
 
 pub fn clear_new_line(content: &str) -> String {
@@ -54,11 +57,40 @@ impl DefaultTopAddressing {
     }
 
     pub fn from_domain(domain: impl Into<String>) -> Self {
-        let domain = domain.into();
+        Self::build_from(domain.into(), &Self::resolve_subgroup(None))
+    }
+
+    /// Explicit setting wins over the `ROCKETMQ_NAMESRV_DOMAIN` environment variable
+    /// (Java ClientConfig semantics: `None` = consult the env, then the Java defaults).
+    pub fn from_settings(domain: Option<&str>, subgroup: Option<&str>) -> Self {
+        let dom = domain
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| std::env::var(NAMESRV_DOMAIN_ENV).unwrap_or_default());
+        Self::build_from(dom, &Self::resolve_subgroup(subgroup))
+    }
+
+    /// Subgroup resolution: explicit > env `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP` > `"nsaddr"`.
+    pub fn resolve_subgroup(explicit: Option<&str>) -> String {
+        if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+            return s.to_string();
+        }
+        if let Ok(env) = std::env::var(NAMESRV_DOMAIN_SUBGROUP_ENV) {
+            let env = env.trim();
+            if !env.is_empty() {
+                return env.to_string();
+            }
+        }
+        DEFAULT_DOMAIN_SUBGROUP.to_string()
+    }
+
+    /// URL assembly from a domain + subgroup pair; an empty domain disables the lookup.
+    fn build_from(domain: String, subgroup: &str) -> Self {
         let ws_addr = if domain.is_empty() {
             String::new()
         } else {
-            Self::get_ws_addr(&domain, None)
+            Self::get_ws_addr(&domain, Some(subgroup))
         };
         Self {
             ws_addr,
@@ -530,10 +562,15 @@ mod tests {
 
     #[tokio::test]
     async fn no_domain_means_disabled() {
-        if DefaultTopAddressing::is_configured() {
-            return; // ROCKETMQ_NAMESRV_DOMAIN is set in the environment, skip the env branch
-        }
-        let ta = DefaultTopAddressing::new();
+        // The guard is dropped before the first `.await`: the env reads all happen while
+        // constructing `DefaultTopAddressing`, `fetch_ns_addr` touches no env vars.
+        let ta = {
+            let _env_guard = env_lock();
+            if DefaultTopAddressing::is_configured() {
+                return; // ROCKETMQ_NAMESRV_DOMAIN is set in the environment, skip the env branch
+            }
+            DefaultTopAddressing::new()
+        };
         assert_eq!(ta.ws_addr(), "");
         assert_eq!(ta.fetch_ns_addr(true).await, None);
     }
@@ -580,5 +617,89 @@ mod tests {
 
     async fn futures_sleep_forever() {
         tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+
+    // ---------------- env-driven defaults (serialised: tests mutate process env) ----------------
+
+    /// All env-touching tests (here and in `mix_all` / facade modules) share one
+    /// process-wide lock: Rust tests run in parallel threads and `std::env` is
+    /// process-global, so without serialisation one test's env mutation would leak into
+    /// another's assertion window.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::common::mix_all::test_support::namesrv_env_lock()
+    }
+
+    fn set_env(key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn resolve_subgroup_follows_explicit_env_default_chain() {
+        // Explicit wins, env irrelevant.
+        assert_eq!(DefaultTopAddressing::resolve_subgroup(Some("grp-x")), "grp-x");
+        assert_eq!(
+            DefaultTopAddressing::resolve_subgroup(Some("  grp-x  ")),
+            "grp-x"
+        );
+        // Blank explicit counts as unset.
+        let _g = env_lock();
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, Some("env-grp"));
+        assert_eq!(DefaultTopAddressing::resolve_subgroup(Some("  ")), "env-grp");
+        assert_eq!(DefaultTopAddressing::resolve_subgroup(None), "env-grp");
+        // Unset env falls to the Java default "nsaddr".
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, None);
+        assert_eq!(
+            DefaultTopAddressing::resolve_subgroup(None),
+            DEFAULT_DOMAIN_SUBGROUP
+        );
+        // A blank env value also falls to the default.
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, Some("   "));
+        assert_eq!(
+            DefaultTopAddressing::resolve_subgroup(None),
+            DEFAULT_DOMAIN_SUBGROUP
+        );
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, None);
+    }
+
+    #[test]
+    fn from_settings_explicit_domain_wins_over_env() {
+        let _g = env_lock();
+        set_env(NAMESRV_DOMAIN_ENV, Some("env-domain:7001"));
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, Some("env-grp"));
+        // Explicit domain + subgroup: env values are ignored entirely.
+        let ta = DefaultTopAddressing::from_settings(Some("explicit:8080"), Some("grp"));
+        assert_eq!(ta.ws_addr(), "http://explicit:8080/rocketmq/grp");
+        // Explicit domain only: subgroup still resolves env > default.
+        let ta = DefaultTopAddressing::from_settings(Some("explicit"), None);
+        assert_eq!(ta.ws_addr(), "http://explicit:8080/rocketmq/env-grp");
+        set_env(NAMESRV_DOMAIN_ENV, None);
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, None);
+    }
+
+    #[test]
+    fn from_settings_falls_back_to_env_domain() {
+        let _g = env_lock();
+        set_env(NAMESRV_DOMAIN_ENV, Some("env-domain"));
+        let ta = DefaultTopAddressing::from_settings(None, None);
+        assert_eq!(ta.ws_addr(), "http://env-domain:8080/rocketmq/nsaddr");
+        // A blank explicit domain counts as unset.
+        let ta = DefaultTopAddressing::from_settings(Some("  "), None);
+        assert_eq!(ta.ws_addr(), "http://env-domain:8080/rocketmq/nsaddr");
+        set_env(NAMESRV_DOMAIN_ENV, None);
+        assert_eq!(DefaultTopAddressing::from_settings(None, None).ws_addr(), "");
+    }
+
+    #[test]
+    fn from_domain_keeps_existing_semantics_and_honours_subgroup_env() {
+        let _g = env_lock();
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, Some("env-grp"));
+        let ta = DefaultTopAddressing::from_domain("h");
+        assert_eq!(ta.ws_addr(), "http://h:8080/rocketmq/env-grp");
+        set_env(NAMESRV_DOMAIN_SUBGROUP_ENV, None);
+        let ta = DefaultTopAddressing::from_domain("h");
+        assert_eq!(ta.ws_addr(), "http://h:8080/rocketmq/nsaddr");
     }
 }

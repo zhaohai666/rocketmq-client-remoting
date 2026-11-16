@@ -1,6 +1,9 @@
 // MixAll implementation (the properties and group-classification parts).
 #include "rocketmq/common/mix_all.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -71,6 +74,33 @@ bool MixAll::isPredefinedGroup(const std::string& consumerGroup) {
         if (consumerGroup == g) return true;
     }
     return false;
+}
+
+std::vector<std::string> MixAll::namesrvAddrsFromEnv() {
+    const char* raw = std::getenv(NAMESRV_ADDR_PROPERTY_ENV);
+    if (raw == nullptr || raw[0] == '\0') {
+        raw = std::getenv(NAMESRV_ADDR_ENV);
+    }
+    if (raw == nullptr || raw[0] == '\0') return {};
+    std::vector<std::string> out;
+    const std::string text(raw);
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t semi = text.find(';', start);
+        size_t comma = text.find(',', start);
+        size_t stop = std::min(semi, comma);
+        const std::string piece = text.substr(start, stop == std::string::npos
+                                                        ? std::string::npos
+                                                        : stop - start);
+        size_t b = 0;
+        size_t e = piece.size();
+        while (b < e && std::isspace(static_cast<unsigned char>(piece[b]))) ++b;
+        while (e > b && std::isspace(static_cast<unsigned char>(piece[e - 1]))) --e;
+        if (e > b) out.push_back(piece.substr(b, e - b));
+        if (stop == std::string::npos) break;
+        start = stop + 1;
+    }
+    return out;
 }
 
 std::string MixAll::getIpStr() { return UtilAll::localIp(); }

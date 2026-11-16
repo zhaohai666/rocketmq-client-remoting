@@ -47,6 +47,14 @@ public:
     // ---------------- configuration ----------------
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
+    // Address-server setting (Java: system properties rocketmq.namesrv.domain[.subgroup],
+    // defaults jmenv.tbsite.net / nsaddr). The explicit setting wins over the
+    // ROCKETMQ_NAMESRV_DOMAIN / ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables;
+    // an empty (or whitespace-only) value resets the setting.
+    void setNamesrvDomain(const std::string& domain);
+    void setNamesrvSubgroup(const std::string& subgroup);
+    const std::string& namesrvDomain() const { return namesrvDomain_; }
+    const std::string& namesrvSubgroup() const { return namesrvSubgroup_; }
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
@@ -303,6 +311,9 @@ private:
     int32_t consumerTimeoutMillisWhenSuspend_ = 30000;
 
     std::vector<std::string> nameServerAddrs_;
+    // Address-server setting; empty = unset (environment variables then apply).
+    std::string namesrvDomain_;
+    std::string namesrvSubgroup_;
     std::shared_ptr<RPCHook> rpcHook_;
     std::set<std::string> registerTopics_;
     // The queue listeners and the last balanced view per topic are read while a caller recomputes an

@@ -178,6 +178,18 @@ final class DefaultMQPushConsumer
     public bool $clientRebalance = true;
     /** @var list<string> */
     public array $nameServerAddrs = [];
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``, default
+     * ``jmenv.tbsite.net``). Explicit value wins over the ``ROCKETMQ_NAMESRV_DOMAIN``
+     * environment variable inside DefaultTopAddressing.
+     */
+    public ?string $nameServerDomain = null;
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``,
+     * default ``nsaddr``). Explicit value wins over the
+     * ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment variable.
+     */
+    public ?string $nameServerSubgroup = null;
     public mixed $rpcHook = null;
     public AllocateMessageQueueStrategy $allocateStrategy;
     /** @var array<string, SubscriptionData> topic => SubscriptionData */
@@ -413,6 +425,26 @@ final class DefaultMQPushConsumer
     public function setNameServerAddresses(array $addrs): void
     {
         $this->nameServerAddrs = array_values($addrs);
+    }
+
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``). The
+     * explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN`` environment variable.
+     * A null / blank value counts as unset.
+     */
+    public function setNameServerDomain(?string $domain): void
+    {
+        $this->nameServerDomain = ($domain !== null && trim($domain) !== '') ? trim($domain) : null;
+    }
+
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``).
+     * The explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment
+     * variable. A null / blank value counts as unset.
+     */
+    public function setNameServerSubgroup(?string $subgroup): void
+    {
+        $this->nameServerSubgroup = ($subgroup !== null && trim($subgroup) !== '') ? trim($subgroup) : null;
     }
 
     public function setInstanceName(string $name): void
@@ -775,7 +807,15 @@ final class DefaultMQPushConsumer
                 MixAll::DEFAULT_CONSUMER_GROUP,
             ));
         }
-        if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
+        if ($this->nameServerAddrs === []) {
+            // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+            // address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+            $this->nameServerAddrs = MixAll::namesrvAddrsFromEnv();
+        }
+        if ($this->nameServerAddrs === [] && $this->nameServerDomain === null
+            && !DefaultTopAddressing::isConfigured()) {
+            // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+            // environment variable: one of the three must be available.
             throw new MQClientException('name server address is not set');
         }
         if ($this->subscriptionData === []) {
@@ -813,6 +853,8 @@ final class DefaultMQPushConsumer
             mqClientApiTimeout: $this->mqClientApiTimeout,
             enableConcurrentHeartbeat: $this->enableConcurrentHeartbeat,
             concurrentHeartbeatThreadPoolSize: $this->concurrentHeartbeatThreadPoolSize,
+            namesrvDomain: $this->nameServerDomain,
+            namesrvSubgroup: $this->nameServerSubgroup,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

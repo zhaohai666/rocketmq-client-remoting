@@ -27,6 +27,7 @@ package client
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -52,9 +53,17 @@ type DefaultMQAdminExt struct {
 	mu sync.Mutex
 
 	NameServerAddrs []string
-	InstanceName    string
-	ClientID        string
-	UnitName        string
+	// NameServerDomain is the address-server domain (Java: system property
+	// rocketmq.namesrv.domain, default jmenv.tbsite.net). The explicit setting
+	// wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable.
+	NameServerDomain string
+	// NameServerSubgroup is the address-server subgroup (Java: system property
+	// rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+	// wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+	NameServerSubgroup string
+	InstanceName       string
+	ClientID           string
+	UnitName           string
 	// EnableStreamRequestType is the classic enableStreamRequestType client knob.
 	EnableStreamRequestType bool
 	// VipChannelEnabled is the broker-facing VIP switch, off by default: with it
@@ -127,6 +136,24 @@ func (a *DefaultMQAdminExt) SetNameServerAddresses(addrs []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.NameServerAddrs = append([]string(nil), addrs...)
+}
+
+// SetNameServerDomain sets the address-server domain (Java: system property
+// rocketmq.namesrv.domain, default jmenv.tbsite.net). The explicit setting
+// wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable.
+func (a *DefaultMQAdminExt) SetNameServerDomain(domain string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.NameServerDomain = strings.TrimSpace(domain)
+}
+
+// SetNameServerSubgroup sets the address-server subgroup (Java: system
+// property rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit
+// setting wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+func (a *DefaultMQAdminExt) SetNameServerSubgroup(subgroup string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.NameServerSubgroup = strings.TrimSpace(subgroup)
 }
 
 // SetInstanceName changes the instance name (and hence the clientId).
@@ -230,6 +257,13 @@ func (a *DefaultMQAdminExt) Start() error {
 		return nil
 	}
 	if len(a.NameServerAddrs) == 0 {
+		// Java ClientConfig default chain (ClientConfig.java:45): with no
+		// explicit address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+		a.NameServerAddrs = common.NamesrvAddrsFromEnv()
+	}
+	if len(a.NameServerAddrs) == 0 && a.NameServerDomain == "" && os.Getenv(common.NamesrvDomainEnv) == "" {
+		// Static addresses, the address-server setting or the domain
+		// environment variable: one of the three must be available.
 		a.mu.Unlock()
 		return common.ClientError("name server address is not set")
 	}
@@ -250,6 +284,8 @@ func (a *DefaultMQAdminExt) Start() error {
 	config.PollNameServerIntervalMillis = pollInterval
 	config.VipChannelEnabled = vipEnabled
 	config.MaxPageSizeInGetMetadata = pageSize
+	config.NamesrvDomain = a.NameServerDomain
+	config.NamesrvSubgroup = a.NameServerSubgroup
 	instance := CreateOrGetInstance(clientID, addrs, config)
 	instance.EnsureRPCHooks("", stream, hook)
 	if err := instance.Start(); err != nil {

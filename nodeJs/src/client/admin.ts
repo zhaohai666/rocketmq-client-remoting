@@ -204,6 +204,11 @@ export class DefaultMQAdminExt {
   adminExtGroup: string;
   createTopicKey: string;
   namesrvAddr: string | null = null;
+  // Address-server setting; explicit value wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables (Java defaults:
+  // jmenv.tbsite.net / nsaddr).
+  namesrvDomain: string | null = null;
+  namesrvSubgroup: string | null = null;
   instanceName: string = 'ADMIN';
   unitName: string | null = null;
   enableStreamRequestType = false;
@@ -239,6 +244,20 @@ export class DefaultMQAdminExt {
 
   setNamesrvAddr(addr: string): void { this.namesrvAddr = addr; }
   setNameServerAddressList(addrs: string[]): void { this.namesrvAddr = addrs.join(';'); }
+
+  // Address-server domain (Java: system property rocketmq.namesrv.domain,
+  // default jmenv.tbsite.net). The explicit setting wins over the
+  // ROCKETMQ_NAMESRV_DOMAIN environment variable.
+  setNamesrvDomain(domain: string): void {
+    this.namesrvDomain = domain != null && domain.trim() !== '' ? domain.trim() : null;
+  }
+
+  // Address-server subgroup (Java: system property
+  // rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+  // wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+  setNamesrvSubgroup(subgroup: string): void {
+    this.namesrvSubgroup = subgroup != null && subgroup.trim() !== '' ? subgroup.trim() : null;
+  }
   setInstanceName(name: string): void { this.instanceName = name; }
   setUnitName(unitName: string): void { this.unitName = unitName; }
   // Java DefaultMQAdminExt#setAdminExtGroup / #getAdminExtGroup. The group identity the admin
@@ -280,6 +299,11 @@ export class DefaultMQAdminExt {
   start(): void {
     if (this._started) return;
     if (!this.namesrvAddr) {
+      // Java ClientConfig default chain (ClientConfig.java:45).
+      this.namesrvAddr = MixAll.namesrvAddrFromEnv();
+    }
+    if (!this.namesrvAddr && !this.namesrvDomain
+        && !process.env['ROCKETMQ_NAMESRV_DOMAIN']) {
       throw new MQClientException('name server address is not set, call setNamesrvAddr() first');
     }
     // Unconditionally make the instance name pid-unique, then build the
@@ -289,7 +313,8 @@ export class DefaultMQAdminExt {
     const presetRC = this.client != null ? this.client.remotingClient : null;
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
-      clientId, () => new MQClient(clientId, this.namesrvAddr, presetRC));
+      clientId, () => new MQClient(clientId, this.namesrvAddr, presetRC,
+        { namesrvDomain: this.namesrvDomain, namesrvSubgroup: this.namesrvSubgroup }));
     this.client = client;
     if (created) {
       // Pass this facade's configured route-refresh period into the shared

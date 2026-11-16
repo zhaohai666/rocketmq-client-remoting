@@ -80,7 +80,12 @@ public:
                      int32_t invokeTimeoutMillis = 15000,
                      bool tlsEnable = tlsEnabledFromEnv(),
                      const std::string& unitName = std::string(),
-                     int32_t pollNameServerIntervalMillis = 30000);
+                     int32_t pollNameServerIntervalMillis = 30000,
+                     // Address-server setting (Java rocketmq.namesrv.domain[.subgroup]):
+                     // explicit values win over the ROCKETMQ_NAMESRV_DOMAIN /
+                     // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables.
+                     const std::string& namesrvDomain = std::string(),
+                     const std::string& namesrvSubgroup = std::string());
     ~MQClientInstance();
 
     MQClientInstance(const MQClientInstance&) = delete;

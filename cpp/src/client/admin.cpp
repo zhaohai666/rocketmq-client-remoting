@@ -18,6 +18,7 @@
 #include "rocketmq/common/message_decoder.h"
 #include "rocketmq/common/mix_all.h"
 #include "rocketmq/common/sysflag.h"
+#include "rocketmq/common/top_addressing.h"
 #include "rocketmq/common/util_all.h"
 #include "rocketmq/remoting/protocol/codes.h"
 #include "rocketmq/remoting/protocol/extra_info.h"
@@ -102,6 +103,26 @@ void DefaultMQAdminExt::setNameServerAddresses(const std::vector<std::string>& a
     nameServerAddrs_ = addrs;
 }
 
+void DefaultMQAdminExt::setNamesrvDomain(const std::string& domain) {
+    size_t b = domain.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        namesrvDomain_.clear();
+        return;
+    }
+    size_t e = domain.find_last_not_of(" \t\r\n");
+    namesrvDomain_ = domain.substr(b, e - b + 1);
+}
+
+void DefaultMQAdminExt::setNamesrvSubgroup(const std::string& subgroup) {
+    size_t b = subgroup.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        namesrvSubgroup_.clear();
+        return;
+    }
+    size_t e = subgroup.find_last_not_of(" \t\r\n");
+    namesrvSubgroup_ = subgroup.substr(b, e - b + 1);
+}
+
 std::string DefaultMQAdminExt::getNamesrvAddr() const {
     std::string s;
     for (size_t i = 0; i < nameServerAddrs_.size(); ++i) {
@@ -113,7 +134,16 @@ std::string DefaultMQAdminExt::getNamesrvAddr() const {
 
 void DefaultMQAdminExt::start() {
     if (started_) return;
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit address,
+    // the field is initialised from the rocketmq.namesrv.addr property falling back to
+    // the NAMESRV_ADDR environment variable.
     if (nameServerAddrs_.empty()) {
+        nameServerAddrs_ = MixAll::namesrvAddrsFromEnv();
+    }
+    // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+    // environment variable: one of the three must be available.
+    if (nameServerAddrs_.empty() && namesrvDomain_.empty()
+            && !DefaultTopAddressing::isConfigured()) {
         throw MQClientException("name server address is not set");
     }
     instanceName_ = changeInstanceNameToPID(instanceName_);
@@ -122,7 +152,8 @@ void DefaultMQAdminExt::start() {
     }
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
-                                        unitName_, pollNameServerIntervalMillis_));
+                                        unitName_, pollNameServerIntervalMillis_,
+                                        namesrvDomain_, namesrvSubgroup_));
     // The instance answers the delegated offset / consumer-list family, and it applies the
     // VIP translation itself -- so the admin's switch has to be handed over before start().
     mqClient_->setVipChannelEnabled(vipChannelEnabled_);

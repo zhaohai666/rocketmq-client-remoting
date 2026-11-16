@@ -14,6 +14,7 @@ package client
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -150,7 +151,12 @@ type DefaultLitePullConsumer struct {
 	accessChannel string
 
 	nameServerAddrs []string
-	pollNamesrvIntv int64
+	// nameServerDomain / nameServerSubgroup are the address-server settings;
+	// explicit values win over the ROCKETMQ_NAMESRV_DOMAIN /
+	// ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables.
+	nameServerDomain   string
+	nameServerSubgroup string
+	pollNamesrvIntv    int64
 
 	// Instance knobs seeded at Start and applied live when the shared instance
 	// already exists: receive-body decode, internal-API timeout and the
@@ -342,6 +348,24 @@ func (c *DefaultLitePullConsumer) SetNameServerAddresses(addrs []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nameServerAddrs = append([]string(nil), addrs...)
+}
+
+// SetNameServerDomain sets the address-server domain (Java: system property
+// rocketmq.namesrv.domain, default jmenv.tbsite.net). The explicit setting
+// wins over the ROCKETMQ_NAMESRV_DOMAIN environment variable.
+func (c *DefaultLitePullConsumer) SetNameServerDomain(domain string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nameServerDomain = strings.TrimSpace(domain)
+}
+
+// SetNameServerSubgroup sets the address-server subgroup (Java: system
+// property rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit
+// setting wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+func (c *DefaultLitePullConsumer) SetNameServerSubgroup(subgroup string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nameServerSubgroup = strings.TrimSpace(subgroup)
 }
 
 func (c *DefaultLitePullConsumer) SetInstanceName(name string) {
@@ -1097,6 +1121,8 @@ func (c *DefaultLitePullConsumer) Start() error {
 	}
 	cfg.SocksProxy = c.socksProxy
 	cfg.PollNameServerIntervalMillis = c.pollNamesrvIntv
+	cfg.NamesrvDomain = c.nameServerDomain
+	cfg.NamesrvSubgroup = c.nameServerSubgroup
 	cfg.DecodeReadBody = c.decodeReadBody
 	cfg.MQClientAPITimeoutMillis = c.mqClientAPITimeoutMillis
 	cfg.EnableConcurrentHeartbeat = c.enableConcurrentHeartbeat
@@ -1177,6 +1203,13 @@ func (c *DefaultLitePullConsumer) checkConfigLocked() error {
 			"consumerGroup can not equal %s, please specify another one.", common.DefaultConsumerGroup))
 	}
 	if len(c.nameServerAddrs) == 0 {
+		// Java ClientConfig default chain (ClientConfig.java:45): with no
+		// explicit address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+		c.nameServerAddrs = common.NamesrvAddrsFromEnv()
+	}
+	if len(c.nameServerAddrs) == 0 && c.nameServerDomain == "" && os.Getenv(common.NamesrvDomainEnv) == "" {
+		// Static addresses, the address-server setting or the domain
+		// environment variable: one of the three must be available.
 		return common.ClientError("name server address is not set")
 	}
 	if c.messageModel == "" {

@@ -475,6 +475,18 @@ class DefaultMQProducer
     public array $topics;
     /** @var list<string> */
     public array $nameServerAddrs = [];
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``, default
+     * ``jmenv.tbsite.net``). Explicit value wins over the ``ROCKETMQ_NAMESRV_DOMAIN``
+     * environment variable inside DefaultTopAddressing.
+     */
+    public ?string $nameServerDomain = null;
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``,
+     * default ``nsaddr``). Explicit value wins over the
+     * ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment variable.
+     */
+    public ?string $nameServerSubgroup = null;
     /** @var MQClientInstance|null */
     public $mqClient = null;
     public bool $started = false;
@@ -766,6 +778,26 @@ class DefaultMQProducer
     public function setNameServerAddresses(array $addrs): void
     {
         $this->nameServerAddrs = array_values($addrs);
+    }
+
+    /**
+     * Address-server domain (Java: system property ``rocketmq.namesrv.domain``). The
+     * explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN`` environment variable.
+     * A null / blank value counts as unset.
+     */
+    public function setNameServerDomain(?string $domain): void
+    {
+        $this->nameServerDomain = ($domain !== null && trim($domain) !== '') ? trim($domain) : null;
+    }
+
+    /**
+     * Address-server subgroup (Java: system property ``rocketmq.namesrv.domain.subgroup``).
+     * The explicit setting wins over the ``ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`` environment
+     * variable. A null / blank value counts as unset.
+     */
+    public function setNameServerSubgroup(?string $subgroup): void
+    {
+        $this->nameServerSubgroup = ($subgroup !== null && trim($subgroup) !== '') ? trim($subgroup) : null;
     }
 
     public function getNamesrvAddr(): string
@@ -1376,7 +1408,18 @@ class DefaultMQProducer
                 MixAll::DEFAULT_PRODUCER_GROUP
             ));
         }
-        if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
+        if ($this->nameServerAddrs === []) {
+            // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+            // address, fall back to ROCKETMQ_NAMESRV_ADDR then NAMESRV_ADDR.
+            $this->nameServerAddrs = MixAll::namesrvAddrsFromEnv();
+        }
+        if ($this->nameServerAddrs === [] && $this->nameServerDomain === null
+            && !DefaultTopAddressing::isConfigured()) {
+            // Static addresses, the address-server setting or the ROCKETMQ_NAMESRV_DOMAIN
+            // environment variable: one of the three must be available. The
+            // protocol surfaces a missing nameserver on the first send (as 10004);
+            // reporting it here is more predictable, but must use the SAME code so
+            // callers do not have to handle two different values for one failure.
             throw new MQClientException('name server address is not set', ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
         }
         $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
@@ -1400,6 +1443,8 @@ class DefaultMQProducer
             mqClientApiTimeout: $this->mqClientApiTimeout,
             enableConcurrentHeartbeat: $this->enableConcurrentHeartbeat,
             concurrentHeartbeatThreadPoolSize: $this->concurrentHeartbeatThreadPoolSize,
+            namesrvDomain: $this->nameServerDomain,
+            namesrvSubgroup: $this->nameServerSubgroup,
         );
         if ($this->rpcHook !== null) {
             $this->mqClient->remotingClient->registerRpcHook($this->rpcHook);

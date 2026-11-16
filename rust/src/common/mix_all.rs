@@ -16,6 +16,11 @@ pub struct MixAll;
 impl MixAll {
     pub const NAMESRV_ADDR_PROPERTY: &'static str = "rocketmq.namesrv.addr";
     pub const NAMESRV_ADDR_ENV: &'static str = "NAMESRV_ADDR";
+    /// Non-JVM ports have no system properties, so the Java property
+    /// `rocketmq.namesrv.addr` ([`Self::NAMESRV_ADDR_PROPERTY`], the default of
+    /// `ClientConfig.namesrvAddr`) maps to this env var, tried before
+    /// [`Self::NAMESRV_ADDR_ENV`] (env names cannot carry dots).
+    pub const NAMESRV_ADDR_PROPERTY_ENV: &'static str = "ROCKETMQ_NAMESRV_ADDR";
     pub const MESSAGE_COMPRESS_LEVEL: &'static str = "rocketmq.message.compressLevel";
     pub const DEFAULT_TOPIC: &'static str = "TBW102";
     pub const BENCHMARK_TOPIC: &'static str = "BenchmarkTest";
@@ -110,6 +115,30 @@ impl MixAll {
 
     pub fn get_retry_topic(consumer_group: &str) -> String {
         format!("{}{}", Self::RETRY_GROUP_TOPIC_PREFIX, consumer_group)
+    }
+
+    /// Java `ClientConfig` default chain (ClientConfig.java:45): the `namesrvAddr` field is
+    /// initialised from the system property `rocketmq.namesrv.addr`, falling back to the
+    /// `NAMESRV_ADDR` environment variable. Non-JVM ports map the property name to
+    /// `ROCKETMQ_NAMESRV_ADDR`. Addresses split on `;` or `,`; blank entries are dropped;
+    /// an unset / blank variable yields an empty list.
+    pub fn namesrv_addrs_from_env() -> Vec<String> {
+        let raw = std::env::var(Self::NAMESRV_ADDR_PROPERTY_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var(Self::NAMESRV_ADDR_ENV).ok())
+            .unwrap_or_default();
+        Self::parse_namesrv_addrs(&raw)
+    }
+
+    /// The pure counterpart of [`Self::namesrv_addrs_from_env`]: splits on `;` / `,`
+    /// and trims, dropping blank entries.
+    pub fn parse_namesrv_addrs(raw: &str) -> Vec<String> {
+        raw.split([';', ','])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     pub fn is_retry_topic(topic: Option<&str>) -> bool {
@@ -476,6 +505,20 @@ impl MixAll {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryMsgType;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Serialises every test that mutates the process-global addressing env vars
+    /// (`ROCKETMQ_NAMESRV_ADDR` / `NAMESRV_ADDR` / `ROCKETMQ_NAMESRV_DOMAIN` /
+    /// `ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP`): Rust tests run on parallel threads, and
+    /// without a shared lock one test's env mutation leaks into another's assertion
+    /// window. The lock is a plain `std::sync::Mutex`; async tests must therefore drop
+    /// it before their first `.await` (or hold it only around synchronous setup).
+    pub(crate) fn namesrv_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl QueryMsgType {
     pub const ALL_MESSAGE: i32 = 0;
     pub const UNIQUE_KEY: i32 = 1;
@@ -750,5 +793,61 @@ mod tests {
             ),
             (0, 1, 2)
         );
+    }
+
+    #[test]
+    fn parse_namesrv_addrs_splits_and_trims() {
+        assert_eq!(
+            MixAll::parse_namesrv_addrs("1.1.1.1:9876;2.2.2.2:9876"),
+            vec!["1.1.1.1:9876", "2.2.2.2:9876"]
+        );
+        assert_eq!(
+            MixAll::parse_namesrv_addrs(" 1.1.1.1:9876 , 2.2.2.2:9876 "),
+            vec!["1.1.1.1:9876", "2.2.2.2:9876"]
+        );
+        // Mixed separators and blank entries are dropped.
+        assert_eq!(
+            MixAll::parse_namesrv_addrs("a:1;; ,b:2,   ;"),
+            vec!["a:1", "b:2"]
+        );
+        assert!(MixAll::parse_namesrv_addrs("").is_empty());
+        assert!(MixAll::parse_namesrv_addrs("   ").is_empty());
+        assert!(MixAll::parse_namesrv_addrs(";,;,").is_empty());
+    }
+
+    #[test]
+    fn namesrv_addrs_from_env_follows_property_then_env_chain() {
+        let _g = crate::common::mix_all::test_support::namesrv_env_lock();
+        // Something outside this suite set the vars (e.g. CI): the default chain is
+        // untestable, skip instead of asserting against unknown values.
+        if std::env::var(MixAll::NAMESRV_ADDR_PROPERTY_ENV).is_ok()
+            || std::env::var(MixAll::NAMESRV_ADDR_ENV).is_ok()
+        {
+            return;
+        }
+        assert!(MixAll::namesrv_addrs_from_env().is_empty());
+
+        // ROCKETMQ_NAMESRV_ADDR (the property equivalent) wins over NAMESRV_ADDR.
+        std::env::set_var(MixAll::NAMESRV_ADDR_PROPERTY_ENV, "9.9.9.9:9876");
+        std::env::set_var(MixAll::NAMESRV_ADDR_ENV, "8.8.8.8:9876");
+        assert_eq!(
+            MixAll::namesrv_addrs_from_env(),
+            vec!["9.9.9.9:9876".to_string()]
+        );
+        std::env::remove_var(MixAll::NAMESRV_ADDR_PROPERTY_ENV);
+        assert_eq!(
+            MixAll::namesrv_addrs_from_env(),
+            vec!["8.8.8.8:9876".to_string()]
+        );
+
+        // A blank property value counts as unset (falls through to NAMESRV_ADDR).
+        std::env::set_var(MixAll::NAMESRV_ADDR_PROPERTY_ENV, "   ");
+        assert_eq!(
+            MixAll::namesrv_addrs_from_env(),
+            vec!["8.8.8.8:9876".to_string()]
+        );
+        std::env::remove_var(MixAll::NAMESRV_ADDR_PROPERTY_ENV);
+        std::env::remove_var(MixAll::NAMESRV_ADDR_ENV);
+        assert!(MixAll::namesrv_addrs_from_env().is_empty());
     }
 }

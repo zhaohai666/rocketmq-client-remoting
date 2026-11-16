@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -52,11 +53,22 @@ type ClientInstanceConfig struct {
 	TLSKeyFile  string
 	TLSCAFile   string
 	// TLSTestMode selects the relaxed TLS test mode (insecure trust, no
-	// hostname check). nil keeps the default, which is ON.
+	// hostname check). nil keeps the transport default, which is OFF — strict
+	// CA verification is the secure path; an explicit true opts in to trusting
+	// self-signed broker certificates.
 	TLSTestMode *bool
 	// NamesrvWsAddr is the address-server URL; when set and no nameserver is
 	// configured, start() fetches addresses from it (TopAddressing).
 	NamesrvWsAddr string
+	// NamesrvDomain is the address-server domain (Java: system property
+	// rocketmq.namesrv.domain, default jmenv.tbsite.net). When NamesrvWsAddr is
+	// empty and the domain is set (or falls back to ROCKETMQ_NAMESRV_DOMAIN),
+	// the URL http://<domain>[:8080]/rocketmq/<subgroup> is built from it.
+	NamesrvDomain string
+	// NamesrvSubgroup is the address-server subgroup (Java: rocketmq.namesrv
+	// .domain.subgroup, default nsaddr). Explicit setting wins over the
+	// ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+	NamesrvSubgroup string
 	// PollNameServerIntervalMillis drives the route-refresh period
 	// (getPollNameServerInterval, default 30s).
 	PollNameServerIntervalMillis int64
@@ -344,7 +356,9 @@ func newInstance(clientID string, nameServerAddrs []string, config ClientInstanc
 	if config.TLSCAFile != "" {
 		remotingConfig.TLSCAFile = config.TLSCAFile
 	}
-	remotingConfig.TLSTestMode = true
+	// TLSTestMode: nil keeps the transport default (ROCKETMQ_TLS_TEST_MODE,
+	// off by default — see remoting.ClientConfig.TLSTestMode); an explicit
+	// value opts in / out of trusting self-signed broker certificates.
 	if config.TLSTestMode != nil {
 		remotingConfig.TLSTestMode = *config.TLSTestMode
 	}
@@ -958,17 +972,16 @@ func (i *Instance) Start() error {
 	// here (an instance driven directly without Start creates it lazily) and
 	// shut down by shutdownFactory.
 	i.ensureConcurrentHeartbeatPool()
-	if len(i.NameServerAddrs()) == 0 && i.config.NamesrvWsAddr != "" {
+	if wsAddr := i.effectiveWSAddr(); len(i.NameServerAddrs()) == 0 && wsAddr != "" {
 		if err := i.FetchNameServerAddr(); err != nil {
 			i.shutdownFactory()
 			return common.ClientErrorCode(common.NoNameServerException,
-				fmt.Sprintf("name server address is not set and address server (%s) failed: %v", i.config.NamesrvWsAddr, err))
+				fmt.Sprintf("name server address is not set and address server (%s) failed: %v", wsAddr, err))
 		}
 		if len(i.NameServerAddrs()) == 0 {
-			ws := i.config.NamesrvWsAddr
 			i.shutdownFactory()
 			return common.ClientErrorCode(common.NoNameServerException,
-				fmt.Sprintf("name server address is not set and address server (%s) returned none", ws))
+				fmt.Sprintf("name server address is not set and address server (%s) returned none", wsAddr))
 		}
 		// scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min): this task is
 		// only scheduled when the address server is in play.
@@ -1102,11 +1115,29 @@ func (i *Instance) PersistConsumerOffsets() {
 
 // ---------------- nameserver address fetch ----------------
 
+// effectiveWSAddr resolves the address-server URL: an explicit NamesrvWsAddr
+// wins; otherwise the URL is built from the NamesrvDomain setting or, when
+// that is empty, the ROCKETMQ_NAMESRV_DOMAIN environment variable. Java
+// ClientConfig semantics: the explicit setting beats the environment.
+func (i *Instance) effectiveWSAddr() string {
+	if i.config.NamesrvWsAddr != "" {
+		return i.config.NamesrvWsAddr
+	}
+	domain := i.config.NamesrvDomain
+	if domain == "" {
+		domain = os.Getenv(common.NamesrvDomainEnv)
+	}
+	if domain == "" {
+		return ""
+	}
+	return common.WSAddrForDomain(domain, common.NamesrvSubgroupSetting(i.config.NamesrvSubgroup))
+}
+
 // FetchNameServerAddr GETs the address-server URL and applies the response
 // only when it changed (the classic remoting protocol's address-server fetch).
 // The body's first ';' field is the address list.
 func (i *Instance) FetchNameServerAddr() error {
-	wsAddr := i.config.NamesrvWsAddr
+	wsAddr := i.effectiveWSAddr()
 	if wsAddr == "" {
 		return nil
 	}

@@ -47,7 +47,22 @@ public sealed class DefaultTopAddressing
             ?? Environment.GetEnvironmentVariable("ROCKETMQ_NAMESRV_DOMAIN");
         WsAddr = !string.IsNullOrEmpty(wsAddr)
             ? wsAddr!
-            : (string.IsNullOrEmpty(dom) ? string.Empty : GetWsAddr(dom, subgroup));
+            : (string.IsNullOrEmpty(dom) ? string.Empty : GetWsAddr(dom, ResolveSubgroup(subgroup)));
+    }
+
+    /// <summary>Subgroup default resolution chain (Java: rocketmq.namesrv.domain.subgroup,
+    /// default "nsaddr"): explicit argument &gt; ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP env &gt; "nsaddr".
+    /// The explicit setting wins over the environment variable.</summary>
+    public static string ResolveSubgroup(string? subgroup)
+    {
+        if (!string.IsNullOrWhiteSpace(subgroup))
+        {
+            return subgroup!;
+        }
+
+        string? env = Environment.GetEnvironmentVariable("RocketMqNamesrvDomainSubgroup")
+            ?? Environment.GetEnvironmentVariable(MixAll.NamesrvDomainSubgroupEnv);
+        return string.IsNullOrEmpty(env) ? DefaultDomainSubgroup : env;
     }
 
     /// <summary>Corresponds to MixAll.getWSAddr: when the domain already carries a port (contains ':'), the default :8080 is not appended.</summary>

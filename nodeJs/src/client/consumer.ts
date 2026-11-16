@@ -270,6 +270,11 @@ export class DefaultMQPushConsumer {
   messageQueueListener: ((topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]) => void) | null = null;
 
   nameServerAddr = '';
+  // Address-server setting; explicit value wins over the ROCKETMQ_NAMESRV_DOMAIN /
+  // ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variables (Java defaults:
+  // jmenv.tbsite.net / nsaddr).
+  nameServerDomain: string | null = null;
+  nameServerSubgroup: string | null = null;
   // wire fields read by MQClient.buildHeartbeatData:
   consumeType: string = ConsumeType.CONSUME_PASSIVELY;
   unitModeFlag = false;
@@ -352,6 +357,22 @@ export class DefaultMQPushConsumer {
 
   // ------------------------------------------------------------- config
   setNamesrvAddr(addr: string): this { this.nameServerAddr = addr; return this; }
+
+  // Address-server domain (Java: system property rocketmq.namesrv.domain,
+  // default jmenv.tbsite.net). The explicit setting wins over the
+  // ROCKETMQ_NAMESRV_DOMAIN environment variable.
+  setNamesrvDomain(domain: string): this {
+    this.nameServerDomain = domain != null && domain.trim() !== '' ? domain.trim() : null;
+    return this;
+  }
+
+  // Address-server subgroup (Java: system property
+  // rocketmq.namesrv.domain.subgroup, default nsaddr). The explicit setting
+  // wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable.
+  setNamesrvSubgroup(subgroup: string): this {
+    this.nameServerSubgroup = subgroup != null && subgroup.trim() !== '' ? subgroup.trim() : null;
+    return this;
+  }
   setNamespace(ns: string): this { this.namespace = ns; return this; }
   // Server-side namespace accessor, read live per request by NamespaceRpcHook.
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
@@ -591,7 +612,16 @@ export class DefaultMQPushConsumer {
     if (this.consumerGroup === DEFAULT_CONSUMER_GROUP) {
       throw new Error(`consumerGroup can not equal ${DEFAULT_CONSUMER_GROUP}, please specify another one.`);
     }
-    if (!this.nameServerAddr) throw new Error('name server address is not set');
+    // Java ClientConfig default chain (ClientConfig.java:45): with no explicit
+    // address the field is initialised from the rocketmq.namesrv.addr property
+    // falling back to the NAMESRV_ADDR environment variable.
+    if (!this.nameServerAddr) this.nameServerAddr = MixAll.namesrvAddrFromEnv() || '';
+    if (!this.nameServerAddr && !this.nameServerDomain
+        && !process.env['ROCKETMQ_NAMESRV_DOMAIN']) {
+      // Static addresses, the address-server setting or the domain environment
+      // variable: one of the three must be available.
+      throw new Error('name server address is not set');
+    }
     if (this.subscription.size === 0) {
       throw new Error('subscription is not set, call subscribe() first');
     }
@@ -612,7 +642,8 @@ export class DefaultMQPushConsumer {
 
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
-      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
+      this.clientID, () => new MQClient(this.clientID, this.nameServerAddr, null,
+        { namesrvDomain: this.nameServerDomain, namesrvSubgroup: this.nameServerSubgroup }));
     if (created) {
       if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
       if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;

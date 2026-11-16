@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"math/bits"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,21 @@ const (
 	NamesrvAddrProperty  = "rocketmq.namesrv.addr"
 	NamesrvAddrEnv       = "NAMESRV_ADDR"
 	MessageCompressLevel = "rocketmq.message.compressLevel"
+
+	// NamesrvAddrPropertyEnv carries the Java system property
+	// rocketmq.namesrv.addr (ClientConfig's default namesrvAddr) as an
+	// environment variable: non-JVM ports have no system properties, and env
+	// names cannot carry dots. It is tried before NamesrvAddrEnv.
+	NamesrvAddrPropertyEnv = "ROCKETMQ_NAMESRV_ADDR"
+	// NamesrvDomainEnv is the address-server domain (Java: system property
+	// rocketmq.namesrv.domain; non-JVM ports read it from the environment).
+	NamesrvDomainEnv = "ROCKETMQ_NAMESRV_DOMAIN"
+	// NamesrvDomainSubgroupEnv is the address-server subgroup (Java: system
+	// property rocketmq.namesrv.domain.subgroup).
+	NamesrvDomainSubgroupEnv = "ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP"
+	// DefaultNamesrvDomainSubgroup is the Java default subgroup
+	// (MixAll.WS_DOMAIN_SUBGROUP).
+	DefaultNamesrvDomainSubgroup = "nsaddr"
 
 	DefaultTopic             = "TBW102"
 	BenchmarkTopic           = "BenchmarkTest"
@@ -67,6 +83,50 @@ const (
 
 // GetRetryTopic builds the %RETRY%<group> topic.
 func GetRetryTopic(consumerGroup string) string { return RetryGroupTopicPrefix + consumerGroup }
+
+// NamesrvAddrsFromEnv implements the Java ClientConfig default chain
+// (ClientConfig.java:45): with no explicit address the namesrvAddr field is
+// initialised from the rocketmq.namesrv.addr property falling back to the
+// NAMESRV_ADDR environment variable. Non-JVM ports map the property name to
+// ROCKETMQ_NAMESRV_ADDR. Addresses are split on ';' or ',' like
+// SetNameServerAddr does.
+func NamesrvAddrsFromEnv() []string {
+	raw := os.Getenv(NamesrvAddrPropertyEnv)
+	if raw == "" {
+		raw = os.Getenv(NamesrvAddrEnv)
+	}
+	var out []string
+	for _, a := range strings.FieldsFunc(raw, func(r rune) bool { return r == ';' || r == ',' }) {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// NamesrvSubgroupSetting resolves the address-server subgroup: an explicit
+// setting wins over the ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP environment variable,
+// which wins over the Java default "nsaddr".
+func NamesrvSubgroupSetting(explicit string) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv(NamesrvDomainSubgroupEnv)); v != "" {
+		return v
+	}
+	return DefaultNamesrvDomainSubgroup
+}
+
+// WSAddrForDomain builds the address-server URL with the Java
+// MixAll.getWSAddr semantics: a domain that already carries a port
+// (contains ':') keeps it as-is, otherwise the default :8080 is appended.
+// The path is /rocketmq/<subgroup>.
+func WSAddrForDomain(domain, subgroup string) string {
+	if strings.Contains(domain, ":") {
+		return fmt.Sprintf("http://%s/rocketmq/%s", domain, subgroup)
+	}
+	return fmt.Sprintf("http://%s:8080/rocketmq/%s", domain, subgroup)
+}
 
 func IsRetryTopic(topic string) bool { return strings.HasPrefix(topic, RetryGroupTopicPrefix) }
 
