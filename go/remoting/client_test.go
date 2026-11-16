@@ -378,6 +378,20 @@ func TestSecondGoAwayFailsInsteadOfLooping(t *testing.T) {
 	}
 }
 
+func TestTLSTestModeDefaultsOff(t *testing.T) {
+	// Strict CA verification is the secure default: TLS test mode (trust any
+	// self-signed certificate) must be an explicit opt-in via the env var or
+	// the instance's TLSTestMode knob, never a silent default.
+	t.Setenv("ROCKETMQ_TLS_TEST_MODE", "")
+	if NewClientConfig().TLSTestMode {
+		t.Fatalf("TLS test mode must default to OFF")
+	}
+	t.Setenv("ROCKETMQ_TLS_TEST_MODE", "1")
+	if !NewClientConfig().TLSTestMode {
+		t.Fatalf("ROCKETMQ_TLS_TEST_MODE=1 must enable TLS test mode")
+	}
+}
+
 func TestGoAwayWithoutReconnectFlagSurfacesError(t *testing.T) {
 	addr, conns := goAwayServer(t, math.MaxInt64)
 	config := NewClientConfig()

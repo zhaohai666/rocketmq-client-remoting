@@ -103,8 +103,13 @@ type ClientConfig struct {
 	ConnectTimeoutMillis int64
 	InvokeTimeoutMillis  int64
 	TLSEnable            bool
-	// TLS test mode (tls.test.mode.enable, default true): trust
-	// self-signed certs, skip hostname checks.
+	// TLS test mode (Java tls.test.mode.enable): trust self-signed certs,
+	// skip hostname checks. OFF by default — strict CA verification is the
+	// secure path, so self-signed brokers need either a CA bundle or an
+	// explicit ROCKETMQ_TLS_TEST_MODE=1 (or TLSTestMode on the instance).
+	// Java's JVM-global default is true, but that default is a known hazard
+	// (any self-signed certificate is silently trusted), so this port ships
+	// the safe default and keeps the flag as an opt-in.
 	TLSTestMode bool
 	// TLSCertFile and TLSKeyFile are the PEM client certificate chain and its
 	// private key; when both are set every TLS connection presents them.
@@ -136,7 +141,7 @@ func NewClientConfig() ClientConfig {
 		TLSCertFile:               envString("ROCKETMQ_TLS_CERT_FILE"),
 		TLSKeyFile:                envString("ROCKETMQ_TLS_KEY_FILE"),
 		TLSCAFile:                 envString("ROCKETMQ_TLS_CA_FILE"),
-		TLSTestMode:               envBool("ROCKETMQ_TLS_TEST_MODE", true),
+		TLSTestMode:               envBool("ROCKETMQ_TLS_TEST_MODE", false),
 		EnableReconnectForGoAway:  true,
 		ChannelIdleTimeoutSeconds: DefaultChannelIdleTimeoutSeconds,
 		CloseChannelOnSyncTimeout: true,
