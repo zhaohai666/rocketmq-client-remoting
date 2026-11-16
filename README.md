@@ -38,27 +38,121 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 | 消息轨迹（LOCAL / CLOUD） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 管理端 / 消息查询 / 位点重置 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 压缩：zlib / LZ4 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 压缩：ZSTD | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ |
+| 压缩：ZSTD | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 客户端日志（轮转 + 环境变量） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-> Go 的 ZSTD 是 🚧：编码产出合法的 store-only 帧（压缩比接近 1:1），解码侧完整；详见下方说明。
+> 注：Go 的 ZSTD 编码产出合法的 store-only 帧（压缩比接近 1:1、不做熵编码），解码侧完整；
+> 对端都能正常解开，需要真实压缩比时用其余六端。
 
 ### 能力细节
 
-| 领域 | 内容 |
-| --- | --- |
-| 协议层 | `RemotingCommand` 帧编解码；JSON / 二进制双序列化；17 段 + 6 段消息编解码；V2 短键 header；对 broker 返回的非严格 JSON 做容错解析 |
-| 传输层 | 长连接惰性建连与复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时与重连、在途请求超时扫描、GO_AWAY 换连接重发一次、连接断开时在途请求立即判死、TLS。七端再各自守着一套连接生命周期规则：解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，只在抓到它的那一层报一次，不会再补一条解码失败）；没人等的响应打一条点名 opaque 与地址的 WARN，连接留着；可写回答的是 socket 发送缓冲——没有活连接的地址可写（下一次发送自己建连），只有塞不下的活连接才不可写；既没读也没写、静默严格超过空闲上限（默认 120s，配非正数恢复默认而不是关掉清扫）的连接被关掉并每个地址一条 WARN，每次成功读写都重打时间戳；每个过期的在途请求各一条 WARN；同步等待超时后默认关掉它发出去的那条 socket，关掉本端的开关才留——只有截止时剩下的预算既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论开关一律关闭。各端旋钮名（空闲上限 / 超时关连接）：Go `ChannelIdleTimeoutSeconds` / `CloseChannelOnSyncTimeout`，Rust `channel_idle_timeout_millis` / `close_socket_on_sync_timeout`，Python `channel_not_active_interval_millis` / `enable_close_channel_on_sync_timeout`，Node.js `maxIdleTimeMillis` / `closeSocketOnSyncTimeout`，C++ `setChannelIdleTimeoutMillis()` / `setCloseSocketOnSyncTimeout()`，C# `ChannelIdleTimeoutMillis` / `CloseSocketOnSyncTimeout`，PHP `setChannelIdleTimeoutSeconds()` / `setCloseChannelOnSyncTimeout()`（PHP 由自己的泵驱动清扫，Node.js 的清扫定时器是 `unref()` 的）。**新连接一建立就补一次注册**：向路由表里的某个 Broker 新建一条连接后，传输层把这条新连接交给监听器，实例立刻顺着它补发一次心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮重平衡；名字服务的连接、路由表里没有的地址、没有消费组的实例三种情况一条都不补发，开关关掉也一样静默（补发的那趟心跳会再触发一次监听器，所以首次接触多出一拍心跳，这是这套契约本身的副作用而不是缺陷）。各端旋钮名（默认全开）：Go `EnableHeartbeatChannelEventListener`，Rust `enable_heartbeat_channel_event_listener`，Python `set_enable_heartbeat_channel_event_listener()`，Node.js `setEnableHeartbeatChannelEventListener()`，C++ `setEnableHeartbeatChannelEventListener()`，C# `EnableHeartbeatChannelEventListener`，PHP `setEnableHeartbeatChannelEventListener()`；每条规则都有只连本机假 broker 的离线用例 |
-| 发送 | 同步 / 定点 / 批量 / 单向 / 队列选择器 / 异步（真异步发送池 + 两个公平背压信号量）/ 事务消息（两阶段 + broker 回查）/ 定时消息撤回（recallMessage） |
-| 消费 | Push Consumer（长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验 + 启动位点解析（`CONSUME_FROM_FIRST` / `LAST` / `TIMESTAMP` 各自的分派，广播组 / `%RETRY%` 组 / 带 SQL92 过滤的订阅都走同一条判定链） + 拉取前流控（每队列三条缓存闸门，只判该队列「持有」的一切：未派发缓冲 + 已交给监听器但尚未结算的批次，按位点去重；条数 / 消息体字节按 1 MiB 整除 / 队列位点跨度，每条都严格大于阈值才停，阈值按字面取值——不 clamp 到 1、0 也不是「关闭」，合法区间由启动配置检查把守，字节闸门累加消息体长度而不是解码记录的 `storeSize`，跨度闸门完全不作用于顺序消费；两个 topic 级缓存预算不在拉取时累计兄弟队列，而是在重平衡改变分配后除以自有队列数、把商写回对应的每队列闸门；命中后本地缓存闸门重排 50ms、broker 的 FLOW_CONTROL(215) 只等 20ms、其余拉取失败等该消费者可配的通用退避（默认 1000ms），告警第 1 次及其后每 1000 次一次；分配集合变动的重平衡轮按序补齐——只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向变动的 topic 回调队列监听，集合未变的轮次与停摆自愈轮什么都不欠；POP 循环没有「已拉未消费」缓冲，它的缓存闸门是本队列待 ack 的欠账数（默认 96，同样严格大于才停、只读本队列、不累加兄弟队列），命中后走同一个 50ms 重排、记进拉取路径那个全局 flowControlTimes 计数与同一套告警节奏，POP 请求被 broker 回 FLOW_CONTROL(215) 时同样只等 20ms）+ 挂起 listener 的清扫逃生口，POP 侧支持单条 ack 与 `BATCH_ACK_MESSAGE`(200151) 批量 ack：同一重试标记 + 队列 + pop 时间窗的多条 CK 合并成一个请求，位集按 `queueOffset-ckQueueOffset` 编码）、Pull Consumer（`fetchSubscribeMessageQueues` 给整个 topic，`fetchMessageQueuesInBalance` 只给本实例应得的那份，算不动时保留现有分配、绝不退化成「全要」；分配集合变动时只欠队列监听这一半）、Lite Pull Consumer（拉取 / 已消费 / 内存提交三张位点表；后台拉取在解析本队列拉取位点之前先过四道缓存闸门——在途拉取轮次 × `PullBatchSize`（默认 10）对 `PullThresholdForAll` 10000、本队列条数 1000、本队列消息体字节按 1 MiB 整除后 100、本队列位点跨度 2000，每条都严格大于阈值才停；命中只重排这一个队列 50ms、兄弟队列照旧，broker 回 `FLOW_CONTROL`(215) 只等 20ms，条数与字节共用一个 trip 计数、聚合与跨度各用自己的，被撤销的队列连缓冲、累计值和在途轮次一起消失；Node.js 的 lite `poll()` 就地拉取、没有预取缓冲，所以四道闸门在该端无对象可判，只保留 215 的按队列 20ms 停拉；自动提交周期的 1000ms 是取值下限而不是 clamp——低于它的新值整条被忽略，已经在跑的那个周期继续跑；误用闸门：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `setSubExpressionForAssign`、没启动就 `poll` / `committed` 都在本地直接报错，`poll` 的负超时同样拒绝，而且状态检查排在超时检查之前——空的一轮和「还没有位点」都跟队列停在尾位点的样子一模一样，缺了 `start()` 只有这样才会被发现） |
-| 队列变更监听 | LitePull 的 `registerTopicMessageQueueChangeListener`：按 topic 注册回调，周期比对队列集合，扩容 / 缩容都能在下一趟检查里被看到（比对趟次现查路由，不吃周期刷新的路由缓存；空队列集按「查不到」处理） |
-| 队列分配 | 六个可插拔策略：`AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` / `MACHINE_ROOM_NEARBY-<内层>`；所有实现共享同一条分配公式 |
-| 命名空间 | 两套彼此独立：`namespace`（本地资源名前缀 `%%ns%%res`，收发 / 心跳 / 位点全线包装与还原）与 `namespace_v2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`，钩子顺序 Namespace → Stream → ACL，所以 `ns` 与 `ReqT` 都进 ACL 签名内容；值为空时一个字段都不写）。生产端 / 三种消费者 / 管理端都**每笔请求现读**，不是启动期快照 |
-| 管理端 | `DefaultMQAdminExt`：topic / 订阅组 / 集群信息 / 各类统计 / 消息查询 / 位点重置 / `searchOffset` 边界语义 |
-| 消息类型 | 普通 / 顺序 / 延迟 / 事务 / 批量 / Request-Reply / 定时撤回 |
-| 观测与安全 | 消息轨迹（编码 + 异步分发 + 钩子，含 recall 轨迹钩子）、消费统计、`ConsumerRunningInfo`(307)、客户端已消费位点回查 `GET_CONSUMER_STATUS`(221，空 topic 即报整张表)、五类钩子、ACL 签名、命名空间 RPC 钩子（`nsd` / `ns`，排在 ACL 签名之前）、动态 NameServer 取址、故障规避选队列 + broker 可达性探测线程 |
-| 压缩 | zlib / LZ4 / ZSTD 三后端：生产端自动压缩 + 消费端自动解压，未支持类型必须报错而非透传压缩流 |
-| 日志 | 每端都落**客户端日志文件**，同一套 `ROCKETMQ_CLIENT_LOG_*` 环境变量，按大小或按天轮转 + 固定备份窗口 |
+#### 协议与传输
+
+- 帧编解码：`RemotingCommand`；JSON / RocketMQ 二进制双序列化（V1/V2 header，V2 用单字母短键）；
+  对 broker 返回的非严格 JSON 做容错解析。
+- 消息编解码：17 段存储格式 + 6 段批量格式，与服务端落盘格式一致。
+- 连接管理：长连接惰性建连与复用、同步 / 异步 / oneway、半包重组、opaque 匹配、超时与重连、
+  在途请求超时扫描、TLS。
+- 异常路径：GO_AWAY 换连接重发一次；连接断开时在途请求立即判死。
+- 连接生命周期规则（每条都有只连本机假 broker 的离线用例）：
+  - 解不开帧的连接打一条点名对端的 ERROR 并被拆掉（长度前缀越界是同一件事更早一层的表现，
+    只在抓到它的那一层报一次，不会再补一条解码失败）；
+  - 没人等的响应打一条点名 opaque 与地址的 WARN，连接留着；
+  - 可写回答的是 socket 发送缓冲——没有活连接的地址可写（下一次发送自己建连），只有塞不下的
+    活连接才不可写；
+  - 既没读也没写、静默严格超过空闲上限（默认 120s，配非正数恢复默认而不是关掉清扫）的连接被
+    关掉并每个地址一条 WARN，每次成功读写都重打时间戳；每个过期的在途请求各一条 WARN；
+  - 同步等待超时后默认关掉它发出去的那条 socket，关掉本端的开关才留——只有截止时剩下的预算
+    既不超过 100ms 又不超过该超时的四分之一才留；写本身失败则无论开关一律关闭；
+  - 旋钮名（空闲上限 / 超时关连接）：Go `ChannelIdleTimeoutSeconds` / `CloseChannelOnSyncTimeout`，
+    Rust `channel_idle_timeout_millis` / `close_socket_on_sync_timeout`，
+    Python `channel_not_active_interval_millis` / `enable_close_channel_on_sync_timeout`，
+    Node.js `maxIdleTimeMillis` / `closeSocketOnSyncTimeout`，
+    C++ `setChannelIdleTimeoutMillis()` / `setCloseSocketOnSyncTimeout()`，
+    C# `ChannelIdleTimeoutMillis` / `CloseSocketOnSyncTimeout`，
+    PHP `setChannelIdleTimeoutSeconds()` / `setCloseChannelOnSyncTimeout()`
+    （PHP 由自己的泵驱动清扫，Node.js 的清扫定时器是 `unref()` 的）。
+- 新连接一建立就补一次注册：向路由表里的某个 Broker 新建一条连接后，实例立刻顺着它补发一次
+  心跳，把本 clientId 名下每个消费组的订阅关系重新递交上去，并叫醒一轮重平衡；名字服务的连接、
+  路由表里没有的地址、没有消费组的实例三种情况一条都不补发，开关关掉也一样静默（补发的那趟
+  心跳会再触发一次监听器，所以首次接触多出一拍心跳，这是这套契约本身的副作用而不是缺陷）。
+  旋钮（默认全开）：Go `EnableHeartbeatChannelEventListener`，
+  Rust `enable_heartbeat_channel_event_listener`，
+  Python `set_enable_heartbeat_channel_event_listener()`，
+  Node.js `setEnableHeartbeatChannelEventListener()`，
+  C++ `setEnableHeartbeatChannelEventListener()`，
+  C# `EnableHeartbeatChannelEventListener`，
+  PHP `setEnableHeartbeatChannelEventListener()`。
+
+#### 发送与消息类型
+
+- 同步 / 定点 / 批量 / 单向 / 队列选择器；异步是真异步发送池 + 两个公平背压信号量。
+- 事务消息：两阶段 + broker 回查；定时消息撤回（recallMessage）。
+- 消息类型：普通 / 顺序 / 延迟 / 事务 / 批量 / Request-Reply / 定时撤回。
+
+#### 消费
+
+- Push Consumer：长轮询 + POP + 顺序 + 广播 + 位点持久化 + 启动期数值校验；启动位点解析
+  （`CONSUME_FROM_FIRST` / `LAST` / `TIMESTAMP` 各自的分派，广播组 / `%RETRY%` 组 / 带 SQL92
+  过滤的订阅都走同一条判定链）。
+- 拉取前三条缓存闸门（只判该队列「持有」的一切：未派发缓冲 + 已交给监听器但尚未结算的批次，
+  按位点去重）：条数 / 消息体字节按 1 MiB 整除 / 队列位点跨度；每条都严格大于阈值才停，阈值按
+  字面取值——不 clamp 到 1、0 也不是「关闭」，合法区间由启动配置检查把守；字节闸门累加消息体
+  长度而不是解码记录的 `storeSize`，跨度闸门完全不作用于顺序消费。
+- 两个 topic 级缓存预算不在拉取时累计兄弟队列，而是在重平衡改变分配后除以自有队列数、把商写回
+  对应的每队列闸门。
+- 流控节奏：本地缓存闸门命中重排 50ms、broker 的 FLOW_CONTROL(215) 只等 20ms、其余拉取失败等
+  该消费者可配的通用退避（默认 1000ms）；告警第 1 次及其后每 1000 次一次。
+- 分配集合变动的重平衡轮按序补齐：只给变动的 topic 重打订阅版本 → 摊预算 → 立刻心跳 → 只向
+  变动的 topic 回调队列监听；集合未变的轮次与停摆自愈轮什么都不欠。
+- POP：循环没有「已拉未消费」缓冲，缓存闸门是本队列待 ack 的欠账数（默认 96，同样严格大于才停、
+  只读本队列、不累加兄弟队列），命中走同一个 50ms 重排、记进同一个全局计数与告警节奏，broker 回
+  215 同样只等 20ms；支持单条 ack 与 `BATCH_ACK_MESSAGE`(200151) 批量 ack——同一重试标记 + 队列 +
+  pop 时间窗的多条 CK 合并成一个请求，位集按 `queueOffset-ckQueueOffset` 编码；另有挂起 listener
+  的清扫逃生口。
+- Pull Consumer：`fetchSubscribeMessageQueues` 给整个 topic；`fetchMessageQueuesInBalance` 只给本
+  实例应得的那份，算不动时保留现有分配、绝不退化成「全要」；分配集合变动时只欠队列监听这一半。
+- Lite Pull Consumer：拉取 / 已消费 / 内存提交三张位点表；后台拉取在解析本队列拉取位点之前先过
+  四道缓存闸门——在途拉取轮次 × `PullBatchSize`（默认 10）对 `PullThresholdForAll` 10000、本队列
+  条数 1000、本队列消息体字节按 1 MiB 整除后 100、本队列位点跨度 2000，每条严格大于阈值才停；
+  命中只重排这一个队列 50ms、兄弟队列照旧，broker 回 215 只等 20ms；条数与字节共用一个 trip 计数、
+  聚合与跨度各用自己的；被撤销的队列连缓冲、累计值和在途轮次一起消失。
+- Lite 差异与误用闸门：Node.js 的 lite `poll()` 就地拉取、没有预取缓冲，四道闸门在该端无对象可判，
+  只保留 215 的按队列 20ms 停拉；自动提交周期的 1000ms 是取值下限而不是 clamp——低于它的新值
+  整条被忽略，已经在跑的那个周期继续跑；空白 topic 的 `subscribe`、空队列列表的 `assign`（等于
+  撤销全部持有队列）、已在跑之后再调 `setSubExpressionForAssign`、没启动就 `poll` / `committed`
+  都在本地直接报错，`poll` 的负超时同样拒绝且状态检查排在超时检查之前——空的一轮和「还没有位点」
+  都跟队列停在尾位点的样子一模一样，缺了 `start()` 只有这样才会被发现。
+- 队列变更监听：LitePull 的 `registerTopicMessageQueueChangeListener` 按 topic 注册回调，周期比对
+  队列集合，扩容 / 缩容都能在下一趟检查里被看到（比对趟次现查路由，不吃周期刷新的路由缓存；
+  空队列集按「查不到」处理）。
+- 队列分配：六个可插拔策略 `AVG` / `AVG_BY_CIRCLE` / `CONFIG` / `CONSISTENT_HASH` / `MACHINE_ROOM` /
+  `MACHINE_ROOM_NEARBY-<内层>`；所有实现共享同一条分配公式。
+
+#### 命名空间与管理端
+
+- 两套彼此独立：`namespace`（本地资源名前缀 `%%ns%%res`，收发 / 心跳 / 位点全线包装与还原）与
+  `namespace_v2`（服务端命名空间，`NamespaceRpcHook` 给每笔请求盖 `nsd=true` / `ns=<值>`，钩子顺序
+  Namespace → Stream → ACL，所以 `ns` 与 `ReqT` 都进 ACL 签名内容；值为空时一个字段都不写）。
+  生产端 / 三种消费者 / 管理端都**每笔请求现读**，不是启动期快照。
+- 管理端 `DefaultMQAdminExt`：topic / 订阅组 / 集群信息 / 各类统计 / 消息查询 / 位点重置 /
+  `searchOffset` 边界语义。
+
+#### 观测与安全
+
+- 消息轨迹：编码 + 异步分发 + 钩子，含 recall 轨迹钩子；`AccessChannel` 支持 LOCAL / CLOUD
+  （CLOUD 路由到 `rmq_sys_TRACE_DATA_<regionId>`）。
+- 消费统计、`ConsumerRunningInfo`(307)、客户端已消费位点回查 `GET_CONSUMER_STATUS`(221，
+  空 topic 即报整张表)。
+- 五类钩子、ACL 签名、命名空间 RPC 钩子（`nsd` / `ns`，排在 ACL 签名之前）、动态 NameServer 取址、
+  故障规避选队列 + broker 可达性探测线程。
+
+#### 压缩与日志
+
+- zlib / LZ4 / ZSTD 三后端：生产端自动压缩 + 消费端自动解压，未支持类型必须报错而非透传压缩流；
+  各端 LZ4 / ZSTD 为手写实现或运行时内置，能力面见「SDK 一览」。
+- 每端都落**客户端日志文件**，同一套 `ROCKETMQ_CLIENT_LOG_*` 环境变量，按大小或按天轮转 +
+  固定备份窗口（详见「客户端日志」一节）。
 
 ## SDK 一览
 
