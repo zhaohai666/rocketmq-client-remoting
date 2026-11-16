@@ -1,0 +1,45 @@
+name: publish-nuget
+
+# NuGet Trusted Publishing (OIDC): no stored API key. The job exchanges a GitHub
+# OIDC token with nuget.org for a short-lived (1h) key via NuGet/login@v1, then
+# pushes the packed nupkg. The trusted-publishing policy on nuget.org must name
+# this workflow file exactly: publish-nuget.yml
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for GitHub to mint the OIDC token NuGet exchanges
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Pack RocketMQ.Client.Remoting
+        run: >
+          dotnet pack csharp/src/RocketMQ.Client/RocketMQ.Client.csproj
+          --configuration Release
+          --output ./artifacts
+
+      # The login step sits after pack on purpose: the exchanged key lives one
+      # hour, so request it as late as possible.
+      # `user` is the nuget.org profile name (not email) that owns the policy.
+      - name: NuGet login (OIDC -> temporary API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: zhaohaihzb
+
+      - name: Push to NuGet
+        run: >
+          dotnet nuget push ./artifacts/*.nupkg
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
