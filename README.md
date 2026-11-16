@@ -1,6 +1,8 @@
-# RocketMQ 经典 remoting 协议多语言客户端
+# RocketMQ 经典 Remoting 协议多语言客户端
 
-> 中文 ｜ [English](README.en.md) ｜ [RocketMQ 官网](https://rocketmq.apache.org/)
+[![License][license-image]][license-url]
+
+[English](README.en.md) | 简体中文 | [RocketMQ 官网](https://rocketmq.apache.org/)
 
 ## 概述
 
@@ -22,6 +24,27 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 
 ## 特性与进度
 
+* 可用 - ✅
+* 部分支持 - 🚧
+
+| 特性 | Python | C++ | C# | Rust | Go | Node.js | PHP |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 标准 / 顺序 / 定时消息 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 事务消息（两阶段 + 回查） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 定时消息撤回（recall） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Push / Pull / Lite Pull 消费 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 队列分配六策略 + 后台重平衡 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ACL 签名 / TLS / 命名空间 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 消息轨迹（LOCAL / CLOUD） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 管理端 / 消息查询 / 位点重置 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 压缩：zlib / LZ4 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 压缩：ZSTD | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ |
+| 客户端日志（轮转 + 环境变量） | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+> Go 的 ZSTD 是 🚧：编码产出合法的 store-only 帧（压缩比接近 1:1），解码侧完整；详见下方说明。
+
+### 能力细节
+
 | 领域 | 内容 |
 | --- | --- |
 | 协议层 | `RemotingCommand` 帧编解码；JSON / 二进制双序列化；17 段 + 6 段消息编解码；V2 短键 header；对 broker 返回的非严格 JSON 做容错解析 |
@@ -41,13 +64,13 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 
 | 语言 | 目录 | 运行形态 | 压缩 | 单元测试 |
 | --- | --- | --- | --- | --- |
-| Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1834 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：77 个 ctest 用例全绿（77/77） |
-| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1220 passed |
-| Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：1224 passed；`cargo clippy --all-targets` 零 warning |
-| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：914 个测试函数（client 581 / common 135 / remoting 198），84 个 `*_test.go`；`go vet` / `gofmt` 零告警 |
-| Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 67 个模块 + 59 套冒烟全绿（逐套计数见下表） |
-| PHP | [`php/`](php/README.md) | PHP 8.1+，单线程 `tick()` 驱动，零 composer 依赖 | zlib 走 `gzcompress`；LZ4 纯 PHP frame；ZSTD 优先 `zstd` CLI，退回纯 PHP Raw/RLE | `php tests/run_all.php`：37 个套件 5381 项断言 + 重复类名守卫 |
+| Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1867 passed + 4 skipped |
+| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：80 个用例全绿（80/80） |
+| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：1255 passed |
+| Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：1251 passed；`cargo clippy --all-targets` 零 warning |
+| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./... -race`：全绿（84 个 `*_test.go`）；`go vet` / `gofmt` 零告警 |
+| Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 67 个模块 + 64 套冒烟全绿 |
+| PHP | [`php/`](php/README.md) | PHP 8.1+，单线程 `tick()` 驱动，零 composer 依赖 | zlib 走 `gzcompress`；LZ4 纯 PHP frame；ZSTD 优先 `zstd` CLI，退回纯 PHP Raw/RLE | `php tests/run_all.php`：5492 项断言全绿 + 重复类名守卫 |
 
 > Go 的 ZSTD 编码产出**合法 zstd 帧但不做熵编码**（store-only Raw/RLE 块），对端能正常解开，
 > 压缩比接近 1:1；真机矩阵里 `storeSize≈消息体大小` 就是这个取值的证据。需要真实压缩比时用
@@ -56,7 +79,7 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 各语言 README 是该实现的构建方式、快速上手、配置项（日志 / TLS / 压缩）、目录结构与真机联调
 工具清单。
 
-## 先决条件
+## 先决条件和构建
 
 - 一套可用的集群：NameServer `9876` + Broker `10911`；`autoCreateTopicEnable=true` 时首次发送
   会自动建 topic。
@@ -65,6 +88,13 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 - 部分用例对 broker 配置有额外要求（在各真机工具的头注释里写明）：主从集群、
   `traceTopicEnable=true`、`enablePropertyFilter=true`、`recallMessageEnable`、POP 专用配置、
   TLS 证书、ACL 鉴权。
+
+本项目是按语言分目录组织的，构建命令见各自子目录的 README：
+
+```sh
+git clone git@github.com:zhaohai666/rocketmq-client-remoting.git
+cd rocketmq-client-remoting
+```
 
 ## 快速上手
 
@@ -446,6 +476,15 @@ scripts/compression_matrix.sh [zlib|lz4|zstd|all]
 欢迎任何形式的贡献：提交 issue、修 bug、补用例、完善文档。改动请带上对应的单测，
 涉及协议语义的改动还需要跑一遍真机联调与 `scripts/compression_matrix.sh`。
 
-## License
+## 相关链接
 
-Apache-2.0。
+* [RocketMQ 主仓库](https://github.com/apache/rocketmq)：服务端实现。
+* [RocketMQ 官网](https://rocketmq.apache.org/)：产品、文档与生态。
+* [能力对齐清单](docs/classic-remoting-capability-checklist.md)：与 Java 5.x 的逐项对照、真机矩阵与判定纪律。
+
+## 开源许可证
+
+[Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0.html) Copyright (C) Apache Software Foundation
+
+[license-image]: https://img.shields.io/badge/license-Apache%202-4EB1BA.svg
+[license-url]: https://www.apache.org/licenses/LICENSE-2.0.html

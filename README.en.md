@@ -1,6 +1,8 @@
 # Multi-language RocketMQ Clients for the Classic Remoting Protocol
 
-> [中文](README.md) ｜ English ｜ [RocketMQ Website](https://rocketmq.apache.org/)
+[![License][license-image]][license-url]
+
+[中文](README.md) | English | [RocketMQ Website](https://rocketmq.apache.org/)
 
 ## Overview
 
@@ -30,6 +32,28 @@ ports; see the table below and each language README for the details.
 
 ## Features and Status
 
+* Ready - ✅
+* Partial - 🚧
+
+| Feature | Python | C++ | C# | Rust | Go | Node.js | PHP |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Standard / FIFO / timed messages | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Transactional messages (two-phase + check-back) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Recall of timed messages | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Push / Pull / Lite Pull consumers | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Six allocation strategies + background rebalance | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| ACL signing / TLS / namespaces | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Message trace (LOCAL / CLOUD) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Admin / message query / offset reset | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Compression: zlib / LZ4 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Compression: ZSTD | ✅ | ✅ | ✅ | ✅ | 🚧 | ✅ | ✅ |
+| Client logging (rotation + env vars) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+> Go's ZSTD is 🚧: the encoder emits valid store-only frames (ratio ~1:1) while decoding is
+> complete. See the note below.
+
+### Capability details
+
 | Area | Content |
 | --- | --- |
 | Protocol | `RemotingCommand` frame codec; JSON / binary dual serialization; 17-field + 6-field message codec; V2 short-key headers; tolerant parsing of the non-strict JSON brokers return |
@@ -49,13 +73,13 @@ ports; see the table below and each language README for the details.
 
 | Language | Directory | Runtime model | Compression | Unit tests |
 | --- | --- | --- | --- | --- |
-| Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1834 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 77 cases green (77/77) |
-| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1220 passed |
-| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1224 passed; `cargo clippy --all-targets` warning-free |
-| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 914 test funcs (client 581 / common 135 / remoting 198), 84 `*_test.go` files; `go vet` / `gofmt` clean |
-| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 67 modules loaded + 59 smoke suites green (per-suite counts in the table below) |
-| PHP | [`php/`](php/README.en.md) | PHP 8.1+, single-threaded `tick()`-driven, zero composer deps | zlib via `gzcompress`; LZ4 as a pure-PHP frame; ZSTD prefers the `zstd` CLI and falls back to pure-PHP raw/RLE | `php tests/run_all.php`: 37 suites, 5,381 assertions + duplicate class-name guard |
+| Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1867 passed + 4 skipped |
+| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 80 cases green (80/80) |
+| C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 1255 passed |
+| Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 1251 passed; `cargo clippy --all-targets` warning-free |
+| Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./... -race`: green (84 `*_test.go` files); `go vet` / `gofmt` clean |
+| Node.js | [`nodeJs/`](nodeJs/README.en.md) | TypeScript run without a build step (`node --experimental-strip-types`), zero third-party deps | zlib / LZ4 both ways with a hand-written frame; ZSTD via `node:zlib` (≥ 23.8), falling back to hand-written raw/RLE blocks on older runtimes | `node selfcheck.ts`: 67 modules loaded + 64 smoke suites green |
+| PHP | [`php/`](php/README.en.md) | PHP 8.1+, single-threaded `tick()`-driven, zero composer deps | zlib via `gzcompress`; LZ4 as a pure-PHP frame; ZSTD prefers the `zstd` CLI and falls back to pure-PHP raw/RLE | `php tests/run_all.php`: 5,492 assertions green + duplicate class-name guard |
 
 > Go's ZSTD encoder emits **valid frames without entropy coding** (store-only raw/RLE blocks): the
 > other ports decode them fine, but the ratio is ~1:1 — `storeSize ≈ body size` in the live matrix
@@ -64,7 +88,7 @@ ports; see the table below and each language README for the details.
 Each language README documents that port's build steps, quick start, configuration (logging / TLS /
 compression), directory layout and live-verification tools.
 
-## Prerequisites
+## Prerequisites and Build
 
 - A working cluster: NameServer `9876` + Broker `10911`. With `autoCreateTopicEnable=true` the
   first send creates the topic for you.
@@ -73,6 +97,14 @@ compression), directory layout and live-verification tools.
 - Some cases need extra broker configuration (stated in the header comment of each live tool):
   master/slave cluster, `traceTopicEnable=true`, `enablePropertyFilter=true`,
   `recallMessageEnable`, POP-dedicated configuration, TLS certificates, ACL enabled.
+
+This project is organized as a monorepo, with each language's binding containing its own build
+instructions in the corresponding subdirectory:
+
+```sh
+git clone git@github.com:zhaohai666/rocketmq-client-remoting.git
+cd rocketmq-client-remoting
+```
 
 ## Quick Start
 
@@ -453,6 +485,16 @@ Any attempt to make this project better is welcome: file an issue, fix a bug, ad
 the docs. Please ship tests with the change, and for anything touching protocol semantics run the
 live tools plus `scripts/compression_matrix.sh`.
 
+## Related
+
+* [rocketmq](https://github.com/apache/rocketmq): the server-side implementation.
+* [RocketMQ Website](https://rocketmq.apache.org/): product, documentation and ecosystem.
+* [Capability checklist](docs/classic-remoting-capability-checklist.md): item-by-item comparison with
+  Java 5.x, live matrices and the judgment discipline behind them.
+
 ## License
 
-Apache-2.0.
+[Apache License, Version 2.0](http://www.apache.org/licenses/LICENSE-2.0.html) Copyright (C) Apache Software Foundation
+
+[license-image]: https://img.shields.io/badge/license-Apache%202-4EB1BA.svg
+[license-url]: https://www.apache.org/licenses/LICENSE-2.0.html
