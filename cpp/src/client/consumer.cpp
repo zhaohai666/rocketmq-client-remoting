@@ -296,8 +296,13 @@ void DefaultMQPushConsumer::notifySubscriptionChanged(const std::string& topic) 
 }
 
 void DefaultMQPushConsumer::unsubscribe(const std::string& topic) {
+    // Same wrap as subscribe(): with a namespace set, the namespaced name is the
+    // subscription key, so a raw caller name must resolve to it. Java 5.x passes
+    // the raw name through here — a quirk that makes a namespaced subscribe
+    // un-unsubscribable; python/rust/php/node/go all wrap on both entries.
+    const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
     std::lock_guard<std::mutex> lk(lock_);
-    subscriptionData_.erase(topic);
+    subscriptionData_.erase(realTopic);
 }
 
 std::vector<std::string> DefaultMQPushConsumer::subscribedTopics() const {

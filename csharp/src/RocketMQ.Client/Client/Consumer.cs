@@ -1301,9 +1301,15 @@ public sealed class DefaultMQPushConsumer
     /// </summary>
     public void Unsubscribe(string topic)
     {
+        // Same wrap as Subscribe(): with a namespace set, the namespaced name is
+        // the subscription key, so a raw caller name resolves to it. Java 5.x
+        // passes the raw name through here — a quirk that makes a namespaced
+        // subscribe un-unsubscribable; python/rust/php/node/go all wrap on both
+        // entries.
+        string realTopic = NamespaceUtil.WrapNamespace(_namespace, topic);
         lock (_lock)
         {
-            _subscriptionData.Remove(topic);
+            _subscriptionData.Remove(realTopic);
         }
     }
 

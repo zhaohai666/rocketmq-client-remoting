@@ -99,6 +99,12 @@ add_executable(rmq_test_namespace_hook test_namespace_hook.cpp)
 target_link_libraries(rmq_test_namespace_hook PRIVATE rocketmq::remoting)
 add_test(NAME namespace_hook COMMAND rmq_test_namespace_hook)
 
+# Namespace subscribe surface: the facade wraps the topic at Subscribe and
+# Unsubscribe resolves a raw name to the wrapped key (Java facade semantics).
+add_executable(rmq_test_namespace_subscribe test_namespace_subscribe.cpp)
+target_link_libraries(rmq_test_namespace_subscribe PRIVATE rocketmq::remoting)
+add_test(NAME namespace_subscribe COMMAND rmq_test_namespace_subscribe)
+
 # Request-Reply (5.x): wait-slot semantics + createReplyMessage shape + 326 push-back entry (incl. late/bad packets)
 add_executable(rmq_test_request_reply test_request_reply.cpp)
 target_link_libraries(rmq_test_request_reply PRIVATE rocketmq::remoting)
