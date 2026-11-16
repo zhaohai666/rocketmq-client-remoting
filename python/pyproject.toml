@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rocketmq-client-remoting"
-version = "4.9.4"
+version = "0.0.1"
 description = "Python implementation of Apache RocketMQ 4.x remoting client (client + remoting protocol)."
 readme = "README.md"
 requires-python = ">=3.8"

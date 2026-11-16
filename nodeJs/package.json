@@ -1,6 +1,6 @@
 {
   "name": "rocketmq-client-remoting-nodejs",
-  "version": "5.5.1",
+  "version": "0.0.1",
   "description": "Apache RocketMQ classic remoting protocol client for Node.js.",
   "type": "module",
   "main": "./dist/index.js",
