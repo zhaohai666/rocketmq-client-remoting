@@ -20,9 +20,9 @@ The assertions below pin the three things that are easy to get wrong:
 """
 from __future__ import annotations
 
-from common.message import MessageQueue
-from remoting.protocol.heartbeat import MessageModel
-from client.consumer import DefaultMQPullConsumer
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer
 
 
 TOPIC = "TopicPullReb"

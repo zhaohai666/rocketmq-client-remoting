@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import struct
 
-from remoting.protocol.serialize import RemotingSerializable, RocketMQSerializable
+from rocketmq_client_remoting.remoting.protocol.serialize import RemotingSerializable, RocketMQSerializable
 
 
 class TestRemotingSerializable:

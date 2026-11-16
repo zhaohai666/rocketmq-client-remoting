@@ -41,7 +41,7 @@ nohup.out
 node_modules/
 
 # Client logs: the python/php clients write to logs/rocketmqlogs under the **current working
-# directory** by default (deliberately not $HOME; see python/rocketmq_logging.py,
+# directory** by default (deliberately not ; see python/rocketmq_client_remoting/logging.py,
 # php/src/Client/Logger.php). Running examples/tests from the repo root or a port directory
 # grows this directory.
 logs/

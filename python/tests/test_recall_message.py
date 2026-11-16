@@ -6,16 +6,16 @@ from typing import List, Optional
 
 import pytest
 
-from client.exception import MQBrokerException, MQClientException
-from client.mq_client import MQClientInstance
-from client.mq_client import TopicPublishInfo
-from client.producer import DefaultMQProducer
-from common import recall_message_handle
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.headers import (RecallMessageRequestHeader,
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.mq_client import TopicPublishInfo
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common import recall_message_handle
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.headers import (RecallMessageRequestHeader,
                                                 RecallMessageResponseHeader,
                                                 SendMessageResponseHeader)
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 TOPIC = "TopicRecallUnit"
 BROKER = "broker-a"

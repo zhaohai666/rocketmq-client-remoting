@@ -8,14 +8,14 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import (ConsumeConcurrentlyStatus,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus,
                                              MessageListenerConcurrently)
-from client.producer import DefaultMQProducer
-from common.message import Message
-from common.mix_all import MixAll
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())
@@ -109,10 +109,10 @@ def main():
 
         check("I3 the producer instance picks up the configured refresh cycle (1s group)",
               fast._mq_client.poll_name_server_interval == FAST_POLL_MS,
-              "client.poll_name_server_interval=%s" % fast._mq_client.poll_name_server_interval)
+              "rocketmq_client_remoting.client.poll_name_server_interval=%s" % fast._mq_client.poll_name_server_interval)
         check("I3 the producer instance defaults to 30s (control group)",
               slow._mq_client.poll_name_server_interval == SLOW_POLL_MS,
-              "client.poll_name_server_interval=%s" % slow._mq_client.poll_name_server_interval)
+              "rocketmq_client_remoting.client.poll_name_server_interval=%s" % slow._mq_client.poll_name_server_interval)
 
         # Register a not-yet-created topic into the periodic refresh set: neither producer will send messages to it,
         # so when it appears in the cache is decided only by each one's refresh cycle.
@@ -178,7 +178,7 @@ def main():
         consumers.append(fast_c)
         check("I3 the consumer instance picks up the configured refresh cycle",
               fast_c._mq_client.poll_name_server_interval == 2000,
-              "client.poll_name_server_interval=%s" % fast_c._mq_client.poll_name_server_interval)
+              "rocketmq_client_remoting.client.poll_name_server_interval=%s" % fast_c._mq_client.poll_name_server_interval)
         slow_c.start()
         consumers.append(slow_c)
 

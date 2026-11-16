@@ -7,16 +7,16 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 
-from client.consumer import DefaultLitePullConsumer, MessageSelector
-from client.consumer_result import PullResult, PullStatus
-from client.exception import MQBrokerException, MQClientException
-from client.mq_client import MQClientInstance
-from common.message import MessageExt, MessageQueue
-from common.subscription_data import ExpressionType
-from common.sysflag import PullSysFlag
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType, MessageModel
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer, MessageSelector
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.subscription_data import ExpressionType
+from rocketmq_client_remoting.common.sysflag import PullSysFlag
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere, ConsumeType, MessageModel
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 
 def _make_msg(topic: str, broker: str, qid: int, offset: int, body: str) -> MessageExt:

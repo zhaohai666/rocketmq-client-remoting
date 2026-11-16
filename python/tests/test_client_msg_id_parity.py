@@ -13,13 +13,13 @@ uses ``msg.getMsgId()`` on a *consumed* message must go through
 """
 from __future__ import annotations
 
-from client.consumer import _build_retry_message
-from client.hook import ConsumeMessageContext
-from client.trace import TraceType
-from client.trace_hook import ConsumeMessageTraceHook
-from common.message import MessageExt, MessageQueue
-from common.message_client_id_setter import client_msg_id
-from common.message_const import MessageConst
+from rocketmq_client_remoting.client.consumer import _build_retry_message
+from rocketmq_client_remoting.client.hook import ConsumeMessageContext
+from rocketmq_client_remoting.client.trace import TraceType
+from rocketmq_client_remoting.client.trace_hook import ConsumeMessageTraceHook
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_client_id_setter import client_msg_id
+from rocketmq_client_remoting.common.message_const import MessageConst
 
 OFFSET_ID = "0A0B0C0D00002A9F0000000000000EA7"
 UNIQ_ID = "AC1E0A0B2C3D4E5F60718293A4B5C6D7"

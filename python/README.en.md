@@ -25,14 +25,14 @@ been driven against a real 5.5.1 cluster (see *Live Cluster Verification*).
 ```bash
 cd python
 python3 -m venv .venv
-.venv/bin/pip install -e .                     # top-level packages: client / common / remoting
+.venv/bin/pip install -e .                     # top-level packages: the single namespace package rocketmq_client_remoting
 
 .venv/bin/pip install pytest                   # needed only to run the unit tests
-.venv/bin/python -m pytest tests/ -q           # 1834 passed, 4 skipped (151.12s)
+.venv/bin/python -m pytest tests/ -q           # 1880 passed, 4 skipped (151.12s)
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` collects 1838 cases and all of them run offline — no cluster needed. The 4 skips all come
+- `pytest` collects 1884 cases and all of them run offline — no cluster needed. The 4 skips all come
   from `tests/test_protocol_alignment.py` (an optional protocol-constant cross-check, off by default).
 - `selfcheck.py` runs 7 encode/decode round-trips of the protocol itself (JSON header / binary header /
   V2 short-field header / 17-segment storage format / long-topic V2 magic / 6-segment batch format /
@@ -46,8 +46,8 @@ python3 -m venv .venv
 Normal message:
 
 ```python
-from client.producer import DefaultMQProducer
-from common.message import Message
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
 
 producer = DefaultMQProducer("PID_DEMO")
 producer.set_namesrv_addr("127.0.0.1:9876")
@@ -61,7 +61,7 @@ producer.shutdown()
 Ordered message (the same `arg` always lands on the same queue):
 
 ```python
-from client.producer import SelectMessageQueueByHash
+from rocketmq_client_remoting.client.producer import SelectMessageQueueByHash
 
 result = producer.send_by_selector(
     Message("TopicTest", b"part-1"), SelectMessageQueueByHash(), "order-1", 3000)
@@ -83,7 +83,7 @@ uniq_key = producer.recall_message("TopicTest", handle)   # request code 370, re
 Transactional message (two-phase plus broker check-back):
 
 ```python
-from client.producer import TransactionMQProducer, TransactionListener, LocalTransactionState
+from rocketmq_client_remoting.client.producer import TransactionMQProducer, TransactionListener, LocalTransactionState
 
 class TxListener(TransactionListener):
     def execute_local_transaction(self, msg, arg):
@@ -103,7 +103,7 @@ tx.shutdown()
 Batch message (one topic, no delay, 4MB per batch):
 
 ```python
-from common.message import MessageBatch
+from rocketmq_client_remoting.common.message import MessageBatch
 
 batch = MessageBatch.generate_from_list(
     [Message("TopicTest", ("b-%d" % i).encode("utf-8")) for i in range(3)])
@@ -113,7 +113,7 @@ result = producer.send(batch)                    # a plain list works too: produ
 Oneway and async:
 
 ```python
-from client.producer import SendCallback
+from rocketmq_client_remoting.client.producer import SendCallback
 
 producer.send_oneway(Message("TopicTest", b"no-result"))
 
@@ -138,7 +138,7 @@ print(bytes(reply.body))
 The responder sends its answer back from inside its own push listener:
 
 ```python
-from client.request_reply import create_reply_message
+from rocketmq_client_remoting.client.request_reply import create_reply_message
 
 reply_msg = create_reply_message(request_msg, b"pong")
 producer.send(reply_msg)                         # goes out as SEND_REPLY_MESSAGE_V2(325)
@@ -149,8 +149,8 @@ producer.send(reply_msg)                         # goes out as SEND_REPLY_MESSAG
 Concurrently:
 
 ```python
-from client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
-from client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
 
 class Listener(MessageListenerConcurrently):
     def consume_message(self, msgs, context):
@@ -171,8 +171,8 @@ Orderly (one queue is consumed strictly in order; returning
 `SUSPEND_CURRENT_QUEUE_A_MOMENT` pauses and redelivers):
 
 ```python
-from client.consumer import MessageListenerOrderly
-from client.consumer_result import ConsumeOrderlyStatus
+from rocketmq_client_remoting.client.consumer import MessageListenerOrderly
+from rocketmq_client_remoting.client.consumer_result import ConsumeOrderlyStatus
 
 class OrderlyListener(MessageListenerOrderly):
     def consume_message(self, msgs, context):
@@ -182,7 +182,7 @@ class OrderlyListener(MessageListenerOrderly):
 Broadcasting (offsets stay local, no rebalance involved):
 
 ```python
-from remoting.protocol.heartbeat import MessageModel, ConsumeFromWhere
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel, ConsumeFromWhere
 
 consumer.set_message_model(MessageModel.BROADCASTING)
 consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
@@ -191,8 +191,8 @@ consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
 Other entry points:
 
 ```python
-from client.consumer import (AllocateMessageQueueConsistentHash, MessageSelector)
-from common.subscription_data import ExpressionType
+from rocketmq_client_remoting.client.consumer import (AllocateMessageQueueConsistentHash, MessageSelector)
+from rocketmq_client_remoting.common.subscription_data import ExpressionType
 
 consumer.subscribe_with_selector(
     "TopicTest", MessageSelector(ExpressionType.SQL92, "price > 100"))
@@ -207,8 +207,8 @@ You drive the cursor and commit the offsets yourself:
 
 ```python
 import time
-from client.consumer import DefaultMQPullConsumer
-from client.consumer_result import PullStatus
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer
+from rocketmq_client_remoting.client.consumer_result import PullStatus
 
 consumer = DefaultMQPullConsumer("GID_PULL")
 consumer.set_namesrv_addr("127.0.0.1:9876")
@@ -237,7 +237,7 @@ consumer.shutdown()
 Misuse of this surface fails locally, before anything else: a blank topic in `subscribe`, an empty queue list in `assign` (that would revoke every held queue), calling `set_sub_expression_for_assign` once the consumer is running, and `poll` / `committed` on a consumer that never started. A negative `poll` timeout is refused too, behind the running check -- an empty round and "no offset yet" both look exactly like a queue sitting at its tail, so a missing `start()` stays hidden until something refuses it.
 
 ```python
-from client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
 
 lite = DefaultLitePullConsumer("GID_LITE")
 lite.set_namesrv_addr("127.0.0.1:9876")
@@ -272,7 +272,7 @@ lite.register_topic_message_queue_change_listener("TopicTest", QueueChangeListen
 
 ```python
 import time
-from client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
 
 admin = DefaultMQAdminExt()
 admin.set_namesrv_addr("127.0.0.1:9876")
@@ -296,8 +296,8 @@ Consumer-side operations live on the same object: `examine_consumer_connection_i
 ### ACL
 
 ```python
-from remoting.rpchook import AclClientRPCHook, SessionCredentials
-from client.producer import DefaultMQProducer
+from rocketmq_client_remoting.remoting.rpchook import AclClientRPCHook, SessionCredentials
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
 
 producer = DefaultMQProducer(
     "PID_DEMO",
@@ -327,7 +327,7 @@ hook order is fixed: Namespace → Stream → ACL.
 ### Compression
 
 ```python
-from common.sysflag import MessageSysFlag
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag
 
 producer.set_compress_msg_body_over_howmuch(1024)          # compress bodies >= 1KB (default 4096)
 producer.set_compress_level(5)
@@ -354,7 +354,7 @@ same transport.
 ### SOCKS proxy
 
 ```python
-from remoting.socks_proxy import SocksProxyConfig
+from rocketmq_client_remoting.remoting.socks_proxy import SocksProxyConfig
 
 producer = DefaultMQProducer("PID_DEMO",
                              socks_proxy_config=SocksProxyConfig(
@@ -404,7 +404,7 @@ third-party dependencies.
 
 ## Client Logging
 
-`rocketmq_logging.py` bridges the internal logger onto standard `logging`. Log files default to
+`rocketmq_client_remoting/logging.py` bridges the internal logger onto standard `logging`. Log files default to
 **`<current working directory>/logs/rocketmqlogs/rocketmq_py_client.log`** and rotate daily, with
 backups named `rocketmq_py_client.log.YYYY-MM-DD`. If the host application has already configured
 Python logging (the root logger has a handler), this module adds no handlers at all.
@@ -495,13 +495,17 @@ named `_live`. One line each on what they prove:
 
 ## Repository Layout
 
-`client/`, `common/` and `remoting/` sit directly under `python/` as three **top-level packages**: put
-`python/` on `sys.path` and import `from client.producer import DefaultMQProducer`
+Everything lives inside the single namespace package **`rocketmq_client_remoting/`** (client /
+common / remoting are its three subpackages, logging is a module inside it). The 0.0.1 layout
+shipped three flat **top-level packages** (`client/`, `common/`, `remoting/` directly under
+`python/`), which polluted site-packages with generic names — restructured in 0.0.2. Put
+`python/` on `sys.path` and import `from rocketmq_client_remoting.client.producer import DefaultMQProducer`
 (`tests/conftest.py` already does this).
 
 ```
 python/
-├── common/                 message model and constants
+├── rocketmq_client_remoting/     the single namespace package (since 0.0.2)
+│   ├── common/                 message model and constants
 │   ├── message.py              Message / MessageExt / MessageBatch / MessageQueue
 │   ├── message_decoder.py      17-segment storage + 6-segment batch codecs, three compression backends
 │   ├── message_const.py        MessageConst property keys
@@ -534,10 +538,8 @@ python/
 │   ├── hook.py / trace.py / trace_hook.py / trace_dispatcher.py / trace_context.py
 │   ├── top_addressing.py       dynamic NameServer discovery
 │   ├── validators.py / send_result.py / consumer_result.py / exception.py
-├── rocketmq_logging.py     logging bridge
 ├── selfcheck.py            cluster-free protocol round trips (7 checks)
-├── __main__.py             command entry (python -m selfcheck)
-├── tests/                  1838 offline cases (conftest.py puts python/ on sys.path)
+├── tests/                  1884 offline cases (conftest.py puts python/ on sys.path)
 ├── verify_*_live.py        live-cluster scripts (see Live Cluster Verification)
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  helper scripts
 ├── pyproject.toml          no runtime dependencies; requires-python >= 3.8

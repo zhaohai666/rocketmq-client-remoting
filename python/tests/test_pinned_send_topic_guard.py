@@ -6,13 +6,13 @@ from typing import List, Optional
 
 import pytest
 
-from client.exception import MQClientException
-from client.mq_client import TopicPublishInfo
-from client.producer import DefaultMQProducer, MessageQueueSelector, SendCallback
-from client.send_result import SendResult, SendStatus
-from common.message import Message, MessageQueue
-from remoting.protocol.codes import RequestCode
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import TopicPublishInfo
+from rocketmq_client_remoting.client.producer import DefaultMQProducer, MessageQueueSelector, SendCallback
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 ADDR = "127.0.0.1:10911"
 NS = "ns1"

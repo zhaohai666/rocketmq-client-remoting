@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """Shared pytest fixture: adds the python/ root to sys.path so that
-``import client`` / ``import common`` / ``import remoting`` work.
+``import rocketmq_client_remoting.client`` / ``.common`` / ``.remoting`` work.
 
-It also pins the client logs to a temporary directory: rocketmq_logging writes to the
-**current working directory** by default (see the trade-off notes in
-python/rocketmq_logging.py); without pinning them, a single test run would grow log
-files under python/logs/rocketmqlogs.
+It also pins the client logs to a temporary directory: the logging module writes
+to the **current working directory** by default (see the trade-off notes in
+rocketmq_client_remoting/logging.py); without pinning them, a single test run
+would grow log files under python/logs/rocketmqlogs.
 """
 import os
 import sys
@@ -26,7 +26,7 @@ os.environ.setdefault(
 @pytest.fixture(autouse=True)
 def _reset_mq_client_manager():
     pass
-    from client.mq_client_manager import MQClientManager
+    from rocketmq_client_remoting.client.mq_client_manager import MQClientManager
 
     MQClientManager.get_instance().reset()
     yield

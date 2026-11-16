@@ -3,8 +3,8 @@ import sys
 
 sys.path.insert(0, ".")
 
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.rpchook import AclClientRPCHook, SessionCredentials
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.rpchook import AclClientRPCHook, SessionCredentials
 
 FAIL = 0
 

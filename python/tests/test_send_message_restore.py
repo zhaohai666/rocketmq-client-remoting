@@ -8,19 +8,19 @@ from typing import List, Optional
 
 import pytest
 
-from client.exception import MQClientException
-from client.mq_client import TopicPublishInfo
-from client.producer import (DefaultMQProducer, LocalTransactionState,
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import TopicPublishInfo
+from rocketmq_client_remoting.client.producer import (DefaultMQProducer, LocalTransactionState,
                                       TransactionListener)
-from client.send_result import SendResult, SendStatus
-from common.message import Message, MessageQueue
-from common.message_client_id_setter import get_uniq_id
-from common.message_decoder import _compress
-from common.sysflag import MessageSysFlag
-from remoting.exception import RemotingSendRequestException
-from remoting.protocol.codes import RequestCode
-from remoting.protocol.headers import EndTransactionRequestHeader
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageQueue
+from rocketmq_client_remoting.common.message_client_id_setter import get_uniq_id
+from rocketmq_client_remoting.common.message_decoder import _compress
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag
+from rocketmq_client_remoting.remoting.exception import RemotingSendRequestException
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
+from rocketmq_client_remoting.remoting.protocol.headers import EndTransactionRequestHeader
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 ADDR = "127.0.0.1:10911"
 NS = "ns1"

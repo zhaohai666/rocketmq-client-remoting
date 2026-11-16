@@ -4,12 +4,12 @@ from __future__ import annotations
 import threading
 from typing import List, Optional
 
-from client.mq_client import MQClientInstance, TopicPublishInfo
-from client.producer import DefaultMQProducer
-from client.send_result import SendResult, SendStatus
-from common.message import Message, MessageBatch, MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.codes import RequestCode
+from rocketmq_client_remoting.client.mq_client import MQClientInstance, TopicPublishInfo
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageBatch, MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
 MQ = MessageQueue("T_Header", "broker-a", 3)
 ADDR = "127.0.0.1:10911"
@@ -140,7 +140,7 @@ class _Recorder:
         self.built.append({"unit_mode": unit_mode, "default_topic": default_topic,
                            "default_topic_queue_nums": default_topic_queue_nums,
                            "mq": mq})
-        from remoting.protocol.remoting_command import RemotingCommand
+        from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
         return RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2, None)
 
     def send_message_async(self, addr, request, msg, mq, timeout, on_complete):

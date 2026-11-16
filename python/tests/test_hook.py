@@ -3,17 +3,17 @@ from __future__ import annotations
 
 import pytest
 
-from client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
                                       client_side_tag_filter, filter_messages_for_delivery)
-from client.hook import (CheckForbiddenContext, CheckForbiddenHook,
+from rocketmq_client_remoting.client.hook import (CheckForbiddenContext, CheckForbiddenHook,
                                   CommunicationMode, FilterMessageContext, FilterMessageHook)
-from client.exception import MQClientException
-from client.mq_client import TopicPublishInfo
-from client.producer import DefaultMQProducer
-from client.send_result import SendResult, SendStatus
-from common.message import Message, MessageExt, MessageQueue
-from common.subscription_data import ExpressionType, FilterAPI
-from common.util_all import utf16_int32_hash
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import TopicPublishInfo
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageExt, MessageQueue
+from rocketmq_client_remoting.common.subscription_data import ExpressionType, FilterAPI
+from rocketmq_client_remoting.common.util_all import utf16_int32_hash
 
 MQ = MessageQueue("TopicTest", "broker-a", 0)
 

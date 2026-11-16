@@ -4,10 +4,10 @@ from __future__ import annotations
 import threading
 from collections import deque
 
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import ConsumeConcurrentlyStatus, PullStatus
-from common.message import MessageExt, MessageQueue
-from common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus, PullStatus
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
 
 GROUP = "GID_OffsetIllegalUnitTest"
 TOPIC = "OffsetIllegalUnitTestTopic"

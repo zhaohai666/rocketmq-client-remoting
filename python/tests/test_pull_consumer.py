@@ -9,15 +9,15 @@ from types import SimpleNamespace
 
 import pytest
 
-from client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.consumer import (DefaultMQPullConsumer, DefaultMQPushConsumer,
                              PullCallback)
-from client.consumer_result import PullResult, PullStatus
-from client.consume_executor import ConsumeExecutor
-from client.exception import MQBrokerException, MQClientException
-from common.message import MessageExt, MessageQueue
-from common.sysflag import PullSysFlag
-from remoting.exception import RemotingTooMuchRequestException
-from remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.consume_executor import ConsumeExecutor
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.sysflag import PullSysFlag
+from rocketmq_client_remoting.remoting.exception import RemotingTooMuchRequestException
+from rocketmq_client_remoting.remoting.protocol.heartbeat import (ConsumeFromWhere, ConsumeType,
                                                   MessageModel)
 
 
@@ -223,7 +223,7 @@ class TestConsumerHeartbeat:
         assert list(cd.subscription_data_set) == []
 
     def test_start_refreshes_routes_then_sends_the_first_heartbeat(self, monkeypatch):
-        import client.consumer as consumer_mod
+        import rocketmq_client_remoting.client.consumer as consumer_mod
 
         holder = {}
 
@@ -247,7 +247,7 @@ class TestConsumerHeartbeat:
             c.shutdown()
 
     def test_shutdown_stops_the_loop_and_unregisters_the_group(self, monkeypatch):
-        import client.consumer as consumer_mod
+        import rocketmq_client_remoting.client.consumer as consumer_mod
 
         holder = {}
 

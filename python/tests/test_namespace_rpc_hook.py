@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import threading
 
-from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                              DefaultMQPushConsumer)
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
-from common.mix_all import MixAll
-from remoting.protocol.codes import RequestCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.rpchook import (AclClientRPCHook, NamespaceRpcHook, RPCHook,
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.rpchook import (AclClientRPCHook, NamespaceRpcHook, RPCHook,
                               SessionCredentials, StreamTypeRPCHook)
 
 ADDR = "127.0.0.1:9876"
@@ -173,7 +173,7 @@ def test_setters_exist_on_every_facade():
         facade.set_namespace_v2(NS_V2)
         assert facade.get_namespace_v2() == NS_V2, type(facade).__name__
         assert facade.namespace_v2 == NS_V2, type(facade).__name__
-    from client.admin import DefaultMQAdminExt
+    from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
     admin = DefaultMQAdminExt()
     admin.set_namespace_v2(NS_V2)
     assert admin.get_namespace_v2() == NS_V2
@@ -192,7 +192,7 @@ def test_namespace_v2_defaults_empty_everywhere():
 
 def _admin():
     # Note: DefaultMQAdminExt's first positional parameter is rpc_hook, not group.
-    from client.admin import DefaultMQAdminExt
+    from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
     return DefaultMQAdminExt()
 
 

@@ -6,8 +6,8 @@ import zlib
 
 import pytest
 
-from common.message import Message, MessageBatch, MessageExt
-from common.message_decoder import (
+from rocketmq_client_remoting.common.message import Message, MessageBatch, MessageExt
+from rocketmq_client_remoting.common.message_decoder import (
     BLANK_MAGIC_CODE, MESSAGE_MAGIC_CODE, MESSAGE_MAGIC_CODE_V2,
     _decompress,
     bytes_to_ip_and_port, bytes2string, count_inner_msg_num, crc32,
@@ -15,7 +15,7 @@ from common.message_decoder import (
     decode_message, decode_message_id, decode_messages,
     encode_message, encode_message_ext, encode_messages,
     ip_and_port_to_bytes, message_properties_2_string, string_2_message_properties)
-from common.sysflag import MessageSysFlag
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag
 
 
 def build_ext(**overrides) -> MessageExt:
@@ -420,3 +420,49 @@ def test_unsupported_compression_type_raises_instead_of_passthrough():
     struct.pack_into(">i", buf_ok, 36, ok_flag)
     good = decode_message(bytes(buf_ok))
     assert good is not None and good.get_body() == body
+
+
+# ------------------------------------------------- optional-codec pre-check (0.0.2)
+
+def test_zlib_codec_is_always_available():
+    from rocketmq_client_remoting.common.message_decoder import codec_available, ensure_codec_available
+    assert codec_available(MessageSysFlag.ZLIB_TYPE) is True
+    assert ensure_codec_available(MessageSysFlag.ZLIB_TYPE) is None
+    assert ensure_codec_available(0) is None  # Java's 0 -> ZLIB compatibility mapping
+
+
+def test_unknown_codec_type_reports_unsupported():
+    import importlib.util
+    from rocketmq_client_remoting.common.message_decoder import codec_available, ensure_codec_available
+    assert codec_available(MessageSysFlag.SNAPPY_TYPE) is False
+    with pytest.raises(RuntimeError, match="unsupported compression type"):
+        ensure_codec_available(MessageSysFlag.SNAPPY_TYPE)
+
+
+def test_lz4_zstd_precheck_matches_installed_packages():
+    import importlib.util
+    from rocketmq_client_remoting.common.message_decoder import codec_available, ensure_codec_available
+    lz4_installed = importlib.util.find_spec("lz4") is not None
+    zstd_installed = importlib.util.find_spec("zstandard") is not None
+    assert codec_available(MessageSysFlag.LZ4_TYPE) is lz4_installed
+    assert codec_available(MessageSysFlag.ZSTD_TYPE) is zstd_installed
+    if not lz4_installed:
+        with pytest.raises(RuntimeError, match=r"pip install .*lz4"):
+            ensure_codec_available(MessageSysFlag.LZ4_TYPE)
+    if not zstd_installed:
+        with pytest.raises(RuntimeError, match=r"pip install .*zstandard"):
+            ensure_codec_available(MessageSysFlag.ZSTD_TYPE)
+
+
+def test_producer_start_fails_fast_without_optional_codec(monkeypatch):
+    # The pre-check must run at start(): an LZ4 compress_type without the package
+    # installed raises before any network work, instead of silently sending
+    # uncompressed from try_to_compress_message's warning path.
+    from rocketmq_client_remoting.client import producer as producer_mod
+    from rocketmq_client_remoting.common import message_decoder
+    monkeypatch.setattr(message_decoder, "codec_available", lambda t: t == MessageSysFlag.ZLIB_TYPE)
+    p = producer_mod.DefaultMQProducer("PID_CODEC_PRECHECK")
+    p.name_server_addrs = ["127.0.0.1:19876"]
+    p.set_compress_type(MessageSysFlag.LZ4_TYPE)
+    with pytest.raises(RuntimeError, match=r"pip install .*lz4"):
+        p.start()

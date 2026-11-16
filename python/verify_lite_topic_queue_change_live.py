@@ -24,9 +24,9 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import DefaultLitePullConsumer, DefaultMQPullConsumer
-from client.exception import MQClientException
-from client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer, DefaultMQPullConsumer
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

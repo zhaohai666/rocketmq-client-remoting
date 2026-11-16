@@ -9,15 +9,15 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import DefaultMQPushConsumer, SimpleMessageListener  # noqa: E402
-from client.consumer_result import ConsumeConcurrentlyStatus  # noqa: E402
-from client.producer import DefaultMQProducer  # noqa: E402
-from client.send_result import SendStatus  # noqa: E402
-from common.message import Message  # noqa: E402
-from remoting.client import RemotingClient  # noqa: E402
-from remoting.protocol import headers as headers_mod  # noqa: E402
-from remoting.protocol import remoting_command as rc_mod  # noqa: E402
-from remoting.protocol.codes import RequestCode, ResponseCode  # noqa: E402
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, SimpleMessageListener  # noqa: E402
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus  # noqa: E402
+from rocketmq_client_remoting.client.producer import DefaultMQProducer  # noqa: E402
+from rocketmq_client_remoting.client.send_result import SendStatus  # noqa: E402
+from rocketmq_client_remoting.common.message import Message  # noqa: E402
+from rocketmq_client_remoting.remoting.client import RemotingClient  # noqa: E402
+from rocketmq_client_remoting.remoting.protocol import headers as headers_mod  # noqa: E402
+from rocketmq_client_remoting.remoting.protocol import remoting_command as rc_mod  # noqa: E402
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode  # noqa: E402
 
 
 def _cli_args(argv: list) -> dict:

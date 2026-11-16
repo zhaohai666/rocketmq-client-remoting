@@ -3,11 +3,11 @@
 import threading
 import time
 
-from client.consumer import (MIN_POP_INVISIBLE_TIME, DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.consumer import (MIN_POP_INVISIBLE_TIME, DefaultMQPushConsumer,
                                       PopProcessQueue, PULL_MAX_IDLE_TIME)
-from common.message import MessageExt, MessageQueue
-from common.subscription_data import SubscriptionData
-from remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
 
 GROUP = "G_pull_expired"
 STALE = PULL_MAX_IDLE_TIME + 5.0
@@ -311,7 +311,7 @@ def test_running_info_reports_real_last_pull_timestamp():
 
 
 def test_running_info_pop_table_reports_last_pop_timestamp():
-    from client.consumer import MessageModel
+    from rocketmq_client_remoting.client.consumer import MessageModel
 
     c, mq, key = _consumer(pop_mode=True)
     _retire_log(c)

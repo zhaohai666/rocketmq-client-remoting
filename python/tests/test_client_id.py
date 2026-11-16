@@ -5,13 +5,13 @@ import re
 
 import pytest
 
-from client import DefaultMQProducer
-from client.admin import DefaultMQAdminExt
-from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from rocketmq_client_remoting.client import DefaultMQProducer
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                                      DefaultMQPushConsumer)
-from common.mix_all import MixAll
-from remoting.exception import RemotingConnectException
-from remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.exception import RemotingConnectException
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
 
 # <IP>@<pid>#<nanoseconds>
 CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())

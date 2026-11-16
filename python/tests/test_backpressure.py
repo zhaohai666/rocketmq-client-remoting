@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import time
 
-from client.backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
+from rocketmq_client_remoting.client.backpressure import (MIN_ASYNC_SEND_NUM, MIN_ASYNC_SEND_SIZE,
                                           FairSemaphore)
 
 

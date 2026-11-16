@@ -13,12 +13,12 @@ from __future__ import annotations
 
 import time
 
-from client.consumer import DefaultLitePullConsumer, DefaultMQPushConsumer
-from client.exception import MQClientException
-from common.message import MessageQueue
-from common.subscription_data import ExpressionType, SubscriptionData
-from remoting.protocol.heartbeat import ConsumeFromWhere, MessageModel
-from remoting.protocol.namespace_util import NamespaceUtil
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer, DefaultMQPushConsumer
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.subscription_data import ExpressionType, SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere, MessageModel
+from rocketmq_client_remoting.remoting.protocol.namespace_util import NamespaceUtil
 
 GROUP = "GID_InitOffsetUnitTest"
 TOPIC = "InitOffsetUnitTestTopic"

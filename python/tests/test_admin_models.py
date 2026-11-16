@@ -5,14 +5,14 @@ import json
 
 import pytest
 
-from common.message import MessageQueue
-from common.topic_config import TopicConfig, TopicFilterType
-from remoting.protocol.admin_body import (ConsumeStats, OffsetWrapper,
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.topic_config import TopicConfig, TopicFilterType
+from rocketmq_client_remoting.remoting.protocol.admin_body import (ConsumeStats, OffsetWrapper,
                                                    TopicConfigSerializeWrapper,
                                                    TopicStatsTable, TopicOffset)
-from remoting.protocol.body import ResetOffsetBody
-from remoting.protocol.serialize import (FastJsonDecodeError, fastjson_loads)
-from remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupConfig,
+from rocketmq_client_remoting.remoting.protocol.body import ResetOffsetBody
+from rocketmq_client_remoting.remoting.protocol.serialize import (FastJsonDecodeError, fastjson_loads)
+from rocketmq_client_remoting.remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupConfig,
                                                      SubscriptionGroupWrapper)
 
 
@@ -126,7 +126,7 @@ def test_reset_offset_body_is_mq_keyed():
 
 def test_consume_stats_list_uses_the_server_field_name():
     pass
-    from remoting.protocol.body import ConsumeStatsList
+    from rocketmq_client_remoting.remoting.protocol.body import ConsumeStatsList
 
     raw = (b'{"consumeStatsList":[{"G_BROKER":[{"offsetTable":{}}]}],'
            b'"brokerAddr":"127.0.0.1:10911","totalDiff":7,"totalInflightDiff":2}')
@@ -209,7 +209,7 @@ def test_subscription_group_round_trip():
 # ---------------------------------------------------------------- MixAll properties
 def test_properties_text_round_trip_matches_the_server_format():
     pass
-    from common.mix_all import MixAll
+    from rocketmq_client_remoting.common.mix_all import MixAll
     text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n"
     props = MixAll.string2_properties(text)
     assert props["a"] == "b"
@@ -225,7 +225,7 @@ def test_properties_text_round_trip_matches_the_server_format():
 
 def test_properties_whitespace_is_a_valid_separator():
     pass
-    from common.mix_all import MixAll
+    from rocketmq_client_remoting.common.mix_all import MixAll
     props = MixAll.string2_properties("a b\nonlykey\nk=v\n")
     assert props["a"] == "b", props
     assert props["onlykey"] == "", props
@@ -240,7 +240,7 @@ def test_properties_whitespace_is_a_valid_separator():
 
 def test_perm_name_is_valid_matches_the_server_rule():
     pass
-    from common.sysflag import PermName
+    from rocketmq_client_remoting.common.sysflag import PermName
     assert PermName.is_valid(0) is True
     assert PermName.is_valid(7) is True
     assert PermName.is_valid(8) is False
@@ -248,7 +248,7 @@ def test_perm_name_is_valid_matches_the_server_rule():
 
 
 def test_mix_all_group_helpers():
-    from common.mix_all import MixAll
+    from rocketmq_client_remoting.common.mix_all import MixAll
     assert MixAll.is_lmq("%LMQ%foo") is True
     assert MixAll.is_lmq("normal") is False
     assert MixAll.is_sys_consumer_group("CID_RMQ_SYS_x") is True
@@ -259,14 +259,14 @@ def test_mix_all_group_helpers():
 
 def test_unique_msg_query_flag_is_extfield_name():
     pass
-    from common.mix_all import MixAll, QueryMsgType
+    from rocketmq_client_remoting.common.mix_all import MixAll, QueryMsgType
     assert MixAll.UNIQUE_MSG_QUERY_FLAG == "_UNIQUE_KEY_QUERY"
     assert QueryMsgType.UNIQUE_KEY == 1
 
 
 def test_message_const_index_types():
     """Broker indexType values: K / U / T."""
-    from common.message_const import MessageConst
+    from rocketmq_client_remoting.common.message_const import MessageConst
     assert MessageConst.INDEX_KEY_TYPE == "K"
     assert MessageConst.INDEX_UNIQUE_TYPE == "U"
     assert MessageConst.INDEX_TAG_TYPE == "T"
@@ -274,7 +274,7 @@ def test_message_const_index_types():
 
 def test_create_topic_header_sends_topic_filter_type():
     """The broker's CreateTopicRequestHeader.checkFields requires topicFilterType to be non-empty."""
-    from remoting.protocol.headers import CreateTopicRequestHeader
+    from rocketmq_client_remoting.remoting.protocol.headers import CreateTopicRequestHeader
     h = CreateTopicRequestHeader()
     h.topic = "t"
     h.default_topic = "TBW102"
@@ -293,7 +293,7 @@ def test_create_topic_header_sends_topic_filter_type():
 
 
 def test_query_message_header_index_type():
-    from remoting.protocol.headers import QueryMessageRequestHeader
+    from rocketmq_client_remoting.remoting.protocol.headers import QueryMessageRequestHeader
     h = QueryMessageRequestHeader()
     h.topic = "t"
     h.key = "k"

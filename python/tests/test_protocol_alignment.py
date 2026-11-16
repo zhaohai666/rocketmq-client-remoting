@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
+from rocketmq_client_remoting.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode, SerializeType
 
 SERVER_SRC = os.environ.get("ROCKETMQ_SERVER_SRC")
 

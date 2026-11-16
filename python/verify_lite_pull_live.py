@@ -7,7 +7,7 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import (AllocateMachineRoomNearby,
+from rocketmq_client_remoting.client.consumer import (AllocateMachineRoomNearby,
                                       AllocateMessageQueueAveragely,
                                       AllocateMessageQueueAveragelyByCircle,
                                       AllocateMessageQueueByConfig,
@@ -15,11 +15,11 @@ from client.consumer import (AllocateMachineRoomNearby,
                                       AllocateMessageQueueConsistentHash,
                                       DefaultLitePullConsumer, DefaultMQPullConsumer,
                                       MachineRoomResolver)
-from client.exception import MQClientException
-from client.producer import DefaultMQProducer
-from client.send_result import SendStatus
-from common.message import Message, MessageQueue
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.send_result import SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

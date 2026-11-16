@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from remoting.protocol.codes import RequestCode
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
 
 class _FakeClient:
@@ -115,7 +115,7 @@ def test_whitespace_group_is_dropped_too():
 
 def test_unregister_fans_out_to_every_broker_including_slaves():
     pass
-    from remoting.protocol.route import BrokerData, TopicRouteData
+    from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout", ["127.0.0.1:9876"])
     route = TopicRouteData()
@@ -136,7 +136,7 @@ def test_unregister_fans_out_to_every_broker_including_slaves():
 
 def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
     pass
-    from remoting.protocol.route import BrokerData, TopicRouteData
+    from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout-fail", ["127.0.0.1:9876"])
     route = TopicRouteData()
@@ -158,9 +158,9 @@ def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
 
 def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only():
     pass
-    from client.consumer import DefaultMQPushConsumer
-    from client.producer import DefaultMQProducer
-    from remoting.protocol.route import BrokerData, TopicRouteData
+    from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+    from rocketmq_client_remoting.client.producer import DefaultMQProducer
+    from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
     master, slave = "127.0.0.1:10911", "127.0.0.1:10912"
 
@@ -204,7 +204,7 @@ def test_unregister_budget_is_the_client_api_timeout():
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "GID_x", "")
     assert spy.timeouts == [3000], spy.timeouts
 
-    from remoting.protocol.route import BrokerData, TopicRouteData
+    from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-timeout", ["127.0.0.1:9876"])
     route = TopicRouteData()

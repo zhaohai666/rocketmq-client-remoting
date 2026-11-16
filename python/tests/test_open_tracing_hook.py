@@ -10,20 +10,20 @@ from __future__ import annotations
 
 import pytest
 
-from client.hook import (ConsumeMessageContext, EndTransactionContext,
+from rocketmq_client_remoting.client.hook import (ConsumeMessageContext, EndTransactionContext,
                          SendMessageContext)
-from client.open_tracing_hook import (MESSAGE_BUS_DESTINATION, PEER_SERVICE,
+from rocketmq_client_remoting.client.open_tracing_hook import (MESSAGE_BUS_DESTINATION, PEER_SERVICE,
                                       SPAN_KIND, SPAN_KIND_CONSUMER,
                                       SPAN_KIND_PRODUCER, TRANS_MSG_COMMIT,
                                       ConsumeMessageOpenTracingHook,
                                       EndTransactionOpenTracingHook,
                                       SendMessageOpenTracingHook)
-from client.producer import LocalTransactionState
-from client.send_result import SendResult, SendStatus
-from client.trace import TraceConstants
-from common.message import Message, MessageExt
-from common.message_const import MessageConst
-from common.message_type import MessageType
+from rocketmq_client_remoting.client.producer import LocalTransactionState
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.client.trace import TraceConstants
+from rocketmq_client_remoting.common.message import Message, MessageExt
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.message_type import MessageType
 
 
 class FakeSpan:

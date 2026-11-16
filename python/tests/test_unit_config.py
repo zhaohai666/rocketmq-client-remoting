@@ -5,16 +5,16 @@ import threading
 
 import pytest
 
-from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                                       DefaultMQPushConsumer, filter_messages_for_delivery)
-from client.hook import (CheckForbiddenContext, CheckForbiddenHook,
+from rocketmq_client_remoting.client.hook import (CheckForbiddenContext, CheckForbiddenHook,
                                  FilterMessageContext, FilterMessageHook)
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from common.message import Message, MessageExt, MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.headers import SendMessageRequestHeaderV2
-from remoting.rpchook import RPCHook, StreamTypeRPCHook
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message, MessageExt, MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.headers import SendMessageRequestHeaderV2
+from rocketmq_client_remoting.remoting.rpchook import RPCHook, StreamTypeRPCHook
 
 MQ = MessageQueue("T", "broker-a", 0)
 
@@ -37,7 +37,7 @@ def _drop(inst: MQClientInstance) -> None:
 # ---------------------------------------------------------------- StreamTypeRPCHook
 def test_stream_hook_only_adds_the_req_t_ext_field():
     pass
-    from remoting.protocol.remoting_command import RemotingCommand
+    from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
     req = RemotingCommand.create_request_command(SendMessageRequestHeaderV2())
     StreamTypeRPCHook().do_before_request("127.0.0.1:9876", req)
     assert MixAll.REQ_T == "ReqT"
@@ -120,7 +120,7 @@ def test_producer_send_passes_its_own_unit_mode():
         publish = None
 
         def __init__(self):
-            from client.mq_client import TopicPublishInfo
+            from rocketmq_client_remoting.client.mq_client import TopicPublishInfo
             self.publish = TopicPublishInfo()
             self.publish.msg_queue_list = [MQ]
 
@@ -139,7 +139,7 @@ def test_producer_send_passes_its_own_unit_mode():
         def send_message(self, group, msg, mq, timeout, sys_flag, unit_mode=False,
                          default_topic=None, default_topic_queue_nums=None):
             seen.append(unit_mode)
-            from client.send_result import SendResult, SendStatus
+            from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
             return SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq)
 
     p = DefaultMQProducer("PID_unit_mode")

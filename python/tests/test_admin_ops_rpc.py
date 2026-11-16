@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import json
 
-from client.admin import CONTROLLER_RPC_TIMEOUT, DefaultMQAdminExt
-from client.exception import MQBrokerException, MQClientException
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.admin import CONTROLLER_RPC_TIMEOUT, DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 ADDR = "127.0.0.1:10911"
 CONTROLLER_ADDR = "127.0.0.1:12011"

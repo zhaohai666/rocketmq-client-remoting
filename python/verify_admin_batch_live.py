@@ -5,10 +5,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.admin import DefaultMQAdminExt, NAMESPACE_ORDER_TOPIC_CONFIG
-from client.exception import MQClientException
-from common.topic_config import TopicConfig
-from remoting.protocol.subscription import SubscriptionGroupConfig
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt, NAMESPACE_ORDER_TOPIC_CONFIG
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.common.topic_config import TopicConfig
+from rocketmq_client_remoting.remoting.protocol.subscription import SubscriptionGroupConfig
 
 NAMESRV = "127.0.0.1:9876"
 STAMP = int(time.time())

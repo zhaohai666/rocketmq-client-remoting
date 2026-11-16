@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import json
 
-from client.admin import DEFAULT_ADMIN_EXT_GROUP, DefaultMQAdminExt
-from client.consumer import DefaultLitePullConsumer
-from common.message import MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.admin import DEFAULT_ADMIN_EXT_GROUP, DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 GROUP = "GID_CapabilityCloseout"
 TOPIC = "CapabilityCloseoutTopic"

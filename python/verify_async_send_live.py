@@ -8,12 +8,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQClientException
-from client.hook import CheckForbiddenHook, SendMessageHook
-from client.producer import DefaultMQProducer, SendCallback
-from client.send_result import SendStatus
-from common.message import Message
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.hook import CheckForbiddenHook, SendMessageHook
+from rocketmq_client_remoting.client.producer import DefaultMQProducer, SendCallback
+from rocketmq_client_remoting.client.send_result import SendStatus
+from rocketmq_client_remoting.common.message import Message
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())

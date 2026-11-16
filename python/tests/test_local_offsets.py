@@ -3,10 +3,10 @@ import os
 
 import pytest
 
-from client.consumer import (_build_local_offsets_json,
+from rocketmq_client_remoting.client.consumer import (_build_local_offsets_json,
                                        _parse_local_offsets_json,
                                        DefaultMQPushConsumer)
-from common.message import MessageQueue
+from rocketmq_client_remoting.common.message import MessageQueue
 
 # Real output of fastjson2 2.0.59 + rocketmq-client 5.5.0 (including the pretty version)
 FASTJSON_OFFSETS_COMPACT = ('{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,'

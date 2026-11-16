@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import time
 
-from client.consumer import (DefaultMQPushConsumer, MessageQueueListener)
-from client.mq_client import MQClientInstance
-from common.message import MessageQueue
-from common.subscription_data import SubscriptionData
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.heartbeat import HeartbeatData, MessageModel
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, MessageQueueListener)
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.heartbeat import HeartbeatData, MessageModel
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 NS = ["127.0.0.1:9876"]
 CLIENT_ID = "python-rebalance-change@1"

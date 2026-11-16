@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import time
 
-from client.consumer_stats import (ConsumerStatsManager, StatsItem, StatsItemSet,
+from rocketmq_client_remoting.client.consumer_stats import (ConsumerStatsManager, StatsItem, StatsItemSet,
                                             compute_stats_data)
-from remoting.protocol.body import ConsumeStatus
+from rocketmq_client_remoting.remoting.protocol.body import ConsumeStatus
 
 GROUP = "GID_StatsUnit"
 TOPIC = "StatsTopic"

@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import pytest
 
-from client.exception import MQClientException
-from client.mq_client import MQClientInstance
-from common.message import MessageQueue
-from remoting.exception import (RemotingConnectException,
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.remoting.exception import (RemotingConnectException,
                                          RemotingTimeoutException)
-from remoting.protocol.codes import ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, QueueData, TopicRouteData
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, QueueData, TopicRouteData
 
 MASTER = 0
 SLAVE = 1
@@ -202,8 +202,8 @@ def test_admin_offset_queries_are_master_only_too():
 # -------------------------------------- Subscription side: findBrokerAddressInSubscribe(MASTER_ID, true)
 def _invoking(route_holder):
     """An offline instance: namesrv replies with ``route_holder[0]``; broker requests are answered by code and each ``(addr, code)`` is recorded."""
-    from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
-    from remoting.protocol.codes import RequestCode
+    from rocketmq_client_remoting.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+    from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
     inst = MQClientInstance("route-test@unit", ["127.0.0.1:9876"])
     calls = []
@@ -233,7 +233,7 @@ def _invoking(route_holder):
 
 def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
     pass
-    from remoting.protocol.codes import RequestCode
+    from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)
@@ -260,8 +260,8 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
 
 def test_pop_message_is_master_only_and_reports_not_exist():
     pass
-    from client.consumer_result import PopStatus
-    from remoting.protocol.codes import RequestCode
+    from rocketmq_client_remoting.client.consumer_result import PopStatus
+    from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)
@@ -287,7 +287,7 @@ def test_pop_message_is_master_only_and_reports_not_exist():
 
 def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
     pass
-    from remoting.protocol.codes import RequestCode
+    from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
     inst, calls = _invoking(holder)

@@ -51,13 +51,13 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.admin import DEFAULT_ADMIN_EXT_GROUP, DefaultMQAdminExt
-from client.consumer import (ConsumeConcurrentlyStatus, DefaultLitePullConsumer,
+from rocketmq_client_remoting.client.admin import DEFAULT_ADMIN_EXT_GROUP, DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (ConsumeConcurrentlyStatus, DefaultLitePullConsumer,
                              DefaultMQPushConsumer, MessageListenerConcurrently)
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from common.message import Message
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "CapLive_%d" % int(time.time() * 1000)

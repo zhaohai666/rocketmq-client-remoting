@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rocketmq-client-remoting"
-version = "0.0.1"
+version = "0.0.2"
 description = "Python implementation of Apache RocketMQ 4.x remoting client (client + remoting protocol)."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -16,18 +16,24 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
+# Optional compression codecs. ZLIB needs nothing (stdlib); LZ4 / ZSTD bodies
+# only arise when a broker (or a producer configured with the matching
+# compress_type) delivers them, and the codecs raise a clear "pip install ..."
+# error when the package is missing (see rocketmq_client_remoting/common/message_decoder.py).
+[project.optional-dependencies]
+lz4 = ["lz4"]
+zstd = ["zstandard"]
+full = ["lz4", "zstandard"]
+
 [tool.setuptools]
-# rocketmq_logging.py is a root-level module, not inside any package: 15 library modules
-# (client/*.py, remoting/client.py) do `from rocketmq_logging import get_logger`. Without
-# py-modules the wheel installs fine but every import of client/remoting dies with
-# ModuleNotFoundError on the first get_logger line.
-py-modules = ["rocketmq_logging"]
+# Everything lives inside the single namespace package rocketmq_client_remoting
+# (client / common / remoting are its subpackages, logging is a module). The
+# 0.0.1 layout shipped three flat top-level packages (client / common / remoting)
+# plus a root rocketmq_logging module, which polluted site-packages with generic
+# names — restructured into one package in 0.0.2.
 
 [tool.setuptools.packages.find]
-# The python/ directory is itself the source root: client / common / remoting are three
-# flat top-level packages (the legacy nested rocketmq.* package was retired with the
-# directory restructuring).
-include = ["client*", "common*", "remoting*"]
+include = ["rocketmq_client_remoting*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

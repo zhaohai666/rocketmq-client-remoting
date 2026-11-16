@@ -6,17 +6,17 @@ import time
 
 import pytest
 
-from client.consumer import (MAX_POP_INVISIBLE_TIME,
+from rocketmq_client_remoting.client.consumer import (MAX_POP_INVISIBLE_TIME,
                                       MIN_POP_INVISIBLE_TIME, POP_DELAY_LEVEL,
                                       DefaultMQPushConsumer, PopProcessQueue)
-from client.consumer_result import (ConsumeConcurrentlyContext,
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyContext,
                                              ConsumeConcurrentlyStatus, PopResult,
                                              PopStatus)
-from client.consumer_stats import ConsumerStatsManager
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from common.subscription_data import SubscriptionData
-from remoting.protocol.extra_info import build_extra_info
+from rocketmq_client_remoting.client.consumer_stats import ConsumerStatsManager
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.extra_info import build_extra_info
 
 GROUP = "GID_PopUnitTest"
 TOPIC = "PopUnitTestTopic"

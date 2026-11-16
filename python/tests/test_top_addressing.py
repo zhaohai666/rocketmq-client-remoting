@@ -6,9 +6,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from client.consumer import DefaultMQPushConsumer
-from client.mq_client import MQClientInstance
-from client.top_addressing import DefaultTopAddressing, clear_new_line
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.top_addressing import DefaultTopAddressing, clear_new_line
 
 
 # ------------------------------------------------------------------ mock server
@@ -230,3 +230,105 @@ class TestConsumerGuard:
             assert mqc.name_server_addrs == ["127.0.0.1:9876"]
         finally:
             mqc.shutdown()
+
+
+# ------------------------------------------------------------------ Setting surface (Java parity)
+
+from rocketmq_client_remoting.common.mix_all import MixAll  # noqa: E402
+
+
+class TestNamesrvAddrsFromEnv:
+    """Java ClientConfig.java:45: namesrvAddr defaults to the rocketmq.namesrv.addr
+    property falling back to the NAMESRV_ADDR env var. Non-JVM ports map the property
+    name to ROCKETMQ_NAMESRV_ADDR."""
+
+    def test_property_env_wins_over_namesrv_addr(self, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_ADDR", "10.0.0.1:9876")
+        monkeypatch.setenv("NAMESRV_ADDR", "10.0.0.2:9876")
+        assert MixAll.namesrv_addrs_from_env() == ["10.0.0.1:9876"]
+
+    def test_falls_back_to_namesrv_addr(self, monkeypatch):
+        monkeypatch.delenv("ROCKETMQ_NAMESRV_ADDR", raising=False)
+        monkeypatch.setenv("NAMESRV_ADDR", "10.0.0.2:9876")
+        assert MixAll.namesrv_addrs_from_env() == ["10.0.0.2:9876"]
+
+    def test_splits_on_semicolon_and_comma(self, monkeypatch):
+        monkeypatch.setenv("NAMESRV_ADDR", " 10.0.0.1:9876 ; 10.0.0.2:9876,,10.0.0.3:9876 ")
+        assert MixAll.namesrv_addrs_from_env() == [
+            "10.0.0.1:9876", "10.0.0.2:9876", "10.0.0.3:9876"]
+
+    def test_unset_means_empty(self, monkeypatch):
+        monkeypatch.delenv("ROCKETMQ_NAMESRV_ADDR", raising=False)
+        monkeypatch.delenv("NAMESRV_ADDR", raising=False)
+        assert MixAll.namesrv_addrs_from_env() == []
+
+    def test_blank_value_means_empty(self, monkeypatch):
+        monkeypatch.setenv("NAMESRV_ADDR", "   ")
+        assert MixAll.namesrv_addrs_from_env() == []
+
+
+class TestSubgroupSetting:
+    def test_explicit_subgroup_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP", "envgrp")
+        ta = DefaultTopAddressing(domain="h", subgroup="grpA")
+        assert ta.ws_addr == "http://h:8080/rocketmq/grpA"
+
+    def test_subgroup_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP", "envgrp")
+        ta = DefaultTopAddressing(domain="h")
+        assert ta.ws_addr == "http://h:8080/rocketmq/envgrp"
+
+    def test_default_subgroup_without_env(self, monkeypatch):
+        monkeypatch.delenv("ROCKETMQ_NAMESRV_DOMAIN_SUBGROUP", raising=False)
+        ta = DefaultTopAddressing(domain="h")
+        assert ta.ws_addr == "http://h:8080/rocketmq/nsaddr"
+
+    def test_explicit_domain_wins_over_domain_env(self, addr_server, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN", "10.9.8.7:1")
+        ta = DefaultTopAddressing(domain="127.0.0.1:%d" % addr_server.port)
+        assert ta.ws_addr == "http://127.0.0.1:%d/rocketmq/nsaddr" % addr_server.port
+
+
+class TestInstanceDomainWiring:
+    def test_instance_passes_domain_setting_to_top_addressing(self):
+        mqc = MQClientInstance("c@domset", [], namesrv_domain="addr.example.com:8080",
+                               namesrv_subgroup="grpB")
+        try:
+            assert mqc.top_addressing.ws_addr == \
+                "http://addr.example.com:8080/rocketmq/grpB"
+        finally:
+            mqc.shutdown()
+
+    def test_instance_setting_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN", "env.example.com")
+        mqc = MQClientInstance("c@domset2", [], namesrv_domain="set.example.com:8080")
+        try:
+            assert mqc.top_addressing.ws_addr == \
+                "http://set.example.com:8080/rocketmq/nsaddr"
+        finally:
+            mqc.shutdown()
+
+    def test_instance_without_setting_uses_env(self, addr_server, monkeypatch):
+        monkeypatch.setenv("ROCKETMQ_NAMESRV_DOMAIN", "127.0.0.1:%d" % addr_server.port)
+        mqc = MQClientInstance("c@domenv", [])
+        try:
+            assert mqc.top_addressing.ws_addr == \
+                "http://127.0.0.1:%d/rocketmq/nsaddr" % addr_server.port
+        finally:
+            mqc.shutdown()
+
+
+class TestFacadeGuardAcceptsDomainSetting:
+    def test_push_consumer_start_guard_accepts_explicit_domain(self, addr_server, monkeypatch):
+        monkeypatch.delenv("ROCKETMQ_NAMESRV_DOMAIN", raising=False)
+        c = DefaultMQPushConsumer("GID_DomSet")
+        c.subscription_data = {"T": None}
+        c.message_listener = None  # the address guard runs before the listener check
+        # no addresses, no env, only the explicit setting: the facade guard passes
+        # (the failure then comes from the unreachable address server, not the guard)
+        c.set_namesrv_domain("127.0.0.1:1")
+        with pytest.raises(Exception) as ei:
+            c.start()
+        assert "name server address is not set" not in str(ei.value) or \
+            "address server" in str(ei.value)
+        c.shutdown() if c._started else None

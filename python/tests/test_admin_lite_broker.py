@@ -6,17 +6,17 @@ from __future__ import annotations
 
 import pytest
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException
-from remoting.protocol.admin_body import (ClientGroup, GetBrokerLiteInfoResponseBody,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.remoting.protocol.admin_body import (ClientGroup, GetBrokerLiteInfoResponseBody,
                                           GetLiteClientInfoResponseBody,
                                           GetLiteGroupInfoResponseBody,
                                           GetLiteTopicInfoResponseBody,
                                           GetParentTopicInfoResponseBody,
                                           LiteLagInfo, OffsetWrapper, TopicOffset)
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.serialize import RemotingSerializable
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.serialize import RemotingSerializable
 
 ADDR = "127.0.0.1:10911"
 VIP_ADDR = "127.0.0.1:10909"

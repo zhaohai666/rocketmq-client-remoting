@@ -15,16 +15,16 @@ from __future__ import annotations
 
 import pytest
 
-from client.consumer import DefaultMQPushConsumer
-from client.exception import MQBrokerException
-from client.mq_client import MQClientInstance
-from common.message import MessageQueue
-from common.mix_all import MixAll
-from common.subscription_data import SubscriptionData
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.heartbeat import (ConsumeType, ConsumerData, HeartbeatData,
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.heartbeat import (ConsumeType, ConsumerData, HeartbeatData,
                                          HeartbeatV2Result, MessageModel, ProducerData)
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 NS = ["127.0.0.1:9876"]
 CLIENT_ID = "python-v2-unit@1"

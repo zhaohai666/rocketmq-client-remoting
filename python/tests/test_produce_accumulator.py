@@ -7,12 +7,12 @@ from typing import List, Optional
 
 import pytest
 
-from client.exception import MQClientException
-from client.produce_accumulator import (AggregateKey, ProduceAccumulator,
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.produce_accumulator import (AggregateKey, ProduceAccumulator,
                                                 get_or_create_produce_accumulator)
-from client.producer import DefaultMQProducer, SendCallback
-from client.send_result import SendResult, SendStatus
-from common.message import Message, MessageBatch, MessageQueue
+from rocketmq_client_remoting.client.producer import DefaultMQProducer, SendCallback
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.common.message import Message, MessageBatch, MessageQueue
 
 TOPIC = "AccumTestTopic"
 
@@ -439,7 +439,7 @@ def test_guard_removes_empty_batch_without_sending():
     """An empty batch that nobody actually adds messages to: the guard thread directly sets closed + removes it from the table, sending nothing."""
     producer = FakeProducer()
     acc = ProduceAccumulator("guard-empty")
-    from client.produce_accumulator import MessageAccumulation
+    from rocketmq_client_remoting.client.produce_accumulator import MessageAccumulation
     key = AggregateKey.of_message(Message(TOPIC, b"x"))
     empty = MessageAccumulation(key, producer, acc)
     with acc._table_lock:
@@ -497,7 +497,7 @@ class StubProducer(DefaultMQProducer):
 
 def test_send_by_accumulator_stamps_uniq_id_then_accumulates():
     pass
-    from common.message_client_id_setter import get_uniq_id
+    from rocketmq_client_remoting.common.message_client_id_setter import get_uniq_id
 
     acc = ProduceAccumulator("send-by-accum")
     acc.batch_max_delay_ms(3000)

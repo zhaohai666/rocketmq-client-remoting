@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 import time
 
-from client.consumer_result import ConsumeConcurrentlyStatus
-from client.hook import ConsumeMessageContext, SendMessageContext
-from client.mq_client import MQClientInstance
-from client.producer import LocalTransactionState
-from client.send_result import SendResult, SendStatus
-from client.trace import (LOCAL_ADDRESS, AccessChannel, TraceBean, TraceConstants,
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.hook import ConsumeMessageContext, SendMessageContext
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import LocalTransactionState
+from rocketmq_client_remoting.client.send_result import SendResult, SendStatus
+from rocketmq_client_remoting.client.trace import (LOCAL_ADDRESS, AccessChannel, TraceBean, TraceConstants,
                                    TraceContext, TraceDataEncoder, TraceTransferBean,
                                    TraceType, split_dropping_trailing_empty)
-from client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
-from client.trace_hook import ConsumeMessageTraceHook, SendMessageTraceHook
-from common.message import MessageExt, MessageQueue
-from common.message_client_id_setter import (create_uniq_id, get_uniq_id, set_uniq_id)
-from common.message_const import MessageConst
-from common.message_type import MessageType
-from common.mix_all import MixAll
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.trace_dispatcher import AsyncTraceDispatcher, TraceDispatcherType
+from rocketmq_client_remoting.client.trace_hook import ConsumeMessageTraceHook, SendMessageTraceHook
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_client_id_setter import (create_uniq_id, get_uniq_id, set_uniq_id)
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.message_type import MessageType
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 SOH = "\u0001"
 STX = "\u0002"
@@ -610,7 +610,7 @@ def test_set_uniq_id_is_idempotent_and_32_hex():
 
 
 def test_parse_send_response_raises_on_error_code():
-    from client.exception import MQBrokerException
+    from rocketmq_client_remoting.client.exception import MQBrokerException
     msg = MessageExt("TopicTest", BODY)
     cmd = RemotingCommand.create_response_command(2)
     cmd.remark = "boom"
@@ -714,7 +714,7 @@ class _RecordingDispatcher:
 
 
 def test_producer_access_channel_is_handed_to_the_trace_dispatcher():
-    from client.producer import DefaultMQProducer
+    from rocketmq_client_remoting.client.producer import DefaultMQProducer
 
     p = DefaultMQProducer("GID_ac")
     assert p.get_access_channel() == AccessChannel.LOCAL
@@ -729,7 +729,7 @@ def test_producer_access_channel_is_handed_to_the_trace_dispatcher():
 
 
 def test_consumer_access_channel_reaches_dispatcher_and_consume_context():
-    from client.consumer import DefaultMQPushConsumer
+    from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
 
     c = DefaultMQPushConsumer("CID_ac")
     assert c.get_access_channel() == AccessChannel.LOCAL

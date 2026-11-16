@@ -6,12 +6,12 @@ import sys
 import threading
 import time
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import (DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer,
                                      SimpleMessageListener)
-from client.producer import DefaultMQProducer
-from common.message import Message
-from client.consumer_result import (  # noqa: F401
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.client.consumer_result import (  # noqa: F401
     ConsumeConcurrentlyStatus,
 )
 

@@ -6,19 +6,19 @@ import re
 
 import pytest
 
-from client import validators
-from client.consumer import (
+from rocketmq_client_remoting.client import validators
+from rocketmq_client_remoting.client.consumer import (
     DefaultLitePullConsumer,
     DefaultMQPullConsumer,
     DefaultMQPushConsumer,
     SimpleMessageListener,
 )
-from client.consumer_result import ConsumeConcurrentlyStatus
-from client.exception import MQClientException
-from client.producer import DefaultMQProducer
-from common.message import Message
-from common.message_const import MessageConst
-from common.topic_validator import (
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.topic_validator import (
     GROUP_MAX_LENGTH,
     NOT_ALLOWED_SEND_TOPIC_SET,
     RETRY_OR_DLQ_TOPIC_MAX_LENGTH,
@@ -30,7 +30,7 @@ from common.topic_validator import (
     is_system_topic,
     is_topic_or_group_illegal,
 )
-from remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
 
 RESOURCE_NAME_PATTERN = re.compile(r"^[%|a-zA-Z0-9_-]+$")
 

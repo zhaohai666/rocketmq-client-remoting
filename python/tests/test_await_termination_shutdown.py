@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import threading
 
-from client.consume_executor import ConsumeExecutor
-from client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consume_executor import ConsumeExecutor
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
 
 
 class _RecordingExecutor:

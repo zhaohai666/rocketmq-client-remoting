@@ -18,7 +18,7 @@ from typing import List
 
 import pytest
 
-from client.consumer import (
+from rocketmq_client_remoting.client.consumer import (
     AllocateMessageQueueAveragely,
     AllocateMessageQueueAveragelyByCircle,
     AllocateMachineRoomNearby,
@@ -33,9 +33,9 @@ from client.consumer import (
     _split_dropping_trailing_empty,
     _strategy_name,
 )
-from client.consumer_result import ConsumeConcurrentlyStatus
-from client.exception import MQClientException
-from common.message import MessageQueue
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.common.message import MessageQueue
 
 
 def _queues(size: int) -> List[MessageQueue]:

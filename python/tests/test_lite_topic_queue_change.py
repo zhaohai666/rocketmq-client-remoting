@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-from client.consumer import (DefaultLitePullConsumer, TopicMessageQueueChangeListener)
-from client.exception import MQClientException
-from common.message import MessageQueue
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, TopicMessageQueueChangeListener)
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.common.message import MessageQueue
 
 
 class FakeInstance:

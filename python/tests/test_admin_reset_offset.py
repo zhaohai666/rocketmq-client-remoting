@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException, MQClientException
-from common.message import MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.body import ResetOffsetBody, TopicList
-from remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.body import ResetOffsetBody, TopicList
+from rocketmq_client_remoting.remoting.protocol.codes import LanguageCode, RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_AdminResetUnit"
 TOPIC = "AdminResetUnitTopic"

@@ -32,17 +32,17 @@ import time
 
 import pytest
 
-from client import consumer as consumer_mod
-from client.consumer import (DefaultMQPushConsumer, PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
+from rocketmq_client_remoting.client import consumer as consumer_mod
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
                              filter_messages_for_delivery)
-from client.consumer_result import PullResult, PullStatus
-from client.consumer_stats import ConsumerStatsManager
-from client.exception import MQBrokerException
-from client.hook import FilterMessageContext, FilterMessageHook
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from common.subscription_data import FilterAPI, SubscriptionData
-from remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.consumer_stats import ConsumerStatsManager
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.client.hook import FilterMessageContext, FilterMessageHook
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.subscription_data import FilterAPI, SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
 
 GROUP = "GID_PullRoundStats"
 TOPIC = "PullRoundStatsTopic"

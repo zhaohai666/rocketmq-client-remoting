@@ -28,13 +28,13 @@ import time
 
 import pytest
 
-from client import consumer as consumer_mod
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import PullResult, PullStatus
-from client.consumer_stats import ConsumerStatsManager
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from common.subscription_data import FilterAPI, SubscriptionData
+from rocketmq_client_remoting.client import consumer as consumer_mod
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.consumer_stats import ConsumerStatsManager
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.subscription_data import FilterAPI, SubscriptionData
 
 GROUP = "GID_PullOffsetSanity"
 TOPIC = "PullOffsetSanityTopic"

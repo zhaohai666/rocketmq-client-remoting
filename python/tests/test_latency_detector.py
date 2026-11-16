@@ -6,11 +6,11 @@ import struct
 import threading
 import time
 
-from client.latency import LatencyFaultToleranceImpl, MQFaultStrategy
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from remoting.protocol import remoting_command as rc_mod
-from remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.client.latency import LatencyFaultToleranceImpl, MQFaultStrategy
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.remoting.protocol import remoting_command as rc_mod
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
 
 BROKER = "broker-a"
 TOPIC = "DetectTopic"

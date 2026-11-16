@@ -9,12 +9,12 @@ import json
 
 import pytest
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException, MQClientException
-from common.topic_config import TopicConfig
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.subscription import SubscriptionGroupConfig
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.topic_config import TopicConfig
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.subscription import SubscriptionGroupConfig
 
 ADDR = "127.0.0.1:10911"
 VIP_ADDR = "127.0.0.1:10909"

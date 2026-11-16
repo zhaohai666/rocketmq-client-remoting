@@ -21,14 +21,14 @@ RocketMQ 经典 remoting 协议的 Python 客户端：直连 NameServer(9876) �
 ```bash
 cd python
 python3 -m venv .venv
-.venv/bin/pip install -e .                     # 顶层包：client / common / remoting
+.venv/bin/pip install -e .                     # 顶层包：单一命名空间包 rocketmq_client_remoting
 
 .venv/bin/pip install pytest                   # 只有跑单元测试才需要它
-.venv/bin/python -m pytest tests/ -q           # 1834 passed, 4 skipped
+.venv/bin/python -m pytest tests/ -q           # 1880 passed, 4 skipped
 .venv/bin/python selfcheck.py                  # selfcheck: 7/7 passed
 ```
 
-- `pytest` 收集 1838 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
+- `pytest` 收集 1884 个用例，全部离线跑，不需要集群。其中 4 个 skip 全部来自
   `tests/test_protocol_alignment.py`（可选的协议常量比对守卫，默认不启用）。
 - `selfcheck.py` 是 7 项协议编解码回环自检（JSON 头 / 二进制头 / V2 短字段头 /
   17 段存储格式 / 长 topic V2 magic / 6 段批量格式 / ACL 签名注入），无需集群；
@@ -41,8 +41,8 @@ python3 -m venv .venv
 普通消息：
 
 ```python
-from client.producer import DefaultMQProducer
-from common.message import Message
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message
 
 producer = DefaultMQProducer("PID_DEMO")
 producer.set_namesrv_addr("127.0.0.1:9876")
@@ -56,7 +56,7 @@ producer.shutdown()
 顺序消息（同一 `arg` 落同一队列）：
 
 ```python
-from client.producer import SelectMessageQueueByHash
+from rocketmq_client_remoting.client.producer import SelectMessageQueueByHash
 
 result = producer.send_by_selector(
     Message("TopicTest", b"part-1"), SelectMessageQueueByHash(), "order-1", 3000)
@@ -78,7 +78,7 @@ uniq_key = producer.recall_message("TopicTest", handle)   # 请求码 370，返�
 事务消息（两阶段 + broker 回查）：
 
 ```python
-from client.producer import TransactionMQProducer, TransactionListener, LocalTransactionState
+from rocketmq_client_remoting.client.producer import TransactionMQProducer, TransactionListener, LocalTransactionState
 
 class TxListener(TransactionListener):
     def execute_local_transaction(self, msg, arg):
@@ -98,7 +98,7 @@ tx.shutdown()
 批量消息（同 topic、非延迟，单条上限 4MB）：
 
 ```python
-from common.message import MessageBatch
+from rocketmq_client_remoting.common.message import MessageBatch
 
 batch = MessageBatch.generate_from_list(
     [Message("TopicTest", ("b-%d" % i).encode("utf-8")) for i in range(3)])
@@ -108,7 +108,7 @@ result = producer.send(batch)                    # 也可直接传列表：produ
 单向与异步：
 
 ```python
-from client.producer import SendCallback
+from rocketmq_client_remoting.client.producer import SendCallback
 
 producer.send_oneway(Message("TopicTest", b"no-result"))
 
@@ -133,7 +133,7 @@ print(bytes(reply.body))
 应答方在自己的 push 监听器里把结果发回去：
 
 ```python
-from client.request_reply import create_reply_message
+from rocketmq_client_remoting.client.request_reply import create_reply_message
 
 reply_msg = create_reply_message(request_msg, b"pong")
 producer.send(reply_msg)                         # 走 SEND_REPLY_MESSAGE_V2(325)
@@ -144,8 +144,8 @@ producer.send(reply_msg)                         # 走 SEND_REPLY_MESSAGE_V2(325
 并发监听：
 
 ```python
-from client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
-from client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
 
 class Listener(MessageListenerConcurrently):
     def consume_message(self, msgs, context):
@@ -165,8 +165,8 @@ consumer.shutdown()
 顺序监听（同一队列串行，返回 `SUSPEND_CURRENT_QUEUE_A_MOMENT` 即挂起重投）：
 
 ```python
-from client.consumer import MessageListenerOrderly
-from client.consumer_result import ConsumeOrderlyStatus
+from rocketmq_client_remoting.client.consumer import MessageListenerOrderly
+from rocketmq_client_remoting.client.consumer_result import ConsumeOrderlyStatus
 
 class OrderlyListener(MessageListenerOrderly):
     def consume_message(self, msgs, context):
@@ -176,7 +176,7 @@ class OrderlyListener(MessageListenerOrderly):
 广播消费（位点只存本地，不吃 rebalance）：
 
 ```python
-from remoting.protocol.heartbeat import MessageModel, ConsumeFromWhere
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel, ConsumeFromWhere
 
 consumer.set_message_model(MessageModel.BROADCASTING)
 consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
@@ -185,8 +185,8 @@ consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
 其他常用入口：
 
 ```python
-from client.consumer import (AllocateMessageQueueConsistentHash, MessageSelector)
-from common.subscription_data import ExpressionType
+from rocketmq_client_remoting.client.consumer import (AllocateMessageQueueConsistentHash, MessageSelector)
+from rocketmq_client_remoting.common.subscription_data import ExpressionType
 
 consumer.subscribe_with_selector(
     "TopicTest", MessageSelector(ExpressionType.SQL92, "price > 100"))
@@ -201,8 +201,8 @@ consumer.pop_mode = True                 # 推模式消费者改走 POP 循环
 
 ```python
 import time
-from client.consumer import DefaultMQPullConsumer
-from client.consumer_result import PullStatus
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer
+from rocketmq_client_remoting.client.consumer_result import PullStatus
 
 consumer = DefaultMQPullConsumer("GID_PULL")
 consumer.set_namesrv_addr("127.0.0.1:9876")
@@ -231,7 +231,7 @@ consumer.shutdown()
 这一表面的误用一律在本地先报错：空白 topic 的 `subscribe`、空队列列表的 `assign`（那等于撤销全部持有队列）、已经在跑之后再调 `set_sub_expression_for_assign`、没启动就 `poll` / `committed`。`poll` 的负超时同样被拒绝，但运行状态检查排在它前面——空的一轮和「还没有位点」都和队列停在尾位点长得一模一样，缺了 `start()` 只有这样才不会一直被藏下去。`subscribe` / `assign` 互斥，先调用者定形；`seek` 依次判「队列是否持有」→「是否已启动」→ 位点落在 `[minOffset, maxOffset]` 内；`assign` 收窄与 `unsubscribe` 立刻撤销不再持有队列的光标、seek 定位、暂停位、park 与本地缓冲。
 
 ```python
-from client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
+from rocketmq_client_remoting.client.consumer import DefaultLitePullConsumer, TopicMessageQueueChangeListener
 
 lite = DefaultLitePullConsumer("GID_LITE")
 lite.set_namesrv_addr("127.0.0.1:9876")
@@ -266,7 +266,7 @@ lite.register_topic_message_queue_change_listener("TopicTest", QueueChangeListen
 
 ```python
 import time
-from client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
 
 admin = DefaultMQAdminExt()
 admin.set_namesrv_addr("127.0.0.1:9876")
@@ -289,8 +289,8 @@ admin.shutdown()
 ### ACL
 
 ```python
-from remoting.rpchook import AclClientRPCHook, SessionCredentials
-from client.producer import DefaultMQProducer
+from rocketmq_client_remoting.remoting.rpchook import AclClientRPCHook, SessionCredentials
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
 
 producer = DefaultMQProducer(
     "PID_DEMO",
@@ -318,7 +318,7 @@ producer.set_namespace_v2("ns2")                            # 服务端命名空
 ### 消息压缩
 
 ```python
-from common.sysflag import MessageSysFlag
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag
 
 producer.set_compress_msg_body_over_howmuch(1024)          # body ≥ 1KB 自动压缩（默认 4096）
 producer.set_compress_level(5)
@@ -342,7 +342,7 @@ producer = DefaultMQProducer("PID_DEMO", tls_enable=True,
 ### SOCKS 代理
 
 ```python
-from remoting.socks_proxy import SocksProxyConfig
+from rocketmq_client_remoting.remoting.socks_proxy import SocksProxyConfig
 
 producer = DefaultMQProducer("PID_DEMO",
                              socks_proxy_config=SocksProxyConfig(
@@ -389,7 +389,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 
 ## 客户端日志
 
-`rocketmq_logging.py` 把内部日志桥接到标准 `logging`，文件默认落在
+`rocketmq_client_remoting/logging.py` 把内部日志桥接到标准 `logging`，文件默认落在
 **`<当前工作目录>/logs/rocketmqlogs/rocketmq_py_client.log`**，按天滚动，
 备份名 `rocketmq_py_client.log.YYYY-MM-DD`。宿主程序若已经配置过 Python logging
 （root logger 已有 handler），则本模块不添加任何 handler。
@@ -476,14 +476,16 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 
 ## 目录结构
 
-`client/`、`common/`、`remoting/` 直接位于 `python/` 下，是三个**顶层包**：
-把 `python/` 放进 `sys.path` 即可 `from client.producer import DefaultMQProducer`
+全部代码位于单一命名空间包 **`rocketmq_client_remoting/`**（client / common / remoting 是它的三个
+子包，logging 是包内模块）。0.0.1 及之前的三个**顶级包**布局（`client/`、`common/`、`remoting/`
+平铺在 `python/` 下）会以这些通用名污染 site-packages，0.0.2 起重构为单包：
+把 `python/` 放进 `sys.path` 即可 `from rocketmq_client_remoting.client.producer import DefaultMQProducer`
 （`tests/conftest.py` 已经做了这件事）。
 
 ```
 python/
-├── common/                 消息模型与常量
-│   ├── message.py              Message / MessageExt / MessageBatch / MessageQueue
+├── rocketmq_client_remoting/     单一命名空间包（0.0.2 起）
+│   ├── common/                 消息模型与常量
 │   ├── message_decoder.py      17 段存储格式 + 6 段批量格式编解码，压缩三后端
 │   ├── message_const.py        MessageConst 属性键
 │   ├── sysflag.py              MessageSysFlag / PullSysFlag / PermName / 压缩类型位
@@ -515,10 +517,9 @@ python/
 │   ├── hook.py / trace.py / trace_hook.py / trace_dispatcher.py / trace_context.py
 │   ├── top_addressing.py       动态 NameServer 取址
 │   ├── validators.py / send_result.py / consumer_result.py / exception.py
-├── rocketmq_logging.py     日志桥接
+│   ├── logging.py              日志桥接
 ├── selfcheck.py            无集群的协议编解码回环自检（7 项）
-├── __main__.py             命令行入口（python -m selfcheck）
-├── tests/                  1838 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
+├── tests/                  1884 个离线用例（conftest.py 负责把 python/ 加进 sys.path）
 ├── verify_*_live.py        真机联调脚本（见「真实集群联调」）
 ├── integration_live_test.py / ns_failover_repro.py / go_*_check.py  联调辅助脚本
 ├── pyproject.toml          零运行时依赖；requires-python >= 3.8

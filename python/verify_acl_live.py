@@ -9,18 +9,18 @@ from typing import Optional
 
 sys.path.insert(0, ".")
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import (ConsumeConcurrentlyStatus,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (ConsumeConcurrentlyStatus,
                                       DefaultMQPushConsumer,
                                       SimpleMessageListener)
-from client.exception import MQBrokerException
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from client.send_result import SendStatus
-from common.message import Message
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.rpchook import AclClientRPCHook, SessionCredentials
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.send_result import SendStatus
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.rpchook import AclClientRPCHook, SessionCredentials
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 AK = sys.argv[2] if len(sys.argv) > 2 else "AK_TEST"

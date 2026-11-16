@@ -7,12 +7,12 @@ import json
 
 import pytest
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException
-from remoting.protocol.admin_body import (AclEntry, AclInfo, AclPolicy, Decision,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.remoting.protocol.admin_body import (AclEntry, AclInfo, AclPolicy, Decision,
                                             PolicyType, UserInfo, UserStatus, UserType)
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 ADDR = "127.0.0.1:10911"
 USERNAME = "alice"

@@ -18,12 +18,12 @@ _KEYS = (
 
 
 def _reload(monkeypatch, env=None):
-    """Reload rocketmq_logging under clean environment variables (its config is evaluated at import time)."""
+    """Reload rocketmq_client_remoting.logging under clean environment variables (its config is evaluated at import time)."""
     for k in _KEYS:
         monkeypatch.delenv(k, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
-    import rocketmq_logging as rl
+    import rocketmq_client_remoting.logging as rl
 
     return importlib.reload(rl)
 

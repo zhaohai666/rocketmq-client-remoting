@@ -9,17 +9,17 @@ import time
 
 import pytest
 
-from client.admin import DefaultMQAdminExt, MessageTrack, TrackType
-from client.exception import MQBrokerException, MQClientException
-from common.message import MessageExt, MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.admin_body import (AdminToolsResultCodeEnum, ConsumeStats,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt, MessageTrack, TrackType
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.admin_body import (AdminToolsResultCodeEnum, ConsumeStats,
                                           OffsetWrapper, TopicOffset, TopicStatsTable)
-from remoting.protocol.body import ConsumerConnection, TopicList
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.serialize import RemotingSerializable
-from remoting.protocol.route import BrokerData, QueueData, TopicRouteData
+from rocketmq_client_remoting.remoting.protocol.body import ConsumerConnection, TopicList
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.serialize import RemotingSerializable
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, QueueData, TopicRouteData
 
 GROUP = "GID_Fanout"
 TOPIC = "FanoutTopic"
@@ -186,7 +186,7 @@ def test_examine_topic_stats_concurrent_contains_a_broker_failure():
 
 
 def test_examine_topic_stats_concurrent_maps_transport_errors_to_the_remote_code():
-    from remoting.exception import RemotingConnectException
+    from rocketmq_client_remoting.remoting.exception import RemotingConnectException
 
     client = _FakeClient()
     client.update_topic_route_info_from_name_server = lambda *a, **k: (
@@ -676,7 +676,7 @@ def test_fan_out_wait_is_bounded_by_the_timeout_but_keeps_the_fast_answers():
 # ------------------------------------------------------------------ envelope mapping
 
 def test_admin_tool_envelope_maps_exception_kinds_to_codes():
-    from remoting.exception import RemotingException
+    from rocketmq_client_remoting.remoting.exception import RemotingException
     admin = _admin(_FakeClient())
 
     def _raise(e):

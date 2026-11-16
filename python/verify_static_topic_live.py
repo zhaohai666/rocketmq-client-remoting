@@ -22,16 +22,16 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import (ConsumeConcurrentlyStatus,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus,
                                     MessageListenerConcurrently)
-from client.producer import DefaultMQProducer
-from client.static_topic import (LOGICAL_QUEUE_MOCK_NOT_EXIST,
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.static_topic import (LOGICAL_QUEUE_MOCK_NOT_EXIST,
                                  get_mock_broker_name,
                                  topic_route_data_2_endpoints_for_static_topic)
-from common.message import Message, MessageQueue
-from common.topic_config import TopicConfig
+from rocketmq_client_remoting.common.message import Message, MessageQueue
+from rocketmq_client_remoting.common.topic_config import TopicConfig
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)

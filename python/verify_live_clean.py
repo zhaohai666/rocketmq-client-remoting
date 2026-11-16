@@ -15,11 +15,11 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.producer import DefaultMQProducer
-from client.consumer import DefaultMQPushConsumer, SimpleMessageListener
-from common.message import Message, MessageBatch
-from remoting.protocol.heartbeat import ConsumeFromWhere
-from client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, SimpleMessageListener
+from rocketmq_client_remoting.common.message import Message, MessageBatch
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
 
 NAMESRV = "127.0.0.1:9876"
 STAMP = int(time.time())

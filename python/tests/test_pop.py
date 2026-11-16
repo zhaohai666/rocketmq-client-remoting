@@ -3,19 +3,19 @@ from __future__ import annotations
 
 import pytest
 
-from client.consumer_result import ChangeInvisibleTimeResult, PopResult, PopStatus
-from client.exception import MQBrokerException
-from client.mq_client import MQClientInstance
-from common.message import MessageExt
-from common.message_const import MessageConst
-from remoting.protocol import extra_info as ei
-from remoting.protocol.codes import ResponseCode
-from remoting.protocol.headers import (AckMessageRequestHeader,
+from rocketmq_client_remoting.client.consumer_result import ChangeInvisibleTimeResult, PopResult, PopStatus
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageExt
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.remoting.protocol import extra_info as ei
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.headers import (AckMessageRequestHeader,
                                                 ChangeInvisibleTimeRequestHeader,
                                                 ChangeInvisibleTimeResponseHeader,
                                                 PopMessageRequestHeader,
                                                 PopMessageResponseHeader)
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 BROKER = "broker-a"
 ADDR = "127.0.0.1:10911"
@@ -298,7 +298,7 @@ class TestAckAndChangeHeaders:
 class TestPopMessageRequest:
     def test_born_time_filled_and_fields_passed(self, monkeypatch):
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, _pop_ext(0), body=b"x")])
-        monkeypatch.setattr("client.mq_client.decode_messages",
+        monkeypatch.setattr("rocketmq_client_remoting.client.mq_client.decode_messages",
                             lambda body, read_body=True: [_msg(queue_offset=0)])
         res = _client(fake).pop_message(GROUP, TOPIC, queue_id=-1, init_mode=0,
                                         invisible_time=60000, poll_time=0,
@@ -416,7 +416,7 @@ class TestStampPopCk:
 
 class TestPopMessagePostProcess:
     def test_broker_name_and_topic_stamped(self, monkeypatch):
-        monkeypatch.setattr("client.mq_client.decode_messages",
+        monkeypatch.setattr("rocketmq_client_remoting.client.mq_client.decode_messages",
                             lambda body, read_body=True: [_msg(queue_offset=0)])
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, _pop_ext(0), body=b"x")])
         res = _client(fake).pop_message(GROUP, TOPIC, queue_id=0,

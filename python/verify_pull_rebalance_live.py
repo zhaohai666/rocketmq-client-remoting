@@ -29,8 +29,8 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import DefaultMQPullConsumer, MessageQueueListener
-from client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer, MessageQueueListener
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "PullReb_%d" % int(time.time() * 1000)

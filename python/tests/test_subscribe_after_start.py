@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from typing import List
 
-from client.consumer import DefaultMQPushConsumer, MessageSelector
-from common.subscription_data import ExpressionType
-from remoting.protocol.heartbeat import HeartbeatData
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, MessageSelector
+from rocketmq_client_remoting.common.subscription_data import ExpressionType
+from rocketmq_client_remoting.remoting.protocol.heartbeat import HeartbeatData
 
 TOPIC = "SubAfterStartTopic"
 

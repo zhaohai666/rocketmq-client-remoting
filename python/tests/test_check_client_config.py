@@ -6,14 +6,14 @@ from typing import List, Optional
 
 import pytest
 
-from client.consumer import DefaultMQPushConsumer
-from client.exception import MQClientException
-from client.mq_client import MQClientInstance
-from common.subscription_data import ExpressionType, SubscriptionData
-from remoting.exception import RemotingConnectException
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.subscription_data import ExpressionType, SubscriptionData
+from rocketmq_client_remoting.remoting.exception import RemotingConnectException
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_CheckCfg"
 TOPIC = "Sql92Topic"

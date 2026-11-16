@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import pytest
 
-from client.admin import DefaultMQAdminExt, MessageTrack, TrackType
-from client.exception import MQBrokerException, MQClientException
-from common.message import MessageExt, MessageQueue
-from common.mix_all import MixAll
-from remoting.protocol.admin_body import ConsumeStats, OffsetWrapper
-from remoting.protocol.body import ClusterInfo, ConsumerConnection
-from remoting.protocol.codes import ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt, MessageTrack, TrackType
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.admin_body import ConsumeStats, OffsetWrapper
+from rocketmq_client_remoting.remoting.protocol.body import ClusterInfo, ConsumerConnection
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_TrackUnit"
 TOPIC = "TrackUnitTopic"

@@ -8,14 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from client.consumer import DefaultMQPullConsumer
-from client.consumer_result import PullResult, PullStatus
-from client.pull_schedule_service import (DEFAULT_PULL_NEXT_DELAY_MILLIS,
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.pull_schedule_service import (DEFAULT_PULL_NEXT_DELAY_MILLIS,
                                           PULL_TASK_EXCEPTION_DELAY_MILLIS,
                                           PullConsumerScheduleService,
                                           PullTaskCallback, PullTaskContext)
-from common.message import MessageExt, MessageQueue
-from remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
 
 TOPIC = "TopicSchedUnit"
 
@@ -570,7 +570,7 @@ class TestShutdown:
     def test_own_consumer_is_closed_on_shutdown(self, monkeypatch):
         """consumer_group construction (the service builds its own consumer) -> shutdown stops the scheduling first then closes the consumer,
         and the consumer in turn closes the instance via MQClientManager reference counting -- a fake MQClientInstance verifies the whole chain."""
-        import client.consumer as consumer_mod
+        import rocketmq_client_remoting.client.consumer as consumer_mod
 
         holder = {}
 

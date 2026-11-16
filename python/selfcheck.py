@@ -14,12 +14,12 @@ from __future__ import annotations
 import struct
 import sys
 
-from common.message import Message, MessageBatch, MessageExt
-from common.message_decoder import (MESSAGE_MAGIC_CODE_V2, create_message_id, crc32,
+from rocketmq_client_remoting.common.message import Message, MessageBatch, MessageExt
+from rocketmq_client_remoting.common.message_decoder import (MESSAGE_MAGIC_CODE_V2, create_message_id, crc32,
                                      decode_batch_messages, decode_messages,
                                      encode_message_ext, string2bytes)
-from remoting.protocol.headers import PutKVConfigRequestHeader, SendMessageRequestHeaderV2
-from remoting.protocol.remoting_command import RemotingCommand, SerializeType
+from rocketmq_client_remoting.remoting.protocol.headers import PutKVConfigRequestHeader, SendMessageRequestHeaderV2
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand, SerializeType
 
 
 def build_v2_frame(topic: str, body: bytes, properties_bytes: bytes) -> bytes:
@@ -176,7 +176,7 @@ def run_selfcheck() -> int:
                           "count=%d bodies=%s" % (len(decoded_batch), [m.get_body() for m in decoded_batch])))
 
     # 6) ACL RPCHook resource signature injection
-    from remoting.rpchook import AclRPCHook, SessionCredentials
+    from rocketmq_client_remoting.remoting.rpchook import AclRPCHook, SessionCredentials
     cred = SessionCredentials(access_key="AK", secret_key="SK", security_token="token123")
     hook = AclRPCHook(cred)
     req = RemotingCommand.create_request_command(310, SendMessageRequestHeaderV2())

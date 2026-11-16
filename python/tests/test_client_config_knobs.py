@@ -14,25 +14,25 @@ import zlib
 
 import pytest
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, DefaultMQPullConsumer,
                              DefaultMQPushConsumer)
-from client.exception import MQClientException
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from common.message import MessageExt, MessageQueue
-from common.message_decoder import crc32, encode_message_ext
-from common.mix_all import MixAll
-from common.subscription_data import SubscriptionData
-from common.sysflag import MessageSysFlag, PullSysFlag
-from common.topic_config import TopicConfig
-from remoting.protocol.admin_body import TopicConfigSerializeWrapper
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.heartbeat import ConsumerData, HeartbeatData, ProducerData
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
-from remoting.protocol.serialize import RemotingSerializable
-from remoting.protocol.subscription import SubscriptionGroupConfig, SubscriptionGroupWrapper
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_decoder import crc32, encode_message_ext
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag, PullSysFlag
+from rocketmq_client_remoting.common.topic_config import TopicConfig
+from rocketmq_client_remoting.remoting.protocol.admin_body import TopicConfigSerializeWrapper
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumerData, HeartbeatData, ProducerData
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.remoting.protocol.serialize import RemotingSerializable
+from rocketmq_client_remoting.remoting.protocol.subscription import SubscriptionGroupConfig, SubscriptionGroupWrapper
 
 GROUP = "GID_KnobsUnit"
 TOPIC = "KnobUnitTopic"
@@ -71,7 +71,7 @@ class _RecordingClient:
     def _check_response(self, response):
         if response.code == ResponseCode.SUCCESS:
             return response
-        from client.exception import MQBrokerException
+        from rocketmq_client_remoting.client.exception import MQBrokerException
         raise MQBrokerException(response.code, response.remark or "")
 
 
@@ -405,7 +405,7 @@ def test_unregister_and_check_config_timeouts():
 
 
 def test_consumer_list_lookup_timeout_follows_the_instance_value():
-    from remoting.protocol.body import GetConsumerListByGroupResponseBody
+    from rocketmq_client_remoting.remoting.protocol.body import GetConsumerListByGroupResponseBody
     body = GetConsumerListByGroupResponseBody()
     body.consumer_id_list = ["cid-1"]
 
@@ -723,7 +723,7 @@ def test_topic_paging_raises_when_the_elapsed_budget_is_exhausted(monkeypatch):
     admin = _admin(client)
     admin.set_max_page_size_in_get_metadata(1)
     clock = iter([0.0, 0.0, 10.0])
-    monkeypatch.setattr("client.admin.time",
+    monkeypatch.setattr("rocketmq_client_remoting.client.admin.time",
                         types.SimpleNamespace(monotonic=lambda: next(clock)))
 
     with pytest.raises(MQClientException) as exc:

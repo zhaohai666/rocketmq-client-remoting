@@ -13,14 +13,14 @@
 import unittest
 from typing import Any, Dict, List, Optional
 
-from client.consumer import DefaultMQPullConsumer, DefaultMQPushConsumer
-from client.exception import MQBrokerException, MQClientException
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from common.message import MessageExt
-from common.message_decoder import (create_message_id, encode_message_ext,
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer, DefaultMQPushConsumer
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import MessageExt
+from rocketmq_client_remoting.common.message_decoder import (create_message_id, encode_message_ext,
                                     ip_and_port_to_bytes)
-from remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
 
 TOPIC = "ViewFacadeUnitTestTopic"
 GROUP = "GID_ViewFacadeUnitTest"
@@ -148,7 +148,7 @@ class AdminTwoLegTest(unittest.TestCase):
         self.assertIn("not found", str(ctx.exception))
 
     def _admin(self, fake: FakeClient):
-        from client.admin import DefaultMQAdminExt
+        from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
         admin = DefaultMQAdminExt()
         admin._started = True
         admin._mq_client = fake

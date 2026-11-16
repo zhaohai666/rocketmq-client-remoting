@@ -27,20 +27,20 @@ import time
 
 import pytest
 
-from client import consumer as consumer_mod
-from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
+from rocketmq_client_remoting.client import consumer as consumer_mod
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
                              filter_messages_for_delivery)
-from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
                                     MessageListenerOrderly,
                                     PopResult, PopStatus, PullResult, PullStatus)
-from client.consumer_stats import ConsumerStatsManager
-from client.exception import MQBrokerException
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from common.subscription_data import FilterAPI, SubscriptionData
-from remoting.protocol.codes import ResponseCode
-from remoting.protocol.namespace_util import NamespaceUtil
+from rocketmq_client_remoting.client.consumer_stats import ConsumerStatsManager
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.subscription_data import FilterAPI, SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.namespace_util import NamespaceUtil
 
 GROUP = "GID_GuardUnitTest"
 TOPIC = "GuardUnitTestTopic"

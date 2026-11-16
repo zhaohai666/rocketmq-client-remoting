@@ -24,12 +24,12 @@ import socketserver
 
 import pytest
 
-from remoting.client import RemotingClient
-from remoting.exception import RemotingConnectException
-from remoting.protocol import remoting_command as rc_mod
-from remoting.protocol import headers as headers_mod
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.socks_proxy import (SOCKS4, SOCKS5, SocksProxyConfig, SocksProxyError)
+from rocketmq_client_remoting.remoting.client import RemotingClient
+from rocketmq_client_remoting.remoting.exception import RemotingConnectException
+from rocketmq_client_remoting.remoting.protocol import remoting_command as rc_mod
+from rocketmq_client_remoting.remoting.protocol import headers as headers_mod
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.socks_proxy import (SOCKS4, SOCKS5, SocksProxyConfig, SocksProxyError)
 
 # Connect budget: failure-class assertions must not falsely fail due to the local loopback's transient quirks (budget >= 30s)
 _CONNECT_TIMEOUT_MILLIS = 35000
@@ -512,7 +512,7 @@ def test_socks_proxy_config_parsing_and_semantics():
 
 def test_socks_proxy_config_flows_to_remoting_client():
     """The facade setter -> MQClientInstance -> RemotingClient propagation chain loses no fields."""
-    from client.mq_client import MQClientInstance
+    from rocketmq_client_remoting.client.mq_client import MQClientInstance
     cfg = SocksProxyConfig("127.0.0.1", 1080, SOCKS5, "u", "secret", enable=True)
     instance = MQClientInstance("socks-plumb-cid", ["127.0.0.1:9876"],
                                 socks_proxy_config=cfg)
@@ -533,10 +533,10 @@ class DefaultMQProducerLike:
     """A facade setter smoke test: the same-named fields across five facades are stored/retrieved (no background threads started)."""
 
     def __init__(self):
-        from client.producer import DefaultMQProducer
-        from client.consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer,
+        from rocketmq_client_remoting.client.producer import DefaultMQProducer
+        from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer,
                                      DefaultLitePullConsumer)
-        from client.admin import DefaultMQAdminExt
+        from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
         self.objs = [DefaultMQProducer("PID_SOCKS_PLUMB"),
                      DefaultMQPushConsumer("GID_SOCKS_PLUMB"),
                      DefaultMQPullConsumer("GID_SOCKS_PLUMB"),

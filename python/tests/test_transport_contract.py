@@ -31,12 +31,12 @@ import time
 
 import pytest
 
-from remoting.client import (DEFAULT_CHANNEL_NOT_ACTIVE_INTERVAL_MILLIS,
+from rocketmq_client_remoting.remoting.client import (DEFAULT_CHANNEL_NOT_ACTIVE_INTERVAL_MILLIS,
                              MAX_FRAME_LENGTH, RemotingClient, _ResponseFuture,
                              _interval_millis_or_default, _mono_millis)
-from remoting.exception import RemotingTimeoutException
-from remoting.protocol import remoting_command as rc_mod
-from remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.exception import RemotingTimeoutException
+from rocketmq_client_remoting.remoting.protocol import remoting_command as rc_mod
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
 
 
 def _recv_exact(sock, n):

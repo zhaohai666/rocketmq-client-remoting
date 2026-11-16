@@ -8,8 +8,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PY_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "python"))
 sys.path.insert(0, PY_ROOT)
 
-from remoting.protocol.remoting_command import RemotingCommand  # noqa: E402
-from remoting.protocol.codes import SerializeType  # noqa: E402
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand  # noqa: E402
+from rocketmq_client_remoting.remoting.protocol.codes import SerializeType  # noqa: E402
 
 TOOL = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "build", "examples", "rmq_interop")
 
@@ -208,9 +208,9 @@ def test_heartbeat():
     got_alias = json.loads(run_tool("--decode-heartbeat", alias.hex()))
     check("hb accepts isWithoutSub alias", got_alias.get("withoutSub") is True, got_alias)
 
-    from common.subscription_data import SubscriptionData as PySub
-    from common.subscription_data import FilterAPI as PyFilterAPI
-    from remoting.protocol.heartbeat import ConsumerData as PyConsumerData
+    from rocketmq_client_remoting.common.subscription_data import SubscriptionData as PySub
+    from rocketmq_client_remoting.common.subscription_data import FilterAPI as PyFilterAPI
+    from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumerData as PyConsumerData
 
     # Guard 1: SubscriptionData must be hashable
     # (it defines __eq__; without a matching __hash__ it is unhashable and

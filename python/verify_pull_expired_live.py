@@ -8,13 +8,13 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import (DefaultMQPushConsumer, PULL_MAX_IDLE_TIME,
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, PULL_MAX_IDLE_TIME,
                                       MessageListenerConcurrently)
-from client.consumer_result import ConsumeConcurrentlyStatus
-from client.mq_client import MQClientInstance
-from client.producer import DefaultMQProducer
-from common.message import Message, MessageQueue
-from remoting.protocol.body import ConsumerRunningInfo
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.common.message import Message, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.body import ConsumerRunningInfo
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "PullExpPy_%d" % int(time.time() * 1000)

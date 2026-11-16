@@ -16,17 +16,17 @@ import threading
 
 import pytest
 
-from remoting.client import RemotingClient
-from remoting.protocol import remoting_command as rc_mod
-from remoting.protocol import headers as headers_mod
-from remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.client import RemotingClient
+from rocketmq_client_remoting.remoting.protocol import remoting_command as rc_mod
+from rocketmq_client_remoting.remoting.protocol import headers as headers_mod
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
 
 # ---------------------------------------------------------------- traceparent
 
-from client.trace_context import (
+from rocketmq_client_remoting.client.trace_context import (
     TRACE_CONTEXT_PROPERTY, child_traceparent, extract_traceparent,
     generate_traceparent, inject_trace_context, is_valid_traceparent)
-from common.message import Message, MessageExt
+from rocketmq_client_remoting.common.message import Message, MessageExt
 
 
 def test_generate_traceparent_shape():

@@ -6,11 +6,11 @@ import time
 
 import pytest
 
-from client.consume_executor import ConsumeExecutor
-from client.consumer import DefaultMQPushConsumer
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from remoting.protocol.body import ConsumerRunningInfo
+from rocketmq_client_remoting.client.consume_executor import ConsumeExecutor
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.remoting.protocol.body import ConsumerRunningInfo
 
 GROUP = "GID_ThreadPoolUnit"
 

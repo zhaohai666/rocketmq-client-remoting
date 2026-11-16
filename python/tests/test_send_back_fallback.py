@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import pytest
 
-from client.consumer import DefaultMQPullConsumer, DefaultMQPushConsumer
-from client.exception import MQClientException
-from common.message import MessageExt, MessageQueue
-from common.message_const import MessageConst
-from common.mix_all import MixAll
-from remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.client.consumer import DefaultMQPullConsumer, DefaultMQPushConsumer
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
 
 GROUP = "GID_SendBackFallbackUnit"
 TOPIC = "SendBackFallbackTopic"

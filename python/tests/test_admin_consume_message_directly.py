@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException, MQClientException
-from common.message_const import MessageConst
-from common.message import MessageExt
-from remoting.protocol.body import CMResult, ConsumeMessageDirectlyResult
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.message import MessageExt
+from rocketmq_client_remoting.remoting.protocol.body import CMResult, ConsumeMessageDirectlyResult
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_AdminDirectlyUnit"
 TOPIC = "AdminDirectlyUnitTopic"

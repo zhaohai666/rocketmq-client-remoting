@@ -3,15 +3,15 @@
 and the instance's getBrokerNameFromMessageQueue override, five cases in total."""
 from __future__ import annotations
 
-from client import static_topic
-from client.mq_client import MQClientInstance
-from client.static_topic import (TopicQueueMappingInfo,
+from rocketmq_client_remoting.client import static_topic
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.static_topic import (TopicQueueMappingInfo,
                                  is_logical_queue_mock_broker_name,
                                  get_mock_broker_name,
                                  parse_topic_queue_mapping_info,
                                  topic_route_data_2_endpoints_for_static_topic)
-from common.message import MessageQueue
-from remoting.protocol.route import TopicRouteData
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.remoting.protocol.route import TopicRouteData
 
 
 def raw_mapping(scope, total_queues, bname, epoch, curr_id_map):

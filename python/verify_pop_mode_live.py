@@ -43,10 +43,10 @@ from typing import Optional, Tuple
 
 sys.path.insert(0, ".")
 
-from client.admin import DefaultMQAdminExt
-from common.mix_all import MixAll
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 LEGS = (sys.argv[2] if len(sys.argv) > 2 else "all").split(",")

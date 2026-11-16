@@ -8,14 +8,14 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import (DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer,
                                       SimpleMessageListener)
-from client.producer import (DefaultMQProducer, LocalTransactionState,
+from rocketmq_client_remoting.client.producer import (DefaultMQProducer, LocalTransactionState,
                                       TransactionListener)
-from common.message import Message
-from common.mix_all import MixAll
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "TxPy_%d" % int(time.time() * 1000)
@@ -50,7 +50,7 @@ class ConsumeCollector:
 
         def listener(msgs, context):
             self.msgs.extend(msgs)
-            from client.consumer import ConsumeConcurrentlyStatus
+            from rocketmq_client_remoting.client.consumer import ConsumeConcurrentlyStatus
             return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
         # It has to be a SimpleMessageListener; the callback parameter is a **list of messages** (not a single one)

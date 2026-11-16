@@ -5,11 +5,11 @@ import threading
 import time
 from collections import deque
 
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import (ConsumeConcurrentlyStatus,
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus,
                                               MessageListenerOrderly)
-from common.message import MessageExt, MessageQueue
-from common.message_accessor import MessageAccessor
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_accessor import MessageAccessor
 
 GROUP = "GID_CleanExpiredUnitTest"
 TOPIC = "CleanExpiredUnitTestTopic"
@@ -179,7 +179,7 @@ def test_sweep_thread_is_daemon_and_stops_with_the_flag():
 def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([m])
 
@@ -196,7 +196,7 @@ def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
     pass
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     head = msg(0)                                   # unstamped
     tail = stamp(msg(1), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([head, tail])
@@ -211,7 +211,7 @@ def test_expiry_is_strictly_greater_than_timeout(monkeypatch):
     pass
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     boundary = stamp(msg(0), int(clock.now_ms) - h.timeout_ms)
     h.inflight([boundary])
 
@@ -272,7 +272,7 @@ def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
     pass
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.inflight([m])
 
@@ -286,7 +286,7 @@ def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
 def test_concurrent_batch_registers_inflight_and_send_back_proceeds(monkeypatch):
     """Control leg: while the message is still registered (not swept), an unacknowledged send-back proceeds normally."""
     h = Harness()
-    monkeypatch.setattr("client.consumer.time", Clock())
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", Clock())
 
     class Listener:
         def consume_message(self, msgs, context):
@@ -305,7 +305,7 @@ def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
     pass
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     swept = []
 
     class Listener:
@@ -329,7 +329,7 @@ def test_sweep_can_reclaim_a_requeued_buffered_message(monkeypatch):
     pass
     h = Harness()
     clock = Clock()
-    monkeypatch.setattr("client.consumer.time", clock)
+    monkeypatch.setattr("rocketmq_client_remoting.client.consumer.time", clock)
     m = stamp(msg(0), int(clock.now_ms) - h.timeout_ms - 1)
     h.buffered([m])
 

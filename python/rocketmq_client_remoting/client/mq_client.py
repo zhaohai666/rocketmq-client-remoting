@@ -1,0 +1,1934 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import random
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
+
+from rocketmq_client_remoting.common.boundary_type import BoundaryType
+from rocketmq_client_remoting.common.message import Message, MessageBatch, MessageExt, MessageQueue
+from rocketmq_client_remoting.common.message_accessor import MessageAccessor
+from rocketmq_client_remoting.common.message_client_id_setter import get_uniq_id, set_uniq_id
+from rocketmq_client_remoting.common.message_const import MessageConst
+from rocketmq_client_remoting.common.message_decoder import (decode_message, decode_messages, decompress_body,
+                                      message_properties_2_string,
+                                      string_2_message_properties,
+                                      unwrap_inner_batch_messages)
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.common.subscription_data import ExpressionType, SubscriptionData
+from rocketmq_client_remoting.common.sysflag import MessageSysFlag, PullSysFlag
+from rocketmq_client_remoting.client import static_topic
+from rocketmq_client_remoting.common.topic_config import TopicFilterType
+from rocketmq_client_remoting.logging import get_logger
+from rocketmq_client_remoting.remoting.client import RemotingClient
+from rocketmq_client_remoting.remoting.protocol.body import (CheckClientRequestBody, ClusterInfo,
+                                      ConsumerRunningInfo, ConsumeMessageDirectlyResult,
+                                      GetConsumerStatusBody,
+                                      GetConsumerListByGroupResponseBody, ResetOffsetBody,
+                                      ResetOffsetBodyForC, TopicList)
+
+if TYPE_CHECKING:
+    from .consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode, SerializeType
+from rocketmq_client_remoting.remoting.protocol.headers import (ConsumeMessageDirectlyResultRequestHeader,
+                                         CreateTopicRequestHeader,
+                                         GetConsumerListByGroupRequestHeader,
+                                         GetConsumerRunningInfoRequestHeader,
+                                         GetConsumerStatusRequestHeader,
+                                         GetMaxOffsetRequestHeader,
+                                         GetMaxOffsetResponseHeader, GetMinOffsetRequestHeader,
+                                         GetMinOffsetResponseHeader,
+                                         NotifyConsumerIdsChangedRequestHeader,
+                                         PullMessageRequestHeader,
+                                         PullMessageResponseHeader, QueryConsumerOffsetRequestHeader,
+                                         QueryConsumerOffsetResponseHeader, QueryMessageRequestHeader,
+                                         QueryMessageResponseHeader,
+                                         RecallMessageRequestHeader, RecallMessageResponseHeader,
+                                         ReplyMessageRequestHeader,
+                                         ResetOffsetRequestHeader,
+                                         SearchOffsetRequestHeader,
+                                         SearchOffsetResponseHeader, SendMessageRequestHeader,
+                                         SendMessageRequestHeaderV2, SendMessageResponseHeader,
+                                         UpdateConsumerOffsetRequestHeader)
+from rocketmq_client_remoting.remoting.protocol.heartbeat import HeartbeatData, HeartbeatV2Result
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import TopicRouteData
+from rocketmq_client_remoting.remoting.rpchook import NamespaceRpcHook, StreamTypeRPCHook
+from .consumer_stats import ConsumerStatsManager
+from .exception import ClientErrorCode, MQBrokerException, MQClientException
+from .heartbeat_v2 import HeartbeatV2Coordinator
+from .mq_client_manager import MQClientManager
+from .request_reply import REQUEST_FUTURE_HOLDER, is_reply_message
+from .send_result import SendResult, SendStatus
+from .top_addressing import DefaultTopAddressing
+
+logger = get_logger()
+
+
+class TopicPublishInfo:
+    pass
+
+    def __init__(self):
+        self.order_topic = False
+        self.msg_queue_list: List[MessageQueue] = []
+        self.topic_route_data: Optional[TopicRouteData] = None
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def ok(self) -> bool:
+        return len(self.msg_queue_list) > 0
+
+    def reset_index(self) -> None:
+        self._index = 0
+
+    def select_one_message_queue(self, *filters) -> Optional[MessageQueue]:
+        pass
+        with self._lock:
+            if not self.msg_queue_list:
+                raise MQClientException("no message queue for publish info")
+            n = len(self.msg_queue_list)
+            if not filters:
+                mq = self.msg_queue_list[self._index % n]
+                self._index += 1
+                return mq
+            for _ in range(n):
+                mq = self.msg_queue_list[self._index % n]
+                self._index += 1
+                if all(f(mq) for f in filters):
+                    return mq
+            return None
+
+    def to_dict(self) -> dict:
+        return {
+            "orderTopic": self.order_topic,
+            "messageQueueList": [
+                {"topic": q.topic, "brokerName": q.broker_name, "queueId": q.queue_id}
+                for q in self.msg_queue_list
+            ],
+        }
+
+
+class MQClientInstance:
+    INSTANCE_MAP: Dict[str, "MQClientInstance"] = {}
+    INSTANCE_LOCK = threading.Lock()
+
+    def __init__(self, client_id: str, name_server_addrs: List[str],
+                 connect_timeout_millis: int = 3000, invoke_timeout_millis: int = 15000,
+                 tls_enable: Optional[bool] = None,
+                 tls_options: Optional[Dict[str, str]] = None,
+                 enable_stream_request_type: bool = False,
+                 unit_name: Optional[str] = None,
+                 namespace_v2: Optional[str] = None,
+                 poll_name_server_interval: int = 30000,
+                 socks_proxy_config=None,
+                 vip_channel_enabled: bool = False,
+                 decode_read_body: bool = True,
+                 mq_client_api_timeout: int = 3000,
+                 enable_concurrent_heartbeat: bool = False,
+                 concurrent_heartbeat_thread_pool_size: Optional[int] = None,
+                 channel_not_active_interval_millis: int = 120000,
+                 namesrv_domain: Optional[str] = None,
+                 namesrv_subgroup: Optional[str] = None):
+        self.client_id = client_id
+        self.name_server_addrs: List[str] = list(name_server_addrs)
+        self.poll_name_server_interval = poll_name_server_interval
+        self.namespace_v2 = namespace_v2 or ""
+        self.socks_proxy_config = socks_proxy_config
+        # When on, every broker RPC listed in ``vip_addr`` below targets the VIP port
+        # (listen port - 2). Off by default: the fast channel only exists on a broker that was
+        # started with it enabled, so rewriting by default would point at a closed port.
+        self.vip_channel_enabled = bool(vip_channel_enabled)
+        # With this switch off, a received message body is skipped (header only) instead of
+        # being copied, CRC-checked and decompressed.
+        self.decode_read_body = bool(decode_read_body)
+        self.mq_client_api_timeout = int(mq_client_api_timeout)
+        self.enable_concurrent_heartbeat = bool(enable_concurrent_heartbeat)
+        self.concurrent_heartbeat_thread_pool_size = max(
+            1, int(concurrent_heartbeat_thread_pool_size or (os.cpu_count() or 1)))
+        # Whether a newly established connection to a known broker immediately re-sends the
+        # consumer heartbeat and wakes rebalance (default on). The broker drops a consumer group
+        # once its last channel closes, so after a reconnect the group is unregistered there
+        # until the next heartbeat; without this the pull loop answers SUBSCRIPTION_NOT_EXIST
+        # for up to a full heartbeat interval. Only reachable through the transport's
+        # channel-active event, see RemotingClient.register_channel_listener.
+        self.enable_heartbeat_channel_event_listener = True
+        self._heartbeat_executor: Optional[ThreadPoolExecutor] = None
+        # Heartbeat V2 per-stream state (the set of brokers known to speak V2 plus the
+        # broker addr -> fingerprint table); the facades decide whether to use it, see
+        # client/heartbeat_v2.py.
+        self._heartbeat_v2 = HeartbeatV2Coordinator(self)
+        self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
+                                              tls_enable=tls_enable, tls_options=tls_options,
+                                              socks_proxy_config=socks_proxy_config,
+                                              channel_not_active_interval_millis=channel_not_active_interval_millis)
+        self.remoting_client.register_rpc_hook(NamespaceRpcHook(self.namespace_v2))
+        self.remoting_client.register_channel_listener(self)
+        if enable_stream_request_type:
+            self.remoting_client.register_rpc_hook(StreamTypeRPCHook())
+        self.topic_route_table: Dict[str, TopicRouteData] = {}
+        self.topic_publish_info_table: Dict[str, TopicPublishInfo] = {}
+        self.broker_addr_table: Dict[str, Dict[int, str]] = {}
+        self.topic_end_points_table: Dict[str, Dict[MessageQueue, str]] = {}
+        self.topic_route_lock = threading.RLock()
+        self._started = False
+        self._last_route_fetch = 0.0
+        self._topics_in_use: set = set()
+        self._route_refresh_thread: Optional[threading.Thread] = None
+        self._route_refresh_stop = threading.Event()
+        self.remoting_client.register_processor(
+            RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, self._process_reply_message)
+        self.remoting_client.register_processor(
+            RequestCode.RESET_CONSUMER_CLIENT_OFFSET, self._process_reset_offset)
+        self.remoting_client.register_processor(
+            RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, self._process_get_consumer_status)
+        self.remoting_client.register_processor(
+            RequestCode.GET_CONSUMER_RUNNING_INFO, self._process_get_consumer_running_info)
+        self.remoting_client.register_processor(
+            RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
+        self.remoting_client.register_processor(
+            RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._process_notify_consumer_ids_changed)
+        # 40 can only be sent by the broker; test cases cannot inject a reverse request, so the count is the
+        # only place that proves "this side actually received and processed it" (see python/tests/test_broker_requests.py).
+        self._consumer_ids_changed_count = 0
+        self.remoting_client.register_processor(
+            RequestCode.CHECK_TRANSACTION_STATE, self._dispatch_check_transaction_state)
+        self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
+        self._transaction_check_handlers: List[Callable] = []
+        # Explicit facade setting wins over the ROCKETMQ_NAMESRV_DOMAIN environment
+        # variable inside DefaultTopAddressing (Java ClientConfig semantics).
+        self.top_addressing = DefaultTopAddressing(
+            unit_name=unit_name or "",
+            domain=(namesrv_domain or "").strip() or None,
+            subgroup=(namesrv_subgroup or "").strip() or None)
+        self.consumer_stats_manager = ConsumerStatsManager()
+        self._namesrv_refresh_stop = threading.Event()
+        self._namesrv_refresh_thread: Optional[threading.Thread] = None
+        self._adjust_pool_stop = threading.Event()
+        self._adjust_pool_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.RLock()
+        MQClientInstance.INSTANCE_MAP[client_id] = self
+
+    def fetch_name_server_addr(self) -> Optional[str]:
+        pass
+        if self.top_addressing is None or not self.top_addressing.ws_addr:
+            return None
+        changed = self.top_addressing.fetch_and_apply()
+        if changed:
+            addrs = [a.strip() for a in changed.split(";") if a.strip()]
+            self.update_name_server_address_list(addrs)
+        return changed
+
+    def adjust_thread_pool(self) -> None:
+        pass
+        for group, consumer in list(self._consumer_table.items()):
+            if consumer is None:
+                continue
+            try:
+                consumer.adjust_thread_pool()
+            except Exception as e:
+                logger.debug("adjustThreadPool failed for group %s: %s", group, e)
+
+    # ---------------- consumer registration (broker proactively dispatches requests by group) ----------------
+    def register_consumer(self, group: str, consumer: "DefaultMQPushConsumer") -> None:
+        pass
+        self._consumer_table[group] = consumer
+
+    def unregister_consumer(self, group: str) -> None:
+        self._consumer_table.pop(group, None)
+
+    def find_consumer(self, group: str) -> Optional["DefaultMQPushConsumer"]:
+        return self._consumer_table.get(group)
+
+    # ---------------- transaction check-back handler registration (facade side dispatched by 39) ----------------
+    def register_transaction_check_handler(self, handler: Callable) -> None:
+        pass
+        with self._lifecycle_lock:
+            if handler not in self._transaction_check_handlers:
+                self._transaction_check_handlers.append(handler)
+
+    def unregister_transaction_check_handler(self, handler: Callable) -> None:
+        with self._lifecycle_lock:
+            try:
+                self._transaction_check_handlers.remove(handler)
+            except ValueError:
+                pass
+
+    def _dispatch_check_transaction_state(self, cmd: RemotingCommand,
+                                          addr: str) -> Optional[RemotingCommand]:
+        """39 is oneway, no response; hand the request to each registered producer handler."""
+        for handler in list(self._transaction_check_handlers):
+            try:
+                handler(cmd, addr)
+            except Exception as e:  # noqa: BLE001 -- one producer's exception does not affect other facades
+                logger.warning("checkTransactionState dispatch failed: %s", e)
+        return None
+
+
+    # ---------------- CHECK_CLIENT_CONFIG(46): verify subscription expression with the broker ----------------
+    def check_client_in_broker(self) -> None:
+        pass
+        for group, consumer in list(self._consumer_table.items()):
+            subs = consumer.subscriptions() if consumer is not None else None
+            if not subs:
+                return
+            self.check_subscriptions_in_broker(group, subs)
+
+    def check_subscriptions_in_broker(self, group: str,
+                                      subs: Iterable[SubscriptionData]) -> None:
+        pass
+        for sub in subs:
+            if sub is None or not sub.expression_type or sub.expression_type == ExpressionType.TAG:
+                continue
+            addr = self.find_broker_addr_by_topic(sub.topic or "")
+            if addr is None:
+                continue
+            try:
+                self.check_client_config(addr, group, self.client_id, sub)
+            except MQClientException:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise MQClientException(
+                    "Check client in broker error, maybe because you use %s to filter "
+                    "message, but server has not been upgraded to support!This error would "
+                    "not affect the launch of consumer, but may has impact on message "
+                    "receiving if you have use the new features which are not supported by "
+                    "server, please check the log!" % sub.expression_type, cause=e)
+
+    # ---------------- 40 NOTIFY_CONSUMER_IDS_CHANGED ----------------
+    @property
+    def consumer_ids_changed_count(self) -> int:
+        """How many times this instance has received the broker's ``NOTIFY_CONSUMER_IDS_CHANGED(40)``."""
+        return self._consumer_ids_changed_count
+
+    def rebalance_immediately(self) -> None:
+        pass
+        for consumer in list(self._consumer_table.values()):
+            if consumer is None:
+                continue
+            wake = getattr(consumer, "rebalance_immediately", None)
+            if wake is None:
+                continue
+            try:
+                wake()
+            except Exception as e:
+                logger.warning("rebalance_immediately failed: %s", e)
+
+    # ---------------- channel-active re-registration ----------------
+    def on_channel_active(self, addr: str) -> None:
+        """A connection to ``addr`` has just been established: re-register the consumer groups.
+
+        The transport calls this right after the connection enters the table. A broker forgets a
+        consumer group when that group's last channel closes, so a reconnect (a sync timeout takes
+        the channel down, see RemotingClient) is followed by pulls the broker rejects with
+        SUBSCRIPTION_NOT_EXIST until the next heartbeat round. Sending one heartbeat now keeps the
+        gap to a round trip instead of a whole heartbeat interval.
+
+        Runs on a background thread: the caller is usually the pull loop that just reconnected,
+        and the heartbeat must do its own round trip without holding up that loop.
+        """
+        if not self.enable_heartbeat_channel_event_listener:
+            return
+        if not self._is_known_broker_addr(addr):
+            return
+        threading.Thread(target=self._re_register_on_channel_active, args=(addr,),
+                         name="rmq-channel-active-%s" % addr, daemon=True).start()
+
+    def _is_known_broker_addr(self, addr: str) -> bool:
+        for broker_addrs in list(self.broker_addr_table.values()):
+            if addr in broker_addrs.values():
+                return True
+        return False
+
+    def _re_register_on_channel_active(self, addr: str) -> None:
+        for group, consumer in list(self._consumer_table.items()):
+            heartbeat = getattr(consumer, "heartbeat_to_broker", None)
+            if heartbeat is None:
+                continue
+            try:
+                heartbeat(addr)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("channel-active heartbeat for group %s to %s failed: %s",
+                             group, addr, e)
+        self.rebalance_immediately()
+
+    def _process_notify_consumer_ids_changed(self, cmd: RemotingCommand,
+                                             addr: str) -> Optional[RemotingCommand]:
+        pass
+        header = NotifyConsumerIdsChangedRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        self._consumer_ids_changed_count += 1
+        logger.info("receive broker's notification[%s], the consumer group: %s changed, "
+                    "rebalance immediately", addr, header.consumer_group)
+        self.rebalance_immediately()
+        return None
+
+    # ---------------- broker proactive request handling (broker -> client requests) ----------------
+    def _process_reset_offset(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """RESET_CONSUMER_CLIENT_OFFSET(220): sent by the broker via invokeOneway, no reply needed.
+
+        But the reset logic triggers rebalance (lock/unlock/batch etc. via invokeSync), which cannot run
+        synchronously on the read thread -- hand it to a background thread and return None immediately (oneway).
+        """
+        header = ResetOffsetRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            logger.warning("RESET_CONSUMER_CLIENT_OFFSET: no consumer for group=%s", group)
+            return None
+        topic = header.topic
+        offset_table: Dict[MessageQueue, int] = {}
+        if cmd.body:
+            try:
+                offset_table = ResetOffsetBody.decode(cmd.body).offset_table
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RESET_CONSUMER_CLIENT_OFFSET: not map-form body: %s", e)
+            if not offset_table:
+                try:
+                    for e in ResetOffsetBodyForC.decode(cmd.body).offset_table:
+                        offset_table[MessageQueue(e.topic, e.broker_name, e.queue_id)] = e.offset
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("RESET_CONSUMER_CLIENT_OFFSET: bad body: %s", e)
+                    return None
+
+        def _run() -> None:
+            try:
+                consumer.reset_offset(topic, offset_table)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("reset offset failed (group=%s topic=%s): %s",
+                               group, topic, e)
+
+        t = threading.Thread(target=_run, daemon=True,
+                             name="rmq-reset-offset-%s" % (group or "?"))
+        t.start()
+        return None
+
+    def _process_get_consumer_status(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """GET_CONSUMER_STATUS_FROM_CLIENT(221): return the consumed-offset table (Map<MessageQueue,Long>)."""
+        header = GetConsumerStatusRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.group
+        consumer = self.find_consumer(group) if group else None
+        # An unknown group is still answered SUCCESS with an empty table: the
+        # asking side always decodes the body, and an error code makes it drop
+        # the reply instead of reporting "this group consumed nothing".
+        status = dict(consumer.get_consumer_status(header.topic)) if consumer else {}
+        body = GetConsumerStatusBody()
+        body.message_queue_table = status
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = body.encode()
+        return resp
+
+    def _process_get_consumer_running_info(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """GET_CONSUMER_RUNNING_INFO(307): return this consumer's running info."""
+        header = GetConsumerRunningInfoRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.consumer_group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            # The admin side reports which client it probed, so the reply has to
+            # name the group that is not hosted here.
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR,
+                "The Consumer Group <%s> not exist in this consumer" % group, None)
+        info = consumer.consumer_running_info()
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = info.encode()
+        return resp
+
+    def _process_consume_message_directly(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        """CONSUME_MESSAGE_DIRECTLY(309): the broker pushes a message down, requiring one real local consumption."""
+        header = ConsumeMessageDirectlyResultRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        group = header.consumer_group
+        consumer = self.find_consumer(group) if group else None
+        if consumer is None:
+            # Same as 307: the probe is reported per client, so name the group.
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR,
+                "The Consumer Group <%s> not exist in this consumer" % group, None)
+        if not cmd.body:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "empty message body", None)
+        msg = decode_message(cmd.body, check_crc=False)
+        if msg is None:
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "decode message failed", None)
+        result = consumer.consume_message_directly(msg, header.broker_name)
+        resp = RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        resp.body = result.encode()
+        return resp
+
+    # ---------------- lifecycle ----------------
+    def start(self) -> None:
+        pass
+        with self._lifecycle_lock:
+            if self._started:
+                return
+            self._started = True
+            try:
+                self._start_locked()
+            except Exception:
+                self._started = False
+                MQClientManager.get_instance().remove_client_factory(self.client_id, self)
+                raise
+
+    def _start_locked(self) -> None:
+        self.consumer_stats_manager.start()
+        if self.enable_concurrent_heartbeat and self._heartbeat_executor is None:
+            self._heartbeat_executor = ThreadPoolExecutor(
+                max_workers=self.concurrent_heartbeat_thread_pool_size,
+                thread_name_prefix="rmq-heartbeat-%s" % self.client_id)
+        dynamic_ns = (not self.name_server_addrs
+                      and self.top_addressing is not None
+                      and bool(self.top_addressing.ws_addr))
+        if dynamic_ns:
+            self.fetch_name_server_addr()
+            if not self.name_server_addrs:
+                raise MQClientException(
+                    "name server address is not set and address server (%s) returned none"
+                    % self.top_addressing.ws_addr,
+                    ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
+            self._namesrv_refresh_stop.clear()
+            t = threading.Thread(target=self._namesrv_refresh_loop, daemon=True,
+                                 name="rmq-namesrv-refresh-%s" % self.client_id)
+            t.start()
+            self._namesrv_refresh_thread = t
+        if self._route_refresh_thread is None:
+            self._route_refresh_stop.clear()
+            t = threading.Thread(target=self._route_refresh_loop, daemon=True,
+                                 name="rmq-route-refresh-%s" % self.client_id)
+            t.start()
+            self._route_refresh_thread = t
+        if self._adjust_pool_thread is None:
+            self._adjust_pool_stop.clear()
+            t = threading.Thread(target=self._adjust_thread_pool_loop, daemon=True,
+                                 name="rmq-adjust-pool-%s" % self.client_id)
+            t.start()
+            self._adjust_pool_thread = t
+
+    def shutdown(self) -> None:
+        # the real shutdown is triggered by MQClientManager when the reference count hits zero (unregister_client);
+        # this shares a lock with start() to avoid interleaving with a concurrent start() under reuse.
+        with self._lifecycle_lock:
+            self._started = False
+            self._route_refresh_stop.set()
+            self._adjust_pool_stop.set()
+            self._namesrv_refresh_stop.set()
+            if self._heartbeat_executor is not None:
+                self._heartbeat_executor.shutdown(wait=True, cancel_futures=True)
+                self._heartbeat_executor = None
+            self.consumer_stats_manager.shutdown()
+            self.remoting_client.shutdown()
+
+    def _namesrv_refresh_loop(self) -> None:
+        pass
+        if self._namesrv_refresh_stop.wait(10.0):
+            return
+        while True:
+            if not self._started:
+                return
+            try:
+                self.fetch_name_server_addr()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("fetchNameServerAddr exception: %s", e)
+            if self._namesrv_refresh_stop.wait(120.0):
+                return
+
+    def _adjust_thread_pool_loop(self) -> None:
+        pass
+        if self._adjust_pool_stop.wait(60.0):
+            return
+        while True:
+            if not self._started:
+                return
+            self.adjust_thread_pool()
+            if self._adjust_pool_stop.wait(60.0):
+                return
+
+    def register_topic_in_use(self, topic: str) -> None:
+        pass
+        if topic:
+            self._topics_in_use.add(topic)
+
+    def _route_refresh_loop(self) -> None:
+        pass
+        if self._route_refresh_stop.wait(0.01):
+            return
+        period = self.poll_name_server_interval / 1000.0
+        while True:
+            if not self._started:
+                return
+            for topic in list(self._topics_in_use):
+                try:
+                    self.update_topic_route_info_from_name_server(topic)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("route refresh failed for %s: %s", topic, e)
+            if self._route_refresh_stop.wait(period):
+                return
+
+    def update_name_server_address_list(self, addrs: List[str]) -> None:
+        if addrs:
+            self.name_server_addrs = list(addrs)
+
+    # ---------------- low-level invoke ----------------
+    def _invoke_sync(self, addr: str, request: RemotingCommand,
+                     timeout_millis: Optional[int] = None) -> RemotingCommand:
+        return self.remoting_client.invoke_sync(addr, request, timeout_millis)
+
+    def vip_addr(self, addr: Optional[str]) -> Optional[str]:
+        """The address a broker RPC is really sent to.
+
+        With the VIP channel enabled, the requests the broker answers on the fast channel it opens
+        next to the plain one -- message sends, the offset / lock / consumer-list family, the topic
+        and subscription administration calls -- target **the broker's listen port minus 2**
+        (``10911 -> 10909``). The NameServer is never rewritten (there is no VIP channel on 9876),
+        and neither are the requests only ever answered on the plain port: PULL_MESSAGE,
+        POP/ACK/CHANGE_INVISIBLE_TIME, HEART_BEAT, UNREGISTER_CLIENT, END_TRANSACTION,
+        RECALL_MESSAGE, and reading a broker's own configuration.
+        """
+        if addr is None or not self.vip_channel_enabled:
+            return addr
+        return MixAll.broker_vip_channel(True, addr)
+
+    def _check_response(self, response: RemotingCommand) -> RemotingCommand:
+        if response.code == ResponseCode.SUCCESS:
+            return response
+        raise MQBrokerException(response.code, response.remark or "")
+
+    # ---------------- route management ----------------
+    def update_topic_route_info_from_name_server(self, topic: str,
+                                                 timeout_millis: Optional[int] = None,
+                                                 is_default: bool = False) -> bool:
+        pass
+        if not self.name_server_addrs:
+            raise MQClientException("name server address list is empty",
+                                    ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
+        timeout_millis = (self.mq_client_api_timeout if timeout_millis is None
+                          else timeout_millis)
+
+        def _fetch(t: str):
+            request = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC, None)
+            request.ext_fields["topic"] = t
+            last_exc = None
+            for ns_addr in self.name_server_addrs:
+                try:
+                    response = self._invoke_sync(ns_addr, request, timeout_millis)
+                except Exception as e:  # noqa: BLE001
+                    last_exc = e
+                    continue
+                if response.code == ResponseCode.SUCCESS and response.body:
+                    return TopicRouteData.decode(response.body)
+                return None
+            if last_exc is not None and not isinstance(last_exc, MQBrokerException):
+                raise last_exc
+            return None
+
+        route = _fetch(topic)
+        if route is None and is_default and topic != MixAll.DEFAULT_TOPIC:
+            route = _fetch(MixAll.DEFAULT_TOPIC)
+            if route is not None:
+                # a new topic is created by the broker with default_topic_queue_nums queues, while the default
+                # topic itself may have more queues configured; trim here to the broker's actual count to avoid
+                # selecting an illegal queueId.
+                cap = MixAll.DEFAULT_TOPIC_QUEUE_NUMS
+                for qd in route.queue_datas:
+                    qd.write_queue_nums = min(qd.write_queue_nums, cap)
+                    qd.read_queue_nums = min(qd.read_queue_nums, cap)
+        if route is None:
+            return False
+        with self.topic_route_lock:
+            self.topic_route_table[topic] = route
+            for bd in route.get_broker_datas():
+                self.broker_addr_table[bd.broker_name] = dict(bd.broker_addrs)
+            endpoints = static_topic.topic_route_data_2_endpoints_for_static_topic(topic, route)
+            if endpoints is not None:
+                self.topic_end_points_table[topic] = endpoints
+            else:
+                self.topic_end_points_table.pop(topic, None)
+            publish = self.topic_publish_info_table.setdefault(topic, TopicPublishInfo())
+            publish.order_topic = route.order_topic_conf is not None
+            publish.topic_route_data = route
+            publish.msg_queue_list = route.get_all_message_queue(topic)
+        return True
+
+    def get_topic_publish_info(self, topic: str, is_default: bool = False) -> TopicPublishInfo:
+        with self.topic_route_lock:
+            info = self.topic_publish_info_table.get(topic)
+            if info is not None and info.ok():
+                return info
+        self.update_topic_route_info_from_name_server(topic, is_default=is_default)
+        with self.topic_route_lock:
+            info = self.topic_publish_info_table.get(topic)
+            if info is None or not info.ok():
+                raise MQClientException("Can not find Message Queue for topic: %s" % topic)
+            return info
+
+    def get_topic_route_data(self, topic: str) -> Optional[TopicRouteData]:
+        with self.topic_route_lock:
+            route = self.topic_route_table.get(topic)
+            if route is not None:
+                return route
+        try:
+            self.update_topic_route_info_from_name_server(topic)
+        except Exception:  # noqa: BLE001
+            pass
+        with self.topic_route_lock:
+            return self.topic_route_table.get(topic)
+
+    def get_topic_subscribe_info(self, topic: str) -> List[MessageQueue]:
+        pass
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return []
+        return route.get_all_subscribe_message_queue(topic)
+
+    @staticmethod
+    def find_broker_addr_in_route(route: TopicRouteData, broker_name: str) -> Optional[str]:
+        for broker_data in route.get_broker_datas():
+            if broker_data.broker_name == broker_name:
+                return broker_data.select_broker_addr()
+        return None
+
+    def find_broker_addr_by_topic(self, topic: str) -> Optional[str]:
+        pass
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return None
+        brokers = route.get_broker_datas()
+        if not brokers:
+            return None
+        return random.choice(brokers).select_broker_addr()
+
+    # ---------------- message send ----------------
+    def publish_addr_for(self, broker_name: str, topic: str) -> str:
+        pass
+        addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(topic)
+            addr = self.find_broker_address_in_publish(broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % broker_name)
+        return addr
+
+    def get_broker_name_from_message_queue(self, mq: MessageQueue) -> str:
+        pass
+        with self.topic_route_lock:
+            endpoints = self.topic_end_points_table.get(mq.topic)
+        if endpoints:
+            real = endpoints.get(mq)
+            if real is not None:
+                return real
+        return mq.broker_name
+
+    def pop_ack_addr(self, broker_name: str, topic: str, queue_id: int) -> str:
+        pass
+        def _resolve_des() -> str:
+            if static_topic.is_logical_queue_mock_broker_name(broker_name):
+                return self.get_broker_name_from_message_queue(
+                    MessageQueue(topic, broker_name, queue_id))
+            return broker_name
+
+        des = _resolve_des()
+        addr = self.find_broker_address_in_publish(des)
+        if not addr:
+            self.update_topic_route_info_from_name_server(topic)
+            des = _resolve_des()
+            addr = self.find_broker_address_in_publish(des)
+        if not addr:
+            raise MQClientException(
+                "The broker[%s] master node does not exist" % des)
+        return addr
+
+    def send_message(self, producer_group: str, msg: Message, mq: MessageQueue,
+                     timeout_millis: int = 3000, sys_flag: int = 0,
+                     unit_mode: bool = False,
+                     default_topic: Optional[str] = None,
+                     default_topic_queue_nums: Optional[int] = None) -> SendResult:
+        return self.send_message_to_addr(producer_group, msg, mq,
+                                         self.publish_addr_for(mq.broker_name, mq.topic),
+                                         timeout_millis, sys_flag, unit_mode, default_topic,
+                                         default_topic_queue_nums)
+
+    def send_message_to_addr(self, producer_group: str, msg: Message, mq: MessageQueue,
+                             addr: str, timeout_millis: int = 3000,
+                             sys_flag: int = 0, unit_mode: bool = False,
+                             default_topic: Optional[str] = None,
+                             default_topic_queue_nums: Optional[int] = None) -> SendResult:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                           unit_mode, default_topic, default_topic_queue_nums)
+        # The VIP channel wraps every send flavour: SEND_MESSAGE_V2, SEND_BATCH_MESSAGE and
+        # SEND_REPLY_MESSAGE_V2 (the request-reply reply is a send, and here the rewrite happens
+        # in the send path itself, i.e. before the request code is even chosen).
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        return self._parse_send_response(response, msg, mq)
+
+    def send_message_oneway(self, producer_group: str, msg: Message, mq: MessageQueue,
+                            addr: str, timeout_millis: int = 3000,
+                            sys_flag: int = 0, unit_mode: bool = False,
+                            default_topic: Optional[str] = None,
+                            default_topic_queue_nums: Optional[int] = None) -> None:
+        request = self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                           unit_mode, default_topic, default_topic_queue_nums)
+        request.mark_oneway_rpc()
+        self.remoting_client.invoke_oneway(self.vip_addr(addr), request)
+
+    def build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
+                           timeout_millis: int = 3000, sys_flag: int = 0,
+                           unit_mode: bool = False,
+                           default_topic: Optional[str] = None,
+                           default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
+        pass
+        return self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
+                                        unit_mode, default_topic, default_topic_queue_nums)
+
+    def send_message_async(self, addr: str, request: RemotingCommand, msg: Message,
+                           mq: MessageQueue, timeout_millis: int,
+                           on_complete: Callable[[Optional[SendResult], Optional[BaseException]],
+                                                 None]) -> None:
+        pass
+        def _callback(response: Optional[RemotingCommand],
+                      error: Optional[BaseException]) -> None:
+            if error is not None:
+                on_complete(None, error)
+                return
+            try:
+                on_complete(self._parse_send_response(response, msg, mq), None)
+            except Exception as parse_error:  # noqa: BLE001 -- on parse failure, still hand it to the caller
+                on_complete(None, parse_error)
+
+        self.remoting_client.invoke_async(self.vip_addr(addr), request, _callback, timeout_millis)
+
+    def _build_send_request(self, producer_group: str, msg: Message, mq: MessageQueue,
+                            timeout_millis: int = 3000, sys_flag: int = 0,
+                            unit_mode: bool = False,
+                            default_topic: Optional[str] = None,
+                            default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
+        pass
+        if not isinstance(msg, MessageBatch):
+            set_uniq_id(msg)
+        header = SendMessageRequestHeaderV2()
+        header.producer_group = producer_group
+        header.topic = msg.topic
+        header.default_topic = default_topic or MixAll.DEFAULT_TOPIC
+        header.default_topic_queue_nums = (default_topic_queue_nums
+                                          if default_topic_queue_nums is not None
+                                          else MixAll.DEFAULT_TOPIC_QUEUE_NUMS)
+        header.queue_id = mq.queue_id
+        header.sys_flag = sys_flag
+        header.born_timestamp = int(time.time() * 1000)
+        header.flag = msg.flag
+        header.properties = message_properties_2_string(msg.properties)
+        header.reconsume_times = 0
+        header.unit_mode = unit_mode
+        header.max_reconsume_times = None
+        if header.topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
+            reconsume_times = MessageAccessor.get_reconsume_time(msg)
+            if reconsume_times is not None:
+                header.reconsume_times = int(reconsume_times)
+                MessageAccessor.clear_property(msg, MessageConst.PROPERTY_RECONSUME_TIME)
+            max_reconsume_times = MessageAccessor.get_max_reconsume_times(msg)
+            if max_reconsume_times is not None:
+                header.max_reconsume_times = int(max_reconsume_times)
+                MessageAccessor.clear_property(msg, MessageConst.PROPERTY_MAX_RECONSUME_TIMES)
+        header.batch = isinstance(msg, MessageBatch)
+        header.broker_name = mq.broker_name or None
+        if is_reply_message(msg):
+            code = RequestCode.SEND_REPLY_MESSAGE_V2
+        elif header.batch:
+            code = RequestCode.SEND_BATCH_MESSAGE
+        else:
+            code = RequestCode.SEND_MESSAGE_V2
+        request = RemotingCommand.create_request_command(code, header)
+        request.body = self._encode_body(msg)
+        return request
+
+    @staticmethod
+    def _encode_body(msg: Message) -> bytes:
+        pass
+        return msg.get_body() or b""
+
+    def _parse_send_response(self, response: RemotingCommand, msg: Message, mq: MessageQueue) -> SendResult:
+        status_map = {
+            ResponseCode.SUCCESS: SendStatus.SEND_OK,
+            ResponseCode.FLUSH_DISK_TIMEOUT: SendStatus.FLUSH_DISK_TIMEOUT,
+            ResponseCode.FLUSH_SLAVE_TIMEOUT: SendStatus.FLUSH_SLAVE_TIMEOUT,
+            ResponseCode.SLAVE_NOT_AVAILABLE: SendStatus.SLAVE_NOT_AVAILABLE,
+        }
+        if response.code in status_map:
+            header = SendMessageResponseHeader()
+            header.from_ext_fields(response.ext_fields)
+            if isinstance(msg, MessageBatch):
+                # A batch result identifies the whole send: prefer the broker-side batch id, otherwise
+                # join every member's own unique id. The batch envelope's own id must not mask members.
+                uniq_msg_id = header.batch_uniq_id or ",".join(
+                    get_uniq_id(m) or "" for m in msg.messages)
+            else:
+                uniq_msg_id = get_uniq_id(msg) or header.batch_uniq_id
+            result = SendResult(
+                send_status=status_map[response.code],
+                msg_id=uniq_msg_id or header.msg_id,
+                message_queue=MessageQueue(mq.topic, mq.broker_name, header.queue_id if header.queue_id is not None else mq.queue_id),
+                queue_offset=header.queue_offset or 0,
+                transaction_id=header.transaction_id,
+                offset_msg_id=header.msg_id,
+            )
+            ext = response.ext_fields or {}
+            region_id = ext.get(MessageConst.PROPERTY_MSG_REGION)
+            result.region_id = region_id if region_id else MixAll.DEFAULT_TRACE_REGION_ID
+            result.trace_on = str(ext.get(MessageConst.PROPERTY_TRACE_SWITCH)) != "false"
+            result.recall_handle = header.recall_handle
+            return result
+        raise MQBrokerException(response.code, response.remark or "")
+
+    # ---------------- scheduled message recall ----------------
+    def recall_message(self, addr: str, header: RecallMessageRequestHeader,
+                       timeout_millis: int) -> str:
+        pass
+        request = RemotingCommand.create_request_command(RequestCode.RECALL_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        if response.code == ResponseCode.SUCCESS:
+            resp_header = RecallMessageResponseHeader()
+            resp_header.from_ext_fields(response.ext_fields)
+            if not resp_header.msg_id:
+                raise MQBrokerException(response.code,
+                                        "recall message response has no msgId, addr %s" % addr)
+            return resp_header.msg_id
+        raise MQBrokerException(response.code, response.remark or "")
+
+    # ---------------- Request-Reply: receive the reply pushed back by the broker ----------------
+    def _process_reply_message(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
+        pass
+        header = ReplyMessageRequestHeader()
+        header.from_ext_fields(cmd.ext_fields)
+        try:
+            body = cmd.body or b""
+            if MessageSysFlag.is_compressed(header.sys_flag or 0):
+                body = decompress_body(body, MessageSysFlag.get_compression_type(header.sys_flag or 0))
+            msg = MessageExt(topic=header.topic or "", body=body)
+            msg.queue_id = header.queue_id or 0
+            msg.store_timestamp = header.store_timestamp or 0
+            msg.flag = header.flag or 0
+            msg.born_timestamp = header.born_timestamp or 0
+            msg.reconsume_times = header.reconsume_times or 0
+            if header.born_host:
+                msg.born_host = header.born_host
+            if header.store_host:
+                msg.store_host = header.store_host
+            msg.properties = string_2_message_properties(header.properties)
+            msg.properties[MessageConst.PROPERTY_REPLY_MESSAGE_ARRIVE_TIME] = str(
+                int(time.time() * 1000))
+            correlation_id = msg.properties.get(MessageConst.PROPERTY_CORRELATION_ID)
+            if REQUEST_FUTURE_HOLDER.put_response(correlation_id, msg) is None:
+                logger.warning("receive reply message, but not matched any request, "
+                               "CorrelationId: %s, reply from host: %s",
+                               correlation_id, header.born_host)
+            return RemotingCommand.create_response_command(ResponseCode.SUCCESS, None, None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("unknown err when receiveReplyMsg", exc_info=True)
+            return RemotingCommand.create_response_command(
+                ResponseCode.SYSTEM_ERROR, "process reply message fail: %s" % e, None)
+
+    # ---------------- message pull ----------------
+    def pull_message(self, consumer_group: str, mq: MessageQueue, queue_offset: int,
+                     max_msg_nums: int, sys_flag: int, commit_offset: int,
+                     subscription: str, sub_version: int, expression_type: str,
+                     timeout_millis: int = 30000, max_msg_bytes: int = -1,
+                     suspend_timeout_millis: int = 15000, addr: Optional[str] = None,
+                     request_source: int = 0,
+                     broker_id: Optional[int] = None) -> "PullResult":
+        from .consumer_result import PullResult, PullStatus
+        slave = False
+        if addr is None:
+            route = self.get_topic_route_data(mq.topic)
+            if route is None:
+                raise MQClientException("No route info of this topic: %s" % mq.topic)
+            if broker_id is not None:
+                broker_data = next((bd for bd in route.broker_datas
+                                    if bd.broker_name == mq.broker_name), None)
+                if broker_data is None:
+                    raise MQClientException("Broker %s not exist" % mq.broker_name)
+                addr, slave = MQClientInstance.find_broker_addr_in_subscribe(
+                    broker_data.broker_addrs, broker_id)
+                if addr is None:
+                    raise MQClientException("Broker %s not exist" % mq.broker_name)
+            else:
+                addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
+                if addr is None:
+                    raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
+        if slave:
+            sys_flag = PullSysFlag.clear_commit_offset_flag(sys_flag)
+        header = PullMessageRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        header.queue_offset = queue_offset
+        header.max_msg_nums = max_msg_nums
+        header.sys_flag = sys_flag
+        header.commit_offset = commit_offset
+        header.suspend_timeout_millis = suspend_timeout_millis
+        header.subscription = subscription
+        header.sub_version = sub_version
+        header.expression_type = expression_type
+        header.max_msg_bytes = max_msg_bytes
+        header.request_source = request_source
+        code = (RequestCode.LITE_PULL_MESSAGE
+                if PullSysFlag.has_lite_pull_flag(sys_flag)
+                else RequestCode.PULL_MESSAGE)
+        request = RemotingCommand.create_request_command(code, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+
+        status = PullStatus.NO_NEW_MSG
+        if response.code == ResponseCode.SUCCESS:
+            status = PullStatus.FOUND
+        elif response.code == ResponseCode.PULL_NOT_FOUND:
+            status = PullStatus.NO_NEW_MSG
+        elif response.code == ResponseCode.PULL_OFFSET_MOVED:
+            status = PullStatus.OFFSET_ILLEGAL
+        elif response.code == ResponseCode.PULL_RETRY_IMMEDIATELY:
+            status = PullStatus.NO_MATCHED_MSG
+        else:
+            raise MQBrokerException(response.code, response.remark or "")
+
+        resp_header = PullMessageResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+        found = []
+        if response.body:
+            found = decode_messages(response.body, read_body=self.decode_read_body)
+            found = unwrap_inner_batch_messages(found)
+            for m in found:
+                m.broker_name = mq.broker_name
+                m.queue_id = mq.queue_id
+        return PullResult(status, resp_header.next_begin_offset or 0,
+                          resp_header.min_offset or 0, resp_header.max_offset or 0, found,
+                          suggest_which_broker_id=resp_header.suggest_which_broker_id)
+
+    @staticmethod
+    def find_broker_addr_in_subscribe(broker_addrs: Dict[int, str], broker_id: int,
+                                      only_this_broker: bool = False):
+        pass
+        if not broker_addrs:
+            return None, False
+        addr = broker_addrs.get(broker_id)
+        if addr is not None:
+            return addr, broker_id != MixAll.MASTER_ID
+        if broker_id != MixAll.MASTER_ID:
+            addr = broker_addrs.get(broker_id + 1)
+            if addr is not None:
+                return addr, True
+        if not only_this_broker:
+            first_id = min(broker_addrs)
+            return broker_addrs[first_id], first_id != MixAll.MASTER_ID
+        return None, False
+
+    # ---------------- POP mode (5.x lightweight consumption) ----------------
+
+    def pop_message(self, consumer_group: str, topic: str, queue_id: int = -1,
+                    max_msg_nums: int = 32, invisible_time: int = 60000,
+                    poll_time: int = 0, init_mode: int = 0,
+                    exp: Optional[str] = None, exp_type: Optional[str] = None,
+                    order: bool = False, broker_name: Optional[str] = None,
+                    timeout_millis: int = 10000, addr: Optional[str] = None) -> "PopResult":
+        """POP a message (``RequestCode.POP_MESSAGE = 200050``).
+
+        Semantic differences from pull:
+        - **no offset commit needed**; after consumption, confirm via ``ack_message``;
+        - un-acked messages are revived by the broker after ``invisible_time`` and redelivered to
+          ``%RETRY%<group>_<topic>`` (V1), so the next POP pops them again -- at-least-once semantics;
+        - ``queue_id = -1`` means pop all queues of the topic.
+
+        ``born_time`` must be the current millisecond timestamp: the broker uses
+        ``now - bornTime - pollTime > 500`` to decide "timed out too long" and directly returns
+        ``POLLING_TIMEOUT(210)``; passing 0 would always fail.
+        """
+        from .consumer_result import PopResult, PopStatus
+        from rocketmq_client_remoting.remoting.protocol import extra_info as ei
+        from rocketmq_client_remoting.remoting.protocol.headers import (PopMessageRequestHeader,
+                                                 PopMessageResponseHeader)
+
+        if not broker_name:
+            route = self.get_topic_route_data(topic)
+            if route is None:
+                raise MQClientException("No route info of this topic: %s" % topic)
+            brokers = route.get_broker_datas()
+            if not brokers:
+                raise MQClientException("No broker in route of topic: %s" % topic)
+            # the caller didn't even give a brokerName ("pop any queue of the topic"): first pick one by
+            # route, then still only its master is accepted.
+            broker_name = brokers[0].broker_name
+        if addr is None:
+            addr = self.publish_addr_for(broker_name, topic)
+
+        header = PopMessageRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.max_msg_nums = max_msg_nums
+        header.invisible_time = invisible_time
+        header.poll_time = poll_time
+        header.born_time = int(time.time() * 1000)
+        header.init_mode = init_mode
+        header.exp_type = exp_type
+        header.exp = exp
+        header.order = order
+        request = RemotingCommand.create_request_command(RequestCode.POP_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+
+        if response.code == ResponseCode.SUCCESS:
+            status = PopStatus.FOUND
+        elif response.code == ResponseCode.POLLING_FULL:
+            status = PopStatus.POLLING_FULL
+        elif response.code == ResponseCode.POLLING_TIMEOUT:
+            status = PopStatus.POLLING_NOT_FOUND
+        elif response.code == ResponseCode.PULL_NOT_FOUND:
+            status = PopStatus.POLLING_NOT_FOUND
+        else:
+            raise MQBrokerException(response.code, response.remark or "")
+
+        resp_header = PopMessageResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+
+        found: List[MessageExt] = []
+        if status == PopStatus.FOUND and response.body:
+            found = decode_messages(response.body, read_body=self.decode_read_body)
+            self._stamp_pop_ck(found, broker_name, resp_header)
+
+        for m in found:
+            m.broker_name = broker_name
+            m.topic = topic
+
+        return PopResult(status, found,
+                         resp_header.rest_num or 0,
+                         resp_header.pop_time or 0,
+                         resp_header.invisible_time or 0,
+                         resp_header.revive_qid or 0,
+                         resp_header.start_offset_info,
+                         resp_header.msg_offset_info,
+                         resp_header.order_count_info)
+
+    @staticmethod
+    def _pop_queue_map_key(extra, m: MessageExt) -> str:
+        pass
+        ck = m.properties.get(MessageConst.PROPERTY_POP_CK)
+        if ck:
+            return extra.get_retry(extra.split(ck)) + "@" + str(m.queue_id)
+        return extra.get_start_offset_info_map_key(m.topic, m.queue_id)
+
+    def _stamp_pop_ck(self, found: List[MessageExt], broker_name: str, resp_header) -> None:
+        pass
+        from rocketmq_client_remoting.remoting.protocol import extra_info as extra
+
+        pop_time = resp_header.pop_time or 0
+        invisible_time = resp_header.invisible_time or 0
+        revive_qid = resp_header.revive_qid or 0
+
+        if not resp_header.start_offset_info:
+            per_queue: Dict[str, str] = {}
+            for m in found:
+                key = str(m.topic) + str(m.queue_id)
+                if key not in per_queue:
+                    per_queue[key] = extra.build_extra_info(
+                        m.queue_offset, pop_time, invisible_time, revive_qid,
+                        m.topic, broker_name, m.queue_id)
+                m.properties[MessageConst.PROPERTY_POP_CK] = (
+                    per_queue[key] + extra.KEY_SEPARATOR + str(m.queue_offset))
+        else:
+            start_map = extra.parse_start_offset_info(resp_header.start_offset_info) or {}
+            msg_map = extra.parse_msg_offset_info(resp_header.msg_offset_info) or {}
+
+            sorted_offsets: Dict[str, List[int]] = {}
+            for m in found:
+                queue_key = self._pop_queue_map_key(extra, m)
+                sorted_offsets.setdefault(queue_key, []).append(m.queue_offset)
+            for offsets in sorted_offsets.values():
+                offsets.sort()
+
+            for m in found:
+                # messages popped back from the retry topic already have POP_CK written by the broker; do not overwrite.
+                if m.properties.get(MessageConst.PROPERTY_POP_CK) is not None:
+                    continue
+                queue_key = self._pop_queue_map_key(extra, m)
+                start_offset = start_map.get(queue_key)
+                offsets = msg_map.get(queue_key)
+                if start_offset is None or not offsets:
+                    continue
+                try:
+                    index = sorted_offsets[queue_key].index(m.queue_offset)
+                except ValueError:
+                    continue
+                if index >= len(offsets):
+                    continue
+                m.properties[MessageConst.PROPERTY_POP_CK] = extra.build_extra_info(
+                    start_offset, pop_time, invisible_time, revive_qid,
+                    m.topic, broker_name, m.queue_id, offsets[index])
+
+        for m in found:
+            m.properties.setdefault(MessageConst.PROPERTY_FIRST_POP_TIME, str(pop_time))
+
+    def _addr_for(self, topic: str, broker_name: Optional[str] = None) -> str:
+        """Resolve the broker address by topic (optionally also by brokerName)."""
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            raise MQClientException("No route info of this topic: %s" % topic)
+        if broker_name:
+            addr = MQClientInstance.find_broker_addr_in_route(route, broker_name)
+            if addr is None:
+                raise MQClientException(
+                    "Broker %s not found in route of topic %s" % (broker_name, topic))
+            return addr
+        brokers = route.get_broker_datas()
+        if not brokers:
+            raise MQClientException("No broker in route of topic: %s" % topic)
+        addr = brokers[0].select_broker_addr()
+        if addr is None:
+            raise MQClientException("No available broker addr for topic: %s" % topic)
+        return addr
+
+    def ack_message(self, consumer_group: str, topic: str, queue_id: int,
+                    extra_info: str, offset: int, broker_name: Optional[str] = None,
+                    timeout_millis: int = 3000, addr: Optional[str] = None) -> int:
+        """Acknowledge a POP message (``RequestCode.ACK_MESSAGE = 200051``).
+
+        ``extra_info`` uses the message's ``POP_CK`` property; ``offset`` must be the
+        **consumeQueue offset** (i.e. the 8th segment of the CK string / msgQueueOffset), not the commitlog
+        offset -- passing the wrong one makes the broker return ``NO_MESSAGE``.
+
+        Returns the broker response code; ``ResponseCode.SUCCESS`` means acknowledgment succeeded.
+        """
+        from rocketmq_client_remoting.remoting.protocol import extra_info as extra
+        from rocketmq_client_remoting.remoting.protocol.headers import AckMessageRequestHeader
+
+        if broker_name is None:
+            broker_name = extra.get_broker_name(extra.split(extra_info))
+        if addr is None:
+            addr = self.pop_ack_addr(broker_name, topic, queue_id)
+
+        header = AckMessageRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.extra_info = extra_info
+        header.offset = offset
+        request = RemotingCommand.create_request_command(RequestCode.ACK_MESSAGE, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        return response.code
+
+    def batch_ack_message(self, consumer_group: str, topic: str,
+                          extra_info_list: List[str], timeout_millis: int = 3000,
+                          addr: Optional[str] = None) -> int:
+        """Acknowledge a whole POP batch with one request (``BATCH_ACK_MESSAGE = 200151``).
+
+        ``extra_info_list`` entries are the messages' ``POP_CK`` properties. Entries that
+        share a (retry flag, queueId, checkpoint offset, popTime) group are merged into a
+        single body entry whose bit set marks each acknowledged offset relative to that
+        checkpoint, so a consumed batch costs one RPC instead of one per message.
+
+        Unlike ``ack_message`` this request carries **no custom header**: the group, topic,
+        queue, offsets, popTime and invisibleTime all travel in the JSON body, and the body
+        names a **single** broker -- the one in the first entry's checkpoint. Checkpoints of
+        other brokers must be acknowledged by a separate call.
+
+        Returns the broker response code; ``ResponseCode.SUCCESS`` means the batch was accepted.
+        """
+        from rocketmq_client_remoting.remoting.protocol import extra_info as extra
+        from rocketmq_client_remoting.remoting.protocol.body import BatchAckMessageRequestBody
+
+        if not extra_info_list:
+            raise MQClientException("batch ack needs at least one extra info")
+
+        first = extra.split(extra_info_list[0])
+        broker_name = extra.get_broker_name(first)
+        if addr is None:
+            addr = self.pop_ack_addr(broker_name, topic, extra.get_queue_id(first))
+
+        request = RemotingCommand.create_request_command(RequestCode.BATCH_ACK_MESSAGE, None)
+        request.body = BatchAckMessageRequestBody.from_extra_infos(
+            consumer_group, topic, extra_info_list).encode()
+        response = self._invoke_sync(addr, request, timeout_millis)
+        return response.code
+
+    def change_invisible_time(self, consumer_group: str, topic: str, queue_id: int,
+                              extra_info: str, offset: int, invisible_time: int,
+                              broker_name: Optional[str] = None,
+                              timeout_millis: int = 3000,
+                              addr: Optional[str] = None) -> "ChangeInvisibleTimeResult":
+        """Extend a POP message's invisible time (``CHANGE_MESSAGE_INVISIBLETIME = 200053``).
+
+        Used for the "still processing, don't let the broker revive and redeliver" scenario. The response
+        returns the **new** popTime / invisibleTime / reviveQid, and the client rebuilds the 8-segment
+        extraInfo from them (returned in the result's ``extra_info`` field) for subsequent ACKs -- not the
+        original old string.
+        """
+        from .consumer_result import ChangeInvisibleTimeResult
+        from rocketmq_client_remoting.remoting.protocol import extra_info as extra
+        from rocketmq_client_remoting.remoting.protocol.headers import (ChangeInvisibleTimeRequestHeader,
+                                                 ChangeInvisibleTimeResponseHeader)
+
+        if broker_name is None:
+            broker_name = extra.get_broker_name(extra.split(extra_info))
+        if addr is None:
+            addr = self.pop_ack_addr(broker_name, topic, queue_id)
+
+        header = ChangeInvisibleTimeRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = topic
+        header.queue_id = queue_id
+        header.extra_info = extra_info
+        header.offset = offset
+        header.invisible_time = invisible_time
+        request = RemotingCommand.create_request_command(
+            RequestCode.CHANGE_MESSAGE_INVISIBLETIME, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+
+        resp_header = ChangeInvisibleTimeResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+
+        new_extra = None
+        if response.code == ResponseCode.SUCCESS:
+            new_extra = extra.build_extra_info(
+                offset, resp_header.pop_time, resp_header.invisible_time,
+                resp_header.revive_qid, topic, broker_name, queue_id,
+                offset)
+        return ChangeInvisibleTimeResult(response.code,
+                                         resp_header.pop_time or 0,
+                                         resp_header.invisible_time or 0,
+                                         resp_header.revive_qid or 0,
+                                         new_extra)
+
+    def query_consumer_offset(self, consumer_group: str, mq: MessageQueue,
+                              timeout_millis: int = 5000, addr: Optional[str] = None,
+                              set_zero_if_not_found: bool = False) -> Optional[int]:
+        if addr is None:
+            addr = self._consumer_offset_addr(mq)
+        header = QueryConsumerOffsetRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        header.set_zero_if_not_found = set_zero_if_not_found
+        request = RemotingCommand.create_request_command(RequestCode.QUERY_CONSUMER_OFFSET, header)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        if response.code == ResponseCode.QUERY_NOT_FOUND:
+            return None
+        self._check_response(response)
+        resp_header = QueryConsumerOffsetResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+        return resp_header.offset
+
+    def update_consumer_offset(self, consumer_group: str, mq: MessageQueue, commit_offset: int,
+                               timeout_millis: int = 5000, addr: Optional[str] = None) -> None:
+        if addr is None:
+            addr = self._broker_addr(mq)
+        header = UpdateConsumerOffsetRequestHeader()
+        header.consumer_group = consumer_group
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        header.commit_offset = commit_offset
+        request = RemotingCommand.create_request_command(RequestCode.UPDATE_CONSUMER_OFFSET, header)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        self._check_response(response)
+
+    def get_max_offset(self, mq: MessageQueue, timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
+        if addr is None:
+            addr = self._publish_addr_in_admin(mq)
+        header = GetMaxOffsetRequestHeader()
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        request = RemotingCommand.create_request_command(RequestCode.GET_MAX_OFFSET, header)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        self._check_response(response)
+        resp_header = GetMaxOffsetResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+        return resp_header.offset or 0
+
+    def get_min_offset(self, mq: MessageQueue, timeout_millis: int = 5000, addr: Optional[str] = None) -> int:
+        if addr is None:
+            addr = self._publish_addr_in_admin(mq)
+        header = GetMinOffsetRequestHeader()
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        request = RemotingCommand.create_request_command(RequestCode.GET_MIN_OFFSET, header)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        self._check_response(response)
+        resp_header = GetMinOffsetResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+        return resp_header.offset or 0
+
+    def search_offset_by_timestamp(self, mq: MessageQueue, timestamp: int,
+                                   timeout_millis: int = 5000, addr: Optional[str] = None,
+                                   boundary_type: Optional[BoundaryType] = BoundaryType.LOWER) -> int:
+        pass
+        if addr is None:
+            addr = self._publish_addr_in_admin(mq)
+        header = SearchOffsetRequestHeader()
+        header.topic = mq.topic
+        header.queue_id = mq.queue_id
+        header.timestamp = timestamp
+        header.boundary_type = boundary_type
+        request = RemotingCommand.create_request_command(RequestCode.SEARCH_OFFSET_BY_TIMESTAMP, header)
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        self._check_response(response)
+        resp_header = SearchOffsetResponseHeader()
+        resp_header.from_ext_fields(response.ext_fields)
+        return resp_header.offset or 0
+
+    def query_message(self, topic: str, key: str, max_num: int, begin_timestamp: int,
+                      end_timestamp: int, timeout_millis: int = 15000,
+                      addr: Optional[str] = None,
+                      index_type: Optional[str] = None,
+                      uniq_key: bool = False) -> Optional[bytes]:
+        pass
+        if addr is None:
+            addr = self._broker_addr_for_topic(topic)
+        header = QueryMessageRequestHeader()
+        header.topic = topic
+        header.key = key
+        header.max_num = max_num
+        header.begin_timestamp = begin_timestamp
+        header.end_timestamp = end_timestamp
+        header.index_type = index_type
+        request = RemotingCommand.create_request_command(RequestCode.QUERY_MESSAGE, header)
+        if uniq_key:
+            request.ext_fields[MixAll.UNIQUE_MSG_QUERY_FLAG] = "true"
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        if response.code == ResponseCode.QUERY_NOT_FOUND:
+            return None
+        self._check_response(response)
+        return response.body
+
+    def _broker_addr_for_topic(self, topic: str) -> str:
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            raise MQClientException("No route info of this topic: %s" % topic)
+        brokers = route.get_broker_datas()
+        if not brokers:
+            raise MQClientException("No broker in route of topic: %s" % topic)
+        addr = brokers[0].select_broker_addr()
+        if addr is None:
+            raise MQClientException("No available broker addr for topic: %s" % topic)
+        return addr
+
+    def query_message_all_brokers(self, topic: str, key: str, max_num: int,
+                                  begin_timestamp: int, end_timestamp: int,
+                                  index_type: Optional[str] = None,
+                                  uniq_key: bool = False,
+                                  timeout_millis: int = 15000) -> List:
+        pass
+        from rocketmq_client_remoting.common.message_const import MessageConst
+        messages: List = []
+        route = self.get_topic_route_data(topic)
+        if route is None:
+            return messages
+        for broker_data in route.get_broker_datas():
+            addr = broker_data.select_broker_addr()
+            if not addr:
+                continue
+            try:
+                body = self.query_message(topic, key, max_num, begin_timestamp,
+                                          end_timestamp, timeout_millis, addr,
+                                          index_type, uniq_key)
+            except Exception:  # noqa: BLE001
+                continue
+            if not body:
+                continue
+            for m in decode_messages(body):
+                m.broker_name = broker_data.broker_name
+                if uniq_key:
+                    # Java decodes query results as MessageClientExt, whose
+                    # getMsgId() returns the UNIQ_KEY property (offset id only as
+                    # fallback) — the client-visible id the hit is verified
+                    # against. The python decoder keeps msg_id = offset id, so
+                    # resolve the client-visible id here (csharp does the same
+                    # swap inside its decoder; node verifies the property).
+                    visible = m.get_property(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) or m.msg_id
+                    if visible == key:
+                        messages.append(m)
+                else:
+                    keys = m.get_keys()
+                    if keys:
+                        for k in keys.split(MessageConst.KEY_SEPARATOR):
+                            if k == key and m.topic == topic:
+                                messages.append(m)
+                                break
+        messages.sort(key=lambda x: (x.queue_offset or 0))
+        return messages[:max_num] if max_num > 0 else messages
+
+    def view_message(self, topic: str, msg_id: str, timeout_millis: int = 6000,
+                     vip_channel_enabled: bool = False) -> MessageExt:
+        """Java ``MQAdminImpl#viewMessage(topic, msgId)`` parity (MQAdminImpl.java:267).
+
+        A SINGLE leg: decode the ``ip:port:offset`` msgId and ask THAT broker
+        ``VIEW_MESSAGE_BY_ID(33)`` directly -- the only id that encodes the
+        broker address and the commitlog offset. A decode failure maps to the
+        ``NO_MESSAGE`` client error Java raises there; every other leg failure
+        surfaces as-is.
+
+        The uniq-key fallback is NOT part of this layer -- it belongs to the
+        admin facade only (``DefaultMQAdminExtImpl#viewMessage``, see
+        ``Admin.view_message``), while the producer / push / pull facades ride
+        this single-leg path in Java. ``timeout_millis`` defaults to
+        ``MQAdminImpl``'s own RPC budget (MQAdminImpl.java:67, 6000).
+        """
+        from rocketmq_client_remoting.common.message_decoder import decode_message_id
+        try:
+            ip, port, offset = decode_message_id(msg_id)
+        except Exception as e:  # noqa: BLE001
+            raise MQClientException("query message by id finished, but no message.", None, e) from e
+        if not 0 < port <= 65535:
+            raise MQClientException("not a valid offset msgId: %s" % msg_id)
+        # The address is the store host:port the broker stamped into the offset
+        # msgId -- a broker address, so the VIP-channel rewrite applies to it
+        # like to any other query request.
+        addr = MixAll.broker_vip_channel(vip_channel_enabled, "%s:%d" % (ip, port))
+        request = RemotingCommand.create_request_command(RequestCode.VIEW_MESSAGE_BY_ID, None)
+        request.ext_fields["topic"] = topic
+        request.ext_fields["offset"] = str(offset)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+        if response.body:
+            return decode_message(response.body)
+        raise MQBrokerException(ResponseCode.NO_MESSAGE, "message not found: %s" % msg_id)
+
+    # ---------------- queue lock (orderly consumption) ----------------
+
+    def lock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
+                      timeout_millis: int = 1000) -> List[MessageQueue]:
+        pass
+        from rocketmq_client_remoting.remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
+        from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
+        from rocketmq_client_remoting.remoting.protocol.headers import LockBatchMqRequestHeader
+        lock_ok: List[MessageQueue] = []
+        by_broker: Dict[str, List[MessageQueue]] = {}
+        for mq in mqs:
+            by_broker.setdefault(mq.broker_name, []).append(mq)
+        for broker_name, broker_mqs in by_broker.items():
+            addr = self.find_broker_address_in_publish(broker_name)
+            if addr is None:
+                continue
+            body = LockBatchRequestBody()
+            body.consumer_group = consumer_group
+            body.client_id = client_id
+            body.mq_set = [{"topic": m.topic, "brokerName": m.broker_name, "queueId": m.queue_id}
+                           for m in broker_mqs]
+            request = RemotingCommand.create_request_command(RequestCode.LOCK_BATCH_MQ, LockBatchMqRequestHeader())
+            request.body = body.encode()
+            try:
+                # LOCK_BATCH_MQ is one of the VIP-wrapped broker requests.
+                response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+                self._check_response(response)
+                rb = LockBatchResponseBody.decode(response.body)
+                for d in rb.lock_ok_mq_set:
+                    lock_ok.append(MessageQueue(d.get("topic"), d.get("brokerName"), int(d.get("queueId") or 0)))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("lock_batch_mq failed for broker %s: %s", broker_name, e)
+        return lock_ok
+
+    def unlock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
+                        timeout_millis: int = 1000) -> None:
+        pass
+        from rocketmq_client_remoting.remoting.protocol.body import UnlockBatchRequestBody
+        from rocketmq_client_remoting.remoting.protocol.codes import RequestCode
+        from rocketmq_client_remoting.remoting.protocol.headers import UnlockBatchMqRequestHeader
+        by_broker: Dict[str, List[MessageQueue]] = {}
+        for mq in mqs:
+            by_broker.setdefault(mq.broker_name, []).append(mq)
+        for broker_name, broker_mqs in by_broker.items():
+            addr = self.find_broker_address_in_publish(broker_name)
+            if addr is None:
+                continue
+            body = UnlockBatchRequestBody()
+            body.consumer_group = consumer_group
+            body.client_id = client_id
+            body.mq_set = [{"topic": m.topic, "brokerName": m.broker_name, "queueId": m.queue_id}
+                           for m in broker_mqs]
+            request = RemotingCommand.create_request_command(RequestCode.UNLOCK_BATCH_MQ, UnlockBatchMqRequestHeader())
+            request.body = body.encode()
+            try:
+                # UNLOCK_BATCH_MQ is one of the VIP-wrapped broker requests.
+                response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+                self._check_response(response)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("unlock_batch_mq failed for broker %s: %s", broker_name, e)
+
+    # ---------------- heartbeat / unregister ----------------
+    def send_heartbeat(self, addr: str, heartbeat_data: HeartbeatData,
+                       timeout_millis: Optional[int] = None) -> int:
+        """HEART_BEAT(34) with a V1 body; returns the broker version from the response header.
+
+        The version comes back in the response header and each round records it per broker; the
+        V1 path is what a ``heartbeatFingerprint == 0`` body takes on
+        the broker, and it stays the default here because ``use_heartbeat_v2`` is off by default.
+        """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
+        request.body = heartbeat_data.encode()
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+        return response.version or 0
+
+    def send_heartbeat_v2(self, addr: str, heartbeat_data: HeartbeatData,
+                          timeout_millis: Optional[int] = None) -> HeartbeatV2Result:
+        """The V2 heartbeat RPC: the same HEART_BEAT(34) frame, V2 body.
+
+        Nothing about the frame changes -- the body carries ``heartbeatFingerprint`` (non-zero) and
+        possibly ``withoutSub``, and the broker answers with the ``IS_SUPPORT_HEART_BEAT_V2`` /
+        ``IS_SUB_CHANGE`` extFields that decide the next round. A broker that predates V2 simply
+        ignores the two extra fields (it registers the full subscription set as before) and sends no
+        extFields back, which parses here as ``support_v2=False``.
+        """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        request = RemotingCommand.create_request_command(RequestCode.HEART_BEAT, None)
+        request.body = heartbeat_data.encode()
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+        return HeartbeatV2Result.from_response(response.version or 0, response.ext_fields)
+
+    def send_heartbeat_to_broker_v2(self, addr: str, heartbeat_data: HeartbeatData,
+                                   owner: str = "",
+                                   timeout_millis: Optional[int] = None) -> int:
+        """Send one heartbeat through the V2 path (see ``client/heartbeat_v2.py``).
+
+        ``owner`` names the heartbeat stream (a facade's group), because this port sends one
+        heartbeat per facade rather than one aggregated heartbeat per client instance.
+        """
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        return self._heartbeat_v2.send_to_broker(owner, addr, heartbeat_data, timeout_millis)
+
+    def _heartbeat_broker_addrs(self, consumer_data_present: bool) -> List[str]:
+        addrs: List[str] = []
+        with self.topic_route_lock:
+            table = {name: dict(ids) for name, ids in self.broker_addr_table.items()}
+        for ids in table.values():
+            for broker_id, addr in ids.items():
+                if not consumer_data_present and broker_id != MixAll.MASTER_ID:
+                    continue
+                if addr and addr not in addrs:
+                    addrs.append(addr)
+        return addrs
+
+    def send_heartbeat_concurrently(self, heartbeat_data: HeartbeatData,
+                                    timeout_millis: Optional[int] = None) -> int:
+        """Send one heartbeat per broker in parallel and wait for every result.
+
+        Guards: an empty heartbeat body sends nothing, and a body without consumer data only
+        reaches masters (slaves do not keep consumer registrations).
+        """
+        if not heartbeat_data.producer_data_set and not heartbeat_data.consumer_data_set:
+            logger.warning("heartbeat skipped: the body contains neither producer nor consumer data")
+            return 0
+        if not self.broker_addr_table:
+            return 0
+        addrs = self._heartbeat_broker_addrs(bool(heartbeat_data.consumer_data_set))
+        if not addrs:
+            return 0
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        executor = self._heartbeat_executor
+        if executor is None:
+            logger.warning("concurrent heartbeat is enabled but no worker pool exists; sending sequentially")
+            ok = 0
+            for addr in addrs:
+                try:
+                    self.send_heartbeat(addr, heartbeat_data, timeout_millis)
+                    ok += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("heartbeat to %s failed: %s", addr, e)
+            return ok
+        latch = threading.Semaphore(0)
+        result_lock = threading.Lock()
+        ok = [0]
+
+        def _send(addr: str) -> None:
+            try:
+                self.send_heartbeat(addr, heartbeat_data, timeout_millis)
+                with result_lock:
+                    ok[0] += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("heartbeat to %s failed: %s", addr, e)
+            finally:
+                latch.release()
+
+        for addr in addrs:
+            try:
+                executor.submit(_send, addr)
+            except RuntimeError as e:
+                # A rejected task still owns one latch permit, otherwise the wait below never ends.
+                logger.warning("heartbeat task for %s rejected: %s", addr, e)
+                latch.release()
+        for _ in addrs:
+            latch.acquire()
+        return ok[0]
+
+    def reset_heartbeat_v2_fingerprint_table(self, owner: Optional[str] = None) -> None:
+        """Drop the remembered fingerprints of one stream or of every stream.
+
+        Call it when the queue allocation changes; ``owner=None`` resets every stream.
+        """
+        self._heartbeat_v2.reset_fingerprint_table(owner)
+
+    def unregister_client(self, addr: str, client_id: str, producer_group: str,
+                          consumer_group: str, timeout_millis: Optional[int] = None) -> None:
+        pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        from rocketmq_client_remoting.remoting.protocol.headers import UnregisterClientRequestHeader
+        header = UnregisterClientRequestHeader()
+        header.client_id = client_id
+        header.producer_group = (producer_group or "").strip() or None
+        header.consumer_group = (consumer_group or "").strip() or None
+        request = RemotingCommand.create_request_command(RequestCode.UNREGISTER_CLIENT, header)
+        response = self._invoke_sync(addr, request, timeout_millis)
+        self._check_response(response)
+
+    def check_client_config(self, broker_addr: str, consumer_group: str, client_id: str,
+                            subscription_data: SubscriptionData,
+                            timeout_millis: Optional[int] = None) -> None:
+        pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        request = RemotingCommand.create_request_command(RequestCode.CHECK_CLIENT_CONFIG, None)
+        body = CheckClientRequestBody()
+        body.client_id = client_id
+        body.group = consumer_group
+        body.subscription_data = subscription_data
+        request.body = body.encode()
+        # CHECK_CLIENT_CONFIG(46) is one of the VIP-wrapped broker requests.
+        response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
+        if response is None:
+            raise MQClientException("checkClientConfig got no response from %s" % broker_addr)
+        if response.code != ResponseCode.SUCCESS:
+            raise MQClientException(response.remark or "", response.code)
+
+    # ---------------- admin APIs ----------------
+    def get_broker_cluster_info(self, timeout_millis: int = 10000) -> ClusterInfo:
+        request = RemotingCommand.create_request_command(RequestCode.GET_BROKER_CLUSTER_INFO, None)
+        for ns_addr in self.name_server_addrs:
+            try:
+                response = self._invoke_sync(ns_addr, request, timeout_millis)
+                if response.code == ResponseCode.SUCCESS and response.body:
+                    return ClusterInfo.decode(response.body)
+            except Exception:  # noqa: BLE001
+                continue
+        raise MQClientException("Failed to get broker cluster info from name server")
+
+    def get_all_topic_list_from_name_server(self, timeout_millis: int = 10000) -> TopicList:
+        request = RemotingCommand.create_request_command(RequestCode.GET_ALL_TOPIC_LIST_FROM_NAMESERVER, None)
+        for ns_addr in self.name_server_addrs:
+            try:
+                response = self._invoke_sync(ns_addr, request, timeout_millis)
+                if response.code == ResponseCode.SUCCESS and response.body:
+                    return TopicList.decode(response.body)
+            except Exception:  # noqa: BLE001
+                continue
+        raise MQClientException("Failed to get all topic list from name server")
+
+    def create_topic_in_broker(self, broker_addr: str, default_topic: str, topic: str,
+                               read_queue_nums: int = 4, write_queue_nums: int = 4,
+                               perm: int = 6, topic_sys_flag: int = 0,
+                               topic_filter_type: str = TopicFilterType.SINGLE_TAG,
+                               order: bool = False, attributes: Optional[str] = None,
+                               timeout_millis: int = 5000, retry_times: int = 5) -> None:
+        pass
+        header = CreateTopicRequestHeader()
+        header.topic = topic
+        header.default_topic = default_topic
+        header.read_queue_nums = read_queue_nums
+        header.write_queue_nums = write_queue_nums
+        header.perm = perm
+        header.topic_filter_type = topic_filter_type
+        header.topic_sys_flag = topic_sys_flag
+        header.order = order
+        header.attributes = attributes if attributes is not None else ""
+        header.force = False
+        request = RemotingCommand.create_request_command(RequestCode.UPDATE_AND_CREATE_TOPIC, header)
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(max(1, retry_times)):
+            try:
+                response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
+                self._check_response(response)
+                return
+            except MQBrokerException:
+                raise
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if attempt == retry_times - 1:
+                    raise
+        if last_exc is not None:
+            raise last_exc
+
+    def create_topic_in_route(self, topic: str, read_queue_nums: int = 4, write_queue_nums: int = 4,
+                              perm: int = 6, topic_sys_flag: int = 0,
+                              attributes: Optional[str] = None,
+                              timeout_millis: int = 5000) -> None:
+        pass
+        route = self.get_topic_route_data(MixAll.DEFAULT_TOPIC)
+        if route is None:
+            raise MQClientException("No route info of default topic %s" % MixAll.DEFAULT_TOPIC)
+        created_at_least_once = False
+        last_exc: Optional[Exception] = None
+        for broker_data in route.get_broker_datas():
+            addr = broker_data.select_broker_addr()
+            if not addr:
+                continue
+            try:
+                self.create_topic_in_broker(addr, MixAll.DEFAULT_TOPIC, topic,
+                                            read_queue_nums, write_queue_nums, perm,
+                                            topic_sys_flag, attributes=attributes,
+                                            timeout_millis=timeout_millis)
+                created_at_least_once = True
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+        if not created_at_least_once and last_exc is not None:
+            raise MQClientException("create new topic failed", cause=last_exc)
+
+    def delete_topic_in_broker(self, broker_addr: str, topic: str, timeout_millis: int = 5000) -> None:
+        request = RemotingCommand.create_request_command(RequestCode.DELETE_TOPIC_IN_BROKER, None)
+        request.ext_fields["topic"] = topic
+        response = self._invoke_sync(self.vip_addr(broker_addr), request, timeout_millis)
+        self._check_response(response)
+
+    def delete_topic_in_namesrv(self, topic: str, timeout_millis: int = 5000) -> None:
+        request = RemotingCommand.create_request_command(RequestCode.DELETE_TOPIC_IN_NAMESRV, None)
+        request.ext_fields["topic"] = topic
+        for ns_addr in self.name_server_addrs:
+            try:
+                response = self._invoke_sync(ns_addr, request, timeout_millis)
+                self._check_response(response)
+                return
+            except Exception:  # noqa: BLE001
+                continue
+        raise MQClientException("Failed to delete topic %s in name server" % topic)
+
+    def get_consumer_list_by_group(self, consumer_group: str, timeout_millis: int = 5000,
+                                   addr: Optional[str] = None) -> GetConsumerListByGroupResponseBody:
+        from rocketmq_client_remoting.remoting.protocol.headers import GetConsumerListByGroupRequestHeader
+        if addr is None:
+            raise MQClientException("broker addr required for get consumer list")
+        header = GetConsumerListByGroupRequestHeader()
+        header.consumer_group = consumer_group
+        request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP, header)
+        # GET_CONSUMER_LIST_BY_GROUP is one of the VIP-wrapped requests.
+        response = self._invoke_sync(self.vip_addr(addr), request, timeout_millis)
+        self._check_response(response)
+        if response.body:
+            return GetConsumerListByGroupResponseBody.decode(response.body)
+        return GetConsumerListByGroupResponseBody()
+
+    # ---------------- utilities ----------------
+    def _consumer_offset_addr(self, mq: MessageQueue) -> str:
+        pass
+        addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(mq.topic)
+            addr = self.broker_addr_of(mq.broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        return addr
+
+    def _broker_addr(self, mq: MessageQueue) -> str:
+        pass
+        route = self.get_topic_route_data(mq.topic)
+        if route is None:
+            raise MQClientException("No route info of this topic: %s" % mq.topic)
+        addr = MQClientInstance.find_broker_addr_in_route(route, mq.broker_name)
+        if addr is None:
+            raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
+        return addr
+
+    def _publish_addr_in_admin(self, mq: MessageQueue) -> str:
+        pass
+        addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            self.update_topic_route_info_from_name_server(mq.topic)
+            addr = self.find_broker_address_in_publish(mq.broker_name)
+        if not addr:
+            raise MQClientException("The broker[%s] not exist" % mq.broker_name)
+        return addr
+
+    def broker_addr_of(self, broker_name: str) -> Optional[str]:
+        for route in self.topic_route_table.values():
+            addr = MQClientInstance.find_broker_addr_in_route(route, broker_name)
+            if addr:
+                return addr
+        return None
+
+    def find_broker_address_in_publish(self, broker_name: str) -> Optional[str]:
+        pass
+        with self.topic_route_lock:
+            addrs = self.broker_addr_table.get(broker_name)
+            if not addrs:
+                return None
+            return addrs.get(0)
+
+    def get_route_of_all_brokers(self) -> List[str]:
+        addrs = []
+        for route in self.topic_route_table.values():
+            for broker_data in route.get_broker_datas():
+                a = broker_data.select_broker_addr()
+                if a and a not in addrs:
+                    addrs.append(a)
+        return addrs
+
+    def get_all_broker_addrs(self) -> List[str]:
+        pass
+        addrs = []
+        for route in self.topic_route_table.values():
+            for broker_data in route.get_broker_datas():
+                for a in broker_data.broker_addrs.values():
+                    if a and a not in addrs:
+                        addrs.append(a)
+        return addrs
+
+    def get_consumer_id_list_by_group(self, topic: str, consumer_group: str,
+                                      timeout_millis: Optional[int] = None) -> Optional[List[str]]:
+        pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        try:
+            addr = self._broker_addr_for_topic(topic)
+        except MQClientException as e:
+            logger.debug("get_consumer_id_list_by_group: no broker for topic %s: %s", topic, e)
+            return None
+        header = GetConsumerListByGroupRequestHeader()
+        header.consumer_group = consumer_group
+        request = RemotingCommand.create_request_command(RequestCode.GET_CONSUMER_LIST_BY_GROUP,
+                                                         header)
+        # Rebalance asks the broker for the group's consumer list: this lookup is
+        # VIP-wrapped too, like the other requests a broker answers on the fast channel.
+        target = self.vip_addr(addr)
+        try:
+            response = self._invoke_sync(target, request, timeout_millis)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("get_consumer_id_list_by_group failed, %s %s: %s",
+                         target, consumer_group, e)
+            return None
+        if response.code != ResponseCode.SUCCESS or response.body is None:
+            return None
+        try:
+            body = GetConsumerListByGroupResponseBody.decode(response.body)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("get_consumer_id_list_by_group decode failed: %s", e)
+            return None
+        return list(body.consumer_id_list)
+
+    def unregister_client_all_brokers(self, client_id: str, producer_group: str,
+                                      consumer_group: str,
+                                      timeout_millis: Optional[int] = None) -> None:
+        pass
+        if timeout_millis is None:
+            timeout_millis = self.mq_client_api_timeout
+        for addr in self.get_all_broker_addrs():
+            try:
+                self.unregister_client(addr, client_id, producer_group, consumer_group,
+                                       timeout_millis)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("unregister_client failed, addr=%s: %s", addr, e)
+
+
+__all__ = ["MQClientInstance", "TopicPublishInfo"]

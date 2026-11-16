@@ -1,9 +1,9 @@
 import pytest
 
-from client.consumer import (MAX_POP_INVISIBLE_TIME,
+from rocketmq_client_remoting.client.consumer import (MAX_POP_INVISIBLE_TIME,
                                       MIN_POP_INVISIBLE_TIME,
                                       DefaultMQPushConsumer)
-from client.exception import MQClientException
+from rocketmq_client_remoting.client.exception import MQClientException
 
 GROUP = "CID_check_config_py"
 TOPIC = "CheckConfigPyTopic"

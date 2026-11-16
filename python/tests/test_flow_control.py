@@ -26,20 +26,20 @@ import inspect
 import threading
 import time
 
-from client import consumer as consumer_mod
-from client.consumer import (DefaultLitePullConsumer, DefaultMQPushConsumer, PopProcessQueue,
+from rocketmq_client_remoting.client import consumer as consumer_mod
+from rocketmq_client_remoting.client.consumer import (DefaultLitePullConsumer, DefaultMQPushConsumer, PopProcessQueue,
                              FLOW_CONTROL_WARN_EVERY_N_TRIPS,
                              PULL_TIME_DELAY_WHEN_BROKER_FLOW_CONTROL,
                              PULL_TIME_DELAY_WHEN_CACHE_FLOW_CONTROL,
                              is_flow_control_warn_trip)
-from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus,
                                     MessageListenerConcurrently, MessageListenerOrderly,
                                     PullResult, PullStatus)
-from client.exception import MQBrokerException
-from common.message import MessageExt, MessageQueue
-from common.subscription_data import SubscriptionData
-from remoting.protocol.codes import ResponseCode
-from remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.client.exception import MQBrokerException
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.remoting.protocol.codes import ResponseCode
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
 from tests.test_lite_pull_consumer import _Lite
 
 TOPIC = "FlowControlPyUnitTopic"

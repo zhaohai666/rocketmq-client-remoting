@@ -4,11 +4,11 @@
 import threading
 import time
 
-from client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, PopProcessQueue,
                              PULL_MAX_IDLE_TIME, PULL_TIME_DELAY_WHEN_SUSPEND)
-from client.consumer_result import PopResult, PullResult, PullStatus
-from common.message import MessageQueue
-from common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.client.consumer_result import PopResult, PullResult, PullStatus
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
 
 GROUP = "G_suspend"
 TOPIC = "SuspendPyUnitTopic"
@@ -141,7 +141,7 @@ def test_suspend_stops_pulls_and_resume_restarts_them():
 def test_suspend_leaves_already_fetched_state_alone():
     pass
     c, mq, key, fake = _consumer()
-    from common.message import MessageExt
+    from rocketmq_client_remoting.common.message import MessageExt
     buffered = [MessageExt(topic=TOPIC, body=b"x")]
     c._pending[key] = list(buffered)
     c._offset_table[key] = 17

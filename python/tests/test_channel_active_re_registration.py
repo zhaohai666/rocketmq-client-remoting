@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import time
 
-from client.consumer import DefaultMQPushConsumer
-from client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
 
 NS = ["127.0.0.1:9876"]
 CLIENT_ID = "python-channel-active@1"

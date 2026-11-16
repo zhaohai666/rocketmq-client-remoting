@@ -7,12 +7,12 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.admin import DefaultMQAdminExt
-from client.exception import MQBrokerException, MQClientException
-from client.producer import DefaultMQProducer
-from client.send_result import SendStatus
-from common.message import Message
-from common.mix_all import MixAll
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.exception import MQBrokerException, MQClientException
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.send_result import SendStatus
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.common.mix_all import MixAll
 
 NAMESRV = os.environ.get("ROCKETMQ_NAMESRV", "127.0.0.1:9876")
 STAMP = int(time.time())

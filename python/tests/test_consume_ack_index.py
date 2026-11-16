@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from collections import deque
 
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import ConsumeConcurrentlyStatus
-from client.hook import ConsumeMessageHook
-from common.message import MessageExt, MessageQueue
-from remoting.protocol.heartbeat import MessageModel
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.client.hook import ConsumeMessageHook
+from rocketmq_client_remoting.common.message import MessageExt, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.heartbeat import MessageModel
 
 GROUP = "GID_AckIndexUnitTest"
 TOPIC = "AckIndexUnitTestTopic"
@@ -97,7 +97,7 @@ class Harness:
 
 class TestContextDefault:
     def test_default_is_the_int32_max_sentinel(self):
-        from client.consumer_result import ConsumeConcurrentlyContext
+        from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyContext
         assert ConsumeConcurrentlyContext().ack_index == (1 << 31) - 1
 
 

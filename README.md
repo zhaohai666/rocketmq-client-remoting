@@ -200,10 +200,10 @@ cd rocketmq-client-remoting
 ### Python
 
 ```python
-from client.producer import DefaultMQProducer
-from client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
-from client.consumer_result import ConsumeConcurrentlyStatus
-from common.message import Message
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer, MessageListenerConcurrently
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus
+from rocketmq_client_remoting.common.message import Message
 
 producer = DefaultMQProducer("PID_DEMO")
 producer.set_namesrv_addr("127.0.0.1:9876")

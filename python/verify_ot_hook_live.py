@@ -30,19 +30,19 @@ import time
 
 sys.path.insert(0, ".")
 
-from client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
+from rocketmq_client_remoting.client.consumer import (ConsumeConcurrentlyStatus, DefaultMQPushConsumer,
                              MessageListenerConcurrently)
-from client.open_tracing_hook import (MESSAGE_BUS_DESTINATION,
+from rocketmq_client_remoting.client.open_tracing_hook import (MESSAGE_BUS_DESTINATION,
                                       SPAN_KIND, SPAN_KIND_CONSUMER,
                                       SPAN_KIND_PRODUCER, TRANS_MSG_COMMIT,
                                       ConsumeMessageOpenTracingHook,
                                       EndTransactionOpenTracingHook,
                                       SendMessageOpenTracingHook)
-from client.producer import (DefaultMQProducer, LocalTransactionState,
+from rocketmq_client_remoting.client.producer import (DefaultMQProducer, LocalTransactionState,
                              TransactionListener)
-from client.trace import TraceConstants
-from common.message import Message, MessageConst
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.trace import TraceConstants
+from rocketmq_client_remoting.common.message import Message, MessageConst
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "OTLivePy_%d" % int(time.time() * 1000)

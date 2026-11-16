@@ -16,15 +16,15 @@ import threading
 
 import pytest
 
-from client.exception import MQClientException
-from client.mq_client import MQClientInstance
-from remoting.client import RemotingClient
-from remoting.protocol import extra_info as ei
-from remoting.protocol.bitset import BitSet
-from remoting.protocol.body import BatchAck, BatchAckMessageRequestBody
-from remoting.protocol.codes import RequestCode, ResponseCode
-from remoting.protocol.headers import AckMessageRequestHeader
-from remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.client.exception import MQClientException
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.remoting.client import RemotingClient
+from rocketmq_client_remoting.remoting.protocol import extra_info as ei
+from rocketmq_client_remoting.remoting.protocol.bitset import BitSet
+from rocketmq_client_remoting.remoting.protocol.body import BatchAck, BatchAckMessageRequestBody
+from rocketmq_client_remoting.remoting.protocol.codes import RequestCode, ResponseCode
+from rocketmq_client_remoting.remoting.protocol.headers import AckMessageRequestHeader
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
 
 BROKER = "broker-a"
 OTHER_BROKER = "broker-b"

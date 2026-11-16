@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-from common.message import (Message, MessageBatch, MessageExt, MessageQueue,
+from rocketmq_client_remoting.common.message import (Message, MessageBatch, MessageExt, MessageQueue,
                                      is_wait_store_msg_ok)
-from common.message_const import MessageConst
+from rocketmq_client_remoting.common.message_const import MessageConst
 
 
 class TestMessageQueue:

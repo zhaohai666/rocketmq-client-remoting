@@ -5,9 +5,9 @@ import threading
 
 import pytest
 
-from client.mq_client import MQClientInstance
-from client.mq_client_manager import MQClientManager
-from client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.client.mq_client_manager import MQClientManager
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
 
 NS = "127.0.0.1:19876"
 
@@ -234,7 +234,7 @@ def test_transaction_check_dispatch_swallows_handler_exception():
 def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
     """Facade level: two producers in the same process (same instanceName → same clientId) share the instance;
     closing one leaves the instance alive; only after all are closed is it really shut down."""
-    from client.mq_client_manager import MQClientManager as Mgr
+    from rocketmq_client_remoting.client.mq_client_manager import MQClientManager as Mgr
 
     mgr = Mgr.get_instance()
     p1 = DefaultMQProducer("MgrSharePG1")
@@ -264,7 +264,7 @@ def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
         assert mgr.get_client_factory(client_id) is None
         assert inst.remoting_client._closed is True
         # After the instance is closed, the p2 side should not have leftover sendable-state confusion — _require_client will reject
-        from client.exception import MQClientException
+        from rocketmq_client_remoting.client.exception import MQClientException
         with pytest.raises(MQClientException):
             p2._require_client()
     finally:

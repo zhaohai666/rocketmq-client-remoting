@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 import threading
 
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import PullResult, PullStatus
-from client.mq_client import MQClientInstance
-from common.message import MessageQueue
-from common.mix_all import MixAll
-from common.subscription_data import SubscriptionData
-from common.sysflag import PullSysFlag
-from remoting.protocol.remoting_command import RemotingCommand
-from remoting.protocol.route import BrokerData, TopicRouteData
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import PullResult, PullStatus
+from rocketmq_client_remoting.client.mq_client import MQClientInstance
+from rocketmq_client_remoting.common.message import MessageQueue
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.common.subscription_data import SubscriptionData
+from rocketmq_client_remoting.common.sysflag import PullSysFlag
+from rocketmq_client_remoting.remoting.protocol.remoting_command import RemotingCommand
+from rocketmq_client_remoting.remoting.protocol.route import BrokerData, TopicRouteData
 
 GROUP = "GID_P5Unit"
 TOPIC = "P5UnitTopic"

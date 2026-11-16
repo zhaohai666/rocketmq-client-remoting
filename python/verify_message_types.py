@@ -34,14 +34,14 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client.producer import (DefaultMQProducer, SelectMessageQueueByHash,
+from rocketmq_client_remoting.client.producer import (DefaultMQProducer, SelectMessageQueueByHash,
                                        SendCallbackImpl, LocalTransactionState, TransactionListener)
-from client.consumer import (DefaultMQPushConsumer, MessageListenerConcurrently,
+from rocketmq_client_remoting.client.consumer import (DefaultMQPushConsumer, MessageListenerConcurrently,
                                        MessageListenerOrderly)
-from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus)
-from common.message import Message, MessageExt, MessageQueue
-from remoting.protocol.heartbeat import ConsumeFromWhere
-from remoting.rpchook import AclClientRPCHook, SessionCredentials
+from rocketmq_client_remoting.client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus)
+from rocketmq_client_remoting.common.message import Message, MessageExt, MessageQueue
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.remoting.rpchook import AclClientRPCHook, SessionCredentials
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 AK = sys.argv[2] if len(sys.argv) > 2 else ""

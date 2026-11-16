@@ -24,15 +24,15 @@ import sys
 import threading
 import time
 
-from client.admin import DefaultMQAdminExt
-from client.consumer import DefaultMQPushConsumer
-from client.consumer_result import ConsumeConcurrentlyStatus, MessageListenerConcurrently
-from client.producer import DefaultMQProducer
-from client.trace import AccessChannel, TraceDataEncoder, TraceType
-from common.message import Message
-from common.message_client_id_setter import get_uniq_id
-from common.mix_all import MixAll
-from remoting.protocol.heartbeat import ConsumeFromWhere
+from rocketmq_client_remoting.client.admin import DefaultMQAdminExt
+from rocketmq_client_remoting.client.consumer import DefaultMQPushConsumer
+from rocketmq_client_remoting.client.consumer_result import ConsumeConcurrentlyStatus, MessageListenerConcurrently
+from rocketmq_client_remoting.client.producer import DefaultMQProducer
+from rocketmq_client_remoting.client.trace import AccessChannel, TraceDataEncoder, TraceType
+from rocketmq_client_remoting.common.message import Message
+from rocketmq_client_remoting.common.message_client_id_setter import get_uniq_id
+from rocketmq_client_remoting.common.mix_all import MixAll
+from rocketmq_client_remoting.remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)
