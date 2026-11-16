@@ -975,6 +975,14 @@ func (c *DefaultMQPushConsumer) SubscribeWithSelector(topic string, selector Mes
 	if strings.TrimSpace(topic) == "" {
 		return common.ClientError("subscription topic is empty")
 	}
+	// Java DefaultMQPushConsumer.subscribe wraps the topic at the public entry
+	// (withNamespace(topic) -> NamespaceUtil.wrapNamespace): with a namespace
+	// set, the namespaced name is the subscription key, so route fetch, pull
+	// request, heartbeat and rebalance all speak it; delivery strips the prefix
+	// again (see consume_service.go). common.WrapNamespace is idempotent and
+	// passes system resources / retry-DLQ names through unchanged, so a caller
+	// that already wrapped (or subscribed a %RETRY%/%DLQ% name) is unaffected.
+	topic = common.WrapNamespace(c.namespace, topic)
 	expr := selector.Expression
 	if expr == "" {
 		expr = "*"
@@ -1010,8 +1018,13 @@ func (c *DefaultMQPushConsumer) SubscribeWithSelector(topic string, selector Mes
 	return nil
 }
 
-// Unsubscribe drops a topic's subscription.
+// Unsubscribe drops a topic's subscription. The topic goes through the same
+// namespace wrap as Subscribe so a raw caller-facing name resolves to the
+// wrapped subscription key (Java 5.x passes the raw name through here, which
+// never matches a namespaced subscribe — the node/cpp ports wrap on both
+// entries, and an unsubscribe that cannot match is useless).
 func (c *DefaultMQPushConsumer) Unsubscribe(topic string) {
+	topic = common.WrapNamespace(c.namespace, topic)
 	c.mu.Lock()
 	_, existed := c.subscription[topic]
 	delete(c.subscription, topic)

@@ -664,6 +664,11 @@ func (c *DefaultMQPullConsumer) Subscribe(topic, subExpression string) error {
 	if err := common.CheckTopic(topic); err != nil {
 		return err
 	}
+	// Same entry-level wrap as the push consumer (Java 4.x's
+	// DefaultMQPullConsumer.subscribe did withNamespace(topic) at the facade):
+	// with a namespace set, the namespaced name is the subscription /
+	// register-topics key, so heartbeat and route fetch speak it.
+	topic = common.WrapNamespace(c.namespace, topic)
 	sub, err := remoting.FilterAPI{}.BuildSubscriptionData(topic, subExpression)
 	if err != nil {
 		return err
@@ -676,7 +681,10 @@ func (c *DefaultMQPullConsumer) Subscribe(topic, subExpression string) error {
 }
 
 // Unsubscribe drops the subscription and the register entry for the topic.
+// The same namespace wrap as Subscribe, so a raw caller name resolves to the
+// wrapped key.
 func (c *DefaultMQPullConsumer) Unsubscribe(topic string) {
+	topic = common.WrapNamespace(c.namespace, topic)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.subscription, topic)

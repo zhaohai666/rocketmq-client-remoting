@@ -846,6 +846,11 @@ func (c *DefaultLitePullConsumer) Subscribe(topic, subExpression string) error {
 	if strings.TrimSpace(topic) == "" {
 		return common.ClientError("Topic can not be null or empty.")
 	}
+	// Java DefaultLitePullConsumer.subscribe wraps the topic at the public
+	// entry (withNamespace(topic)); the namespaced name becomes the
+	// subscription / route / heartbeat key, delivery strips the prefix again
+	// (see the WithoutNamespace step on the lite delivery path).
+	topic = common.WrapNamespace(c.namespace, topic)
 	if subExpression == "" {
 		subExpression = "*"
 	}
@@ -883,6 +888,11 @@ func (c *DefaultLitePullConsumer) Unsubscribe(topic string) {
 	if strings.TrimSpace(topic) == "" {
 		return
 	}
+	// Java DefaultLitePullConsumer.unsubscribe wraps too
+	// (withNamespace(topic)) — the same wrap as Subscribe, so a raw caller
+	// name resolves to the wrapped subscription key and the queue revocation
+	// below matches the queues held under that key.
+	topic = common.WrapNamespace(c.namespace, topic)
 	c.mu.Lock()
 	delete(c.subscription, topic)
 	if _, ok := c.assignSubExpr[topic]; !ok {
