@@ -810,6 +810,12 @@ public sealed class DefaultMQPushConsumer
     // triggers an immediate rebalance on NOTIFY_CONSUMER_IDS_CHANGED(40).
     private List<MessageQueue> _assigned = new();
     private readonly ManualResetEventSlim _rebalanceNow = new(false);
+    // Test-only freeze gate: when set, RebalanceLoop parks before its next
+    // DoRebalance so a unit test can drive exact rounds via DoRebalanceForTest
+    // without a background round consuming a "changed" assignment first.
+    // Defaults false, so production behavior is untouched.
+    private volatile bool _rebalanceFrozenForTest;
+    private readonly ManualResetEventSlim _rebalanceFrozenAckForTest = new(false);
     // Revocation marker (isDropped semantics): after rebalance removes a
     // queue from this instance's assignment, _dropped is set and the pull
     // thread discards its batch and exits once the long poll returns (it no
@@ -2601,6 +2607,27 @@ public sealed class DefaultMQPushConsumer
     /// correction).</summary>
     public bool RebalancePendingForTest() => _rebalanceNow.IsSet;
 
+    /// <summary>Test-only: freeze background rebalance rounds. This waits for the
+    /// loop to acknowledge the freeze, so after return no background DoRebalance
+    /// can run until <see cref="UnfreezeRebalanceForTest"/>. Use it after Start
+    /// has produced the first assignment, in tests that drive exact rebalance
+    /// rounds via <see cref="DoRebalanceForTest"/>.</summary>
+    public void FreezeRebalanceForTest()
+    {
+        _rebalanceFrozenForTest = true;
+        _rebalanceNow.Set(); // wake a parked Wait so the freeze ack is prompt
+        if (!_rebalanceFrozenAckForTest.Wait(5000))
+            throw new InvalidOperationException("rebalance loop did not acknowledge the freeze");
+    }
+
+    /// <summary>Test-only: release the freeze gate set by <see cref="FreezeRebalanceForTest"/>.</summary>
+    public void UnfreezeRebalanceForTest()
+    {
+        _rebalanceFrozenForTest = false;
+        _rebalanceFrozenAckForTest.Reset();
+        _rebalanceNow.Set();
+    }
+
     private RemotingCommand? OnGetConsumerRunningInfo(RemotingCommand cmd, string addr)
     {
         // GET_CONSUMER_RUNNING_INFO(307) handling.
@@ -3199,6 +3226,16 @@ public sealed class DefaultMQPushConsumer
             _rebalanceNow.Wait(interval);
             _rebalanceNow.Reset();
             if (_stop || !_started) return;
+            // Test-only freeze: park before the round so the test owns every
+            // DoRebalance (the 2s startup retry would otherwise steal a
+            // "changed" round on a loaded CI runner).
+            if (_rebalanceFrozenForTest)
+            {
+                _rebalanceFrozenAckForTest.Set();
+                while (_rebalanceFrozenForTest && !_stop) _rebalanceNow.Wait(100);
+                if (_stop) return;
+                continue;
+            }
             try
             {
                 MaybeSendHeartbeat();

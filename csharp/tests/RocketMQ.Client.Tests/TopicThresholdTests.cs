@@ -484,6 +484,7 @@ public class TopicThresholdTests
                 + c.PullThresholdForQueue);
             // Control: the byte budget is off, so its knob is exactly the user's 50.
             Assert.Equal(50, c.PullThresholdSizeForQueue);
+            c.FreezeRebalanceForTest(); // own every subsequent round; no 2s background interleaving
 
             // An identical round must NOT divide: only a changed assignment does, so the
             // hand-set value survives. Reverting the gate to "always divide" writes 250
@@ -513,6 +514,11 @@ public class TopicThresholdTests
             Assert.True(WaitFor(() => c.PullThresholdForQueue == 250), "first round divides");
             Assert.True(c.MqMapContainsForTest(KeyOf(new MessageQueue(Topic, "broker-0", 1))));
             Assert.True(c.MqMapContainsForTest(KeyOf(new MessageQueue(Topic, "broker-1", 1))));
+            // The first assignment is in place. Freeze the background loop from
+            // here: the 2s startup retry (Consumer.cs:3195-3199) otherwise races
+            // the manual rounds below and can consume the "changed" verdict on
+            // a loaded CI runner. All subsequent rounds are driven explicitly.
+            c.FreezeRebalanceForTest();
 
             // 3 queues on the first broker, 1 on the second: still 4 in total, so a count
             // comparison would call this round unchanged and leave the 777 below in place.
