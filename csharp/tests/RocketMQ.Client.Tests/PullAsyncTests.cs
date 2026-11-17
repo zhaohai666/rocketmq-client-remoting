@@ -43,17 +43,23 @@ public class PullAsyncTests
         public Exception? LastError;
         public long CallbackThreadId;
         public bool ThrowFromCallback;
-        public bool Threw;
+        // Published by the callback thread, read by the test thread after the
+        // wait handle fires. volatile documents that cross-thread publication.
+        public volatile bool Threw;
 
         public void OnSuccess(PullResult pullResult)
         {
             Interlocked.Increment(ref Successes);
             LastResult = pullResult;
             CallbackThreadId = Thread.CurrentThread.ManagedThreadId;
+            // Publish Threw BEFORE signalling _first: WaitForRec returning true
+            // is the test's cue to read Threw, so signalling first lets the test
+            // thread observe a stale false on a loaded CI runner (the flake in
+            // PullAsync_CallbackThrows_IsSwallowed_AndConsumerKeepsWorking).
+            if (ThrowFromCallback) Threw = true;
             _first.Set();
             if (ThrowFromCallback)
             {
-                Threw = true;
                 throw new InvalidOperationException("callback boom (must not escape)");
             }
         }
@@ -63,10 +69,11 @@ public class PullAsyncTests
             Interlocked.Increment(ref Exceptions);
             LastError = error;
             CallbackThreadId = Thread.CurrentThread.ManagedThreadId;
+            // See OnSuccess: publish the flag before the wait handle fires.
+            if (ThrowFromCallback) Threw = true;
             _first.Set();
             if (ThrowFromCallback)
             {
-                Threw = true;
                 throw new InvalidOperationException("callback boom (must not escape)");
             }
         }
